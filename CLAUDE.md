@@ -53,6 +53,7 @@ src/backtest 回测 CLI，复用 src/core
 | 写指标或策略 | [docs/04](./docs/04-指标与信号引擎.md)（公式与口径都在这，含与来源文档的差异说明） |
 | 接数据源 | [docs/03](./docs/03-数据源与存储设计.md) + [src/main/providers/README.md](./src/main/providers/README.md) |
 | 改窗口或交互 | [docs/06](./docs/06-桌宠交互与非干扰设计.md) |
+| 做或验收美术资源 | [docs/09](./docs/09-美术资源规格.md)（形象无关的规格与验收标准；具体形象的设定放 `docs/skins/<skinName>.md`。资源是外包件，不在仓库里手搓） |
 | 改提醒逻辑 | [docs/05](./docs/05-风控与提醒规则.md) |
 | 写测试或回测 | [docs/07](./docs/07-回测与验证方案.md)（回测陷阱清单必读） |
 
