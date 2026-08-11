@@ -48,9 +48,10 @@ pnpm dev            # 启动桌宠（开发模式会画出命中区虚线框，�
 pnpm test           # 引擎单测（不需要启动 Electron）
 ```
 
-> **美术资源不在仓库里**（外包件，规格见 [docs/09](./docs/09-美术资源规格.md)）。
-> `resources/pet/default/` 为空时桌宠显示几何占位形状、托盘用内置兜底图标 ——
-> 这是设计内的降级路径，不影响 C1/C2 验收。交付方按 docs/09 §8 放入 28 个文件即自动生效。
+> 默认皮肤「小猫」由 [`tools/asset-build/`](./tools/asset-build/) 程序化生成，
+> 已过 [docs/09](./docs/09-美术资源规格.md) §9.1 的 A1–A13 自动验收：
+> `pnpm assets:build` 重出素材，`pnpm verify:assets` 校验。形象设定见 [docs/skins/default.md](./docs/skins/default.md)。
+> 皮肤缺失时桌宠会退化为几何占位形状、托盘用内置兜底图标 —— 那条降级路径仍然保留。
 >
 > `better-sqlite3` 为原生模块，需在 Electron ABI 下重建（`pnpm-workspace.yaml` 里已显式跳过其默认构建）。
 

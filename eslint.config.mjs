@@ -33,6 +33,17 @@ export default tseslint.config(
     },
   },
   {
+    // 构建期工具：纯 Node 脚本，不参与打包，也不受 src 的分层约束
+    files: ['tools/**/*.mjs', 'scripts/**/*.mjs'],
+    languageOptions: {
+      globals: {
+        Buffer: 'readonly',
+        console: 'readonly',
+        process: 'readonly',
+      },
+    },
+  },
+  {
     files: ['**/*.ts', '**/*.tsx'],
     rules: {
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],

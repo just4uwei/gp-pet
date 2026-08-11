@@ -33,6 +33,11 @@ jobs:
       - name: Test
         run: pnpm test
 
+      # docs/09 §9.1 建议把资源验收做成 CI 门禁：素材是生成件，
+      # 改了生成代码却忘记重出图集时，这一步会立刻发现帧数与图集宽度不一致
+      - name: Verify assets
+        run: pnpm verify:assets
+
       # 构建产物本身就是一次冒烟：三个渲染入口、preload、主进程都得能打出来
       - name: Build
         run: pnpm electron-vite build

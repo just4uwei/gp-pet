@@ -1,0 +1,39 @@
+{
+  "outline": "#2A2028",
+  "colors": [
+    "#2A2028",
+    "#FDFBF5",
+    "#EFE7DA",
+    "#D9CDBB",
+    "#B5A692",
+    "#E8A0A8",
+    "#5B7FA6",
+    "#E8721C",
+    "#F59D4E",
+    "#F2C230",
+    "#F8DE7A",
+    "#4A4E5A",
+    "#9AA0B4",
+    "#C8CCD9",
+    "#ECEEF2",
+    "#6F748A",
+    "#6C8EBF",
+    "#6B7080"
+  ],
+  "semantic": {
+    "riskAmber": [
+      "#E8721C",
+      "#F59D4E"
+    ],
+    "chanceGold": [
+      "#F2C230",
+      "#F8DE7A"
+    ],
+    "offlineGray": [
+      "#4A4E5A",
+      "#9AA0B4",
+      "#C8CCD9",
+      "#ECEEF2"
+    ]
+  }
+}

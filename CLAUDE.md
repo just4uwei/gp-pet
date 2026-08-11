@@ -70,7 +70,8 @@ src/backtest 回测 CLI，复用 src/core
 - **主进程/preload 的外置依赖清单在 `electron.vite.config.ts`**，从 `package.json` 的 `dependencies` 派生。别用 `rollupOptions.external` 去覆盖它 —— 漏外置 `electron` 会让 `import { app } from 'electron'` 解析到 npm 上那个「返回 exe 路径」的启动器包，**构建照样成功，启动才炸**。
 - **preload 必须打成 CJS**：安全基线要求 `sandbox: true`，而沙箱化的 preload 不支持 ESM。electron-vite 5 默认输出 ESM，配置里已显式改回。
 - **改完主进程要真启一次**（`pnpm dev`）。typecheck + build 全绿也可能启动即崩 —— 上面两条就是这么发现的。
-- **美术资源不在仓库里**，缺资源时走占位皮肤 + 兜底托盘图标的降级路径。写代码不要假设 `resources/pet/<skin>/` 存在，测试更不许拿它当 fixture。
+- **默认皮肤「小猫」是生成件**，源在 `tools/asset-build/`，改素材要改代码再 `pnpm assets:build && pnpm verify:assets`，不要直接手改 PNG（下次重出就被覆盖）。
+- **仍然不要假设皮肤存在**：缺资源时走占位皮肤 + 兜底托盘图标的降级路径，测试不许拿 `resources/pet/<skin>/` 当 fixture（用户皮肤、第三方皮肤都可能缺）。
 
 ## 措辞纪律
 

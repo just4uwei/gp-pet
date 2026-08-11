@@ -22,7 +22,9 @@
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
     "backtest": "tsx src/backtest/cli.ts",
-    "verify:indicators": "node scripts/verify/run.mjs"
+    "verify:indicators": "node scripts/verify/run.mjs",
+    "assets:build": "node tools/asset-build/build-skin.mjs",
+    "verify:assets": "node tools/asset-build/verify-assets.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
