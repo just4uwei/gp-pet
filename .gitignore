@@ -1,0 +1,32 @@
+node_modules/
+out/
+dist/
+release/
+*.log
+logs/
+
+# 本地运行产物
+.env
+.env.local
+*.db
+*.db-journal
+*.db.bak-*
+reports/
+.vite/
+.eslintcache
+
+# 工具
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# 文档转换的中间产物
+strategy*.txt
+
+# Claude Code 本地设置
+.claude/settings.local.json
+
+# 无关素材
+*_raw.jpeg
