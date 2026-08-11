@@ -9,10 +9,11 @@
 
 import { app, powerMonitor } from 'electron'
 import { AppController } from './controller'
+import { createDataLayer } from './data-layer'
 import { registerHandlers } from './ipc/handlers'
 import { reportUnimplementedChannels } from './ipc/router'
 import { initLogging, log } from './logging'
-import { registerResourceProtocol, registerResourceScheme } from './resources'
+import { registerResourceProtocol, registerResourceScheme, resourcesRoot } from './resources'
 import { TrayController } from './tray/TrayController'
 
 initLogging()
@@ -33,6 +34,24 @@ void app.whenReady().then(() => {
 
   controller.start()
   tray.start()
+
+  // 数据层装配是异步的（开库 + undici），故意排在窗口与托盘之后：
+  // 装配失败时用户至少还能看到桌宠与托盘菜单，而不是双击图标毫无反应
+  void createDataLayer({
+    userDataDir: app.getPath('userData'),
+    resourcesRoot: resourcesRoot(),
+    log: { info: (...args) => log.info(...args), warn: (...args) => log.warn(...args) },
+    onQuotes: () => controller?.onQuotes(),
+  })
+    .then((layer) => {
+      controller?.attachDataLayer(layer)
+      layer.start()
+      log.info('[app] 数据层就绪。M1：有数据源、有调度，尚无引擎与提醒。')
+    })
+    .catch((error: unknown) => {
+      // 数据层起不来是「行情离线」，不是崩溃 —— engineStatus 会如实报 offline
+      log.error('[app] 数据层装配失败，将以离线状态运行：', error)
+    })
 
   // 休眠唤醒后重新校验窗口位置：合盖期间可能换过显示器拓扑（docs/02 §6）
   powerMonitor.on('resume', () => {

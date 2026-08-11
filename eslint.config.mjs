@@ -37,8 +37,11 @@ export default tseslint.config(
     files: ['tools/**/*.mjs', 'scripts/**/*.mjs'],
     languageOptions: {
       globals: {
+        AbortSignal: 'readonly',
         Buffer: 'readonly',
+        TextDecoder: 'readonly',
         console: 'readonly',
+        fetch: 'readonly',
         process: 'readonly',
       },
     },

@@ -23,6 +23,7 @@
     "test:cov": "vitest run --coverage",
     "backtest": "tsx src/backtest/cli.ts",
     "verify:indicators": "node scripts/verify/run.mjs",
+    "fixtures:record": "node scripts/record-fixtures.mjs",
     "assets:build": "node tools/asset-build/build-skin.mjs",
     "verify:assets": "node tools/asset-build/verify-assets.mjs"
   },

@@ -1,11 +1,12 @@
 /**
  * 通道实现登记（docs/02 §5）。
  *
- * 骨架阶段只实现桌宠交互与连通性探针所需的通道；其余通道尚未实现，
- * 由 reportUnimplementedChannels() 在启动日志里列出 —— 缺口要看得见，不静默（docs/02 §7）。
+ * M1 补齐了自选股、设置与健康度；信号相关通道（signal:*）要等引擎（M2），
+ * 仍由 reportUnimplementedChannels() 在启动日志里列出 —— 缺口要看得见，不静默（docs/02 §7）。
  */
 
 import { Menu } from 'electron'
+import { normalizeCode } from '@core/code'
 import type { AppController } from '../../controller'
 import { buildContextMenu } from '../../tray/menu'
 import { handle } from '../router'
@@ -15,6 +16,36 @@ export function registerHandlers(controller: AppController): void {
   handle('app:ping', (_event, payload) => ({ pong: payload, at: Date.now() }))
 
   handle('app:engineStatus', () => controller.engineStatus())
+
+  handle('app:providerHealth', () => controller.providerHealth())
+
+  // ── 自选股 ───────────────────────────────────────────────────────
+  // 代码规范化在这一层做（docs/03 §5）：渲染层可以传 600000 / sh600000 / SH600000，
+  // 再往下的仓储与取数层一律只认 SH600000
+
+  handle('watchlist:list', () => controller.watchlist())
+
+  handle('watchlist:add', (_event, code, group) =>
+    group === undefined ? controller.addWatch(code) : controller.addWatch(code, group)
+  )
+
+  handle('watchlist:remove', (_event, code) => controller.removeWatch(normalizeCode(code)))
+
+  handle('watchlist:reorder', (_event, codes) =>
+    controller.reorderWatch(codes.map((code) => normalizeCode(code)))
+  )
+
+  handle('position:set', (_event, code, shares, cost) =>
+    controller.setPosition(normalizeCode(code), shares, cost)
+  )
+
+  handle('position:clear', (_event, code) => controller.clearPosition(normalizeCode(code)))
+
+  // ── 设置 ─────────────────────────────────────────────────────────
+
+  handle('settings:get', () => controller.getSettings())
+
+  handle('settings:patch', (_event, patch) => controller.patchSettings(patch))
 
   handle('pet:getSkin', () => controller.currentSkin)
 

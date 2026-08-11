@@ -79,6 +79,10 @@ export interface EngineStatus {
   unreadAlerts: number
   doNotDisturb: boolean
   offline: boolean
+  /** 日历依据不硬（内置表未核对，或退化到「周一至周五」），UI 应提示日历可能过期（docs/03 §3） */
+  calendarUncertain?: boolean
+  /** 最近一轮行情取自缓存 —— UI 显示灰态而非假装实时（docs/03 §2.2） */
+  stale?: boolean
 }
 
 export interface Rect {
@@ -200,7 +204,8 @@ export interface AppSettings {
   soundEnabled: boolean
   quietHours: { start: string; end: string }[]
   respectFullscreen: boolean
-  providerPriority: string[]
+  /** 与 src/main/providers/types.ts 的 ProviderId 同集合（同一 union，跨层不引用） */
+  providerPriority: ('eastmoney' | 'sina' | 'tencent')[]
   autoLaunch: boolean
   skin: string
   minimalMode: boolean

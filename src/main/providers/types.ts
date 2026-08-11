@@ -38,6 +38,7 @@ export type ProviderStatus = 'OK' | 'DEGRADED' | 'DOWN'
 
 export interface ProviderRegistryOptions {
   priority: ProviderId[]
+  /** 单次 HTTP 请求的超时与重试 —— 由 HttpClient 执行，registry 只负责透传给装配层 */
   timeoutMs: number
   retries: number
   /** 连续失败达此次数即标记 DEGRADED 并冷却 */
@@ -45,6 +46,12 @@ export interface ProviderRegistryOptions {
   cooldownMs: number
   globalConcurrency: number
   perProviderConcurrency: number
+  /**
+   * 单个 provider 一次「取数动作」的总上限。一次动作可能含多个请求
+   * （日线要拉原价 + 复权两趟、快照要分片），所以它必须大于 timeoutMs×(retries+1)。
+   * 作用是防止某个源连接挂住时把整个 tick 拖死。
+   */
+  attemptDeadlineMs: number
 }
 
 export interface HealthRecord {

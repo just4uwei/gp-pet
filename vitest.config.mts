@@ -27,6 +27,9 @@ export default defineConfig({
         'src/main/ipc/**',
         'src/main/index.ts',
         'src/main/controller.ts',
+        // 纯接线：真实依赖全是 undici / SQLite / Electron 路径。
+        // 一轮 tick 的判断逻辑已下沉到 src/main/engine/tick.ts（有测试），这里只剩装配
+        'src/main/data-layer.ts',
         'src/main/logging.ts',
         'src/main/resources.ts',
         // 类型契约文件，编译后无可执行语句

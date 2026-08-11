@@ -19,7 +19,7 @@
 ## 重新录制 fixture
 
 ```bash
-pnpm tsx scripts/record-fixtures.ts --provider eastmoney --code SH600000
+pnpm fixtures:record -- --provider eastmoney
 ```
 
 录制后需人工比对新旧 fixture 的差异再提交 —— 自动覆盖会让「接口变了」这件事悄无声息地通过。

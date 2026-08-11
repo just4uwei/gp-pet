@@ -16,7 +16,8 @@ export type SecCode = string
 export type TradeDate = string
 
 export type Market = 'SH' | 'SZ' | 'BJ'
-export type Board = 'MAIN' | 'GEM' | 'STAR' | 'BSE' | 'ETF'
+/** INDEX 不是可交易品种，但基准指数（默认 SH000300）要走同一套取数与落库路径（docs/04 §1.6） */
+export type Board = 'MAIN' | 'GEM' | 'STAR' | 'BSE' | 'ETF' | 'INDEX'
 export type AdjustMode = 'none' | 'qfq' | 'hfq'
 
 export interface SecProfile {
@@ -43,8 +44,13 @@ export interface Candle {
   highAdj: number
   lowAdj: number
   closeAdj: number
+  /** 股。各源单位不一（腾讯给手），统一在 provider 适配层换算 */
   volume: number
-  amount: number
+  /**
+   * 成交额，元。部分数据源的日线不含该字段（如腾讯日线只给量不给额），此时为 null
+   * —— 用 0 冒充会读成「零成交额」。目前没有指标依赖它，它只服务于展示与换手率。
+   */
+  amount: number | null
   /** 由实时快照拼出的当日临时 K 线，收盘前会持续变化（见 docs/04 §6） */
   provisional?: boolean
   /** 与前一根之间存在交易日缺口，回测应跳过该段（见 docs/07 §4） */
@@ -59,10 +65,16 @@ export interface Snapshot {
   high: number
   low: number
   preClose: number
+  /** 股 */
   volume: number
+  /** 元 */
   amount: number
-  limitUp: number
-  limitDown: number
+  /**
+   * 涨跌停价。指数无涨跌停、上市首日无昨收，此时为 null。
+   * 绝不用 0 兜底 —— limitUp = 0 会让「已涨停」判定永真（见 src/core/code.ts priceLimits）。
+   */
+  limitUp: number | null
+  limitDown: number | null
   suspended: boolean
 }
 

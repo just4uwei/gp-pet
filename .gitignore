@@ -30,3 +30,6 @@ strategy*.txt
 
 # 无关素材
 *_raw.jpeg
+
+# 覆盖率报告是构建产物
+coverage/
