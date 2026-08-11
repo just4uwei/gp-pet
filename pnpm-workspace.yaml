@@ -1,0 +1,10 @@
+# pnpm 10.16+ 起，构建脚本白名单从 package.json 的 pnpm 字段迁到本文件。
+# 显式登记的目的是让 `pnpm install` 在 CI 上以 0 退出，且「哪些包被允许跑脚本」有据可查。
+allowBuilds:
+  # 原生模块。npm 侧的预编译产物对 Electron ABI 无用，须用 electron-rebuild 单独重建
+  # （见 CLAUDE.md「容易踩的坑」），因此这里跳过默认构建。M1 接存储层时再处理。
+  better-sqlite3: false
+  # electron-builder 的 Squirrel 后端；本项目走 NSIS + portable（docs/02 §1）
+  electron-winstaller: false
+  # 平台二进制由 @esbuild/win32-x64 直接提供，postinstall 只做校验
+  esbuild: false

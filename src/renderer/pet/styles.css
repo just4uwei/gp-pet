@@ -1,0 +1,60 @@
+/*
+ * 桌宠窗口样式。
+ *
+ * 窗口是 transparent 的，所以 body 必须彻底透明 —— 任何背景色都会变成一块
+ * 始终置顶的实心矩形，直接违反 C2 的观感前提。
+ */
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  /* 桌宠不参与文本选择；拖拽时选中文本会留下高亮残影 */
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+.stage {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.pet {
+  position: absolute;
+  image-rendering: pixelated;
+  background-repeat: no-repeat;
+  background-position: 0 0;
+}
+
+/* 皮肤缺失时的几何占位。M0 只要能验证 C1/C2，不需要形象 */
+.pet--placeholder {
+  border-radius: 42% 42% 38% 38%;
+  background: #6c8ebf;
+  box-shadow: inset 0 -6px 0 rgb(0 0 0 / 18%);
+  outline: 2px solid #2a2028;
+}
+
+/* 命中区可视化：仅开发期，用于肉眼验收 C2（docs/06 §1） */
+.hitbox {
+  position: absolute;
+  border: 1px dashed rgb(232 114 28 / 90%);
+  background: rgb(232 114 28 / 12%);
+  pointer-events: none;
+}
+
+.debug {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  font: 10px/1.4 ui-monospace, Consolas, monospace;
+  color: #f8de7a;
+  text-shadow: 0 1px 0 #000;
+  pointer-events: none;
+}

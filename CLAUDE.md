@@ -7,7 +7,8 @@
 GP Pet：Windows 桌面桌宠，跟踪用户自选的 A 股，用量化策略判断买卖时机并以不打断工作的方式提醒。
 Electron + React + TypeScript · 本地 SQLite · 免登录 · 无服务端 · **不接券商、不下单**。
 
-当前处于 **M0（工程骨架）**，`src/` 下多数目录只有类型契约与占位，无业务实现。里程碑见 [docs/08](./docs/08-开发路线图.md)。
+当前处于 **M0（工程骨架）代码就绪、等待真机验收**。已实现：Pet/Panel 窗口、点击穿透、托盘、类型化 IPC、皮肤加载。
+`src/core`、`src/main/providers`、`src/main/storage`、`src/backtest` 仍只有类型契约与占位。里程碑见 [docs/08](./docs/08-开发路线图.md)。
 
 ## 五条不可违反的约束
 
@@ -65,8 +66,11 @@ src/backtest 回测 CLI，复用 src/core
 - **MACD 柱用 `2×(DIF−DEA)`**（国内平台口径），与来源文档的 `DIF−DEA` 不同，但不影响任何穿越判定。
 - **布林带标准差除 n 而非 n−1**（国内平台口径）。
 - **穿越只在相邻两根间判定一次**，不做「N 日内曾金叉」的模糊匹配；去重是提醒层的职责，不是指标层的。
-- **package.json 里的依赖版本是占位值**，首次 `pnpm install` 前应用 `pnpm dlx npm-check-updates` 校准并锁定。
-- **better-sqlite3 是原生模块**，需在 Electron ABI 下重建（`electron-rebuild`）。
+- **better-sqlite3 是原生模块**，需在 Electron ABI 下重建（`electron-rebuild`）。`pnpm-workspace.yaml` 里已显式跳过它的默认构建。
+- **主进程/preload 的外置依赖清单在 `electron.vite.config.ts`**，从 `package.json` 的 `dependencies` 派生。别用 `rollupOptions.external` 去覆盖它 —— 漏外置 `electron` 会让 `import { app } from 'electron'` 解析到 npm 上那个「返回 exe 路径」的启动器包，**构建照样成功，启动才炸**。
+- **preload 必须打成 CJS**：安全基线要求 `sandbox: true`，而沙箱化的 preload 不支持 ESM。electron-vite 5 默认输出 ESM，配置里已显式改回。
+- **改完主进程要真启一次**（`pnpm dev`）。typecheck + build 全绿也可能启动即崩 —— 上面两条就是这么发现的。
+- **美术资源不在仓库里**，缺资源时走占位皮肤 + 兜底托盘图标的降级路径。写代码不要假设 `resources/pet/<skin>/` 存在，测试更不许拿它当 fixture。
 
 ## 措辞纪律
 

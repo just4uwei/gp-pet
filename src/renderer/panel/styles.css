@@ -1,0 +1,16 @@
+@import 'tailwindcss';
+
+/*
+ * Tailwind v4 无需配置文件，内容扫描自动完成。
+ * 面板是常规窗口（docs/06 §2.4），不受零干扰契约约束，可以正常用背景色与滚动。
+ */
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: #101216;
+  color: #eceef2;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+}

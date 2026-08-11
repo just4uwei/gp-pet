@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    # Windows 优先（docs/02 §1）。点击穿透与免打扰探测都是 Windows 专有实现，
+    # 在 Linux 跑 CI 只会掩盖真正会出问题的地方。
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Test
+        run: pnpm test
+
+      # 构建产物本身就是一次冒烟：三个渲染入口、preload、主进程都得能打出来
+      - name: Build
+        run: pnpm electron-vite build

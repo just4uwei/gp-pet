@@ -88,10 +88,57 @@ export interface Rect {
   h: number
 }
 
+// ─────────────────────────── 皮肤（见 docs/06 §5、docs/09） ───────────────────────────
+
+/** 九个动画 key 是跨皮肤契约，缺一即整套皮肤作废（docs/09 §1.2） */
+export const PET_ANIMATION_KEYS = [
+  'idle',
+  'blink',
+  'look',
+  'watching',
+  'excited',
+  'alert',
+  'sleepy',
+  'offline',
+  'shush',
+] as const
+
+export type PetAnimationKey = (typeof PET_ANIMATION_KEYS)[number]
+
+export interface PetAnimation {
+  sheet: string
+  frames: number
+  fps: number
+  loop: boolean
+  minHold?: number
+  /** 主进程解析出的可加载 URL（res:// 协议）；图集缺失时为 null，渲染层退化为占位形状 */
+  url: string | null
+  /** @2x 图集（docs/09 §2.1）。缺失时为 null，渲染层退回 @1x 而不是请求一个 404 */
+  url2x: string | null
+}
+
+/** 主进程投影给渲染层的皮肤视图 —— 渲染层不碰文件系统 */
+export interface PetSkinView {
+  /** 目录名，等于 AppSettings.skin */
+  id: string
+  name: string
+  canvas: { width: number; height: number }
+  anchor: { bubbleX: number; bubbleY: number }
+  /** 矩形命中区（docs/06 §2.2 方案 1），坐标相对 canvas 左上角 */
+  hitRects: Rect[]
+  states: Record<PetAnimationKey, PetAnimation>
+  /** true 表示皮肤校验失败已回退到内置占位皮肤。按 docs/06 §5：面板提示，不弹窗 */
+  fallback: boolean
+  /** 校验失败原因，供面板展示 */
+  fallbackReason?: string
+}
+
 // ─────────────────────────── 通道契约 ───────────────────────────
 
 /** 请求-响应：渲染层 → 主进程 */
 export interface IpcInvokeMap {
+  /** 骨架阶段的连通性探针（docs/08 M0） */
+  'app:ping': (payload: string) => { pong: string; at: number }
   'watchlist:list': () => WatchItem[]
   'watchlist:add': (code: string, group?: string) => WatchItem
   'watchlist:remove': (code: SecCode) => void
@@ -105,8 +152,22 @@ export interface IpcInvokeMap {
   'settings:patch': (patch: Partial<AppSettings>) => AppSettings
   'app:providerHealth': () => ProviderHealth[]
   'app:engineStatus': () => EngineStatus
+  'pet:getSkin': () => PetSkinView
   'pet:setHitRegion': (rects: Rect[]) => void
+  /**
+   * 渲染层完成命中判定后上报：鼠标是否落在桌宠本体上。
+   * true → 主进程关掉点击穿透；false → 恢复穿透（见 docs/06 §2.2）。
+   */
+  'pet:setInteractive': (interactive: boolean) => void
+  /** 拖拽增量（屏幕像素）。用手动拖拽而非 -webkit-app-region，避免拖拽区吞掉命中判定所需的 mousemove */
+  'pet:dragBy': (dx: number, dy: number) => void
+  /** 拖拽结束：做边缘吸附并持久化位置 */
+  'pet:dragEnd': () => void
+  /** 右键唤起上下文菜单（与托盘菜单同一份，见 docs/06 §4） */
+  'pet:contextMenu': () => void
   'pet:setDoNotDisturb': (until: number | null) => void
+  /** 双击桌宠切换免打扰（C8），返回切换后的截止时间 */
+  'pet:toggleDoNotDisturb': () => number | null
   'panel:toggle': () => void
 }
 
@@ -116,6 +177,18 @@ export interface IpcPushMap {
   'push:alert': AlertPayload
   'push:quoteTick': QuoteTick[]
   'push:engineStatus': EngineStatus
+}
+
+/**
+ * preload 经 contextBridge 暴露的唯一接口（window.gp）。
+ * 渲染层不允许直接 ipcRenderer.invoke 字符串通道（docs/02 §5）。
+ */
+export interface GpBridge {
+  invoke<K extends keyof IpcInvokeMap>(
+    channel: K,
+    ...args: Parameters<IpcInvokeMap[K]>
+  ): Promise<Awaited<ReturnType<IpcInvokeMap[K]>>>
+  on<K extends keyof IpcPushMap>(channel: K, listener: (payload: IpcPushMap[K]) => void): () => void
 }
 
 // ─────────────────────────── 设置 ───────────────────────────

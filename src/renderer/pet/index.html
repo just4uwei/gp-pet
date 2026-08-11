@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      CSP：禁止一切远程来源。img-src 放行 res: 是桌宠精灵图的加载通道（见 src/main/resources.ts）。
+      script-src 的 'unsafe-inline' 是 Vite 注入内联引导脚本所需；因为没有任何远程来源可加载，
+      实际风险面仍限于本地打包产物。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' res: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'none'"
+    />
+    <title>GP Pet</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

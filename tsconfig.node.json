@@ -8,7 +8,8 @@
     "src/backtest/**/*",
     "tests/**/*",
     "electron.vite.config.ts",
-    "vitest.config.ts"
+    "vitest.config.mts",
+    "package.json"
   ],
   "compilerOptions": {
     "composite": true,
