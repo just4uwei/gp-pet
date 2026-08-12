@@ -50,6 +50,35 @@ export interface Split {
   to: TradeDate
 }
 
+/**
+ * 一段切分应当跳过多少根才开始判信号。
+ *
+ * **这里错过一次，整个三段切分就失效。** 早先的实现把每一段当成独立序列喂进引擎，
+ * 于是 300 根预热在**每段内部**重新走一遍：验证集 359 根只剩 59 根被真正判定，
+ * 测试集 272 根 < 300 根预热 → **一笔交易都不可能产生**，而报告上显示的是
+ * 「测试集 0 笔」，看起来像策略不出信号，实际是工具的问题。
+ *
+ * 正确做法：把该段之前的历史也喂进去（回测本来就一次性载入了三段的并集），
+ * 只是不在那段上判信号 —— 判定正好从 `split.from` 开始，且身后带着完整历史。
+ *
+ * @param dates   该标的的全部交易日（升序），已按 `<= split.to` 截断
+ * @param split   目标区间
+ * @param floor   最少预热根数（`params.data.fullBars`，或 CLI 的 --warmup）
+ */
+export function warmupForSplit(
+  dates: readonly TradeDate[],
+  split: Pick<Split, 'from'>,
+  floor: number
+): number {
+  let before = 0
+  for (const date of dates) {
+    if (date >= split.from) break
+    before++
+  }
+  // 段前历史不足 floor 时只能按 floor 预热，判定起点会晚于 split.from —— 无解，但要知道
+  return Math.max(floor, before)
+}
+
 /** docs/07 §3 的默认切分。测试集的 `to` 由 CLI 的 --to 覆盖 */
 export const DEFAULT_SPLITS: readonly Split[] = [
   { name: 'train', from: '2018-01-01', to: '2023-12-31' },

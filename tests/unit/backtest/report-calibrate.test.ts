@@ -23,6 +23,7 @@ import {
   expandGrid,
   renderCalibration,
   sensitivityFlags,
+  warmupForSplit,
   type Split,
 } from '@backtest/calibrate'
 import { DEFAULT_PARAMS } from '@core/params'
@@ -363,5 +364,41 @@ describe('标定流程（docs/07 §3）', () => {
       const currentStart = DEFAULT_SPLITS[i]?.from ?? ''
       expect(currentStart > previousEnd, `${currentStart} 应晚于 ${previousEnd}`).toBe(true)
     }
+  })
+})
+
+/**
+ * 这一组守的是「三段切分是否真的在判定那三段」。
+ *
+ * 曾经的实现把每段单独切出来喂引擎，于是 300 根预热在每段内部重来一遍：
+ * 测试集只有 272 根 < 300 根预热 → 恒为 0 笔交易，而报告上看起来像「策略不出信号」。
+ * 这类错误不会抛异常、不会让测试变红，只会让标定结论静静地变成噪音。
+ */
+describe('warmupForSplit', () => {
+  const dates = (from: number, count: number): TradeDate[] =>
+    Array.from({ length: count }, (_, i) => `2018-01-${String(from + i).padStart(2, '0')}` as TradeDate)
+
+  it('段前历史充足时，预热到 split.from 为止 —— 判定从该段第一天开始', () => {
+    const all = dates(1, 20)
+    expect(warmupForSplit(all, { from: '2018-01-11' }, 3)).toBe(10)
+  })
+
+  it('段前历史不足 floor 时退回 floor，不会因为「段前只有 2 根」就只预热 2 根', () => {
+    const all = dates(1, 20)
+    expect(warmupForSplit(all, { from: '2018-01-03' }, 8)).toBe(8)
+  })
+
+  it('段起点早于全部数据（训练集常见）时等于 floor', () => {
+    const all = dates(5, 10)
+    expect(warmupForSplit(all, { from: '2018-01-01' }, 6)).toBe(6)
+  })
+
+  it('回归：测试集短于预热时，判定根数不再恒为 0', () => {
+    // 1816 根历史 + 272 根测试段，预热 300
+    const history = Array.from({ length: 1816 }, (_, i) => `1${String(i).padStart(6, '0')}` as TradeDate)
+    const test = Array.from({ length: 272 }, (_, i) => `2${String(i).padStart(6, '0')}` as TradeDate)
+    const warmup = warmupForSplit([...history, ...test], { from: '2000000' }, 300)
+    expect(warmup).toBe(1816)
+    expect(history.length + test.length - warmup).toBe(272)
   })
 })

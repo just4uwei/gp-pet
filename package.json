@@ -24,8 +24,10 @@
     "backtest": "tsx src/backtest/cli.ts",
     "verify:indicators": "node scripts/verify/run.mjs",
     "fixtures:record": "node scripts/record-fixtures.mjs",
+    "fetch:history": "node scripts/fetch-history.mjs",
     "assets:build": "node tools/asset-build/build-skin.mjs",
-    "verify:assets": "node tools/asset-build/verify-assets.mjs"
+    "verify:assets": "node tools/asset-build/verify-assets.mjs",
+    "build:universe": "node scripts/build-universe.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

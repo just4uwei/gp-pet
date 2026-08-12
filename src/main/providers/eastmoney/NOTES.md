@@ -13,6 +13,12 @@
 > 同一台机器上 `quote.eastmoney.com` 返回 200，换 UA、加 Referer、http/https、
 > 换 `82.push2his` 备用域名均无效 —— 判断是出口网络对该 API 的拦截，不是接口下线。
 >
+> **2026-08-12 更正：上面这个判断错了。** 它只在 curl 上成立。node fetch（undici，
+> 应用真正用的客户端）访问同样的 URL **6/6 成功**；`provider_health` 今天记录 83 成功 /
+> 24 失败（≈78%），`other side closed` 是随机出现、重试可过的间歇故障。
+> **别用 curl 判断这个接口通不通。** 录制仍未做的真实原因是
+> `scripts/record-fixtures.mjs` 没有重试，4 个请求通常只成 2 个。
+>
 > 因此 `tests/fixtures/providers/eastmoney/*.json` 是**按下述已知字段契约手写的**，
 > 它验证的是「解析器对这个形状的输入是否正确」，**不能**证明真实响应就是这个形状。
 >

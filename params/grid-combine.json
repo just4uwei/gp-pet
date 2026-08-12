@@ -1,0 +1,34 @@
+{
+  "combine": [
+    {
+      "scoreThreshold": 0.35,
+      "voteThreshold": 1,
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9
+    },
+    {
+      "scoreThreshold": 0.4,
+      "voteThreshold": 2,
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9
+    },
+    {
+      "scoreThreshold": 0.5,
+      "voteThreshold": 2,
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": 3,
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9
+    },
+    {
+      "scoreThreshold": 0.72,
+      "voteThreshold": 4,
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9
+    }
+  ]
+}

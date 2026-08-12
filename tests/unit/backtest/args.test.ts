@@ -22,6 +22,14 @@ describe('parseArgs', () => {
     expect(options.fixedWeights).toBe(true)
   })
 
+  it('吃掉裸 `--`：pnpm 11 会把分隔符原样传进来', () => {
+    const options = parse('--', '--codes', 'SH600000', '--fixtures', './fx')
+    expect(options).not.toBe('help')
+    if (options === 'help') return
+    expect(options.codes).toEqual(['SH600000'])
+    expect(options.fixtures).toBe('./fx')
+  })
+
   it('区间、数据源、成本与输出', () => {
     const options = parse(
       '--codes', 'SH600000',

@@ -12,6 +12,8 @@ logs/
 *.db-journal
 *.db.bak-*
 reports/
+# 抓下来的历史行情（scripts/fetch-history.mjs 的产物，可重出）
+data/history/
 .vite/
 .eslintcache
 

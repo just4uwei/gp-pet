@@ -1,0 +1,17 @@
+{
+  "combine": [
+    { "scoreThreshold": 0.35, "voteThreshold": 1, "conflictBand": 0.15, "provisionalDiscount": 0.9 },
+    { "scoreThreshold": 0.4, "voteThreshold": 2, "conflictBand": 0.15, "provisionalDiscount": 0.9 },
+    { "scoreThreshold": 0.5, "voteThreshold": 2, "conflictBand": 0.15, "provisionalDiscount": 0.9 },
+    { "scoreThreshold": 0.6, "voteThreshold": 3, "conflictBand": 0.15, "provisionalDiscount": 0.9 },
+    { "scoreThreshold": 0.72, "voteThreshold": 4, "conflictBand": 0.15, "provisionalDiscount": 0.9 }
+  ],
+  "macd": [
+    { "preset": "AShareOptimized", "fast": 12, "slow": 17, "signal": 9 },
+    { "preset": "Classic", "fast": 12, "slow": 26, "signal": 9 }
+  ],
+  "adx": [
+    { "period": 14, "baseThreshold": 20, "volScale": 8, "maxThreshold": 28, "rangeGap": 5 },
+    { "period": 14, "baseThreshold": 22, "volScale": 8, "maxThreshold": 30, "rangeGap": 5 }
+  ]
+}

@@ -107,6 +107,9 @@ export function parseArgs(argv: readonly string[]): CliOptions | 'help' {
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i]
     if (key === undefined) continue
+    // 裸 `--`：npm / 旧版 pnpm 用它分隔脚本参数并自行吃掉，pnpm 11 却原样传进来。
+    // 两种写法都得能跑，否则全部文档里的 `pnpm backtest -- --codes …` 都是错的。
+    if (key === '--') continue
     const next = FLAGS.has(key) ? undefined : argv[i + 1]
     if (!FLAGS.has(key)) i++
 

@@ -12,8 +12,15 @@ Electron + React + TypeScript · 本地 SQLite · 免登录 · 无服务端 · *
 —— 信号目前的唯一出口是面板列表，桌宠表情不由信号驱动。
 
 **两条出口条件尚未达成**：M1 的「跑满一个交易日 + 健康度 > 99%」要真机联网；
-M2 的「回测报告产出并据此确定出厂参数」要 2018 年以来的真实日线，而本机三家行情接口全部不通。
-所以 `src/core/params.ts` 里的数值仍是未标定的初始猜测（见约束 2）。
+M2 的「回测报告产出并据此确定出厂参数」尚未产出结论。
+`src/core/params.ts` 里的数值因此仍是未标定的初始猜测（见约束 2）。
+
+**数据现状（2026-08-12 实测）**：三家接口都能用。**eastmoney 不是被封，是间歇性的**
+—— undici（应用用的客户端）成功率约 78%，失败症状 `other side closed`，重试能过；
+而 curl 对它 100% 失败（客户端指纹差异）。**别再用 curl 的结果判断这个接口的可用性。**
+历史日线用 `pnpm fetch:history` 从腾讯拉（不复权 + 前复权两轨，自带重试），
+落成回测 fixture，**不需要先跑通 `pnpm dev`**。
+所以标定卡的不再是数据，而是「标的池怎么选」与「结论谁来复核」。
 里程碑见 [docs/08](./docs/08-开发路线图.md)，偏差见 [docs/notes/](./docs/notes/)。
 
 ## 五条不可违反的约束
@@ -37,8 +44,9 @@ pnpm test:cov         # 覆盖率；src/core 门槛 90%，其余 60%
 pnpm typecheck        # 双 tsconfig（node / web）分别校验
 pnpm lint
 pnpm verify:indicators           # 重出指标黄金用例；加 -- --check 只校验不重写
-pnpm backtest -- --codes SH600000 --from 2020-01-01 --to 2026-06-30
-pnpm backtest -- --codes ... --grid params/grid.json   # 参数标定（需真实日线）
+pnpm fetch:history -- --codes SH600000,SZ000001 --from 2018-01-01   # 拉真实日线 → data/history/
+pnpm backtest -- --codes SH600000 --fixtures ./data/history --from 2020-01-01 --to 2026-06-30
+pnpm backtest -- --codes ... --fixtures ./data/history --grid params/grid.json   # 参数标定
 pnpm package          # electron-builder 打包 Windows
 ```
 
@@ -69,6 +77,10 @@ src/backtest 回测 CLI，复用 src/core
 ## 容易踩的坑
 
 - **复权**：指标用前复权（`*Adj` 字段），展示与持仓成本用不复权。混用会伪造出金叉死叉。
+- **回测数据里的 `*Adj` 是后复权，不是前复权。** 腾讯的前复权是加性的（减价差），高分红股上会
+  变成**负数** —— 实测中远海控（SH601919）2018–2026 有 714 根前复权收盘价 ≤ 0，最低 -5.145，
+  而负价上的 MA / MACD / RSI / 布林带全是垃圾。`fetch:history` 因此拉后复权：对指标与净值等价
+  （指标全是比率型，净值用相邻比值），且历史值不随抓取日变。**别改回 qfq**，脚本里有断言挡着。
 - **盘中 K 线是临时的**：`Candle.provisional` 为 true 时指标会抖，信号只能是 `PROVISIONAL`，最高 L2 提醒，收盘确认轮再定论。
 - **盘中量比必须按时间归一化**，否则上午永远显示「缩量」。
 - **MACD 柱用 `2×(DIF−DEA)`**（国内平台口径），与来源文档的 `DIF−DEA` 不同，但不影响任何穿越判定。

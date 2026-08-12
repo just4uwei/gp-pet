@@ -27,7 +27,15 @@ import {
 } from '../core/params'
 import type { SecCode, TradeDate } from '../core/types'
 import { SENSITIVITY_PRESETS, USAGE, parseArgs, type CliOptions } from './args'
-import { calibrate, expandGrid, renderCalibration, DEFAULT_SPLITS, type GridSpec, type Split } from './calibrate'
+import {
+  calibrate,
+  expandGrid,
+  renderCalibration,
+  warmupForSplit,
+  DEFAULT_SPLITS,
+  type GridSpec,
+  type Split,
+} from './calibrate'
 import { DEFAULT_COSTS, type CostModel } from './costs'
 import { openFixtureSource, openSqliteSource, sentimentSeries, type DataSource, type LoadedSeries } from './data'
 import { assembleReport, performanceOf, mergeEquity, renderReport, type PerformanceBlock } from './report'
@@ -241,6 +249,14 @@ async function runCalibration(options: CliOptions): Promise<number> {
   }
 }
 
+/**
+ * 跑一段切分。
+ *
+ * **不能直接把该段的 K 线切出来喂进去** —— 那样 300 根预热会在每段内部重来一遍，
+ * 测试集（272 根）短于预热就永远是 0 笔。这里改成「喂到 split.to 为止的全部历史，
+ * 但预热到 split.from 才开始判」，判定区间才真是这一段。理由见 calibrate.ts
+ * 的 warmupForSplit()。
+ */
 function runSplit(
   loaded: Loaded,
   params: EngineParams,
@@ -248,7 +264,26 @@ function runSplit(
   views: { sentiment: SentimentLookup; byDate: Map<TradeDate, number> },
   split: Split
 ): PerformanceBlock {
-  const results = runSimulation(loaded, params, options, views.sentiment, split)
+  const costs = resolveCosts(options)
+  const floor = options.warmup ?? params.data.fullBars
+  const results = loaded.series.map((series) => {
+    const candles = series.candles.filter((c) => c.date <= split.to)
+    return simulateCode(
+      { profile: series.profile, candles },
+      {
+        params,
+        costs,
+        capitalPerCode: options.capital,
+        lookback: options.lookback,
+        warmupBars: warmupForSplit(
+          candles.map((c) => c.date),
+          split,
+          floor
+        ),
+      },
+      views.sentiment
+    )
+  })
   const equity = mergeEquity(results, views.byDate)
   return performanceOf(
     equity,
