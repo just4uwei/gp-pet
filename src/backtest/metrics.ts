@@ -158,6 +158,34 @@ export interface TradeLike {
   costs: number
 }
 
+export interface ExposureLike {
+  entryPrice: number
+  shares: number
+  holdingBars: number
+}
+
+/**
+ * 平均资金占用率：持仓市值 × 持仓日数的总和 ÷（初始资金 × 交易日数），0..1。
+ *
+ * **报告里给出这个数，是因为「超额收益」离开它就会被误读。** 基准（沪深300）是 100% 满仓的，
+ * 而信号策略绝大多数时间空仓 —— 拿一个占用 4% 资金的策略去比满仓指数，
+ * 差额里有多少是「策略不行」、有多少是「钱没投进去」，光看超额一个数分不出来。
+ *
+ * 口径与近似：按**建仓价**计价（不随持仓期间的浮盈浮亏变化），部分止盈拆出的每条交易
+ * 各按自己的份额与持仓天数计入。这是一个持仓规模的近似，不是逐日精确的资金曲线占用率 ——
+ * 它够用来回答「资金基本闲置还是基本满仓」这个量级问题，不适合再往下做精细归因。
+ */
+export function averageExposure(
+  trades: readonly ExposureLike[],
+  startCapital: number,
+  bars: number
+): number | null {
+  if (startCapital <= 0 || bars <= 0) return null
+  let positionBarValue = 0
+  for (const trade of trades) positionBarValue += trade.entryPrice * trade.shares * trade.holdingBars
+  return positionBarValue / (startCapital * bars)
+}
+
 export function summarizeTrades(trades: readonly TradeLike[]): TradeStats {
   if (trades.length === 0) {
     return {

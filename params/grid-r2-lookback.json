@@ -1,0 +1,39 @@
+{
+  "strategy": [
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 90
+    },
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 5,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 90
+    },
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 8,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 90
+    },
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 12,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 90
+    },
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 20,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 90
+    }
+  ]
+}

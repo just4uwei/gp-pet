@@ -33,8 +33,11 @@ import {
   renderCalibration,
   warmupForSplit,
   DEFAULT_SPLITS,
+  codeGroups,
+  timeSlices,
   type GridSpec,
   type Split,
+  type SplitRun,
 } from './calibrate'
 import { DEFAULT_COSTS, type CostModel } from './costs'
 import { openFixtureSource, openSqliteSource, sentimentSeries, type DataSource, type LoadedSeries } from './data'
@@ -53,6 +56,29 @@ function log(options: CliOptions, message: string): void {
   if (!options.quiet && !options.json) process.stdout.write(`${message}\n`)
 }
 
+/**
+ * `--params` / `--grid` 里的 JSON 不经过类型检查，写错了只会在引擎里变成 `undefined`。
+ * 最危险的一种是 `voteThreshold` 写成数字（2026-08-12 之前的写法）：
+ * `votes >= undefined` 恒为 false，回测会一声不响地跑出 0 笔交易，看起来像「参数太严」。
+ * 所以这里显式挡一次 —— 报错比 0 笔更容易查。
+ */
+function assertParamsShape(source: string, raw: Record<string, unknown>): void {
+  const combine = raw['combine']
+  if (typeof combine !== 'object' || combine === null) return
+  const vote = (combine as Record<string, unknown>)['voteThreshold']
+  if (vote === undefined) return
+  if (typeof vote === 'number') {
+    throw new Error(
+      `${source} 里的 combine.voteThreshold 是数字（${vote}）。` +
+        '票数线自 2026-08-12 起按策略分开，应写成 {"trend": 3, "meanReversion": 2}。'
+    )
+  }
+  const line = vote as Record<string, unknown>
+  if (typeof line['trend'] !== 'number' || typeof line['meanReversion'] !== 'number') {
+    throw new Error(`${source} 里的 combine.voteThreshold 缺 trend 或 meanReversion`)
+  }
+}
+
 function resolveParams(options: CliOptions): EngineParams {
   let overrides: ParamOverrides = {}
   if (options.params) {
@@ -60,6 +86,7 @@ function resolveParams(options: CliOptions): EngineParams {
     if (typeof parsed !== 'object' || parsed === null) {
       throw new Error(`--params 文件不是 JSON 对象：${options.params}`)
     }
+    assertParamsShape(options.params, parsed as Record<string, unknown>)
     overrides = parsed as ParamOverrides
   }
   if (options.sensitivity) {
@@ -158,21 +185,12 @@ function runSimulation(
   )
 }
 
-/** 固定 0.5/0.5 权重对照组：M2 出口条件要回答「权重切换是否有效」 */
-function fixedWeightParams(params: EngineParams): EngineParams {
-  const flat = { trend: 0.5, meanReversion: 0.5 }
-  return withParams(
-    {
-      weights: {
-        TREND_UP: flat,
-        TREND_DOWN: { ...flat, meanReversionBuyPenalty: 1 },
-        RANGE: flat,
-        TRANSITION: flat,
-      },
-    },
-    params
-  )
-}
+/*
+ * 这里曾经有一个 `fixedWeightParams()`：把权重表压成 0.5/0.5 跑一遍同参数对照组，
+ * 用来回答 M2 出口条件里的「按状态切换权重是否有效」。**2026-08-12 随权重表一起删除** ——
+ * 权重表没了，对照组就是拿引擎和它自己比，只会让每次回测的耗时翻倍。
+ * 那两轮对照的结论见 M2 偏差报告 §5.5–§5.8。
+ */
 
 async function runBacktest(options: CliOptions): Promise<number> {
   const range = { from: options.from, to: options.to }
@@ -183,13 +201,9 @@ async function runBacktest(options: CliOptions): Promise<number> {
   try {
     log(options, `[backtest] ${loaded.series.length} 只 · ${range.from} → ${range.to} · ${loaded.source.description}`)
     const results = runSimulation(loaded, params, options, views.sentiment, range)
-    const fixed = options.fixedWeights
-      ? runSimulation(loaded, fixedWeightParams(params), options, views.sentiment, range)
-      : undefined
 
     const report = assembleReport({
       results,
-      ...(fixed ? { fixedWeightResults: fixed } : {}),
       benchmarkByDate: views.byDate,
       meta: {
         engineVersion: engineVersionOf(params),
@@ -218,6 +232,9 @@ async function runCalibration(options: CliOptions): Promise<number> {
   const spec: unknown = JSON.parse(readFileSync(options.grid, 'utf8'))
   if (typeof spec !== 'object' || spec === null) throw new Error('--grid 文件不是 JSON 对象')
   const candidates = expandGrid(spec as GridSpec)
+  candidates.forEach((candidate, i) =>
+    assertParamsShape(`${options.grid} 的第 ${i + 1} 组候选`, candidate as Record<string, unknown>)
+  )
   log(options, `[calibrate] 网格展开 ${candidates.length} 组候选`)
 
   // 三段区间的并集用于一次取数；测试集尾部由 --to 收口
@@ -231,23 +248,38 @@ async function runCalibration(options: CliOptions): Promise<number> {
   const loaded = await loadAll(options, span)
   const views = benchmarkViews(loaded.benchmark)
 
+  const groups = codeGroups(
+    loaded.series.map((s) => s.profile.code),
+    options.codeFolds
+  )
+  log(
+    options,
+    `[calibrate] 折单元 ${groups.length} 个标的子集 × ${options.timeSlices} 个时间片 = ` +
+      `${groups.length * options.timeSlices} 折（同一次模拟切出来，不额外跑）`
+  )
+
   try {
     const report = calibrate({
       candidates,
       base: resolveParams(options),
       splits,
+      touchTest: options.touchTest,
+      ...(options.minDeltaT === undefined ? {} : { minDeltaT: options.minDeltaT }),
       log: (message) => log(options, message),
-      run: (params, split) => runSplit(loaded, params, options, views, split),
+      run: (params, split) => runSplit(loaded, params, options, views, split, groups),
     })
 
     if (options.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)
     else process.stdout.write(`${renderCalibration(report)}\n`)
     if (options.out) writeJson(options.out, report)
-    return report.winner ? 0 : 2
+    // 退出码：WRITE_BACK 0（有东西可写回）· KEEP 0（出厂值站得住，**这是结论不是失败**）
+    // · INCONCLUSIVE 2（判不了，要人介入）
+    return report.verdict === 'INCONCLUSIVE' ? 2 : 0
   } finally {
     loaded.source.close()
   }
 }
+
 
 /**
  * 跑一段切分。
@@ -256,14 +288,34 @@ async function runCalibration(options: CliOptions): Promise<number> {
  * 测试集（272 根）短于预热就永远是 0 笔。这里改成「喂到 split.to 为止的全部历史，
  * 但预热到 split.from 才开始判」，判定区间才真是这一段。理由见 calibrate.ts
  * 的 warmupForSplit()。
+ *
+ * **但净值曲线必须切回本段**（2026-08-12 修）：`simulateCode` 对喂进去的每一根都
+ * push 一个净值点，预热段那些点也在里面。不切的话 `bars` 是「数据起点 → split.to」
+ * 而不是本段长度，于是：
+ * - `annualized` 用错误的年数折算 —— 验证集实测被压小 **5.1 倍**（0.17% ↔ 0.87%）；
+ * - `sharpe` 被一串 0 收益稀释，约 ×√(本段/全长)（验证集 ≈ 0.44）；
+ * - `benchmarkReturn` 更离谱：验证集拿的是 2018→2025-06 的指数涨跌，
+ *   跟只赚了 18 个月的策略收益相减，`excessReturn` 直接没有意义。
+ * 段内排名不受影响（每个候选的 `bars` 一样），但**跨段的 Calmar 衰减红线是坏的** ——
+ * 2026-08-12 那轮 16 个候选里它对 3 个报了「衰减超过 50%」，修正后全是 −43% ~ −78%
+ * 的**改善**，三个全是假阳性。见 M2 §5.14。
+ * `totalReturn` 与 `maxDrawdown` 不受影响（预热段净值恒等于初始资金）。
+ *
+ * **2026-08-13 起还返回折单元**（`SplitRun.cells`）：横截面折 = 按标的子集重新合并净值，
+ * 时间片 = 把判定区间等分。两者都是**从同一批模拟结果里切出来的**，一折都不多跑模拟 ——
+ * 39 只 × 一个候选的一段模拟要 50 秒上下，靠重跑攒离散度是负担不起的，
+ * 而离散度是「这个差值算不算数」的唯一依据（M2 §5.15）。
+ * 单折的绩效**不可与 `overall` 横向比较**（窗口短、标的少、回撤分母小），
+ * 它只用于同一折上两个候选之差。
  */
 function runSplit(
   loaded: Loaded,
   params: EngineParams,
   options: CliOptions,
   views: { sentiment: SentimentLookup; byDate: Map<TradeDate, number> },
-  split: Split
-): PerformanceBlock {
+  split: Split,
+  groups: readonly SecCode[][]
+): SplitRun {
   const costs = resolveCosts(options)
   const floor = options.warmup ?? params.data.fullBars
   const results = loaded.series.map((series) => {
@@ -284,11 +336,27 @@ function runSplit(
       views.sentiment
     )
   })
-  const equity = mergeEquity(results, views.byDate)
-  return performanceOf(
-    equity,
-    results.flatMap((r) => r.trades)
+
+  const blockOf = (subset: readonly CodeResult[], from: TradeDate, to: TradeDate): PerformanceBlock => {
+    const equity = mergeEquity(subset, views.byDate).filter((p) => p.date >= from && p.date <= to)
+    const trades = subset.flatMap((r) => r.trades).filter((t) => t.entryDate >= from && t.entryDate <= to)
+    return performanceOf(equity, trades)
+  }
+
+  const overall = blockOf(results, split.from, split.to)
+  // 折单元由**同一批模拟结果**切出来：横截面按标的子集重新合并净值，时间上按判定区间等分。
+  // 因此折数怎么加都不多跑一次模拟 —— 这是这套判据能负担得起的原因。
+  const dates = mergeEquity(results, views.byDate)
+    .map((p) => p.date)
+    .filter((date) => date >= split.from && date <= split.to)
+  const cells: SplitRun['cells'] = timeSlices(dates, options.timeSlices).flatMap((slice, s) =>
+    groups.map((group, g) => {
+      const subset = results.filter((r) => group.includes(r.code))
+      return { name: `g${g + 1}/p${s + 1}`, block: blockOf(subset, slice.from, slice.to) }
+    })
   )
+
+  return { overall, cells }
 }
 
 function writeJson(file: string, payload: unknown): void {

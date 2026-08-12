@@ -1,0 +1,164 @@
+{
+  "combine": [
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.5,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.55,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.66,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.72,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 1
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 3
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 2,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 4,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.05,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.1,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.25,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.4,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.5
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.25
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 0.75
+    },
+    {
+      "scoreThreshold": 0.6,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
+      "conflictBand": 0.15,
+      "provisionalDiscount": 0.9,
+      "downtrendBuyPenalty": 1
+    }
+  ]
+}

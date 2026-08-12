@@ -81,13 +81,8 @@ describe('R2 回归中轨', () => {
     [LAST]: { close: 10.2, high: 10.3, low: 9.9 },
   }
 
-  it('BUY：近 3 日曾破下轨 + 收回中轨上 + 柱子转正', () => {
+  it('BUY：近 3 日曾破下轨 + 今日上穿中轨 + 柱子在改善', () => {
     expect(ids(meanReversionSignals(ctx(spec, overrides)))).toContain('R2_REVERT_TO_MID:BUY')
-  })
-
-  it('BUY 反例：柱子没有转正（前一根已经是正的，不算「转」）', () => {
-    const stillPositive = { ...spec, hist: [...new Array<number>(LAST).fill(0.2), 0.3] }
-    expect(ids(meanReversionSignals(ctx(stillPositive, overrides)))).not.toContain('R2_REVERT_TO_MID:BUY')
   })
 
   it('BUY 反例：回溯窗口之外破的下轨（第 3 根，超出 3 日窗口）', () => {
@@ -95,7 +90,37 @@ describe('R2 回归中轨', () => {
     expect(ids(meanReversionSignals(ctx(spec, tooOld)))).not.toContain('R2_REVERT_TO_MID:BUY')
   })
 
-  it('SELL：近 3 日曾越上轨 + 跌回中轨下 + 柱子转负', () => {
+  /**
+   * 这一条钉住 2026-08-12 的改写（docs/04 §3.2）：触发条件是**上穿中轨那一刻**，
+   * 不是「已经在中轨上方」这个状态。旧写法用状态判定，约一半的交易日都成立，
+   * 等于没有这个条件 —— 而它一旦不再是约束项，`revertLookback` 就永远调不动结果。
+   * 这条变红说明有人把事件退回成了状态判定，去读 docs/04 §3.2，不要改断言。
+   */
+  it('BUY 反例：前一根就已在中轨上方 —— 不是穿越，只是「还在上面」', () => {
+    const alreadyAbove = {
+      [LAST - 2]: { close: 9.4 },
+      [LAST - 1]: { close: 10.1 },
+      [LAST]: { close: 10.2, high: 10.3, low: 9.9 },
+    }
+    expect(ids(meanReversionSignals(ctx(spec, alreadyAbove)))).not.toContain('R2_REVERT_TO_MID:BUY')
+  })
+
+  /**
+   * 改写同时把动量确认从「柱子过零」放宽成「柱子朝有利方向」：过零 = DIF 上穿 DEA，
+   * 是慢事件（实测在一次轨道外之后中位数要等 35 根以上），与 2–5 根的回溯窗口
+   * 时间常数差一个量级。放宽后柱子仍在负区也算，但**必须在变好**。
+   */
+  it('BUY：柱子仍在负区，只要在抬头就算确认', () => {
+    const stillNegative = { ...spec, hist: [...new Array<number>(LAST).fill(-0.4), -0.2] }
+    expect(ids(meanReversionSignals(ctx(stillNegative, overrides)))).toContain('R2_REVERT_TO_MID:BUY')
+  })
+
+  it('BUY 反例：柱子在走弱 —— 上穿中轨但动量没配合', () => {
+    const weakening = { ...spec, hist: [...new Array<number>(LAST).fill(0.3), 0.1] }
+    expect(ids(meanReversionSignals(ctx(weakening, overrides)))).not.toContain('R2_REVERT_TO_MID:BUY')
+  })
+
+  it('SELL：近 3 日曾越上轨 + 今日下穿中轨 + 柱子在走弱', () => {
     const sellSpec: IndicatorSpec = {
       mid: 10,
       upper: 10.4,

@@ -1,0 +1,14 @@
+{
+  "strategy": [
+    { "pullbackLookback": 5, "revertLookback": 3, "squeezeBbwPct": 16, "midReversionStd": 1.5, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 3, "squeezeBbwPct": 24, "midReversionStd": 1.5, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 3, "squeezeBbwPct": 30, "midReversionStd": 1.5, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 3, "squeezeBbwPct": 40, "midReversionStd": 1.5, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 3, "squeezeBbwPct": 50, "midReversionStd": 1.5, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 5, "squeezeBbwPct": 16, "midReversionStd": 1.0, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 5, "squeezeBbwPct": 24, "midReversionStd": 1.0, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 5, "squeezeBbwPct": 30, "midReversionStd": 1.0, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 5, "squeezeBbwPct": 40, "midReversionStd": 1.0, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 5, "squeezeBbwPct": 50, "midReversionStd": 1.0, "expandedBbwPct": 90 }
+  ]
+}

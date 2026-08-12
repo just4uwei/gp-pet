@@ -1,12 +1,12 @@
 /**
  * 报告组装与渲染（docs/07 §2.2）。
  *
- * 最重要的一节是 **分 Regime 归因**：整套设计的核心假设是「按市场状态切换策略权重
- * 能提升表现」。所以报告里同时给出
- *   ① 动态权重的绩效
- *   ② 固定 0.5/0.5 权重的同参数对照组
- * 若①不优于②，该假设就该被推翻，而不是保留一套复杂而无效的机制
- * （docs/08 关键决策点 2）。报告不替人做这个判断，但必须把两个数字并排放出来。
+ * 最重要的一节是 **分 Regime 归因**：它是「市场状态判定是否有用」的唯一证据来源，
+ * 也是回答「哪个状态下的信号该被更谨慎对待」的入口。
+ *
+ * 这里曾经还有一栏「动态权重 vs 固定 0.5/0.5 对照」—— 那是整套设计核心假设的验收位。
+ * 假设在 2026-08-12 被推翻（两轮实测都看不出效果），权重表已删除，这一栏随之失去靶子，
+ * 一并删掉。判据见 M2 偏差报告 §5.5–§5.8，决策记录见 docs/08 关键决策点 2。
  *
  * 报告头部固定三句免责：标的池偏差、参数未标定、回测≠实盘。
  */
@@ -16,6 +16,7 @@ import type { Regime, SecCode, TradeDate } from '../core/types'
 import type { BacktestTrade, CodeResult } from './simulate'
 import {
   annualizedReturn,
+  averageExposure,
   informationRatio,
   maxDrawdown,
   returnsOf,
@@ -37,6 +38,11 @@ export interface PerformanceBlock {
   benchmarkReturn: number | null
   excessReturn: number | null
   informationRatio: number | null
+  /**
+   * 平均资金占用率 0..1。**读 `excessReturn` 之前先读它**：基准是满仓的，
+   * 策略绝大多数时间空仓，两者的收益率不在同一个口径上（见 `averageExposure` 的注释）。
+   */
+  exposure: number | null
   trades: TradeStats
 }
 
@@ -65,8 +71,6 @@ export interface BacktestReport {
   }
   disclaimers: string[]
   performance: PerformanceBlock
-  /** 固定 0.5/0.5 权重的对照组；未跑对照时为 null */
-  fixedWeightBaseline: PerformanceBlock | null
   regimeAttribution: RegimeAttribution[]
   perCode: {
     code: SecCode
@@ -158,6 +162,7 @@ export function performanceOf(equity: readonly EquityPoint[], trades: readonly B
     excessReturn: benchmarkReturn === null ? null : totalReturn - benchmarkReturn,
     informationRatio:
       benchmarkReturns.length > 0 ? informationRatio(strategyReturns, benchmarkReturns) : null,
+    exposure: averageExposure(trades, first, equity.length),
     trades: summarizeTrades(trades),
   }
 }
@@ -184,7 +189,6 @@ export function attributeByRegime(
 
 export interface AssembleInput {
   results: readonly CodeResult[]
-  fixedWeightResults?: readonly CodeResult[] | undefined
   benchmarkByDate?: Map<TradeDate, number> | undefined
   meta: Omit<BacktestReport['meta'], 'unvalidatedParams'>
 }
@@ -213,20 +217,10 @@ export function assembleReport(input: AssembleInput): BacktestReport {
     warnings.push('缺少基准指数日线，超额收益与信息比率未计算（不以 0 代替）。')
   }
 
-  let fixedWeightBaseline: PerformanceBlock | null = null
-  if (input.fixedWeightResults) {
-    const baselineEquity = mergeEquity(input.fixedWeightResults, input.benchmarkByDate)
-    fixedWeightBaseline = performanceOf(
-      baselineEquity,
-      input.fixedWeightResults.flatMap((r) => r.trades)
-    )
-  }
-
   return {
     meta: { ...input.meta, unvalidatedParams: ENGINE_VERSION.includes('unvalidated') },
     disclaimers: [...DISCLAIMERS],
     performance,
-    fixedWeightBaseline,
     regimeAttribution: attributeByRegime(trades, input.results),
     perCode: input.results.map((result) => {
       const first = result.equity[0]?.equity ?? 0
@@ -283,6 +277,8 @@ export function renderReport(report: BacktestReport): string {
     }）`
   )
   lines.push(`  基准 ${pct(p.benchmarkReturn)}  超额 ${pct(p.excessReturn)}  信息比率 ${num(p.informationRatio)}`)
+  // 超额与占用率必须相邻打印：基准满仓、策略多数时间空仓，只看超额会把「没投钱」读成「策略差」
+  lines.push(`  平均资金占用 ${pct(p.exposure)}（基准为满仓 100%，超额收益须结合本行读）`)
   lines.push(`  夏普 ${num(p.sharpe)}（rf = 0）`)
   lines.push(
     `  交易 ${p.trades.count} 笔  胜率 ${pct(p.trades.winRate)}  盈亏比 ${num(p.trades.profitFactor)}  平均持仓 ${num(
@@ -291,14 +287,6 @@ export function renderReport(report: BacktestReport): string {
     )} 日`
   )
   lines.push(`  累计成本 ${num(p.trades.totalCosts, 0)} 元  净盈亏 ${num(p.trades.totalPnl, 0)} 元`)
-
-  if (report.fixedWeightBaseline) {
-    const b = report.fixedWeightBaseline
-    lines.push('')
-    lines.push('【动态权重 vs 固定 0.5/0.5 对照】—— 这一栏回答「权重切换是否有效」')
-    lines.push(`  动态：总收益 ${pct(p.totalReturn)}  回撤 ${pct(p.maxDrawdown)}  夏普 ${num(p.sharpe)}  ${p.trades.count} 笔`)
-    lines.push(`  固定：总收益 ${pct(b.totalReturn)}  回撤 ${pct(b.maxDrawdown)}  夏普 ${num(b.sharpe)}  ${b.trades.count} 笔`)
-  }
 
   lines.push('')
   lines.push('【分市场状态归因】（按建仓时的状态）')

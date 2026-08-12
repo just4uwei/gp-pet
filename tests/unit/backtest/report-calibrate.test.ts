@@ -25,6 +25,7 @@ import {
   sensitivityFlags,
   warmupForSplit,
   type Split,
+  type SplitRun,
 } from '@backtest/calibrate'
 import { DEFAULT_PARAMS } from '@core/params'
 import type { BacktestTrade, CodeResult } from '@backtest/simulate'
@@ -192,23 +193,15 @@ describe('报告组装', () => {
     expect(report.suppressions[0]).toEqual({ rule: 'B', count: 5 })
   })
 
-  it('固定权重对照组存在时一并给出 —— 这一栏回答「权重切换是否有效」', () => {
-    const report = assembleReport({
-      results: [codeResult()],
-      fixedWeightResults: [codeResult({ trades: [trade({ pnl: 200 })] })],
-      meta,
-    })
-    expect(report.fixedWeightBaseline).not.toBeNull()
+  // 这里曾有两条「固定 0.5/0.5 权重对照组」的用例。对照组在 2026-08-12 随权重表一起删除 ——
+  // 权重表没了，对照组就是拿引擎和它自己比（M2 偏差报告 §5.5–§5.8）。
+
+  it('渲染出的报告带免责声明与分状态归因', () => {
+    const report = assembleReport({ results: [codeResult()], meta })
     const text = renderReport(report)
-    expect(text).toContain('权重切换是否有效')
+    expect(text).toContain('回测报告')
     expect(text).toContain('仅供参考，非投资建议')
     expect(text).toContain('分市场状态归因')
-  })
-
-  it('不跑对照组时该字段为 null，渲染不报错', () => {
-    const report = assembleReport({ results: [codeResult()], meta })
-    expect(report.fixedWeightBaseline).toBeNull()
-    expect(renderReport(report)).toContain('回测报告')
   })
 })
 
@@ -257,6 +250,7 @@ function block(overrides: { annualized?: number | null; maxDrawdown?: number; tr
     benchmarkReturn: null,
     excessReturn: null,
     informationRatio: null,
+    exposure: 0.2,
     trades: {
       count: overrides.trades ?? 50,
       wins: 30,
@@ -269,6 +263,11 @@ function block(overrides: { annualized?: number | null; maxDrawdown?: number; tr
       totalCosts: 500,
     },
   }
+}
+
+/** 这一组只测红线与排名口径；折与三态裁决在 calibrate-folds.test.ts */
+function splitRun(overall: PerformanceBlock): SplitRun {
+  return { overall, cells: [] }
 }
 
 describe('标定流程（docs/07 §3）', () => {
@@ -286,11 +285,38 @@ describe('标定流程（docs/07 §3）', () => {
       splits,
       run: (_params, split) => {
         seen.push(split.name)
-        return block({ trades: 3 })
+        return splitRun(block({ trades: 3 }))
       },
     })
-    expect(seen).toEqual(['train'])
-    expect(report.candidates[0]?.rejected).toContain('3 笔')
+    // 出厂值那一行是工具自动补的（配对比较的基准），所以 train 会被跑两次；
+    // 这条用例守的是「淘汰在训练集就发生」——验证集一次都不该被碰
+    expect(seen).toEqual(['train', 'train'])
+    expect(report.candidates.find((c) => !c.incumbent)?.rejected).toContain('3 笔')
+    expect(report.winner).toBeNull()
+  })
+
+  /**
+   * 排名口径是验证集，这本身是对的（用训练集排名等于直接过拟合），
+   * 但它留了个盲区：训练集亏钱、验证集正好赚钱的候选会排到很前面。
+   * 2026-08-12 标定 combine 块时 `voteThreshold.meanReversion = 1` 就这样排到第 2（M2 §5.14）。
+   */
+  it('训练集年化为负的候选直接淘汰，且不跑验证集 —— 验证集再好也只是窗口运气', () => {
+    const seen: string[] = []
+    const report = calibrate({
+      candidates: [{ combine: { scoreThreshold: 0.5 } }],
+      base: DEFAULT_PARAMS,
+      splits,
+      run: (_params, split) => {
+        seen.push(split.name)
+        return splitRun(
+          split.name === 'train'
+            ? block({ annualized: -0.04, maxDrawdown: 0.2 })
+            : block({ annualized: 0.3, maxDrawdown: 0.1 })
+        )
+      },
+    })
+    expect(seen).toEqual(['train', 'train'])
+    expect(report.candidates.find((c) => !c.incumbent)?.rejected).toContain('训练集年化为负')
     expect(report.winner).toBeNull()
   })
 
@@ -300,7 +326,7 @@ describe('标定流程（docs/07 §3）', () => {
       base: DEFAULT_PARAMS,
       splits,
       run: (_params, split) =>
-        split.name === 'train' ? block({ annualized: 0.5 }) : block({ annualized: -0.2 }),
+        splitRun(split.name === 'train' ? block({ annualized: 0.5 }) : block({ annualized: -0.2 })),
     })
     expect(report.candidates[0]?.rejected).toContain('验证集')
     expect(report.winner).toBeNull()
@@ -312,37 +338,48 @@ describe('标定流程（docs/07 §3）', () => {
       base: DEFAULT_PARAMS,
       splits,
       run: (_params, split) =>
-        split.name === 'train'
-          ? block({ annualized: 0.6, maxDrawdown: 0.1 })
-          : block({ annualized: 0.05, maxDrawdown: 0.1 }),
+        splitRun(
+          split.name === 'train'
+            ? block({ annualized: 0.6, maxDrawdown: 0.1 })
+            : block({ annualized: 0.05, maxDrawdown: 0.1 })
+        ),
     })
     expect(report.candidates[0]?.flags.join(' ')).toContain('过拟合')
     expect(report.winner).toBeNull()
     expect(report.notes.join(' ')).toContain('过拟合')
   })
 
-  it('通过红线的候选按**验证集** Calmar 排名，测试集只跑一次', () => {
-    const testRuns: string[] = []
+  /**
+   * 排名口径没变（仍是验证集 Calmar），但**优胜者**多了一道配对门槛：
+   * 没有折就估不出离散度，于是不给优胜者、裁决 INCONCLUSIVE。
+   * 以前这里会直接把分数最高的那组报成优胜者并顺手跑一遍测试集 —— 那是 docs/07 §3 ④
+   * 累计被触碰 5 次的直接原因，而那 5 次的优胜者几乎全都最终没被采用。
+   */
+  it('排名仍按验证集 Calmar，但没有折时不给优胜者、不碰测试集', () => {
+    const seen: string[] = []
     const report = calibrate({
-      candidates: [{ combine: { scoreThreshold: 0.5 } }, { combine: { scoreThreshold: 0.6 } }],
+      candidates: [{ combine: { scoreThreshold: 0.5 } }, { combine: { scoreThreshold: 0.55 } }],
       base: DEFAULT_PARAMS,
       splits,
       run: (params, split) => {
-        if (split.name === 'test') testRuns.push(String(params.combine.scoreThreshold))
-        // 0.6 那组在验证集上更好
-        const better = params.combine.scoreThreshold === 0.6
+        seen.push(split.name)
+        // 0.55 那组在验证集上更好
+        const better = params.combine.scoreThreshold === 0.55
         const annualized = split.name === 'validation' ? (better ? 0.3 : 0.15) : 0.3
-        return block({ annualized, maxDrawdown: 0.1 })
+        return splitRun(block({ annualized, maxDrawdown: 0.1 }))
       },
     })
-    expect(report.winner?.overrides).toEqual({ combine: { scoreThreshold: 0.6 } })
-    expect(testRuns).toEqual(['0.6'])
-    expect(report.test).not.toBeNull()
+    const ranked = [...report.candidates].sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+    expect(ranked[0]?.overrides).toEqual({ combine: { scoreThreshold: 0.55 } })
+    expect(report.verdict).toBe('INCONCLUSIVE')
+    expect(report.winner).toBeNull()
+    expect(seen).not.toContain('test')
+    expect(report.test).toBeNull()
   })
 
   it('没有训练集区间时直接抛错（配置错了要早发现）', () => {
     expect(() =>
-      calibrate({ candidates: [{}], base: DEFAULT_PARAMS, splits: [], run: () => block() })
+      calibrate({ candidates: [{}], base: DEFAULT_PARAMS, splits: [], run: () => splitRun(block()) })
     ).toThrow(/训练集/)
   })
 
@@ -351,7 +388,7 @@ describe('标定流程（docs/07 §3）', () => {
       candidates: [{}],
       base: DEFAULT_PARAMS,
       splits,
-      run: () => block(),
+      run: () => splitRun(block()),
     })
     expect(report.notes.join(' ')).toContain('不自动改文件')
     expect(renderCalibration(report)).toContain('参数标定报告')

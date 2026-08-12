@@ -1,0 +1,19 @@
+{
+  "rsi": [
+    { "period": 14, "obBase": 65, "osBase": 15, "sentimentScale": 20, "sentimentIndex": "SH000300" },
+    { "period": 14, "obBase": 60, "osBase": 20, "sentimentScale": 20, "sentimentIndex": "SH000300" },
+    { "period": 14, "obBase": 70, "osBase": 10, "sentimentScale": 20, "sentimentIndex": "SH000300" }
+  ],
+
+  "strategy": [
+    { "pullbackLookback": 5, "revertLookback": 3, "squeezeBbwPct": 10, "midReversionStd": 1.5, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 2, "squeezeBbwPct": 10, "midReversionStd": 1.5, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 5, "squeezeBbwPct": 10, "midReversionStd": 1.5, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 3, "squeezeBbwPct": 5, "midReversionStd": 1.5, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 3, "squeezeBbwPct": 20, "midReversionStd": 1.5, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 3, "squeezeBbwPct": 10, "midReversionStd": 1.0, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 3, "squeezeBbwPct": 10, "midReversionStd": 2.0, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 5, "squeezeBbwPct": 20, "midReversionStd": 1.0, "expandedBbwPct": 90 },
+    { "pullbackLookback": 5, "revertLookback": 2, "squeezeBbwPct": 5, "midReversionStd": 2.0, "expandedBbwPct": 90 }
+  ]
+}

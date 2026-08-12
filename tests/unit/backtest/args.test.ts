@@ -19,7 +19,6 @@ describe('parseArgs', () => {
     if (options === 'help') return
     expect(options.codes).toEqual(['SH600000', 'sz000001'])
     expect(options.benchmark).toBe('SH000300')
-    expect(options.fixedWeights).toBe(true)
   })
 
   it('吃掉裸 `--`：pnpm 11 会把分隔符原样传进来', () => {
@@ -48,8 +47,7 @@ describe('parseArgs', () => {
       '--params', './p.json',
       '--grid', './g.json',
       '--json',
-      '--quiet',
-      '--no-fixed-weights'
+      '--quiet'
     )
     if (options === 'help') throw new Error('不该是 help')
     expect(options.from).toBe('2020-01-01')
@@ -58,7 +56,6 @@ describe('parseArgs', () => {
     expect(options.costs.transferFeeRate).toBe(0.00002)
     expect(options.capital).toBe(50_000)
     expect(options.warmup).toBe(350)
-    expect(options.fixedWeights).toBe(false)
     expect(options.json).toBe(true)
     expect(options.quiet).toBe(true)
     expect(options.grid).toBe('./g.json')
@@ -74,10 +71,21 @@ describe('parseArgs', () => {
     const options = parse('--codes', 'SH600000', '--sensitivity', 'Conservative')
     if (options === 'help') throw new Error('不该是 help')
     expect(options.sensitivity).toBe('CONSERVATIVE')
-    expect(SENSITIVITY_PRESETS.CONSERVATIVE).toEqual({ scoreThreshold: 0.72, voteThreshold: 4 })
-    expect(SENSITIVITY_PRESETS.SENSITIVE.voteThreshold).toBeLessThan(
-      SENSITIVITY_PRESETS.BALANCED.voteThreshold
+    expect(SENSITIVITY_PRESETS.CONSERVATIVE).toEqual({
+      scoreThreshold: 0.72,
+      voteThreshold: { trend: 4, meanReversion: 3 },
+    })
+    // 三档必须单调收紧，且**两个策略同向收紧** —— 只收一边会让某一档偏袒某个策略
+    expect(SENSITIVITY_PRESETS.SENSITIVE.voteThreshold.trend).toBeLessThan(
+      SENSITIVITY_PRESETS.BALANCED.voteThreshold.trend
     )
+    expect(SENSITIVITY_PRESETS.BALANCED.voteThreshold.meanReversion).toBeLessThanOrEqual(
+      SENSITIVITY_PRESETS.CONSERVATIVE.voteThreshold.meanReversion
+    )
+    // 均值回归只有 4 个子信号，线不该高于趋势的（那是 2026-08-12 修掉的不对等）
+    for (const preset of Object.values(SENSITIVITY_PRESETS)) {
+      expect(preset.voteThreshold.meanReversion).toBeLessThanOrEqual(preset.voteThreshold.trend)
+    }
   })
 
   it('--help 返回 help，且用法里写明了数据来源二选一', () => {

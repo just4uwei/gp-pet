@@ -2,31 +2,46 @@
   "combine": [
     {
       "scoreThreshold": 0.35,
-      "voteThreshold": 1,
+      "voteThreshold": {
+        "trend": 1,
+        "meanReversion": 1
+      },
       "conflictBand": 0.15,
       "provisionalDiscount": 0.9
     },
     {
       "scoreThreshold": 0.4,
-      "voteThreshold": 2,
+      "voteThreshold": {
+        "trend": 2,
+        "meanReversion": 2
+      },
       "conflictBand": 0.15,
       "provisionalDiscount": 0.9
     },
     {
       "scoreThreshold": 0.5,
-      "voteThreshold": 2,
+      "voteThreshold": {
+        "trend": 2,
+        "meanReversion": 2
+      },
       "conflictBand": 0.15,
       "provisionalDiscount": 0.9
     },
     {
       "scoreThreshold": 0.6,
-      "voteThreshold": 3,
+      "voteThreshold": {
+        "trend": 3,
+        "meanReversion": 2
+      },
       "conflictBand": 0.15,
       "provisionalDiscount": 0.9
     },
     {
       "scoreThreshold": 0.72,
-      "voteThreshold": 4,
+      "voteThreshold": {
+        "trend": 4,
+        "meanReversion": 3
+      },
       "conflictBand": 0.15,
       "provisionalDiscount": 0.9
     }

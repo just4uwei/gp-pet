@@ -19,7 +19,13 @@ import { DEFAULT_PARAMS, withParams } from '@core/params'
 import type { Candle } from '@core/types'
 import { buildCandles, chopCloses } from '../../fixtures/klines'
 
-const SENSITIVE = withParams({ combine: { ...DEFAULT_PARAMS.combine, scoreThreshold: 0.3, voteThreshold: 1 } })
+const SENSITIVE = withParams({
+  combine: {
+    ...DEFAULT_PARAMS.combine,
+    scoreThreshold: 0.3,
+    voteThreshold: { trend: 1, meanReversion: 1 },
+  },
+})
 
 const OPTIONS: SimulateOptions = {
   params: SENSITIVE,

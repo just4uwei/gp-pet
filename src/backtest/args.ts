@@ -30,8 +30,14 @@ export interface CliOptions {
     slippage?: number
   }
   sensitivity?: 'SENSITIVE' | 'BALANCED' | 'CONSERVATIVE'
-  /** 跑固定 0.5/0.5 权重对照组（默认开 —— 它是 M2 出口条件要回答的问题） */
-  fixedWeights: boolean
+  /** 标定：横截面折数（标的子集），默认 4 */
+  codeFolds: number
+  /** 标定：验证窗口内的时间片数，默认 3 */
+  timeSlices: number
+  /** 标定：可分辨门槛 |Δ|/stderr，默认由 calibrate.ts 定（2） */
+  minDeltaT?: number
+  /** 标定：是否读测试集。默认 false —— 每读一次都要按 docs/07 §3 ④ 记账 */
+  touchTest: boolean
   /** 只打印 JSON，便于管道 */
   json: boolean
   quiet: boolean
@@ -51,8 +57,17 @@ export const USAGE = `用法：
 
 参数：
   --params <file>        JSON 覆盖块，形如 { "macd": { "fast": 12, "slow": 26, "signal": 9 } }
-  --sensitivity <档位>   sensitive | balanced | conservative（对应 0.50/2 · 0.60/3 · 0.72/4）
+  --sensitivity <档位>   sensitive | balanced | conservative（得分/票数线：0.50/(2,2) · 0.60/(3,2) · 0.72/(4,3)）
   --grid <file>          网格标定模式：{ "macd": [ …候选… ], "combine": [ … ] }
+
+标定（仅 --grid 下生效）：
+  --code-folds <n>       横截面折数（标的按代码轮转分组），默认 4
+  --time-slices <n>      验证窗口内的时间片数，默认 3
+                         折单元 = 折数 × 片数，用于与出厂值做逐折配对比较；
+                         都是从同一次模拟里切出来的，加折不加耗时
+  --min-delta-t <倍>     可分辨门槛 |Δ| / 标准误，默认 2
+  --touch-test           读一次测试集（默认不读）。docs/07 §3 ④ 要求「测试集只跑一次」，
+                         每加一次都要在那一节的计数里记账
 
 成交与成本：
   --capital <元>         每只标的的独立资金，默认 100000
@@ -66,12 +81,11 @@ export const USAGE = `用法：
 
 输出：
   --out <file>           JSON 报告落盘路径
-  --no-fixed-weights     不跑固定权重对照组
   --json                 只输出 JSON
   --quiet                不打印进度
 `
 
-const FLAGS = new Set(['--json', '--quiet', '--no-fixed-weights', '--help', '-h'])
+const FLAGS = new Set(['--json', '--quiet', '--help', '-h', '--touch-test'])
 
 function requireValue(key: string, value: string | undefined): string {
   if (value === undefined) throw new Error(`${key} 缺少取值`)
@@ -81,6 +95,12 @@ function requireValue(key: string, value: string | undefined): string {
 function positiveNumber(key: string, raw: string): number {
   const value = Number(raw)
   if (!Number.isFinite(value) || value < 0) throw new Error(`${key} 必须是非负数字，收到 ${raw}`)
+  return value
+}
+
+function positiveInteger(key: string, raw: string): number {
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 1) throw new Error(`${key} 必须是 ≥ 1 的整数，收到 ${raw}`)
   return value
 }
 
@@ -99,7 +119,9 @@ export function parseArgs(argv: readonly string[]): CliOptions | 'help' {
     capital: 100_000,
     lookback: 320,
     costs: {},
-    fixedWeights: true,
+    codeFolds: 4,
+    timeSlices: 3,
+    touchTest: false,
     json: false,
     quiet: false,
   }
@@ -179,8 +201,17 @@ export function parseArgs(argv: readonly string[]): CliOptions | 'help' {
         options.sensitivity = value
         break
       }
-      case '--no-fixed-weights':
-        options.fixedWeights = false
+      case '--code-folds':
+        options.codeFolds = positiveInteger(key, requireValue(key, next))
+        break
+      case '--time-slices':
+        options.timeSlices = positiveInteger(key, requireValue(key, next))
+        break
+      case '--min-delta-t':
+        options.minDeltaT = positiveNumber(key, requireValue(key, next))
+        break
+      case '--touch-test':
+        options.touchTest = true
         break
       case '--json':
         options.json = true
@@ -199,12 +230,17 @@ export function parseArgs(argv: readonly string[]): CliOptions | 'help' {
   return options
 }
 
-/** 三档灵敏度预设（docs/04 §4.2）：灵敏 0.50/2 · 均衡 0.60/3 · 保守 0.72/4 */
+/**
+ * 三档灵敏度预设（docs/04 §4.2）：灵敏 0.50/(2,2) · 均衡 0.60/(3,2) · 保守 0.72/(4,3)。
+ *
+ * 票数线按策略分开，两个数由**同一个比例**换算：趋势 2/3/4 票是 5 个子信号的 40%/60%/80%，
+ * 均值回归 4 个子信号按同比例取整得 2/2/3。理由见 params.ts 的 `combine` 注释。
+ */
 export const SENSITIVITY_PRESETS: Record<
   NonNullable<CliOptions['sensitivity']>,
-  { scoreThreshold: number; voteThreshold: number }
+  { scoreThreshold: number; voteThreshold: { trend: number; meanReversion: number } }
 > = {
-  SENSITIVE: { scoreThreshold: 0.5, voteThreshold: 2 },
-  BALANCED: { scoreThreshold: 0.6, voteThreshold: 3 },
-  CONSERVATIVE: { scoreThreshold: 0.72, voteThreshold: 4 },
+  SENSITIVE: { scoreThreshold: 0.5, voteThreshold: { trend: 2, meanReversion: 2 } },
+  BALANCED: { scoreThreshold: 0.6, voteThreshold: { trend: 3, meanReversion: 2 } },
+  CONSERVATIVE: { scoreThreshold: 0.72, voteThreshold: { trend: 4, meanReversion: 3 } },
 }

@@ -1,0 +1,60 @@
+{
+  "adx": [
+    {
+      "period": 14,
+      "baseThreshold": 20,
+      "volScale": 8,
+      "maxThreshold": 28
+    },
+    {
+      "period": 14,
+      "baseThreshold": 16,
+      "volScale": 8,
+      "maxThreshold": 28
+    },
+    {
+      "period": 14,
+      "baseThreshold": 24,
+      "volScale": 8,
+      "maxThreshold": 28
+    },
+    {
+      "period": 14,
+      "baseThreshold": 20,
+      "volScale": 4,
+      "maxThreshold": 28
+    },
+    {
+      "period": 14,
+      "baseThreshold": 20,
+      "volScale": 12,
+      "maxThreshold": 28
+    },
+    {
+      "period": 14,
+      "baseThreshold": 20,
+      "volScale": 8,
+      "maxThreshold": 24
+    },
+    {
+      "period": 14,
+      "baseThreshold": 20,
+      "volScale": 8,
+      "maxThreshold": 34
+    }
+  ],
+  "regime": [
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03
+    },
+    {
+      "hysteresisDays": 3,
+      "rangeMidBand": 0.03
+    },
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.05
+    }
+  ]
+}

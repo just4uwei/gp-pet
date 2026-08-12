@@ -18,6 +18,7 @@ import {
 import {
   BARS_PER_YEAR,
   annualizedReturn,
+  averageExposure,
   informationRatio,
   maxDrawdown,
   mean,
@@ -147,5 +148,36 @@ describe('绩效指标', () => {
     expect(stats.winRate).toBeNull()
     expect(stats.avgPnlPct).toBeNull()
     expect(stats.count).toBe(0)
+  })
+
+  /**
+   * 平均资金占用率存在的意义是让「超额收益」可读：基准满仓、策略多数时间空仓。
+   * 实测出厂参数下这个数只有 4.15%，而超额是 −8.17pp —— 两个数必须一起看（M2 §5.13）。
+   */
+  describe('平均资金占用率', () => {
+    it('满仓一整段 = 1', () => {
+      expect(averageExposure([{ entryPrice: 10, shares: 1000, holdingBars: 100 }], 10000, 100)).toBeCloseTo(1, 10)
+    })
+
+    it('半仓一半时间 = 0.25', () => {
+      expect(averageExposure([{ entryPrice: 10, shares: 500, holdingBars: 50 }], 10000, 100)).toBeCloseTo(0.25, 10)
+    })
+
+    it('多笔交易累加（部分止盈拆出的每条各按自己的份额与天数计）', () => {
+      const trades = [
+        { entryPrice: 10, shares: 400, holdingBars: 50 },
+        { entryPrice: 10, shares: 600, holdingBars: 25 },
+      ]
+      expect(averageExposure(trades, 10000, 100)).toBeCloseTo((400 * 50 + 600 * 25) / 100000, 10)
+    })
+
+    it('没有交易 = 0（空仓是事实，不是缺数据）', () => {
+      expect(averageExposure([], 10000, 100)).toBe(0)
+    })
+
+    it('资金或交易日为 0 时给 null，不是 0', () => {
+      expect(averageExposure([], 0, 100)).toBeNull()
+      expect(averageExposure([], 10000, 0)).toBeNull()
+    })
   })
 })

@@ -71,22 +71,30 @@ describe('DEFAULT_PARAMS · 结构不变式', () => {
     // 盘中信号必须被折价，否则临时 K 线的抖动会和收盘确认信号等价（docs/04 §6）
     expect(provisionalDiscount).toBeGreaterThan(0)
     expect(provisionalDiscount).toBeLessThan(1)
-    expect(Number.isInteger(voteThreshold)).toBe(true)
-    expect(voteThreshold).toBeGreaterThan(0)
-  })
-
-  it('每个市场状态下的策略权重和为 1', () => {
-    for (const [regime, weights] of Object.entries(DEFAULT_PARAMS.weights)) {
-      expect(weights.trend + weights.meanReversion, `${regime} 权重和`).toBeCloseTo(1, 10)
-      expect(weights.trend).toBeGreaterThanOrEqual(0)
-      expect(weights.meanReversion).toBeGreaterThanOrEqual(0)
+    for (const line of Object.values(voteThreshold)) {
+      expect(Number.isInteger(line)).toBe(true)
+      expect(line).toBeGreaterThan(0)
     }
   })
 
-  it('趋势市与震荡市的权重取向相反 —— 否则动态权重切换没有意义', () => {
-    const { TREND_UP, RANGE } = DEFAULT_PARAMS.weights
-    expect(TREND_UP.trend).toBeGreaterThan(TREND_UP.meanReversion)
-    expect(RANGE.meanReversion).toBeGreaterThan(RANGE.trend)
+  it('票数线不得超过该策略的子信号个数 —— 否则那个策略在算术上永远无法独立触发', () => {
+    // 趋势 T1–T5 共 5 条，均值回归 R1–R4 共 4 条（docs/04 §3.1/§3.2）。
+    // 2026-08-12 之前两者共用一条「≥ 3 票」，对只有 4 条规则的均值回归系统性不利，
+    // 实测里它在出厂参数下一次都没独立出手过（M2 §5.7）。这条用例钉住的是上界，
+    // 不是「3 和 2 这两个数是对的」—— 具体取值仍待标定（ADR-0003）。
+    const { voteThreshold } = DEFAULT_PARAMS.combine
+    expect(voteThreshold.trend).toBeLessThanOrEqual(5)
+    expect(voteThreshold.meanReversion).toBeLessThanOrEqual(4)
+  })
+
+  // 这里曾有两条关于 `weights` 表的不变式（每行和为 1、趋势市与震荡市取向相反）。
+  // 权重表在 2026-08-12 随动态权重一起删除（两轮实测都看不出效果，M2 偏差报告 §5.5–§5.8），
+  // 两条用例也就没有了断言对象。**不要在没有新机制的情况下把它们加回来。**
+
+  it('下跌趋势里的买入折价落在 0..1 —— 它是抑制项，不能变成加成', () => {
+    const { downtrendBuyPenalty } = DEFAULT_PARAMS.combine
+    expect(downtrendBuyPenalty).toBeGreaterThan(0)
+    expect(downtrendBuyPenalty).toBeLessThanOrEqual(1)
   })
 
   it('风控比例均在 0..1 之间，且盈利保护的回吐线低于触发线', () => {

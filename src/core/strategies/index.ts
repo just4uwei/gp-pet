@@ -18,8 +18,14 @@ export interface StrategyOutput {
 }
 
 export function runStrategies(ctx: StrategyContext, weekly: WeeklyIndicators): StrategyOutput {
+  // 消融开关（params.enabledStrategies）：被关掉的策略一个子信号都不产出，
+  // 因此它对组合层既不供分也不供票 —— 这是「权重调 0」做不到的（见 params.ts 的说明）。
+  const enabled = ctx.params.enabledStrategies
   return {
-    subSignals: [...trendSignals(ctx), ...meanReversionSignals(ctx)],
+    subSignals: [
+      ...(enabled.trend ? trendSignals(ctx) : []),
+      ...(enabled.meanReversion ? meanReversionSignals(ctx) : []),
+    ],
     adjustments: multiTfAdjustments(ctx, weekly),
   }
 }
