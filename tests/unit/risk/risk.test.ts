@@ -1,0 +1,406 @@
+/**
+ * 风控层规则表（docs/05 §2、§3）。
+ *
+ * 表驱动：每条规则一个用例 + 一个边界用例。这一层的错误后果最直接 ——
+ * 漏一条硬抑制，用户会收到「买入」提醒却买不到；漏一条持仓强制规则，止损不响。
+ *
+ * 措辞纪律（CLAUDE.md）也在这里验：文案里不得出现「胜率」「必涨」「抄底」一类词。
+ */
+
+import { describe, expect, it } from 'vitest'
+import { downgrade, downgrades, gateSignal, hardSuppressions, positionVerdict, type GateInput } from '@core/risk'
+import { composeHeadline, confidenceText, describeSubSignal, topReasons } from '@core/risk/text'
+import { DEFAULT_PARAMS } from '@core/params'
+import type {
+  CombinedSignal,
+  Direction,
+  Position,
+  SecProfile,
+  SignalStage,
+  Snapshot,
+  SubSignal,
+} from '@core/types'
+import { buildCandles } from '../../fixtures/klines'
+import { FULL_SUFFICIENCY, LIMITED_SUFFICIENCY, makeIndicators } from '../../fixtures/indicators'
+
+const P = DEFAULT_PARAMS
+const LEN = 400
+const LAST = LEN - 1
+
+const PROFILE: SecProfile = {
+  code: 'SH600000',
+  name: '浦发银行',
+  market: 'SH',
+  board: 'MAIN',
+  isST: false,
+}
+
+function sub(id: string, direction: Direction, score = 0.9, weight = 0.25): SubSignal {
+  return { id, strategy: 'TREND', direction, score, weight, evidence: { volRatio: 1.4, rsi: 22, adx: 30 } }
+}
+
+function signalOf(
+  direction: CombinedSignal['direction'],
+  score = 0.8,
+  stage: SignalStage = 'CONFIRMED'
+): CombinedSignal {
+  return {
+    code: PROFILE.code,
+    date: '2026-08-11',
+    direction,
+    score,
+    votes: 3,
+    regime: 'TREND_UP',
+    stage,
+    subSignals: [sub('T1_MA_CROSS', direction === 'SELL' ? 'SELL' : 'BUY'), sub('T3_BREAKOUT', direction === 'SELL' ? 'SELL' : 'BUY')],
+    adjustments: [],
+    scoreByDirection: { BUY: direction === 'BUY' ? score : 0.1, SELL: direction === 'SELL' ? score : 0.1 },
+    sufficiencyPenalty: 1,
+  }
+}
+
+function snapshot(overrides: Partial<Snapshot> = {}): Snapshot {
+  return {
+    code: PROFILE.code,
+    at: 1_000_000,
+    last: 10,
+    open: 10,
+    high: 10.2,
+    low: 9.8,
+    preClose: 10,
+    volume: 1_000_000,
+    amount: 10_000_000,
+    limitUp: 11,
+    limitDown: 9,
+    suspended: false,
+    ...overrides,
+  }
+}
+
+function input(overrides: Partial<GateInput> = {}): GateInput {
+  return {
+    signal: signalOf('BUY'),
+    profile: PROFILE,
+    candles: buildCandles(new Array<number>(LEN).fill(10)),
+    ind: makeIndicators(LEN, { bbwPct: 50 }),
+    index: LAST,
+    sufficiency: { ...FULL_SUFFICIENCY },
+    snapshot: snapshot(),
+    now: { minuteOfDay: 10 * 60, session: 'CONTINUOUS_AM' },
+    params: P,
+    ...overrides,
+  }
+}
+
+function position(overrides: Partial<Position> = {}): Position {
+  return { code: PROFILE.code, shares: 1000, cost: 10, peakPrice: 10, openedAt: 0, ...overrides }
+}
+
+describe('硬抑制（docs/05 §2.1）', () => {
+  it('停牌', () => {
+    const verdicts = hardSuppressions(input({ snapshot: snapshot({ suspended: true }) }), 'BUY')
+    expect(verdicts.map((v) => v.rule)).toContain('SUSPENDED')
+  })
+
+  it('全日零成交也视为无法交易', () => {
+    const candles = buildCandles(new Array<number>(LEN).fill(10), { overrides: { [LAST]: { volume: 0 } } })
+    expect(hardSuppressions(input({ candles }), 'BUY').map((v) => v.rule)).toContain('SUSPENDED')
+  })
+
+  it('涨停时抑制买入，但不抑制卖出', () => {
+    const shot = snapshot({ last: 11 })
+    expect(hardSuppressions(input({ snapshot: shot }), 'BUY').map((v) => v.rule)).toContain('HARD_LIMIT_UP')
+    expect(hardSuppressions(input({ snapshot: shot }), 'SELL').map((v) => v.rule)).not.toContain('HARD_LIMIT_UP')
+  })
+
+  it('跌停时抑制卖出与减仓，但不抑制买入', () => {
+    const shot = snapshot({ last: 9 })
+    expect(hardSuppressions(input({ snapshot: shot }), 'SELL').map((v) => v.rule)).toContain('HARD_LIMIT_DOWN')
+    expect(hardSuppressions(input({ snapshot: shot }), 'REDUCE').map((v) => v.rule)).toContain('HARD_LIMIT_DOWN')
+    expect(hardSuppressions(input({ snapshot: shot }), 'BUY').map((v) => v.rule)).not.toContain('HARD_LIMIT_DOWN')
+  })
+
+  it('快照没给涨跌停价时按板块规则本地算（免费源常给 -1）', () => {
+    const shot = snapshot({ last: 11, limitUp: null, limitDown: null, preClose: 10 })
+    expect(hardSuppressions(input({ snapshot: shot }), 'BUY').map((v) => v.rule)).toContain('HARD_LIMIT_UP')
+  })
+
+  it('指数无涨跌停 → 不产出涨跌停抑制', () => {
+    const index: SecProfile = { ...PROFILE, code: 'SH000300', board: 'INDEX' }
+    const shot = snapshot({ last: 11, limitUp: null, limitDown: null })
+    expect(hardSuppressions(input({ profile: index, snapshot: shot }), 'BUY').map((v) => v.rule)).not.toContain(
+      'HARD_LIMIT_UP'
+    )
+  })
+
+  it('数据不足（< 40 根）', () => {
+    const sufficiency = { ...LIMITED_SUFFICIENCY, bars: 20, usable: false }
+    expect(hardSuppressions(input({ sufficiency }), 'BUY').map((v) => v.rule)).toContain('INSUFFICIENT_DATA')
+  })
+
+  it('次新股（不足 60 个交易日）', () => {
+    const sufficiency = { ...LIMITED_SUFFICIENCY, bars: 50 }
+    expect(hardSuppressions(input({ sufficiency }), 'BUY').map((v) => v.rule)).toContain('NEW_LISTING')
+  })
+
+  it('连续竞价时段里快照超过 5 分钟未更新', () => {
+    const stale = input({
+      snapshot: snapshot({ at: 0 }),
+      now: { minuteOfDay: 10 * 60, session: 'CONTINUOUS_AM', atMs: 6 * 60_000 },
+    })
+    expect(hardSuppressions(stale, 'BUY').map((v) => v.rule)).toContain('STALE_SNAPSHOT')
+  })
+
+  it('收盘后不判快照陈旧 —— 那时快照本来就是旧的', () => {
+    const settled = input({
+      snapshot: snapshot({ at: 0 }),
+      now: { minuteOfDay: 15 * 60, session: 'SETTLE', atMs: 60 * 60_000 },
+    })
+    expect(hardSuppressions(settled, 'BUY').map((v) => v.rule)).not.toContain('STALE_SNAPSHOT')
+  })
+
+  it('没有墙上时刻（回测）时跳过陈旧判定，而不是拿编出来的时刻去比', () => {
+    const backtest = input({
+      snapshot: snapshot({ at: 0 }),
+      now: { minuteOfDay: 10 * 60, session: 'CONTINUOUS_AM' },
+    })
+    expect(hardSuppressions(backtest, 'BUY').map((v) => v.rule)).not.toContain('STALE_SNAPSHOT')
+  })
+})
+
+describe('降级（docs/05 §2.2）', () => {
+  it('T+1 尾盘：14:50 之后的买入改为明日观察', () => {
+    const late = input({ now: { minuteOfDay: 14 * 60 + 55, session: 'CONTINUOUS_PM' } })
+    expect(downgrades(late, 'BUY').map((v) => v.rule)).toContain('T1_LATE_BUY')
+    const gated = gateSignal(late)
+    expect(gated.direction).toBe('NEXT_DAY_WATCH')
+  })
+
+  it('T+1 规则只作用于买入 —— 尾盘卖出照常', () => {
+    const late = input({
+      signal: signalOf('SELL'),
+      now: { minuteOfDay: 14 * 60 + 55, session: 'CONTINUOUS_PM' },
+    })
+    expect(downgrades(late, 'SELL')).toEqual([])
+    expect(gateSignal(late).direction).toBe('SELL')
+  })
+
+  it('ST 股买入降级并标注风险', () => {
+    const st: SecProfile = { ...PROFILE, name: 'ST 浦发', isST: true }
+    expect(downgrades(input({ profile: st }), 'BUY').map((v) => v.rule)).toContain('ST_RISK')
+  })
+
+  it('名称含 ST 但 isST 标志没给 → 仍然按 ST 处理（数据源不单独给这个标志）', () => {
+    const st: SecProfile = { ...PROFILE, name: '*ST 某某', isST: false }
+    expect(downgrades(input({ profile: st }), 'BUY').map((v) => v.rule)).toContain('ST_RISK')
+  })
+
+  it('行业集中度超上限', () => {
+    expect(downgrades(input({ industryShare: 0.35 }), 'BUY').map((v) => v.rule)).toContain(
+      'INDUSTRY_CONCENTRATION'
+    )
+  })
+
+  it('未统计行业占比（undefined）时不触发 —— 不能用 0 顶替「未知」', () => {
+    expect(downgrades(input({ industryShare: undefined }), 'BUY')).toEqual([])
+  })
+
+  it('波动率处于历史高位时买入降级', () => {
+    const wide = input({ ind: makeIndicators(LEN, { bbwPct: 95 }) })
+    expect(downgrades(wide, 'BUY').map((v) => v.rule)).toContain('VOLATILITY_EXPANDED')
+  })
+
+  it('downgrade() 以 L1 为地板', () => {
+    expect(downgrade('L3')).toBe('L2')
+    expect(downgrade('L3', 2)).toBe('L1')
+    expect(downgrade('L1')).toBe('L1')
+    expect(downgrade('L2', 0)).toBe('L2')
+  })
+})
+
+describe('持仓强制通道（docs/05 §2.3）', () => {
+  it('固定止损：亏损触及 8% → 强制卖出 L3', () => {
+    const result = positionVerdict(
+      input({ position: position({ cost: 11 }), snapshot: snapshot({ last: 10 }) })
+    )
+    expect(result?.verdict.rule).toBe('STOP_LOSS')
+    expect(result?.direction).toBe('SELL')
+    expect(result?.level).toBe('L3')
+  })
+
+  it('移动止损：**当前**仍盈利 ≥ 5%，但自最高点回撤 3%', () => {
+    // 成本 10、最高 11、现价 10.6：浮盈 6%，自峰回撤 3.6%
+    const result = positionVerdict(
+      input({ position: position({ cost: 10, peakPrice: 11 }), snapshot: snapshot({ last: 10.6 }) })
+    )
+    expect(result?.verdict.rule).toBe('TRAILING_STOP')
+    expect(result?.level).toBe('L3')
+  })
+
+  it('回撤减仓：自最高点回撤 7%、当前浮盈已不足 5%（否则由移动止损接手）', () => {
+    // 成本 10、最高 11、现价 10.2：浮盈 2%，自峰回撤 7.3%
+    const result = positionVerdict(
+      input({ position: position({ cost: 10, peakPrice: 11 }), snapshot: snapshot({ last: 10.2 }) })
+    )
+    expect(result?.verdict.rule).toBe('DRAWDOWN_REDUCE')
+    expect(result?.direction).toBe('REDUCE')
+  })
+
+  it('移动止损与回撤减仓同时成立时，先走「趁还赚着落袋」的移动止损', () => {
+    // 浮盈 6%、自峰回撤 8%：两条都成立
+    const result = positionVerdict(
+      input({ position: position({ cost: 10, peakPrice: 11.52 }), snapshot: snapshot({ last: 10.6 }) })
+    )
+    expect(result?.verdict.rule).toBe('TRAILING_STOP')
+  })
+
+  it('盈利保护：曾达 +5% 后回落到 +2% 以下 → L2 减仓', () => {
+    const result = positionVerdict(
+      input({ position: position({ cost: 10, peakPrice: 10.6 }), snapshot: snapshot({ last: 10.1 }) })
+    )
+    expect(result?.verdict.rule).toBe('PROFIT_PROTECT')
+    expect(result?.level).toBe('L2')
+  })
+
+  it('优先级：同时满足止损与回撤时取更严重的止损', () => {
+    const result = positionVerdict(
+      input({ position: position({ cost: 12, peakPrice: 13 }), snapshot: snapshot({ last: 10 }) })
+    )
+    expect(result?.verdict.rule).toBe('STOP_LOSS')
+  })
+
+  it('无持仓 / 零股 / 无成本 → 不产出', () => {
+    expect(positionVerdict(input())).toBeNull()
+    expect(positionVerdict(input({ position: position({ shares: 0 }) }))).toBeNull()
+    expect(positionVerdict(input({ position: position({ cost: 0 }) }))).toBeNull()
+  })
+
+  it('持仓风控用**不复权**价：没有快照时取当根原始收盘', () => {
+    const candles = buildCandles(new Array<number>(LEN).fill(10), {
+      factor: 0.5,
+      overrides: { [LAST]: { close: 9 } },
+    })
+    const result = positionVerdict(input({ candles, snapshot: undefined, position: position({ cost: 10 }) }))
+    // 前复权价是 4.5，若误用它会算出 -55% 的亏损；用原始价才是 -10%
+    expect(result?.verdict.rule).toBe('STOP_LOSS')
+    expect(Number(result?.verdict.evidence['profitPct'])).toBeCloseTo(-10, 6)
+  })
+
+  it('止损不经过组合层得分：方向为 NONE 时照样强制卖出', () => {
+    const gated = gateSignal(
+      input({
+        signal: signalOf('NONE', 0.1),
+        position: position({ cost: 11 }),
+        snapshot: snapshot({ last: 10 }),
+      })
+    )
+    expect(gated.direction).toBe('SELL')
+    expect(gated.level).toBe('L3')
+  })
+
+  it('强制卖出不因 ST / 集中度等降级规则而掉级', () => {
+    const st: SecProfile = { ...PROFILE, name: 'ST 某某', isST: true }
+    const gated = gateSignal(
+      input({ profile: st, position: position({ cost: 11 }), snapshot: snapshot({ last: 10 }) })
+    )
+    expect(gated.level).toBe('L3')
+  })
+})
+
+describe('分级（docs/05 §3）', () => {
+  it('得分 ≥ 0.75 且已收盘确认 → L3', () => {
+    expect(gateSignal(input({ signal: signalOf('BUY', 0.8, 'CONFIRMED') })).level).toBe('L3')
+  })
+
+  it('得分 ≥ 0.75 但仍是盘中临时 → 最高 L2', () => {
+    expect(gateSignal(input({ signal: signalOf('BUY', 0.8, 'PROVISIONAL') })).level).toBe('L2')
+  })
+
+  it('得分不足 0.75 → L1', () => {
+    expect(gateSignal(input({ signal: signalOf('BUY', 0.65) })).level).toBe('L1')
+  })
+
+  it('每命中一条降级规则退一档', () => {
+    const st: SecProfile = { ...PROFILE, name: 'ST 某某', isST: true }
+    expect(gateSignal(input({ profile: st, signal: signalOf('BUY', 0.8) })).level).toBe('L2')
+  })
+
+  it('被硬抑制后一律 L1，且 suppressed 为真（仍要入库，docs/05 §4）', () => {
+    const gated = gateSignal(input({ snapshot: snapshot({ suspended: true }) }))
+    expect(gated.level).toBe('L1')
+    expect(gated.suppressed).toBe(true)
+    // 方向保留，否则面板回答不了「它到底想让我买还是卖」
+    expect(gated.direction).toBe('BUY')
+    expect(gated.reasons.join(' ')).toContain('停牌')
+  })
+
+  it('方向为 NONE 且一切正常 → L1、不抑制、无依据行', () => {
+    const gated = gateSignal(input({ signal: signalOf('NONE', 0.2) }))
+    expect(gated.direction).toBe('NONE')
+    expect(gated.suppressed).toBe(false)
+    expect(gated.reasons).toEqual([])
+    expect(gated.headline).toBe('无一致信号')
+  })
+
+  it('方向为 NONE 但数据不足 → 抑制原因照样记下来', () => {
+    // 「这只股票为什么从来不出信号」是面板必须能回答的问题
+    const gated = gateSignal(
+      input({
+        signal: signalOf('NONE', 0),
+        sufficiency: { ...LIMITED_SUFFICIENCY, bars: 20, usable: false },
+      })
+    )
+    expect(gated.suppressed).toBe(true)
+    expect(gated.verdicts.map((v) => v.rule)).toContain('INSUFFICIENT_DATA')
+    expect(gated.headline).toContain('日线')
+  })
+
+  it('受限模式会附一条 ANNOTATE 说明，但不改变级别', () => {
+    const gated = gateSignal(input({ sufficiency: { ...LIMITED_SUFFICIENCY } }))
+    expect(gated.verdicts.map((v) => v.rule)).toContain('LIMITED_DATA')
+    expect(gated.reasons.join(' ')).toContain('数据不足')
+  })
+})
+
+describe('文案（docs/05 §5）', () => {
+  const subs = [sub('T3_BREAKOUT', 'BUY', 0.9, 0.25), sub('T1_MA_CROSS', 'BUY', 0.6, 0.2)]
+
+  it('headline 形如「首要依据 · 市场状态」', () => {
+    expect(composeHeadline(subs, 'BUY', 'TREND_UP')).toBe('放量突破上轨 · 上升趋势')
+  })
+
+  it('依据行最多 3 条，按权重×强度排序', () => {
+    const reasons = topReasons(
+      [...subs, sub('T4_ALIGNMENT', 'BUY', 0.5, 0.15), sub('T5_PULLBACK_HOLD', 'BUY', 0.5, 0.15)],
+      'BUY'
+    )
+    expect(reasons).toHaveLength(3)
+    expect(reasons[0]).toContain('放量突破上轨')
+  })
+
+  it('依据带关键数值，取不到就只给标签', () => {
+    expect(describeSubSignal(sub('T3_BREAKOUT', 'BUY'))).toContain('量比 1.4')
+    expect(describeSubSignal({ ...sub('T3_BREAKOUT', 'BUY'), evidence: {} })).toBe('放量突破上轨')
+    expect(describeSubSignal(sub('R1_RSI_BAND', 'BUY'))).toContain('RSI 22')
+    expect(describeSubSignal(sub('T4_ALIGNMENT', 'BUY'))).toContain('ADX 30')
+    expect(describeSubSignal({ ...sub('R4_MID_REVERSION', 'BUY'), evidence: { deviationInStd: -1.8 } })).toContain('1.8σ')
+  })
+
+  it('未知 ID 退化为 ID 本身，不抛错', () => {
+    expect(describeSubSignal(sub('X9_UNKNOWN', 'BUY'))).toBe('X9_UNKNOWN')
+  })
+
+  it('置信度称「置信」，**不得**称胜率或概率（docs/04 §4.3）', () => {
+    const text = confidenceText(0.784)
+    expect(text).toBe('置信 78%')
+    expect(text).not.toContain('胜率')
+    expect(text).not.toContain('概率')
+  })
+
+  it('全部文案不含禁用词（CLAUDE.md 措辞纪律）', () => {
+    const banned = ['必涨', '抄底', '稳赚', '牛股', '胜率']
+    const gated = gateSignal(input({ signal: signalOf('BUY', 0.8) }))
+    const text = [gated.headline, ...gated.reasons].join(' ')
+    for (const word of banned) expect(text).not.toContain(word)
+  })
+})

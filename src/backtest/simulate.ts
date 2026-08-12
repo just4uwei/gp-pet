@@ -1,0 +1,390 @@
+/**
+ * 回测模拟器（docs/07 §2.2）。
+ *
+ * 「陷阱 → 对策」逐条落地，每一条都是常见的自欺来源：
+ *
+ * | 陷阱 | 本文件里的对策 |
+ * |---|---|
+ * | 未来函数 | 引擎只拿到 `candles.slice(…, i+1)`，且数组被 `Object.freeze`；`assertNoFuture` 再兜一道 |
+ * | 信号当日成交 | 第 i 根收盘产生的信号，成交价用第 **i+1 根开盘价** |
+ * | T+1 | 买入在 i+1 开盘成交，卖出信号最早在 i+1 收盘产生、i+2 开盘成交 → 天然满足 |
+ * | 涨跌停无法成交 | 次日开盘触及涨停 → 买单作废；触及跌停 → 卖单**顺延**到下一根 |
+ * | 缺口 | `hasGap` 的那根跳过成交与判定（docs/07 §4） |
+ * | 复权 | 资金按**前复权**价计价 → 收益率已含除权影响；持仓成本另存**不复权**价供风控用 |
+ * | 成本与滑点 | 见 costs.ts，双边佣金 + 印花税 + 过户费 + 滑点，全部可配 |
+ * | 幸存者偏差 | 标的池由用户自选股决定 → 报告里明确标注「不代表全市场表现」 |
+ *
+ * **仓位模型**：每只标的一个等额独立仓位（默认 10 万元），组合净值 = 各仓位净值之和。
+ * 这不是资金管理策略，只是让「信号本身值不值钱」可比 —— 引入调仓与权重优化
+ * 会让绩效差异分不清是策略的还是资金管理的。
+ */
+
+import { evaluate } from '../core/engine'
+import { aggregateWeekly } from '../core/indicators/weekly'
+import { priceLimits } from '../core/code'
+import { CONTINUOUS_MINUTES } from '../core/session'
+import type { EngineParams } from '../core/params'
+import type {
+  Candle,
+  EngineContext,
+  GatedDirection,
+  Position,
+  Regime,
+  SecCode,
+  TradeDate,
+} from '../core/types'
+import { DEFAULT_COSTS, buyFees, buyFill, lotsAffordable, sellFees, sellFill, type CostModel } from './costs'
+import type { EquityPoint } from './metrics'
+import type { LoadedSeries } from './data'
+
+export interface SimulateOptions {
+  params: EngineParams
+  costs: CostModel
+  /** 每只标的的独立资金，元 */
+  capitalPerCode: number
+  /**
+   * 引擎每次能看到的最大回看根数。与实盘 `MarketDataService.initialBars` 对齐（默认 320）
+   * —— 若回测让引擎看 3000 根而实盘只给 320 根，两边的 BBW 分位不是同一个东西。
+   */
+  lookback: number
+  /** 前 N 根只喂数据不判信号。默认取 params.data.fullBars，保证 BBW 分位已预热 */
+  warmupBars?: number
+}
+
+export const DEFAULT_SIMULATE_OPTIONS: Omit<SimulateOptions, 'params'> = {
+  costs: DEFAULT_COSTS,
+  capitalPerCode: 100_000,
+  lookback: 320,
+}
+
+export interface BacktestTrade {
+  code: SecCode
+  entryDate: TradeDate
+  exitDate: TradeDate
+  /** 前复权成交价（净值口径） */
+  entryPrice: number
+  exitPrice: number
+  /** 不复权成交价（用户视角的「我买在多少」） */
+  entryPriceRaw: number
+  exitPriceRaw: number
+  shares: number
+  pnl: number
+  pnlPct: number
+  holdingBars: number
+  costs: number
+  regimeAtEntry: Regime
+  entryScore: number
+  /** 触发买入的子信号 ID，归因用 */
+  entrySignals: string[]
+  /** 卖出原因：子信号 ID 或风控规则 ID */
+  exitRule: string
+  /** 减仓（非清仓）产生的那笔 */
+  partial: boolean
+}
+
+export interface SuppressionCount {
+  rule: string
+  count: number
+}
+
+export interface CodeResult {
+  code: SecCode
+  equity: EquityPoint[]
+  trades: BacktestTrade[]
+  /** 判定过的 K 线根数 */
+  evaluations: number
+  /** 产出过可执行方向的次数（未必成交） */
+  actionable: number
+  suppressed: Map<string, number>
+  /** 因涨停买不到 / 跌停卖不掉而作废或顺延的次数 */
+  limitBlocked: number
+  /** 因 hasGap 跳过的根数 */
+  gapSkipped: number
+  regimeBars: Map<Regime, number>
+  /** 期末仍持仓（未平仓）—— 报告里要单独说明，否则「总收益」里混着浮盈 */
+  openPosition: boolean
+}
+
+interface PendingOrder {
+  action: 'BUY' | 'SELL' | 'REDUCE'
+  rule: string
+  signals: string[]
+  score: number
+  regime: Regime
+  /** 已顺延的次数（跌停卖不掉时会顺延） */
+  deferred: number
+}
+
+/** 卖单最多顺延几根。连续跌停超过这个天数就当作「这段时间根本没法卖」，作废并记账 */
+const MAX_DEFER_BARS = 5
+
+/**
+ * 未来函数的第二道防线。
+ *
+ * 第一道是物理的（切片本身不含未来）。这一道防的是「切错了」：
+ * 比如把 `i+1` 写成 `i+2`、或者把完整数组直接传进去。断言失败即抛错，
+ * 宁可回测跑不完，也不要产出一份带未来函数的漂亮报告。
+ */
+export function assertNoFuture(window: readonly Candle[], asOf: TradeDate): void {
+  const last = window[window.length - 1]
+  if (!last) throw new Error('回测窗口为空')
+  if (last.date !== asOf) {
+    throw new Error(`回测窗口末根为 ${last.date}，与判定日 ${asOf} 不符 —— 疑似未来函数`)
+  }
+  for (const candle of window) {
+    if (candle.date > asOf) throw new Error(`回测窗口含未来数据：${candle.date} > ${asOf}`)
+  }
+}
+
+export interface SentimentLookup {
+  /** 截至该日期的大盘情绪 0..1；无基准数据时返回 0.5（中性） */
+  at(date: TradeDate): number
+}
+
+/** 常量情绪，用于无基准数据的场景 */
+export const NEUTRAL_SENTIMENT: SentimentLookup = { at: () => 0.5 }
+
+export function simulateCode(
+  series: LoadedSeries,
+  options: SimulateOptions,
+  sentiment: SentimentLookup = NEUTRAL_SENTIMENT
+): CodeResult {
+  const { params, costs, capitalPerCode, lookback } = options
+  const warmup = options.warmupBars ?? params.data.fullBars
+  const candles = series.candles
+  const profile = series.profile
+
+  let cash = capitalPerCode
+  let shares = 0
+  /** 前复权成本价（净值口径） */
+  let costAdj = 0
+  /** 不复权成本价（风控口径 —— 用户的成本是真实成交价） */
+  let costRaw = 0
+  let peakRaw = 0
+  let entryIndex = -1
+  let entryDate: TradeDate = ''
+  let entryPriceAdj = 0
+  let entryPriceRaw = 0
+  let entryCosts = 0
+  let entryContext: { regime: Regime; signals: string[]; score: number } | null = null
+  let pending: PendingOrder | null = null
+
+  const result: CodeResult = {
+    code: profile.code,
+    equity: [],
+    trades: [],
+    evaluations: 0,
+    actionable: 0,
+    suppressed: new Map(),
+    limitBlocked: 0,
+    gapSkipped: 0,
+    regimeBars: new Map(),
+    openPosition: false,
+  }
+
+  for (let i = 0; i < candles.length; i++) {
+    const bar = candles[i]
+    if (!bar) continue
+
+    // ── ① 执行上一根产生的委托：用**本根开盘价** ──────────────────────
+    if (pending) {
+      if (bar.hasGap === true) {
+        // 缺口段不成交：这一段的价格连续性本身就不可信（docs/07 §4）
+        result.gapSkipped++
+        pending = null
+      } else {
+        // 取出来用局部常量：下面每个分支都会重写 pending，
+        // 边读边写同一个变量在类型收窄上也站不住脚（顺延分支会从 order 重建 pending，
+        // 不显式标注类型 TS 就得循环推断）
+        const order: PendingOrder = pending
+        const limits = priceLimits(candles[i - 1]?.close ?? 0, profile.board, profile.isST)
+        if (order.action === 'BUY') {
+          const limitedUp = limits !== null && bar.open >= limits.limitUp - 0.001
+          if (limitedUp) {
+            result.limitBlocked++
+            pending = null
+          } else {
+            const fillAdj = buyFill(bar.openAdj, costs)
+            const qty = lotsAffordable(cash, fillAdj, costs)
+            if (qty > 0) {
+              const amount = qty * fillAdj
+              const fees = buyFees(amount, costs)
+              cash -= amount + fees
+              shares = qty
+              costAdj = fillAdj
+              costRaw = buyFill(bar.open, costs)
+              peakRaw = Math.max(bar.high, costRaw)
+              entryIndex = i
+              entryDate = bar.date
+              entryPriceAdj = fillAdj
+              entryPriceRaw = costRaw
+              entryCosts = fees
+              entryContext = {
+                regime: order.regime,
+                signals: order.signals,
+                score: order.score,
+              }
+            }
+            pending = null
+          }
+        } else {
+          const limitedDown = limits !== null && bar.open <= limits.limitDown + 0.001
+          if (limitedDown && order.deferred < MAX_DEFER_BARS) {
+            // 跌停卖不掉 → 顺延到下一根，而不是当作已卖出
+            result.limitBlocked++
+            pending = { ...order, deferred: order.deferred + 1 }
+          } else if (limitedDown) {
+            result.limitBlocked++
+            pending = null
+          } else if (shares > 0) {
+            const fraction = order.action === 'REDUCE' ? 0.5 : 1
+            const qty = quantizeSell(shares, fraction)
+            const fillAdj = sellFill(bar.openAdj, costs)
+            const amount = qty * fillAdj
+            const fees = sellFees(amount, costs)
+            cash += amount - fees
+            // 部分卖出时买入费用按比例摊到这一笔，剩余留给后续那笔
+            const allocatedEntryCosts = entryCosts * (qty / shares)
+            entryCosts -= allocatedEntryCosts
+            const grossPnl = (fillAdj - costAdj) * qty
+            result.trades.push({
+              code: profile.code,
+              entryDate,
+              exitDate: bar.date,
+              entryPrice: entryPriceAdj,
+              exitPrice: fillAdj,
+              entryPriceRaw,
+              exitPriceRaw: sellFill(bar.open, costs),
+              shares: qty,
+              pnl: grossPnl - fees - allocatedEntryCosts,
+              pnlPct: costAdj > 0 ? (fillAdj - costAdj) / costAdj : 0,
+              holdingBars: i - entryIndex,
+              costs: fees + allocatedEntryCosts,
+              regimeAtEntry: entryContext?.regime ?? 'TRANSITION',
+              entryScore: entryContext?.score ?? 0,
+              entrySignals: entryContext?.signals ?? [],
+              exitRule: order.rule,
+              partial: qty < shares,
+            })
+            shares -= qty
+            if (shares === 0) {
+              costAdj = 0
+              costRaw = 0
+              peakRaw = 0
+              entryIndex = -1
+              entryContext = null
+              entryCosts = 0
+            }
+            pending = null
+          } else {
+            pending = null
+          }
+        }
+      }
+    }
+
+    // ── ② 持仓峰值：每交易日收盘更新（docs/05 §2.3） ────────────────────
+    if (shares > 0) peakRaw = Math.max(peakRaw, bar.high)
+
+    // ── ③ 收盘净值 ───────────────────────────────────────────────────
+    result.equity.push({
+      date: bar.date,
+      equity: cash + shares * bar.closeAdj,
+      benchmark: null,
+    })
+
+    // ── ④ 收盘后判定信号（最后一根不判：没有下一根可成交，判了也只是幻觉） ──
+    if (i < warmup || i >= candles.length - 1) continue
+    if (bar.hasGap === true) {
+      result.gapSkipped++
+      continue
+    }
+
+    const from = Math.max(0, i - lookback + 1)
+    const window = Object.freeze(candles.slice(from, i + 1))
+    assertNoFuture(window, bar.date)
+
+    const position: Position | undefined =
+      shares > 0
+        ? {
+            code: profile.code,
+            shares,
+            cost: costRaw,
+            peakPrice: peakRaw,
+            openedAt: entryIndex,
+          }
+        : undefined
+
+    const ctx: EngineContext = {
+      profile,
+      candles: window,
+      weekly: aggregateWeekly(window),
+      marketSentiment: sentiment.at(bar.date),
+      // 收盘确认口径：连续竞价已走完 240 分钟，时段为 SETTLE（15:00–15:10 的确认轮）
+      now: { date: bar.date, minutesSinceOpen: CONTINUOUS_MINUTES, session: 'SETTLE' },
+      ...(position ? { position } : {}),
+    }
+
+    const evaluation = evaluate(ctx, params)
+    if (!evaluation) continue
+    result.evaluations++
+    result.regimeBars.set(
+      evaluation.regime.regime,
+      (result.regimeBars.get(evaluation.regime.regime) ?? 0) + 1
+    )
+
+    const gated = evaluation.gated
+    if (gated.suppressed) {
+      for (const verdict of gated.verdicts.filter((v) => v.action === 'SUPPRESS')) {
+        result.suppressed.set(verdict.rule, (result.suppressed.get(verdict.rule) ?? 0) + 1)
+      }
+      continue
+    }
+
+    const order = toOrder(gated.direction, shares > 0)
+    if (!order) continue
+    result.actionable++
+
+    const forced = gated.verdicts.find((v) => v.action === 'FORCE_SELL' || v.action === 'FORCE_REDUCE')
+    const direction = order === 'BUY' ? 'BUY' : 'SELL'
+    pending = {
+      action: order,
+      rule: forced?.rule ?? topSignalId(evaluation, direction) ?? gated.direction,
+      signals: evaluation.signal.subSignals
+        .filter((sub) => sub.direction === direction)
+        .map((sub) => sub.id),
+      score: evaluation.signal.score,
+      regime: evaluation.regime.regime,
+      deferred: 0,
+    }
+  }
+
+  result.openPosition = shares > 0
+  return result
+}
+
+/** 「明日开盘观察」在回测里就是买入 —— 回测的成交模型本来就是次日开盘（见文件头） */
+function toOrder(direction: GatedDirection, holding: boolean): PendingOrder['action'] | null {
+  if (!holding && (direction === 'BUY' || direction === 'NEXT_DAY_WATCH')) return 'BUY'
+  if (holding && direction === 'SELL') return 'SELL'
+  if (holding && direction === 'REDUCE') return 'REDUCE'
+  return null
+}
+
+/** 卖出数量取整手；不足一手的零股一次卖光（否则会留下永远卖不掉的碎股） */
+function quantizeSell(shares: number, fraction: number): number {
+  if (fraction >= 1) return shares
+  const target = Math.floor((shares * fraction) / 100) * 100
+  return target <= 0 || shares - target < 100 ? shares : target
+}
+
+function topSignalId(
+  evaluation: NonNullable<ReturnType<typeof evaluate>>,
+  direction: 'BUY' | 'SELL'
+): string | null {
+  const top = evaluation.signal.subSignals
+    .filter((sub) => sub.direction === direction)
+    .slice()
+    .sort((a, b) => b.weight * b.score - a.weight * a.score)[0]
+  return top?.id ?? null
+}

@@ -7,8 +7,14 @@
 GP Pet：Windows 桌面桌宠，跟踪用户自选的 A 股，用量化策略判断买卖时机并以不打断工作的方式提醒。
 Electron + React + TypeScript · 本地 SQLite · 免登录 · 无服务端 · **不接券商、不下单**。
 
-当前处于 **M0（工程骨架）代码就绪、等待真机验收**。已实现：Pet/Panel 窗口、点击穿透、托盘、类型化 IPC、皮肤加载。
-`src/core`、`src/main/providers`、`src/main/storage`、`src/backtest` 仍只有类型契约与占位。里程碑见 [docs/08](./docs/08-开发路线图.md)。
+当前处于 **M2（引擎层）代码就绪**：五层引擎（指标 → 状态 → 策略 → 组合 → 风控）、回测 CLI、
+标定工具、面板「今日信号」列表都已实现并有测试。**提醒分发（气泡/通知/冷却/免打扰）仍是 M3**
+—— 信号目前的唯一出口是面板列表，桌宠表情不由信号驱动。
+
+**两条出口条件尚未达成**：M1 的「跑满一个交易日 + 健康度 > 99%」要真机联网；
+M2 的「回测报告产出并据此确定出厂参数」要 2018 年以来的真实日线，而本机三家行情接口全部不通。
+所以 `src/core/params.ts` 里的数值仍是未标定的初始猜测（见约束 2）。
+里程碑见 [docs/08](./docs/08-开发路线图.md)，偏差见 [docs/notes/](./docs/notes/)。
 
 ## 五条不可违反的约束
 
@@ -30,7 +36,9 @@ pnpm test             # 单元 + 集成测试（Vitest，不需要启动 Electro
 pnpm test:cov         # 覆盖率；src/core 门槛 90%，其余 60%
 pnpm typecheck        # 双 tsconfig（node / web）分别校验
 pnpm lint
+pnpm verify:indicators           # 重出指标黄金用例；加 -- --check 只校验不重写
 pnpm backtest -- --codes SH600000 --from 2020-01-01 --to 2026-06-30
+pnpm backtest -- --codes ... --grid params/grid.json   # 参数标定（需真实日线）
 pnpm package          # electron-builder 打包 Windows
 ```
 
@@ -71,6 +79,13 @@ src/backtest 回测 CLI，复用 src/core
 - **preload 必须打成 CJS**：安全基线要求 `sandbox: true`，而沙箱化的 preload 不支持 ESM。electron-vite 5 默认输出 ESM，配置里已显式改回。
 - **改完主进程要真启一次**（`pnpm dev`）。typecheck + build 全绿也可能启动即崩 —— 上面两条就是这么发现的。
 - **默认皮肤「小猫」是生成件**，源在 `tools/asset-build/`，改素材要改代码再 `pnpm assets:build && pnpm verify:assets`，不要直接手改 PNG（下次重出就被覆盖）。
+- **指标黄金用例的期望值来自独立参照实现**（`scripts/verify/reference.mjs`，刻意不 import `src/core`）。
+  改了 `params.ts` 或指标算法后要 `pnpm verify:indicators` 重出黄金值 —— 那条用例会先告诉你「参数不一致」。
+  **不要靠改断言来让它变绿**，那会让回归基线失去意义。
+- **回测的资金按前复权价计价，持仓成本另存不复权价**：止损用的是用户真实成交价，
+  混用会在除权后凭空触发一次卖出提醒。
+- **`src/backtest` 用相对路径 import**（不用 `@core/*`）：CLI 由 tsx 直接跑，
+  而根 `tsconfig.json` 是 solution 风格、不带 `paths`，别名在那里解析不到。
 - **仍然不要假设皮肤存在**：缺资源时走占位皮肤 + 兜底托盘图标的降级路径，测试不许拿 `resources/pet/<skin>/` 当 fixture（用户皮肤、第三方皮肤都可能缺）。
 
 ## 措辞纪律

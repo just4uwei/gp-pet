@@ -7,17 +7,31 @@
  * 本文件**只接线，不做判断** —— 一轮 tick 到底做什么在 engine/tick.ts（那儿能用假依赖测）。
  * 装配层的正确性靠真机启动一次来验（CLAUDE.md：改完主进程要真启一次）。
  *
- * M1 到此为止：**不算指标、不产信号、不发提醒**。engineStatus 里 offline / stale 如实上报，
- * 宁可显示「行情离线」也不要让界面看起来在工作而实际没有数据。
+ * M2 追加了信号编排（SignalEngine）：取数之后跑一轮引擎，指标与信号落库。
+ * 提醒（气泡、通知、冷却、免打扰）仍属 M3 —— 这里只把评估结果交给 onSignals 回调。
+ * engineStatus 里 offline / stale 如实上报，宁可显示「行情离线」也不要让界面
+ * 看起来在工作而实际没有数据。
  */
 
 import { join } from 'node:path'
-import type { AppSettings, EngineStatus, ProviderHealth, QuoteTick } from '@shared/ipc-types'
+import type {
+  AppSettings,
+  EngineStatus,
+  ProviderHealth,
+  QuoteTick,
+  SignalEvidence,
+  SignalRecord,
+} from '@shared/ipc-types'
+import type { SecCode } from '@core/types'
 import {
+  BENCHMARK_CODE,
   createMarketDataService,
+  createSignalEngine,
   createTickPipeline,
   createWatchlistService,
   type MarketDataService,
+  type SignalEngine,
+  type SignalOutcome,
   type SnapshotOutcome,
   type WatchlistService,
 } from './engine'
@@ -56,6 +70,8 @@ export interface DataLayerOptions {
   now?: () => number
   /** 每轮取数结束后回调：controller 用它推 push:quoteTick 与刷新托盘 */
   onQuotes?: (ctx: TickContext, snapshots: SnapshotOutcome) => void
+  /** 每轮引擎跑完后回调：M2 用它刷新面板；M3 在这里接 AlertDispatcher */
+  onSignals?: (ctx: TickContext, outcomes: SignalOutcome[]) => void
   onTickError?: (error: unknown, ctx: TickContext) => void
 }
 
@@ -66,6 +82,7 @@ export interface DataLayer {
   readonly calendar: TradingCalendar
   readonly market: MarketDataService
   readonly watchlist: WatchlistService
+  readonly signals: SignalEngine
   readonly scheduler: Scheduler
 
   start(): void
@@ -79,6 +96,10 @@ export interface DataLayer {
   }
   health(): ProviderHealth[]
   quoteTicks(): QuoteTick[]
+  signalHistory(query: { code?: SecCode; from?: number; to?: number; limit?: number }): SignalRecord[]
+  explainSignal(id: string): SignalEvidence | null
+  /** 最近一轮的评估结果，供桌宠状态与面板使用 */
+  latestSignals(): SignalOutcome[]
   dispose(): void
 }
 
@@ -95,6 +116,7 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     log = { info: () => {}, warn: () => {} },
     now = () => Date.now(),
     onQuotes,
+    onSignals,
     onTickError,
   } = options
 
@@ -165,6 +187,21 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     log: (m) => log.info(m),
   })
 
+  // ── 信号编排（M2）───────────────────────────────────────────────
+  // 参数取出厂默认值：用户可改参数属 M4 的设置页，改完只需在这里换一个 params
+  const signals = createSignalEngine({
+    market,
+    watchlist: storage.watchlist,
+    positions: storage.positions,
+    signals: storage.signals,
+    indicators: storage.indicators,
+    lookback: market.options.initialBars,
+    log,
+  })
+  // 参数或算法变了 → 旧的指标缓存不再可比，启动时清一次（docs/03 §4.2）
+  const purged = signals.purgeStaleCache()
+  if (purged > 0) log.info(`[engine] 引擎版本 ${signals.engineVersion}，已清理 ${purged} 条旧指标缓存`)
+
   // ── tick 流水线 ────────────────────────────────────────────────
   // 行为都在 engine/tick.ts 里（那儿有测试）；这里只负责把真实依赖递进去
   const pipeline = createTickPipeline({
@@ -172,9 +209,12 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     watchlist,
     calendar,
     meta: storage.meta,
+    auxCodes: () => [BENCHMARK_CODE],
     prune: (at) => pruneIfDue(db, at),
     log,
+    engine: signals,
     ...(onQuotes ? { onQuotes } : {}),
+    ...(onSignals ? { onSignals } : {}),
   })
 
   const scheduler = createScheduler({
@@ -195,6 +235,7 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     calendar,
     market,
     watchlist,
+    signals,
     scheduler,
 
     start() {
@@ -242,6 +283,18 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
         if (lastError) item.lastError = lastError
         return item
       })
+    },
+
+    signalHistory(query) {
+      return signals.history(query)
+    },
+
+    explainSignal(id) {
+      return signals.explain(id)
+    },
+
+    latestSignals() {
+      return signals.latest()
     },
 
     quoteTicks() {

@@ -1,6 +1,7 @@
 /**
  * engine：把 src/core 的纯函数接到真实数据与存储上的编排层（docs/02 §3）。
- * M1 只有取数编排（MarketDataService），指标与策略编排是 M2。
+ * M1 取数编排（MarketDataService）+ M2 信号编排（SignalEngine）。
+ * 提醒编排（AlertDispatcher）仍属 M3。
  */
 
 export {
@@ -9,6 +10,8 @@ export {
   createMarketDataService,
   expectedLastBar,
 } from './market-data'
+export { BENCHMARK_CODE, createSignalEngine, evidencePayload, snapshotOfIndicators, toSignalRecord } from './signals'
+export type { SignalEngine, SignalEngineDeps, SignalOutcome, TickInfo } from './signals'
 export { MAINTENANCE_INTERVAL_MS, createTickPipeline } from './tick'
 export type { TickMetaStore, TickPipeline, TickPipelineDeps, TickState } from './tick'
 export { DEFAULT_GROUP, MAX_WATCH_ITEMS, createWatchlistService, toWatchItem } from './watchlist'

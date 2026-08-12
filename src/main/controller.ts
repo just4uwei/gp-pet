@@ -1,9 +1,12 @@
 /**
  * 应用编排：把窗口、托盘、皮肤、免打扰状态、数据层串起来（docs/02 §2）。
  *
- * M1：数据层（Scheduler / MarketData / Registry）已接入，Engine 与 AlertDispatcher 仍未实现。
- * 因此桌宠状态只由「免打扰 / 是否开市 / 数据源是否全挂」决定，绝不出现 EXCITED / ALERT
- * —— 那两态必须由真实信号驱动（M2/M3），提前点亮就是假信号。
+ * M2：数据层与信号引擎（SignalEngine）已接入，AlertDispatcher 仍未实现。
+ *
+ * 因此桌宠状态**仍然**只由「免打扰 / 是否开市 / 数据源是否全挂」决定，不出现 EXCITED / ALERT：
+ * 那两态属于提醒分级的表现层，而分级要经过防抖、冷却、频率上限与免打扰探测
+ * （docs/05 §4）才算数 —— 那整套是 M3。信号在 M2 的唯一出口是**面板列表**。
+ * 提前把表情点亮，等于绕过还没实现的四道闸门直接骚扰用户。
  */
 
 import { app } from 'electron'
@@ -15,6 +18,8 @@ import type {
   PetState,
   ProviderHealth,
   Rect,
+  SignalEvidence,
+  SignalRecord,
   WatchItem,
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
@@ -117,6 +122,19 @@ export class AppController {
     return this.data?.health() ?? []
   }
 
+  // ── 信号（M2）─────────────────────────────────────────────────────
+
+  signalHistory(query: { code?: SecCode; from?: number; to?: number; limit?: number }): SignalRecord[] {
+    // 数据层没起来时返回空列表而不是抛错：面板要能把「数据层未就绪」那条横幅画出来
+    return this.data?.signalHistory(query) ?? []
+  }
+
+  explainSignal(id: string): SignalEvidence {
+    const evidence = this.requireData().explainSignal(id)
+    if (!evidence) throw new Error('该信号已不在库中（可能已被保留策略裁剪）')
+    return evidence
+  }
+
   /** 用户点「刷新」或新加自选后：跑一轮 tick。失败只记日志，不弹窗 */
   async refreshData(): Promise<void> {
     if (!this.data) return
@@ -133,6 +151,17 @@ export class AppController {
     this.windows.push('push:quoteTick', this.data.quoteTicks())
     this.pushPetState()
     this.onChange?.()
+  }
+
+  /**
+   * 引擎每轮跑完后由 data-layer 回调。
+   *
+   * M2 只做一件事：让面板重新拉一次信号列表（借 push:engineStatus 触发）。
+   * 真正的提醒分发在 M3 —— 那时这里会接 AlertDispatcher，而不是在这里直接推气泡。
+   */
+  onSignals(): void {
+    if (!this.data) return
+    this.windows.push('push:engineStatus', this.engineStatus())
   }
 
   private requireData(): DataLayer {

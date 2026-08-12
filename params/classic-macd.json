@@ -1,0 +1,3 @@
+{
+  "macd": { "preset": "Classic", "fast": 12, "slow": 26, "signal": 9 }
+}

@@ -7,15 +7,19 @@
 import type { Database } from './db'
 import { CalendarRepo } from './repositories/calendar'
 import { ProviderHealthRepo } from './repositories/health'
+import { IndicatorRepo } from './repositories/indicator'
 import { KlineRepo } from './repositories/kline'
 import { MetaRepo } from './repositories/meta'
 import { PositionRepo } from './repositories/position'
+import { SignalRepo } from './repositories/signal'
 import { WatchlistRepo } from './repositories/watchlist'
 
 export interface Storage {
   readonly db: Database
   readonly watchlist: WatchlistRepo
   readonly klines: KlineRepo
+  readonly indicators: IndicatorRepo
+  readonly signals: SignalRepo
   readonly calendar: CalendarRepo
   readonly health: ProviderHealthRepo
   readonly positions: PositionRepo
@@ -28,6 +32,8 @@ export function createStorage(db: Database): Storage {
     db,
     watchlist: new WatchlistRepo(db),
     klines: new KlineRepo(db),
+    indicators: new IndicatorRepo(db),
+    signals: new SignalRepo(db),
     calendar: new CalendarRepo(db),
     health: new ProviderHealthRepo(db),
     positions: new PositionRepo(db),

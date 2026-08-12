@@ -116,12 +116,19 @@ export interface IndicatorSet {
   volMa: Series
   /** 成交量比；盘中值已按交易时间占比归一化（见 docs/04 §1.7） */
   volRatio: Series
-  /** 由动态阈值公式算出的当期阈值，落在 evidence 里便于解释 */
+  /**
+   * 由动态阈值公式算出的当期阈值，落在 evidence 里便于解释「为什么今天的门槛是 24」。
+   *
+   * ⚠ RSI 两条阈值来自**当期**大盘情绪标量，整条序列是同一个值铺满的
+   * —— 历史位置上的值不代表当时的真实阈值，只有最后一根有意义（见 indicators/thresholds.ts）。
+   */
   thresholds: {
     adxTrend: Series
     adxRange: Series
     rsiOverbought: Series
     rsiOversold: Series
+    /** ATR/close 的 250 日分位 0..1，ADX 阈值的输入 */
+    volPct: Series
   }
 }
 
@@ -214,6 +221,13 @@ export interface GatedSignal {
   direction: GatedDirection
   level: AlertLevel
   verdicts: RiskVerdict[]
+  /**
+   * 硬抑制命中：**仅落库不提醒**（docs/05 §2.1）。
+   *
+   * 为什么不把 direction 改成 NONE 了事：面板要显示「今日被静默的 5 条信号」及原因
+   * （docs/05 §4），方向被抹掉就没法回答「它到底想让我买还是卖」。
+   */
+  suppressed: boolean
   /** 面板与气泡展示用的文案片段，规范见 docs/05 §5 */
   headline: string
   reasons: string[]
@@ -227,14 +241,40 @@ export interface GatedSignal {
  */
 export interface EngineContext {
   profile: SecProfile
-  candles: Candle[]
-  weekly: Candle[]
+  /**
+   * 升序日线，最后一根即被判定的那根。**只读**：引擎不得改写调用方的数组
+   * —— 回测正是靠 `Object.freeze(candles.slice(0, i+1))` 从物理上消除未来函数的。
+   */
+  candles: readonly Candle[]
+  weekly: readonly Candle[]
   snapshot?: Snapshot
   position?: Position
   /** 基准指数的情绪值 0..1，用于 RSI 动态阈值（见 docs/04 §1.6） */
   marketSentiment: number
-  /** 由调用方注入，不在引擎内读时钟 */
-  now: { date: TradeDate; minutesSinceOpen: number; session: TradingSession }
+  /**
+   * 该标的所属行业在当前持仓中的占比 0..1。用于 docs/05 §2.2 的行业集中度降级。
+   * 缺省（无持仓或未统计）时不触发该规则 —— 不要用 0 顶替「未知」，
+   * 0 是个明确的结论（完全没有同行业持仓），会让规则永不触发且看不出是缺数据。
+   */
+  industryShare?: number
+  /**
+   * 由调用方注入，不在引擎内读时钟。
+   *
+   * `minutesSinceOpen` 的口径是**已完成的连续竞价分钟数 0..240（午休不计）**，
+   * 即 `session.ts` 的 `continuousMinutesElapsed`。量比的时间归一化除的就是它 / 240
+   * —— 若误传成含午休的自然分钟，13:00 的量比会凭空缩小三成（docs/04 §1.7）。
+   */
+  now: {
+    date: TradeDate
+    minutesSinceOpen: number
+    session: TradingSession
+    /**
+     * 墙上时刻（epoch ms），只用于「快照是否陈旧」这一条风控（docs/05 §2.1）。
+     * 可选：回测没有快照，也就没有陈旧一说 —— 缺省时该规则不参与判定，
+     * 而不是拿一个编出来的时刻去比。
+     */
+    atMs?: number
+  }
 }
 
 export type TradingSession =

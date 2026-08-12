@@ -7,6 +7,7 @@ export default defineConfig({
       '@core': resolve('src/core'),
       '@shared': resolve('src/shared'),
       '@main': resolve('src/main'),
+      '@backtest': resolve('src/backtest'),
     },
   },
   test: {
@@ -17,7 +18,7 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       // 限定扩展名：不加的话 v8 会去解析 src/main/providers/README.md 并报一个吓人的 parse error
-      include: ['src/core/**/*.ts', 'src/main/**/*.ts'],
+      include: ['src/core/**/*.ts', 'src/main/**/*.ts', 'src/backtest/**/*.ts'],
       // 排除的都是「只有跑起 Electron 才能验证」的胶水层：窗口、托盘、协议、入口、
       // IPC 登记。它们的正确性靠 docs/06 §1 的手工验收清单，不靠行覆盖率。
       // 判据类逻辑一律下沉到 src/main/util 与 src/main/skin，那两处不在排除名单里。
@@ -32,6 +33,9 @@ export default defineConfig({
         'src/main/data-layer.ts',
         'src/main/logging.ts',
         'src/main/resources.ts',
+        // 回测 CLI 的装配层：参数解析、模拟器、报告、标定都各自有测试，
+        // 这里只剩「读文件、开库、拼装、打印」，与 data-layer.ts 同一类
+        'src/backtest/cli.ts',
         // 类型契约文件，编译后无可执行语句
         'src/core/types.ts',
         'src/main/providers/types.ts',

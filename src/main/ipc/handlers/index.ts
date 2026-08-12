@@ -1,8 +1,9 @@
 /**
  * 通道实现登记（docs/02 §5）。
  *
- * M1 补齐了自选股、设置与健康度；信号相关通道（signal:*）要等引擎（M2），
- * 仍由 reportUnimplementedChannels() 在启动日志里列出 —— 缺口要看得见，不静默（docs/02 §7）。
+ * M1 补齐了自选股、设置与健康度；M2 补齐了 signal:history / signal:explain。
+ * signal:markRead 要写 alert_log，而那张表在 M3 才有内容 —— 仍由
+ * reportUnimplementedChannels() 在启动日志里列出，缺口要看得见，不静默（docs/02 §7）。
  */
 
 import { Menu } from 'electron'
@@ -40,6 +41,21 @@ export function registerHandlers(controller: AppController): void {
   )
 
   handle('position:clear', (_event, code) => controller.clearPosition(normalizeCode(code)))
+
+  // ── 信号（M2）─────────────────────────────────────────────────────
+  // 「今日信号」列表与依据展开都走这两条；提醒日志（含被抑制条目）复用同一份数据，
+  // 因为被抑制的信号也在 signal 表里（docs/05 §4：不制造信息黑洞）
+
+  handle('signal:history', (_event, query) =>
+    controller.signalHistory({
+      ...(query.code === undefined ? {} : { code: normalizeCode(query.code) }),
+      ...(query.from === undefined ? {} : { from: query.from }),
+      ...(query.to === undefined ? {} : { to: query.to }),
+      ...(query.limit === undefined ? {} : { limit: query.limit }),
+    })
+  )
+
+  handle('signal:explain', (_event, id) => controller.explainSignal(id))
 
   // ── 设置 ─────────────────────────────────────────────────────────
 

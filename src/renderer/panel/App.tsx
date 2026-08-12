@@ -1,9 +1,9 @@
 /**
- * 面板窗口 —— M1：自选股列表 + 数据层状态。
+ * 面板窗口 —— M2：自选股列表 + 数据层状态 + 今日信号（含被静默条目）。
  *
  * 三条克制：
  *
- * 1. **只显示已经有的东西。** 信号、评分、持仓盈亏属 M2/M3，这里一律不留占位行
+ * 1. **只显示已经有的东西。** 持仓盈亏与提醒日志属 M3，这里一律不留占位行
  *    —— 空着的占位比没有更容易让人误判完成度。
  * 2. **拿不到数据就明说。** 行情离线、日历可能过期、数据源降级都摆在顶部，
  *    绝不用上一轮的价格假装实时（stale 一律灰显并标注）。
@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { EngineStatus, PetSkinView, ProviderHealth, QuoteTick, WatchItem } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
+import { SignalList } from './SignalList'
 
 const SESSION_LABEL: Record<string, string> = {
   CLOSED: '休市',
@@ -217,6 +218,8 @@ export function App(): React.JSX.Element {
   const [health, setHealth] = useState<ProviderHealth[]>([])
   const [skin, setSkin] = useState<PetSkinView | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // 引擎每轮跑完会推一次 engineStatus；用它当信号列表的重取信号（M2 没有专门的推送通道）
+  const [signalKey, setSignalKey] = useState(0)
 
   const reload = useCallback(async (): Promise<void> => {
     try {
@@ -238,7 +241,10 @@ export function App(): React.JSX.Element {
     void window.gp.invoke('pet:getSkin').then(setSkin)
     void reload()
 
-    const offStatus = window.gp.on('push:engineStatus', setStatus)
+    const offStatus = window.gp.on('push:engineStatus', (next) => {
+      setStatus(next)
+      setSignalKey((key) => key + 1)
+    })
     const offQuotes = window.gp.on('push:quoteTick', (ticks) => {
       setQuotes(ticks)
       // 每轮取数后基础信息可能补上了名称/行业，健康度也变了，顺带重取一次
@@ -324,7 +330,7 @@ export function App(): React.JSX.Element {
 
       <AddForm onAdd={add} />
 
-      <section className="mt-4 min-h-0 flex-1 overflow-y-auto">
+      <section className="mt-4 min-h-0 flex-1 space-y-5 overflow-y-auto">
         {items.length === 0 ? (
           <p className="py-8 text-center text-sm text-white/35">还没有自选股，先在上面添加一只。</p>
         ) : (
@@ -342,10 +348,12 @@ export function App(): React.JSX.Element {
             ))}
           </ul>
         )}
+
+        {items.length > 0 ? <SignalList refreshKey={signalKey} onError={setError} /> : null}
       </section>
 
       <footer className="mt-4 shrink-0 text-xs text-white/40">
-        <p>M1：只有行情与存储，尚无信号与提醒。</p>
+        <p>M2：信号只进面板，尚无气泡与系统通知（提醒分发是 M3）。</p>
         <p className="mt-1">仅供参考，非投资建议</p>
       </footer>
     </main>

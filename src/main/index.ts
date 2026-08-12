@@ -42,11 +42,14 @@ void app.whenReady().then(() => {
     resourcesRoot: resourcesRoot(),
     log: { info: (...args) => log.info(...args), warn: (...args) => log.warn(...args) },
     onQuotes: () => controller?.onQuotes(),
+    onSignals: () => controller?.onSignals(),
   })
     .then((layer) => {
       controller?.attachDataLayer(layer)
       layer.start()
-      log.info('[app] 数据层就绪。M1：有数据源、有调度，尚无引擎与提醒。')
+      log.info(
+        `[app] 数据层与引擎就绪（${layer.signals.engineVersion}）。M2：有信号与面板列表，尚无提醒分发。`
+      )
     })
     .catch((error: unknown) => {
       // 数据层起不来是「行情离线」，不是崩溃 —— engineStatus 会如实报 offline
