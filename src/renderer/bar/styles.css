@@ -71,11 +71,74 @@ body,
   background: #fb7185;
 }
 
-.name {
+/*
+ * 跑马灯：全部自选轮流经过（docs/06 §2.1）。
+ *
+ * 两条不能省：
+ * 1. **装得下就不滚** —— 轨道只在渲染层量出「一圈比可视区宽」时才加 .track--scroll，
+ *    一条常驻置顶的条子没必要为了有动效而一直动（C7 的精神）。
+ * 2. **休市 / 离线 / 免打扰要停** —— .track--paused 由 petState 给出，
+ *    对应 C7「休市时 CPU ≈ 0，动画降至 6fps 或暂停」。
+ * 鼠标停在条子上时也暂停：想看清某一只时它正好在往外走，是最直接的一种烦人。
+ */
+.viewport {
+  display: flex;
   flex: 1 1 auto;
+  align-items: center;
   min-width: 0;
+  height: 100%;
   overflow: hidden;
-  text-overflow: ellipsis;
+}
+
+.track {
+  display: flex;
+  align-items: center;
+  width: max-content;
+}
+
+.track--scroll {
+  /* 时长由渲染层按内容宽度算，写在 style 里 */
+  animation: marquee linear infinite;
+}
+
+.track--paused,
+.bar:hover .track--scroll {
+  animation-play-state: paused;
+}
+
+/* 轨道里是两份相同内容，滚过一份即首尾相接 */
+@keyframes marquee {
+  from {
+    transform: translateX(0);
+  }
+
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .track--scroll {
+    animation: none;
+  }
+}
+
+.lap {
+  display: flex;
+  align-items: center;
+}
+
+.item {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  /* 右侧留白同时充当两份内容之间的间隔，所以不能用 .lap 的 gap */
+  padding-right: 18px;
+}
+
+.name {
+  flex: none;
   color: rgb(255 255 255 / 88%);
 }
 
@@ -88,10 +151,45 @@ body,
 
 .change {
   flex: none;
-  width: 52px;
-  text-align: right;
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum";
+}
+
+/* 方向标签。措辞与面板的今日信号列表同源（买入/卖出/减仓/明日观察/观察） */
+.act {
+  flex: none;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 14px;
+}
+
+/* 买入用红（A 股红涨），卖出/减仓用暖橙 —— 红色作警示会与涨跌色打架（docs/05 §5） */
+.act--buy {
+  background: rgb(251 113 133 / 18%);
+  color: #fda4af;
+}
+
+.act--sell {
+  background: rgb(251 191 36 / 18%);
+  color: #fcd34d;
+}
+
+.act--neutral {
+  background: rgb(255 255 255 / 10%);
+  color: rgb(255 255 255 / 70%);
+}
+
+/* 今天没有信号：是事实陈述，不是一条中性建议，所以不给它任何标签底色 */
+.act--none {
+  padding: 0;
+  color: rgb(255 255 255 / 32%);
+}
+
+/* 轮播末尾的固定小字（措辞纪律） */
+.disclaimer {
+  color: rgb(255 255 255 / 32%);
+  font-size: 10px;
 }
 
 /* A 股习惯：红涨绿跌 */

@@ -27,6 +27,24 @@ function appIcon(): Electron.NativeImage | undefined {
   return image.isEmpty() ? undefined : image
 }
 
+/**
+ * 顶栏配色 —— 与 `src/renderer/panel/styles.css` 的 `--gp-surface` / 正文色**必须一致**。
+ *
+ * 系统标题栏在浅色 Windows 主题下是白的，压在一整屏暗色面板上格外突兀，而
+ * `nativeTheme.themeSource = 'dark'` 只能换来系统那个近黑灰（#1f1f1f 一类），仍然与面板差一档。
+ * 所以走 `titleBarStyle: 'hidden'` + `titleBarOverlay`：**标题栏区域交给页面自己画**，
+ * 只把最小化/最大化/关闭三颗按钮留给系统绘制（自绘窗口控件在 Windows 上永远差一口气：
+ * 悬停高亮、Snap Layouts、高对比度主题都得自己补）。
+ *
+ * 代价与约束：
+ * - 页面必须自己提供拖拽区（渲染层头部的 `-webkit-app-region: drag`），否则窗口拖不动。
+ * - 右上角那块（Win11 三颗控件约 3×46px，高 `TITLE_BAR_HEIGHT`）归系统，页面内容不能放进去
+ *   —— 渲染层头部那一行因此留了 `pr-[144px]` 的右内边距。**两处一起改，别只改一个。**
+ */
+const TITLE_BAR_COLOR = '#161a21'
+const TITLE_BAR_SYMBOL_COLOR = '#eceef2'
+const TITLE_BAR_HEIGHT = 40
+
 export class PanelWindow {
   private win: BrowserWindow | null = null
 
@@ -43,6 +61,13 @@ export class PanelWindow {
       title: 'GP Pet',
       ...(icon ? { icon } : {}),
       backgroundColor: '#101216',
+      // 顶栏交给页面画，只保留系统的窗口控件（见 TITLE_BAR_COLOR 上面那段）
+      titleBarStyle: 'hidden',
+      titleBarOverlay: {
+        color: TITLE_BAR_COLOR,
+        symbolColor: TITLE_BAR_SYMBOL_COLOR,
+        height: TITLE_BAR_HEIGHT,
+      },
       webPreferences: {
         preload: PRELOAD_PATH,
         contextIsolation: true,

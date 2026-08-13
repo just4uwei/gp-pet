@@ -7,27 +7,36 @@
  * 没有像素级命中测试。区别是悬浮条**窗口即本体**，所以命中区不是描一个轮廓，
  * 而是「整块减掉四个圆角」，三个矩形就够。
  *
- * ## 两条纪律
+ * ## 四条纪律
  *
  * 1. **状态点只跟着 `push:petState` 走，不自己从信号里推断强度。**
  *    WATCHING / EXCITED / ALERT 由主进程的 `PetStateMachine` 给出，而它只接受
  *    **过了四道闸门**（防抖、冷却、频率上限、免打扰）的提醒。这里若自己去读
  *    signal:history 点亮状态点，等于开一条绕过闸门的旁路 —— 那正是 M3 之前
- *    这段注释在防的事。
+ *    这段注释在防的事。跑马灯上的方向标签**不受这条约束**：它复述的是
+ *    「引擎今天判了什么」（面板的今日信号列表同源），不是「有没有提醒你」。
  * 2. **价格取缓存时必须灰显**（`stale`），不假装实时。
+ * 3. **今天没有信号就写「无信号」**，不许填一个像建议的中性词 —— 引擎没说话，
+ *    条子不替它说（判据在 `@shared/ticker`）。
+ * 4. **休市 / 离线 / 免打扰时滚动必须停**（C7 休市零开销，docs/06 §1）。
+ * 5. **单击不做任何事，双击才开面板**（2026-08-13 改）。理由是这条子会被拖着走，
+ *    而拖拽以一次 click 收尾 —— 单击绑面板时，每挪一次位置都会顺手开一次面板。
+ *    连带后果是**双击不再是免打扰**（C8 因此退到右键菜单，见 docs/06 §4 的注），
+ *    桌宠形态仍是「单击面板 / 双击免打扰」，两种形态的手势自此不同。
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { hitTest } from '@shared/hit-test'
-import { pickFeatured } from '@shared/featured'
+import { applyOrder, buildTicker, orderFingerprint, type TickerEntry } from '@shared/ticker'
+import type { GatedDirection, SecCode } from '@core/types'
 import type { EngineStatus, PetState, QuoteTick, Rect, SignalRecord, WatchItem } from '@shared/ipc-types'
 
 /** 与 styles.css 的 `.bar { border-radius }` 必须一致，否则命中区会盖到圆角外 */
 const CORNER_RADIUS = 8
 /** 位移超过这个距离就算拖拽，不再当作单击 */
 const DRAG_SLOP_PX = 4
-/** 区分单击与双击的等待窗口 */
-const DOUBLE_CLICK_MS = 250
+/** 跑马灯速度。慢到能读完一只票，快到不必等太久 */
+const SCROLL_PX_PER_SEC = 28
 
 const DOT_CLASS: Record<PetState, string> = {
   OFFLINE: 'dot--offline',
@@ -45,6 +54,24 @@ const DOT_TITLE: Record<PetState, string> = {
   WATCHING: '关注中',
   EXCITED: '有较强信号',
   ALERT: '有需要处理的提醒',
+}
+
+/** 与面板的今日信号列表同一份措辞（SignalList.tsx），别在两处各写一套 */
+const ACTION_LABEL: Record<GatedDirection, string> = {
+  BUY: '买入',
+  SELL: '卖出',
+  REDUCE: '减仓',
+  NEXT_DAY_WATCH: '明日观察',
+  NONE: '观察',
+}
+
+/** 卖出/减仓用暖橙不用红：A 股红涨绿跌，红色作警示会与涨跌色打架（docs/05 §5） */
+const ACTION_CLASS: Record<GatedDirection, string> = {
+  BUY: 'act--buy',
+  SELL: 'act--sell',
+  REDUCE: 'act--sell',
+  NEXT_DAY_WATCH: 'act--neutral',
+  NONE: 'act--neutral',
 }
 
 interface DragState {
@@ -84,6 +111,50 @@ function changeClass(value: number): string {
   return 'change--flat'
 }
 
+/**
+ * 跑马灯里的一只票。
+ *
+ * 「无信号」是一个**事实**，不是一条中性建议 —— 引擎今天没对它说话，
+ * 这里就不许写「观望」「持有」之类看起来像结论的词（措辞纪律，CLAUDE.md）。
+ */
+function Item({ entry }: { entry: TickerEntry }): React.JSX.Element {
+  const grey = entry.stale ? ' stale' : ''
+  return (
+    <span className="item">
+      <span className="name">{entry.name}</span>
+      <span className={`price${grey}`}>{entry.last === null ? '—' : entry.last.toFixed(2)}</span>
+      <span
+        className={`change ${entry.changePct === null ? 'change--flat' : changeClass(entry.changePct)}${grey}`}
+      >
+        {entry.changePct === null ? '—' : signed(entry.changePct)}
+      </span>
+      {entry.action === null ? (
+        <span className="act act--none">无信号</span>
+      ) : (
+        <span className={`act ${ACTION_CLASS[entry.action]}`}>{ACTION_LABEL[entry.action]}</span>
+      )}
+    </span>
+  )
+}
+
+/**
+ * 滚动一圈的全部内容。
+ *
+ * 末尾那句免责小字跟着「条子上确实出现了方向标签」走：跑马灯把买卖建议摆到了
+ * 桌面上，而气泡与通知的那句固定小字（docs/05 §5）在这里没有落点，
+ * 于是让它跟着轮播过一遍 —— 只在真有建议时出现，没有建议时不占位置。
+ */
+function Lap({ entries, disclaimer }: { entries: TickerEntry[]; disclaimer: boolean }): React.JSX.Element {
+  return (
+    <>
+      {entries.map((entry) => (
+        <Item key={entry.code} entry={entry} />
+      ))}
+      {disclaimer ? <span className="item disclaimer">仅供参考，非投资建议</span> : null}
+    </>
+  )
+}
+
 export function App(): React.JSX.Element {
   const [petState, setPetState] = useState<PetState>('IDLE')
   const [quotes, setQuotes] = useState<QuoteTick[]>([])
@@ -95,9 +166,29 @@ export function App(): React.JSX.Element {
   const dragRef = useRef<DragState | null>(null)
   /** 本地缓存的穿透状态，避免每次 mousemove 都发 IPC */
   const interactiveRef = useRef(false)
-  const clickTimerRef = useRef<number | null>(null)
 
-  const rects = useMemo(() => barHitRects(window.innerWidth, window.innerHeight), [])
+  /**
+   * 命中区跟着窗口尺寸走，不是挂载时算一次。
+   *
+   * 只在挂载时算过一次的版本有一个很难归因的坏结局：窗口尺寸一旦与它不符
+   * （历史上是拖拽把窗口撑大，见 OverlayWindow.moveTo），鼠标压在条子上却被判成
+   * 「不在命中区」→ 穿透 → 点什么都没反应。主进程那边已经堵住了成因，
+   * 这里再跟一手，让「尺寸变了」最多是一帧的事而不是永久失灵。
+   */
+  const [viewport, setViewport] = useState({ w: window.innerWidth, h: window.innerHeight })
+  const rects = useMemo(() => barHitRects(viewport.w, viewport.h), [viewport])
+
+  useEffect(() => {
+    const onResize = (): void => {
+      setViewport((prev) =>
+        prev.w === window.innerWidth && prev.h === window.innerHeight
+          ? prev
+          : { w: window.innerWidth, h: window.innerHeight }
+      )
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
   useEffect(() => {
     void window.gp.invoke('pet:setHitRegion', rects)
@@ -185,33 +276,14 @@ export function App(): React.JSX.Element {
     }
   }, [rects, setInteractive])
 
-  useEffect(() => {
-    return () => {
-      if (clickTimerRef.current !== null) window.clearTimeout(clickTimerRef.current)
-    }
-  }, [])
-
-  // ── 手势（docs/06 §4，与桌宠一致）─────────────────────────────────
+  // ── 手势（docs/06 §4；悬浮条形态与桌宠不同，见文件头纪律 5）───────────
   const onMouseDown = (event: React.MouseEvent): void => {
     if (event.button !== 0) return
     dragRef.current = { lastScreenX: event.screenX, lastScreenY: event.screenY, travelled: 0 }
   }
 
-  const onClick = (): void => {
-    // 单击要等一个双击窗口期，否则双击会先触发一次面板开关
-    if (clickTimerRef.current !== null) return
-    clickTimerRef.current = window.setTimeout(() => {
-      clickTimerRef.current = null
-      void window.gp.invoke('panel:toggle')
-    }, DOUBLE_CLICK_MS)
-  }
-
   const onDoubleClick = (): void => {
-    if (clickTimerRef.current !== null) {
-      window.clearTimeout(clickTimerRef.current)
-      clickTimerRef.current = null
-    }
-    void window.gp.invoke('pet:toggleDoNotDisturb')
+    void window.gp.invoke('panel:toggle')
   }
 
   const onContextMenu = (event: React.MouseEvent): void => {
@@ -221,20 +293,47 @@ export function App(): React.JSX.Element {
 
   // ── 绘制 ─────────────────────────────────────────────────────────
   const actionable = useMemo(() => signals.filter((s) => s.suppressedReason === undefined), [signals])
-  const featured = useMemo(() => pickFeatured(quotes, actionable), [quotes, actionable])
-  const stale = featured?.stale === true
-  const nameOf = useMemo(() => {
-    const map = new Map(items.map((item) => [item.code, item.name]))
-    // 自选还没读到（或刚加进来还没补基础信息）时退到信号里的名称，再退到代码本身
-    for (const signal of signals) if (!map.has(signal.code)) map.set(signal.code, signal.name)
-    return map
-  }, [items, signals])
+  const fresh = useMemo(() => buildTicker(items, quotes, signals), [items, quotes, signals])
+
+  /**
+   * 位置只在「集合或方向变了」时才重排 —— 排序规则里有 |涨跌幅|，而它每一轮取数都在变，
+   * 照单重排会让跑马灯在滚动过程中把条目换位，看起来像卡带（判据在 @shared/ticker）。
+   * 渲染期改 ref 是刻意的：这是纯粹从 props 派生的顺序，走 state + effect 只会多渲染一遍。
+   */
+  const fingerprint = useMemo(() => orderFingerprint(fresh), [fresh])
+  const orderRef = useRef<SecCode[]>([])
+  const fingerprintRef = useRef<string | null>(null)
+  if (fingerprintRef.current !== fingerprint) {
+    fingerprintRef.current = fingerprint
+    orderRef.current = fresh.map((entry) => entry.code)
+  }
+  const entries = useMemo(() => applyOrder(fresh, orderRef.current), [fresh, fingerprint])
+  const hasAdvice = useMemo(() => entries.some((entry) => entry.action !== null), [entries])
+
+  /**
+   * 内容比可视区宽才滚；装得下就静止 —— 一条常驻置顶的条子，
+   * 没必要为了「有动效」而一直动（C7 的精神）。
+   */
+  const viewportRef = useRef<HTMLDivElement | null>(null)
+  const lapRef = useRef<HTMLDivElement | null>(null)
+  const [scrollSec, setScrollSec] = useState(0)
+  useLayoutEffect(() => {
+    const lap = lapRef.current
+    const view = viewportRef.current
+    if (lap === null || view === null) return
+    // 一份内容的宽度就是滚一圈的距离。量的是第一份，所以「加不加第二份」不会反过来影响测量
+    const width = lap.scrollWidth
+    const next = width > view.clientWidth ? width / SCROLL_PX_PER_SEC : 0
+    setScrollSec((prev) => (Math.abs(prev - next) < 0.05 ? prev : next))
+  }, [entries, hasAdvice, viewport])
+
+  // 休市 / 离线 / 免打扰时停下（C7 休市零开销）
+  const paused = petState === 'SLEEPY' || petState === 'OFFLINE' || status?.doNotDisturb === true
 
   return (
     <div
       className={`bar${status?.doNotDisturb === true ? ' bar--quiet' : ''}`}
       onMouseDown={onMouseDown}
-      onClick={onClick}
       onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
     >
@@ -247,14 +346,23 @@ export function App(): React.JSX.Element {
       */}
       <span className={`dot ${DOT_CLASS[petState]}`} title={DOT_TITLE[petState]} />
 
-      {featured ? (
-        <>
-          <span className="name">{nameOf.get(featured.code) || featured.code}</span>
-          <span className={`price${stale ? ' stale' : ''}`}>{featured.last.toFixed(2)}</span>
-          <span className={`change ${changeClass(featured.changePct)}${stale ? ' stale' : ''}`}>
-            {signed(featured.changePct)}
-          </span>
-        </>
+      {entries.length > 0 ? (
+        <div className="viewport" ref={viewportRef}>
+          <div
+            className={`track${scrollSec > 0 ? ' track--scroll' : ''}${paused ? ' track--paused' : ''}`}
+            style={scrollSec > 0 ? { animationDuration: `${scrollSec.toFixed(1)}s` } : undefined}
+          >
+            <div className="lap" ref={lapRef}>
+              <Lap entries={entries} disclaimer={hasAdvice} />
+            </div>
+            {/* 第二份是为了首尾相接地循环；装得下时不渲染，否则会露在空白处 */}
+            {scrollSec > 0 ? (
+              <div className="lap" aria-hidden>
+                <Lap entries={entries} disclaimer={hasAdvice} />
+              </div>
+            ) : null}
+          </div>
+        </div>
       ) : (
         // 还没有报价时不显示任何数字（docs/03：没有报价 ≠ 报价为 0）
         <span className="empty">{status?.watchCount === 0 ? '未添加自选' : '等待行情…'}</span>

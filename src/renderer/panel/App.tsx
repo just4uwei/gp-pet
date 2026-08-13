@@ -386,15 +386,30 @@ export function App(): React.JSX.Element {
 
   return (
     <main className="flex h-full flex-col overflow-hidden">
-      <header className="shrink-0 border-b border-white/10 bg-[var(--gp-surface)] px-5 py-3">
-        <div className="flex items-center gap-2.5">
+      {/*
+        这个头部**同时是窗口的标题栏**：主进程用 titleBarStyle: 'hidden' 把系统标题栏收掉了
+        （浅色 Windows 主题下它是白的，压在一整屏暗色面板上格外突兀），只留三颗系统窗口控件
+        画在右上角。代价是两条：
+        1. 拖窗口靠 `-webkit-app-region: drag`，所以头部里**每一个可点的东西都要 no-drag**，
+           否则点它等于拖窗口（按钮会「点不动」）。
+        2. 右上角那块归系统，`pr-[144px]` 是给三颗控件让的位置（与 PanelWindow.ts 的
+           TITLE_BAR_HEIGHT 成对，改一处要改两处）。
+      */}
+      <header
+        className="shrink-0 border-b border-white/10 bg-[var(--gp-surface)] px-5 py-3"
+        style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
+      >
+        <div className="flex items-center gap-2.5 pr-[144px]">
           {/* 纯装饰的品牌标记。这里**不放状态点** —— 状态点的唯一判定者是主进程的
               PetStateMachine（CLAUDE.md），面板上再放一个语义相近的点只会让两处对不上 */}
           <span className="h-5 w-5 shrink-0 rounded bg-gradient-to-br from-sky-400/70 to-indigo-500/70" />
           <h1 className="text-sm font-semibold tracking-wide">GP Pet</h1>
           <span className="hidden text-xs text-white/30 sm:inline">自选 · 信号 · 提醒</span>
 
-          <div className="ml-auto flex items-center gap-2">
+          <div
+            className="ml-auto flex items-center gap-2"
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+          >
             <ConfigTransferButtons onOutcome={onTransfer} />
             <button className="gp-btn" onClick={() => void reload()} title="重新读取自选与数据源健康度">
               刷新
@@ -402,7 +417,8 @@ export function App(): React.JSX.Element {
           </div>
         </div>
 
-        <div className="mt-2.5">
+        {/* 状态条里有可点的东西（数据源健康度），不能落在拖拽区里 */}
+        <div className="mt-2.5" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
           <StatusBar status={status} health={health} />
         </div>
       </header>

@@ -38,9 +38,12 @@ export class OverlayWindow {
   private readonly win: BrowserWindow
   /** 当前是否关闭了点击穿透。缓存一份避免每次 mousemove 都跨进程重复设置 */
   private interactive = false
+  /** 形态的标称尺寸（DIP）。每次移动都按它把宽高重申一遍，见 `moveTo` */
+  private readonly size: { width: number; height: number }
 
   constructor(readonly form: AppearanceForm) {
     const size = OVERLAY_SIZE[form]
+    this.size = size
     const primary = screen.getPrimaryDisplay()
     const origin = bottomRightOf(primary.workArea, size)
 
@@ -107,17 +110,33 @@ export class OverlayWindow {
     }
   }
 
+  /**
+   * 只改位置，**但每次都把标称宽高一起写回**。
+   *
+   * 不能用 `setPosition`：在缩放比不是 100% 的显示器上（Windows 上 125% / 150% 是常态），
+   * Electron 会把当前 bounds 在 DIP 与物理像素之间来回换算，两个方向都按「包住」
+   * 取整（ScaleToEnclosingRect）—— 于是一次「只挪位置」的调用也可能把宽高各撑大 1px。
+   * 一次拖拽会发出几百次 `dragBy`，条子因此越拖越大；而渲染层挂载时算出的命中区
+   * 还是 240×38，盖不住撑大后的窗口，鼠标压在窗口上却判成穿透，
+   * 表现就是「拖完之后点什么都没反应」。把宽高显式写回常量即可截断这个累积。
+   */
+  private moveTo(x: number, y: number): void {
+    this.win.setBounds({ x: Math.round(x), y: Math.round(y), ...this.size })
+  }
+
   /** 拖拽增量（屏幕像素）。渲染层用 screenX/screenY 求差，窗口跟着走也不会累积误差 */
   dragBy(dx: number, dy: number): void {
     if (!this.alive) return
     const [x, y] = this.win.getPosition()
-    this.win.setPosition(Math.round((x ?? 0) + dx), Math.round((y ?? 0) + dy))
+    this.moveTo((x ?? 0) + dx, (y ?? 0) + dy)
   }
 
   /** 松手：边缘吸附 + 越界回收（docs/06 §4） */
   dragEnd(): void {
     if (!this.alive) return
-    const bounds: Bounds = this.win.getBounds()
+    // 宽高取标称值而非 getBounds()：万一之前已经被撑大过，吸附不该照着那个坏尺寸算
+    const [x, y] = this.win.getPosition()
+    const bounds: Bounds = { x: x ?? 0, y: y ?? 0, ...this.size }
     const nearest = screen.getDisplayMatching(bounds)
     const snapped = snapToEdge(bounds, nearest.workArea)
     const visible = ensureVisible(
@@ -125,7 +144,7 @@ export class OverlayWindow {
       screen.getAllDisplays().map((d) => d.workArea),
       screen.getPrimaryDisplay().workArea
     )
-    this.win.setPosition(visible.x, visible.y)
+    this.moveTo(visible.x, visible.y)
   }
 
   /** 显示器拓扑变化后重新校验位置（拔插外接屏、改分辨率） */
