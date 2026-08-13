@@ -106,6 +106,25 @@ export interface PositionView {
   openedAt: number
 }
 
+/**
+ * 配置导入导出的结果（src/main/settings/transfer.ts）。
+ *
+ * `warnings` 是**必须显示**的：解析时坏字段退回默认值、坏行被丢掉都记在这里，
+ * 静默吞掉会让用户以为整份配置都原样搬过来了（docs/02 §7）。
+ */
+export interface ConfigTransferResult {
+  /** DONE 真的写了 / 导入了；CANCELED 用户在系统对话框里取消；FAILED 出错，看 error */
+  status: 'DONE' | 'CANCELED' | 'FAILED'
+  /** 导出时是落盘路径；导入时是来源文件 */
+  path?: string
+  /** 导出/导入涉及的条数 */
+  counts?: { watchlist: number; positions: number }
+  /** 导入时被清掉的旧数据条数 */
+  removed?: { watchlist: number; positions: number }
+  warnings: string[]
+  error?: string
+}
+
 export interface ProviderHealth {
   provider: string
   status: 'OK' | 'DEGRADED' | 'DOWN'
@@ -202,6 +221,13 @@ export interface IpcInvokeMap {
   'alert:markRead': (ids: string[]) => number
   'settings:get': () => AppSettings
   'settings:patch': (patch: Partial<AppSettings>) => AppSettings
+  /**
+   * 个人配置导出：设置 + 自选（含分组与排序）+ 持仓。路径由系统保存对话框选。
+   * 行情、信号、提醒日志不导 —— 它们是可再生的派生物。
+   */
+  'config:export': () => ConfigTransferResult
+  /** 个人配置导入：**覆盖式**，动手前会弹一个系统确认框报出将被清除的条数 */
+  'config:import': () => ConfigTransferResult
   'app:providerHealth': () => ProviderHealth[]
   'app:engineStatus': () => EngineStatus
   'pet:getSkin': () => PetSkinView

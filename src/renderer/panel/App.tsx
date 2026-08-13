@@ -1,5 +1,5 @@
 /**
- * 面板窗口 —— 自选股列表 + 数据层状态 + 今日信号 + 持仓录入 + 提醒日志。
+ * 面板窗口 —— 自选股列表 + 数据层状态 + 今日信号 + 持仓录入 + 提醒日志 + 配置导入导出。
  *
  * 三条克制：
  *
@@ -10,6 +10,16 @@
  *
  * 「今日信号」与「提醒日志」是两件事，刻意分成两块：
  * 前者回答「引擎判了什么」，后者回答「它有没有真的提醒我，没提醒是被哪道闸门挡的」。
+ *
+ * ## 布局：两栏，页面本身不滚
+ *
+ * 左栏是**我关心哪些票**（自选 + 持仓录入），右栏是**今天发生了什么**（信号 + 提醒判定）。
+ * 这不是为了填满宽度而拆的：这两件事的刷新节奏不同 —— 自选是我偶尔改一次的清单，
+ * 信号是每轮 tick 都在变的流水。挤在一列里滚动时，改自选要先滚过一屏信号。
+ *
+ * 三处可滚区域各自独立（自选列表、信号列表、提醒日志），**最外层 `overflow: hidden`**
+ * （styles.css）。窄到 md 以下（面板最小宽 720，用户可以拖到这么窄）退回单列，
+ * 这时改由中间那层容器整体滚动。
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
@@ -23,6 +33,7 @@ import type {
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
 import { AlertLog } from './AlertLog'
+import { ConfigTransferButtons, ConfigTransferNotice, type TransferOutcome } from './ConfigTransfer'
 import { PositionEditor } from './PositionEditor'
 import { SignalList } from './SignalList'
 
@@ -88,34 +99,32 @@ function StatusBar({
 }): React.JSX.Element {
   const session = status ? (SESSION_LABEL[status.session] ?? status.session) : '…'
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-white/50">
-      <span>
+    <div className="flex flex-wrap items-center gap-1.5">
+      <span className="gp-chip">
         时段 <span className="text-white/80">{session}</span>
       </span>
-      <span>
+      <span className="gp-chip">
         自选 <span className="text-white/80">{status?.watchCount ?? 0}</span> 只
       </span>
       {status?.doNotDisturb ? (
         // 免打扰的成因要摆出来：用户问的是「为什么刚才没弹」，不是「有没有静默」
-        <span className="text-white/80">
+        <span className="gp-chip text-amber-200/80">
           免打扰生效中{status.doNotDisturbReason ? `（${status.doNotDisturbReason}）` : ''}
         </span>
       ) : null}
-      <span className="flex gap-2">
-        {health.length === 0 ? (
-          <span>数据源 …</span>
-        ) : (
-          health.map((h) => (
-            <span key={h.provider} title={h.lastError ?? ''}>
-              {h.provider}{' '}
-              <span className={HEALTH_TONE[h.status]}>
-                {HEALTH_LABEL[h.status]}
-                {h.successRate > 0 ? ` ${Math.round(h.successRate * 100)}%` : ''}
-              </span>
+      {health.length === 0 ? (
+        <span className="gp-chip">数据源 …</span>
+      ) : (
+        health.map((h) => (
+          <span className="gp-chip" key={h.provider} title={h.lastError ?? ''}>
+            {h.provider}{' '}
+            <span className={HEALTH_TONE[h.status]}>
+              {HEALTH_LABEL[h.status]}
+              {h.successRate > 0 ? ` ${Math.round(h.successRate * 100)}%` : ''}
             </span>
-          ))
-        )}
-      </span>
+          </span>
+        ))
+      )}
     </div>
   )
 }
@@ -142,19 +151,15 @@ function AddForm({ onAdd }: { onAdd: (code: string) => Promise<void> }): React.J
   }
 
   return (
-    <form className="mt-4" onSubmit={(e) => void submit(e)}>
+    <form className="shrink-0 border-b border-white/10 px-3 py-2.5" onSubmit={(e) => void submit(e)}>
       <div className="flex gap-2">
         <input
-          className="min-w-0 flex-1 rounded border border-white/15 bg-white/5 px-3 py-1.5 text-sm outline-none placeholder:text-white/25 focus:border-white/35"
+          className="min-w-0 flex-1 rounded border border-white/15 bg-black/25 px-2.5 py-1.5 text-sm outline-none placeholder:text-white/25 focus:border-white/35"
           placeholder="添加自选：600000 / sh600000 / 000001.SZ"
           value={value}
           onChange={(e) => setValue(e.target.value)}
         />
-        <button
-          className="rounded border border-white/15 px-3 py-1.5 text-sm text-white/80 hover:border-white/35 disabled:opacity-40"
-          type="submit"
-          disabled={busy || value.trim() === ''}
-        >
+        <button className="gp-btn shrink-0" type="submit" disabled={busy || value.trim() === ''}>
           {busy ? '添加中…' : '添加'}
         </button>
       </div>
@@ -191,7 +196,7 @@ function WatchRow({
   // 没有报价 ≠ 报价为 0。这一栏在拿到第一轮快照前显示 '—'，不显示数字
   const stale = quote?.stale === true
   return (
-    <li className="border-b border-white/10 py-2 text-sm">
+    <li className="border-b border-white/[0.06] px-3 py-2 text-sm last:border-b-0 hover:bg-white/[0.02]">
       <div className="flex items-center gap-3">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
@@ -206,14 +211,14 @@ function WatchRow({
           </div>
         </div>
 
-        <div className={`w-20 text-right font-mono ${stale ? 'text-white/35' : ''}`}>
+        <div className={`w-16 text-right font-mono ${stale ? 'text-white/35' : ''}`}>
           {quote ? quote.last.toFixed(2) : '—'}
         </div>
-        <div className={`w-20 text-right font-mono ${stale ? 'text-white/35' : changeTone(quote?.changePct ?? 0)}`}>
+        <div className={`w-18 text-right font-mono ${stale ? 'text-white/35' : changeTone(quote?.changePct ?? 0)}`}>
           {quote ? signed(quote.changePct) : '—'}
         </div>
 
-        <div className="flex w-24 shrink-0 justify-end gap-1 text-xs text-white/40">
+        <div className="flex shrink-0 justify-end gap-0.5 text-xs text-white/40">
           <button
             className={`px-1 hover:text-white/80 ${editing ? 'text-white/80' : ''}`}
             title="录入持仓（启用止损类强制提醒）"
@@ -265,6 +270,7 @@ export function App(): React.JSX.Element {
   const [positions, setPositions] = useState<PositionView[]>([])
   const [editing, setEditing] = useState<SecCode | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [transfer, setTransfer] = useState<TransferOutcome | null>(null)
   // 引擎每轮跑完会推一次 engineStatus；用它当信号与提醒日志的重取信号
   const [signalKey, setSignalKey] = useState(0)
 
@@ -351,72 +357,124 @@ export function App(): React.JSX.Element {
     [items, reload]
   )
 
+  const onTransfer = useCallback(
+    (outcome: TransferOutcome): void => {
+      // 静默取消（用户在文件框里按了取消、且解析阶段没产生 warning）什么都不说 ——
+      // 存下来会让横幅区留一条空白，那比没有更奇怪
+      const silent = outcome.result.status === 'CANCELED' && outcome.result.warnings.length === 0
+      setTransfer(silent ? null : outcome)
+      // 导入成功后整份自选与持仓都换了，界面必须立刻跟上，不能等下一轮 tick
+      if (outcome.kind === 'import' && outcome.result.status === 'DONE') {
+        setEditing(null)
+        void reload()
+        refreshStatus()
+        setSignalKey((key) => key + 1)
+      }
+    },
+    [reload, refreshStatus]
+  )
+
+  // 逐条显式比较而不是 `a ?? b ?? c`：这些字段是 `boolean | undefined`，
+  // `false ?? x` 会停在 false 上，把后面几条横幅一起吞掉
+  const hasBanner =
+    error !== null ||
+    status?.offline === true ||
+    status?.stale === true ||
+    status?.calendarUncertain === true ||
+    skin?.fallback === true ||
+    transfer !== null
+
   return (
-    <main className="mx-auto flex h-full max-w-2xl flex-col p-6">
-      <header>
-        <div className="flex items-baseline justify-between">
-          <h1 className="text-lg font-semibold">GP Pet · 自选股</h1>
-          <button
-            className="text-xs text-white/40 hover:text-white/80"
-            onClick={() => void reload()}
-            title="重新读取自选与数据源健康度"
-          >
-            刷新
-          </button>
+    <main className="flex h-full flex-col overflow-hidden">
+      <header className="shrink-0 border-b border-white/10 bg-[var(--gp-surface)] px-5 py-3">
+        <div className="flex items-center gap-2.5">
+          {/* 纯装饰的品牌标记。这里**不放状态点** —— 状态点的唯一判定者是主进程的
+              PetStateMachine（CLAUDE.md），面板上再放一个语义相近的点只会让两处对不上 */}
+          <span className="h-5 w-5 shrink-0 rounded bg-gradient-to-br from-sky-400/70 to-indigo-500/70" />
+          <h1 className="text-sm font-semibold tracking-wide">GP Pet</h1>
+          <span className="hidden text-xs text-white/30 sm:inline">自选 · 信号 · 提醒</span>
+
+          <div className="ml-auto flex items-center gap-2">
+            <ConfigTransferButtons onOutcome={onTransfer} />
+            <button className="gp-btn" onClick={() => void reload()} title="重新读取自选与数据源健康度">
+              刷新
+            </button>
+          </div>
         </div>
-        <div className="mt-2">
+
+        <div className="mt-2.5">
           <StatusBar status={status} health={health} />
         </div>
       </header>
 
-      <div className="mt-3 flex flex-col gap-2">
-        {error ? <Banner tone="warn">{error}</Banner> : null}
-        {status?.offline ? (
-          <Banner tone="warn">行情离线：数据源全部不可用，下面显示的是最后一次成功取到的价格。</Banner>
-        ) : status?.stale ? (
-          <Banner tone="warn">最近一轮取数失败，价格取自缓存，未必是最新的。</Banner>
-        ) : null}
-        {status?.calendarUncertain ? (
-          <Banner tone="info">交易日历尚未核对，休市判断可能不准（节假日会照常轮询）。</Banner>
-        ) : null}
-        {skin?.fallback ? <Banner tone="info">皮肤已回退到占位形象：{skin.fallbackReason}</Banner> : null}
+      {/* 横幅区：只在真有话说时占高度，空着时一个像素都不留 */}
+      {hasBanner ? (
+        <div className="flex shrink-0 flex-col gap-2 px-5 pt-3">
+          {error ? <Banner tone="warn">{error}</Banner> : null}
+          {status?.offline ? (
+            <Banner tone="warn">行情离线：数据源全部不可用，下面显示的是最后一次成功取到的价格。</Banner>
+          ) : status?.stale ? (
+            <Banner tone="warn">最近一轮取数失败，价格取自缓存，未必是最新的。</Banner>
+          ) : null}
+          {status?.calendarUncertain ? (
+            <Banner tone="info">交易日历尚未核对，休市判断可能不准（节假日会照常轮询）。</Banner>
+          ) : null}
+          {skin?.fallback ? <Banner tone="info">皮肤已回退到占位形象：{skin.fallbackReason}</Banner> : null}
+          {transfer ? (
+            <ConfigTransferNotice outcome={transfer} onDismiss={() => setTransfer(null)} />
+          ) : null}
+        </div>
+      ) : null}
+
+      {/*
+        两栏。md 以下退回单列并交给这一层滚动；md 及以上两栏各自内部滚动。
+        左栏权重稍大（1.4 : 1）—— 自选那一行要放名称、代码、行业、价格、涨跌与四个按钮，
+        右栏的信号行短得多。
+      */}
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 overflow-y-auto p-5 md:grid-cols-[minmax(0,1.4fr)_minmax(300px,1fr)] md:overflow-hidden">
+        <section className="gp-card max-h-full">
+          <div className="gp-card-head">
+            <h2 className="gp-card-title">自选股</h2>
+            <span className="text-xs text-white/30">{items.length} 只</span>
+          </div>
+
+          <AddForm onAdd={add} />
+
+          {items.length === 0 ? (
+            <p className="px-3 py-10 text-center text-sm text-white/35">还没有自选股，先在上面添加一只。</p>
+          ) : (
+            <ul className="min-h-0 flex-1 overflow-y-auto">
+              {items.map((item, i) => (
+                <WatchRow
+                  key={item.code}
+                  item={item}
+                  quote={quoteOf.get(item.code)}
+                  position={positionOf.get(item.code)}
+                  editing={editing === item.code}
+                  first={i === 0}
+                  last={i === items.length - 1}
+                  onRemove={remove}
+                  onMove={move}
+                  onToggleEdit={(code) => setEditing((current) => (current === code ? null : code))}
+                  onSaved={() => void reload()}
+                  onError={setError}
+                />
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <div className="flex min-h-0 flex-col gap-4">
+          {/* 信号是流水，占掉右栏剩下的全部高度；提醒日志是按需展开的，按内容给高 */}
+          <SignalList refreshKey={signalKey} onError={setError} />
+          <AlertLog
+            refreshKey={signalKey}
+            unread={status?.unreadAlerts ?? 0}
+            onRead={refreshStatus}
+            onError={setError}
+          />
+        </div>
       </div>
-
-      <AddForm onAdd={add} />
-
-      <section className="mt-4 min-h-0 flex-1 space-y-5 overflow-y-auto">
-        {items.length === 0 ? (
-          <p className="py-8 text-center text-sm text-white/35">还没有自选股，先在上面添加一只。</p>
-        ) : (
-          <ul>
-            {items.map((item, i) => (
-              <WatchRow
-                key={item.code}
-                item={item}
-                quote={quoteOf.get(item.code)}
-                position={positionOf.get(item.code)}
-                editing={editing === item.code}
-                first={i === 0}
-                last={i === items.length - 1}
-                onRemove={remove}
-                onMove={move}
-                onToggleEdit={(code) => setEditing((current) => (current === code ? null : code))}
-                onSaved={() => void reload()}
-                onError={setError}
-              />
-            ))}
-          </ul>
-        )}
-
-        {items.length > 0 ? <SignalList refreshKey={signalKey} onError={setError} /> : null}
-
-        <AlertLog
-          refreshKey={signalKey}
-          unread={status?.unreadAlerts ?? 0}
-          onRead={refreshStatus}
-          onError={setError}
-        />
-      </section>
 
       {/*
         这里以前有一行「信号只在这个列表里显示，还不会弹气泡或发系统通知」——
@@ -424,8 +482,8 @@ export function App(): React.JSX.Element {
         能力边界仍然对用户有意义，但现在的边界写在提醒日志里（每条为什么发/没发），
         比页脚上一句静态的话诚实得多。
       */}
-      <footer className="mt-4 shrink-0 text-xs text-white/40">
-        <p>仅供参考，非投资建议</p>
+      <footer className="shrink-0 border-t border-white/10 px-5 py-2 text-xs text-white/35">
+        仅供参考，非投资建议
       </footer>
     </main>
   )

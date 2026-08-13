@@ -3,14 +3,129 @@
 /*
  * Tailwind v4 无需配置文件，内容扫描自动完成。
  * 面板是常规窗口（docs/06 §2.4），不受零干扰契约约束，可以正常用背景色与滚动。
+ *
+ * ## 暗色是一套「层」，不是一个背景色
+ *
+ * 三层表面：窗口底（--gp-bg）→ 头部与卡片（--gp-surface）→ 卡片内的内嵌块（--gp-inset）。
+ * 分层用的是**亮度差 + 一条极淡的描边**，不是阴影 —— 桌面暗色界面上阴影几乎看不见，
+ * 而描边在任何缩放比例下都成立。
+ *
+ * ## 页面本身不滚动
+ *
+ * `overflow: hidden` 是刻意的：面板分左右两栏，各自内部滚动（App.tsx）。
+ * 让最外层也能滚会出现「两条滚动条互相打架、头部被推出视野」的经典毛病。
  */
+
+:root {
+  --gp-bg: #0e1015;
+  --gp-surface: #161a21;
+  --gp-inset: rgba(0, 0, 0, 0.25);
+  --gp-border: rgba(255, 255, 255, 0.08);
+  --gp-border-strong: rgba(255, 255, 255, 0.16);
+}
 
 html,
 body,
 #root {
   margin: 0;
   height: 100%;
-  background: #101216;
+  overflow: hidden;
+  background: var(--gp-bg);
   color: #eceef2;
   font-family: 'Segoe UI', system-ui, sans-serif;
+}
+
+/*
+ * 自定义类必须放进 components 层。
+ * Tailwind v4 把工具类放在 utilities 层，而**无层的 CSS 优先级高于任何层** ——
+ * 写成裸规则会让 TSX 里的 `p-3`、`text-xs` 一律失效，是 v4 下很难查的一类坑。
+ */
+@layer components {
+  .gp-card {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border-radius: 0.5rem;
+    border: 1px solid var(--gp-border);
+    background: var(--gp-surface);
+  }
+
+  /* 卡片头：与卡片体之间只用一条分隔线，不用第二种底色 —— 层次已经够了 */
+  .gp-card-head {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 0.5rem;
+    border-bottom: 1px solid var(--gp-border);
+    padding: 0.625rem 0.875rem;
+  }
+
+  .gp-card-title {
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.75);
+  }
+
+  .gp-btn {
+    border-radius: 0.375rem;
+    border: 1px solid var(--gp-border-strong);
+    padding: 0.3125rem 0.625rem;
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.75);
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .gp-btn:hover:not(:disabled) {
+    border-color: rgba(255, 255, 255, 0.32);
+    color: #eceef2;
+  }
+
+  .gp-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  /* 状态栏的一格。信息密度高，靠底色分组比靠间距分组更省横向空间 */
+  .gp-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    border-radius: 0.25rem;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 0.125rem 0.4375rem;
+    font-size: 0.6875rem;
+    line-height: 1.25rem;
+    color: rgba(255, 255, 255, 0.45);
+    white-space: nowrap;
+  }
+}
+
+/*
+ * 暗色滚动条。默认那条亮灰的在 #0e1015 上白得刺眼，
+ * 而面板里同时有三处可滚区域（自选、信号、日志），一处刺眼就是三处刺眼。
+ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 9999px;
+  background-clip: padding-box;
+  background-color: rgba(255, 255, 255, 0.14);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.26);
 }

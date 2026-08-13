@@ -31,7 +31,15 @@ export interface Database {
   readonly schemaVersion: number
   exec(sql: string): void
   prepare: SqlDriver['prepare']
-  /** BEGIN/COMMIT/ROLLBACK 包裹。两种驱动都没有可移植的 transaction() API，所以自己来 */
+  /**
+   * BEGIN/COMMIT/ROLLBACK 包裹。两种驱动都没有可移植的 transaction() API，所以自己来。
+   *
+   * **可重入**：嵌套调用直接并入外层事务，不再发一次 BEGIN。
+   * SQLite 不支持嵌套 BEGIN（`cannot start a transaction within a transaction`），
+   * 而仓储方法自带事务是常态（如 `WatchlistRepo.reorder`）—— 上层想把几个仓储调用
+   * 凑成一个原子操作时，不该被「这个方法里面有没有事务」绊倒。
+   * 内层抛错仍会一路冒到最外层并整体 ROLLBACK。
+   */
   transaction<T>(fn: () => T): T
   close(): void
 }
@@ -133,13 +141,24 @@ export async function openDatabase(options: OpenDatabaseOptions): Promise<Databa
   }
 
   const active = driver
+  // 嵌套深度。>0 时内层只跑函数体，BEGIN/COMMIT 归最外层那一次
+  let depth = 0
   return {
     driver: active,
     schemaVersion: version,
     exec: (sql) => active.exec(sql),
     prepare: (sql) => active.prepare(sql),
     transaction<T>(fn: () => T): T {
+      if (depth > 0) {
+        depth += 1
+        try {
+          return fn()
+        } finally {
+          depth -= 1
+        }
+      }
       active.exec('BEGIN')
+      depth = 1
       try {
         const result = fn()
         active.exec('COMMIT')
@@ -147,6 +166,8 @@ export async function openDatabase(options: OpenDatabaseOptions): Promise<Databa
       } catch (error) {
         active.exec('ROLLBACK')
         throw error
+      } finally {
+        depth = 0
       }
     },
     close: () => active.close(),

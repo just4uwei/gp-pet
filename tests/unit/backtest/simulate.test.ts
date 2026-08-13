@@ -17,7 +17,7 @@ import { fallbackProfile, sentimentSeries } from '@backtest/data'
 import { marketSentiment } from '@core/indicators/thresholds'
 import { DEFAULT_PARAMS, withParams } from '@core/params'
 import type { Candle } from '@core/types'
-import { buildCandles, chopCloses } from '../../fixtures/klines'
+import { buildCandles, chopCloses, limitUpBreakout } from '../../fixtures/klines'
 
 const SENSITIVE = withParams({
   combine: {
@@ -123,24 +123,14 @@ describe('成交模型', () => {
 
 describe('无法成交的情形', () => {
   it('次日开盘涨停 → 买单作废，一笔都不成交', () => {
-    // 一字涨停链：开=高=低=收，且每根都精确等于按板块规则算出的涨停价（分到 2 位）。
-    // 价格必须与 priceLimits 的取整口径完全一致，否则差半分钱就成了「没涨停」
-    const flat = new Array<number>(320).fill(10)
-    const closes = [...flat]
-    let price = 10
-    for (let i = 0; i < 30; i++) {
-      price = Math.round(price * 1.1 * 100) / 100
-      closes.push(price)
-    }
-    const overrides: Record<number, { open: number; high: number; low: number; close: number }> = {}
-    for (let i = 0; i < closes.length; i++) {
-      const close = closes[i] ?? 0
-      overrides[i] = { open: close, high: close, low: close, close }
-    }
-    const candles = buildCandles(closes, { overrides })
-    const result = run(candles, { warmupBars: 322 })
+    // fixture 见 limitUpBreakout()：**必须有一张真的买单**，否则这条断言在真空里通过。
+    // 旧写法就地造了一段字面意义的直线（STD=0、量比恒 1.0），一个信号都产不出来，
+    // limitBlocked 恒为 0 —— 这条安全路径当时其实是零覆盖
+    const result = run(limitUpBreakout().candles, { warmupBars: 322 })
     expect(result.limitBlocked).toBeGreaterThan(0)
     expect(result.trades).toHaveLength(0)
+    // 委托被挡掉之后，后面几根一字涨停当天的买入信号还会被风控硬抑制（买不到）
+    expect([...result.suppressed.keys()]).toContain('HARD_LIMIT_UP')
   })
 
   it('缺口段跳过判定与成交（docs/07 §4）', () => {
@@ -164,7 +154,12 @@ describe('无法成交的情形', () => {
     const rules = [...result.suppressed.keys()]
     expect(rules).toContain('INSUFFICIENT_DATA')
     expect(rules).toContain('NEW_LISTING')
-    expect(result.trades).toHaveLength(0)
+
+    // 抑制期内**一笔都不成交**。原先写的是「整个窗口一笔都没有」，那是过度断言：
+    // NEW_LISTING 只压制前 60 根，而窗口有 120 根 —— 后 60 根本来就该正常出手，
+    // 于是这条用例挂了三次提交，看起来像风控坏了，其实是断言比用例名承诺的多
+    const lastSuppressedDate = short[DEFAULT_PARAMS.risk.newListingMinBars - 1]?.date ?? ''
+    for (const trade of result.trades) expect(trade.entryDate > lastSuppressedDate).toBe(true)
   })
 })
 

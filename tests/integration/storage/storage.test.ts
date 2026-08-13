@@ -437,4 +437,39 @@ describe('事务', () => {
     ).toThrow('boom')
     expect(storage.watchlist.codes()).toEqual(['SH600000'])
   })
+
+  // 仓储方法自带事务是常态（reorder 就是），上层想把几个调用凑成一个原子操作
+  // 不该被「这个方法里面有没有事务」绊倒 —— SQLite 的嵌套 BEGIN 直接报错
+  it('可重入：嵌套事务并入外层，不再发一次 BEGIN', () => {
+    storage.db.transaction(() => {
+      storage.watchlist.add(profile('SH600000', 'A'), '自选', 1)
+      storage.watchlist.add(profile('SH600001', 'B'), '自选', 2)
+      // reorder 内部自己也开事务
+      storage.watchlist.reorder(['SH600001', 'SH600000'])
+    })
+    expect(storage.watchlist.codes()).toEqual(['SH600001', 'SH600000'])
+  })
+
+  it('内层抛错时整体回滚到最外层之前', () => {
+    storage.watchlist.add(profile('SH600000', 'A'), '自选', 1)
+    expect(() =>
+      storage.db.transaction(() => {
+        storage.watchlist.add(profile('SH600001', 'B'), '自选', 2)
+        storage.db.transaction(() => {
+          throw new Error('inner boom')
+        })
+      })
+    ).toThrow('inner boom')
+    expect(storage.watchlist.codes()).toEqual(['SH600000'])
+  })
+
+  it('回滚后仍能继续开新事务（深度计数没有卡在 >0）', () => {
+    expect(() =>
+      storage.db.transaction(() => {
+        throw new Error('boom')
+      })
+    ).toThrow('boom')
+    storage.db.transaction(() => storage.watchlist.add(profile('SH600002', 'C'), '自选', 3))
+    expect(storage.watchlist.codes()).toEqual(['SH600002'])
+  })
 })

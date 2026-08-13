@@ -263,7 +263,13 @@ describe('createTickPipeline', () => {
     const h = harness()
     const pipeline = createTickPipeline(h.deps)
 
-    expect(pipeline.state()).toEqual({ lastTickAt: 0, lastCtx: null, lastSnapshots: null })
+    // lastSignals 是 M2 给 TickState 加的第四个字段 —— toEqual 是全等比较，漏一个就红
+    expect(pipeline.state()).toEqual({
+      lastTickAt: 0,
+      lastCtx: null,
+      lastSnapshots: null,
+      lastSignals: [],
+    })
 
     const ctx = ctxOf()
     await pipeline.run(ctx)

@@ -244,6 +244,17 @@ src/backtest 回测 CLI，复用 src/core
 - **preload 必须打成 CJS**：安全基线要求 `sandbox: true`，而沙箱化的 preload 不支持 ESM。electron-vite 5 默认输出 ESM，配置里已显式改回。
 - **改完主进程要真启一次**（`pnpm dev`）。typecheck + build 全绿也可能启动即崩 —— 上面两条就是这么发现的。
 - **默认皮肤「小猫」是生成件**，源在 `tools/asset-build/`，改素材要改代码再 `pnpm assets:build && pnpm verify:assets`，不要直接手改 PNG（下次重出就被覆盖）。
+- **造 K 线 fixture 时，横盘段的噪音必须没有周期。** 固定错拍的锯齿（旧 `chopCloses`）
+  振幅够、看起来完全正常，但 +DM 与 −DM 长期抵消，320 根之后 **ADX ≈ 8**，
+  而 `adxRange` 是 15–23 —— 于是 `T1_MA_CROSS:BUY` 与 `T4_ALIGNMENT` 在所有基于它的 fixture 里
+  **结构上无法触发**，两条断言因此三次提交没绿过，还差点被误判成引擎缺陷。
+  真实数据的判据是 **46 只 2709 次金叉里 60.6% 当日 ADX 就够**（M2 §5.19）。
+  同一形状的坑此前只记了「真直线 → BBW 恒 0」那个显眼版本。
+  **新增场景之后打印一次子信号集合**，别信「断言不触发」自己通过。
+- **编排层的用例把组合阈值调低到 0.3 分 / 1 票**（`simulate.test.ts` / `signals.test.ts` 都这么做）。
+  用出厂阈值（0.60 / 趋势 3 票）时 fixture 里没有一根凑得够票数，`persist()` 一行不写，
+  去重用例会退化成 `0 === 0` 的假通过。信号稀疏本身是对的（M2 §5.13：真实占用只有 4%），
+  但**验编排不该被信号质量卡住**。
 - **指标黄金用例的期望值来自独立参照实现**（`scripts/verify/reference.mjs`，刻意不 import `src/core`）。
   改了 `params.ts` 或指标算法后要 `pnpm verify:indicators` 重出黄金值 —— 那条用例会先告诉你「参数不一致」。
   **不要靠改断言来让它变绿**，那会让回归基线失去意义。

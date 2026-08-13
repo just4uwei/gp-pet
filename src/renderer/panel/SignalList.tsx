@@ -119,7 +119,8 @@ function Evidence({ evidence }: { evidence: SignalEvidence }): React.JSX.Element
 
       <div>
         <div className="text-white/40">触发时的指标值</div>
-        <div className="mt-1 grid grid-cols-2 gap-x-4 font-mono text-white/55 sm:grid-cols-3">
+        {/* 固定两列：右栏只有 ~330px 宽，三列会让指标名与数值挤成一团 */}
+        <div className="mt-1 grid grid-cols-2 gap-x-4 font-mono text-white/55">
           {indicators.map(([key, value]) => (
             <span key={key}>
               {key} {numberText(value)}
@@ -144,7 +145,7 @@ function SignalRow({
 }): React.JSX.Element {
   const suppressed = record.suppressedReason !== undefined
   return (
-    <li className="border-b border-white/10 py-2">
+    <li className="border-b border-white/[0.06] py-2 last:border-b-0">
       <button className="flex w-full items-center gap-3 text-left" onClick={() => onToggle(record.id)}>
         <span
           className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${DIRECTION_TONE[record.direction]}`}
@@ -243,11 +244,13 @@ export function SignalList({
     }
   }, [records, showSuppressed])
 
+  // 卡片自己吃掉右栏剩下的高度，列表在卡片内部滚动 —— 信号是每轮都在长的流水，
+  // 让它把整页顶长会把下面的提醒日志推出视野
   return (
-    <section>
-      <div className="flex items-baseline justify-between">
-        <h2 className="text-sm text-white/70">今日信号</h2>
-        <label className="flex items-center gap-1.5 text-xs text-white/40">
+    <section className="gp-card min-h-0 flex-1">
+      <div className="gp-card-head">
+        <h2 className="gp-card-title">今日信号</h2>
+        <label className="ml-auto flex items-center gap-1.5 text-xs text-white/40">
           <input
             type="checkbox"
             checked={showSuppressed}
@@ -258,11 +261,11 @@ export function SignalList({
       </div>
 
       {visible.length === 0 ? (
-        <p className="py-6 text-center text-xs text-white/35">
+        <p className="px-3 py-8 text-center text-xs text-white/35">
           今日暂无信号。收盘后引擎会做一次确认轮，届时再看。
         </p>
       ) : (
-        <ul className="mt-1">
+        <ul className="min-h-0 flex-1 overflow-y-auto px-3">
           {visible.map((record) => (
             <SignalRow
               key={record.id}

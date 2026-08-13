@@ -237,9 +237,15 @@ export function App(): React.JSX.Element {
       onClick={onClick}
       onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
-      title={`${DOT_TITLE[petState]} · 单击打开面板 · 双击免打扰 · 右键菜单`}
     >
-      <span className={`dot ${DOT_CLASS[petState]}`} />
+      {/*
+        整块的 title 以前是「盯盘中 · 单击打开面板 · 双击免打扰 · 右键菜单」——
+        一条常驻置顶的悬浮条，鼠标每次路过都弹一次操作说明，那本身就是干扰
+        （零干扰契约的精神，docs/06 §1）。手势说明属于首次引导与右键菜单，
+        不属于每一次 hover。状态语义留在状态点上：它是**变化**的信息，
+        用户看到点变色时确实需要一句话解释。
+      */}
+      <span className={`dot ${DOT_CLASS[petState]}`} title={DOT_TITLE[petState]} />
 
       {featured ? (
         <>
@@ -255,7 +261,7 @@ export function App(): React.JSX.Element {
       )}
 
       {actionable.length > 0 ? (
-        <span className="badge" title={`今日 ${actionable.length} 条信号，单击查看`}>
+        <span className="badge" title={`今日 ${actionable.length} 条信号`}>
           {actionable.length > 99 ? '99+' : actionable.length}
         </span>
       ) : null}

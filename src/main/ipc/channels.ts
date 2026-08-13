@@ -27,6 +27,8 @@ export const INVOKE_CHANNELS = [
   'alert:markRead',
   'settings:get',
   'settings:patch',
+  'config:export',
+  'config:import',
   'pet:getSkin',
   'pet:setHitRegion',
   'pet:setInteractive',

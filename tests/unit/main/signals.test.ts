@@ -21,6 +21,23 @@ import { buildCandles, chopCloses, goldenCrossBreakout } from '../../fixtures/kl
 
 const PROFILE: SecProfile = { code: 'SH600000', name: '浦发银行', market: 'SH', board: 'MAIN', isST: false }
 
+/**
+ * 把组合阈值调低（0.3 分 / 1 票），与 `tests/unit/backtest/simulate.test.ts` 同一个理由：
+ * **这里验的是编排，不是信号质量。**
+ *
+ * 用出厂阈值（0.60 分 / 趋势 3 票）的话，fixture 里没有任何一根能凑够票数
+ * —— 实测最好的一根只有 2 票（T1+T3），于是 `persist()` 一行都不写，
+ * 「同一条信号连续多轮只落一行」这类去重用例全部退化成 `0 === 0` 的假通过。
+ * 信号稀疏本身是对的（真实回测里平均资金占用只有 4%），但不该让编排层无从验起。
+ */
+const SENSITIVE = withParams({
+  combine: {
+    ...DEFAULT_PARAMS.combine,
+    scoreThreshold: 0.3,
+    voteThreshold: { trend: 1, meanReversion: 1 },
+  },
+})
+
 function entry(profile: SecProfile = PROFILE): WatchEntry {
   return { profile, group: '自选', sortOrder: 0, createdAt: 0 }
 }
@@ -94,6 +111,7 @@ function harness(options: {
       count: () => cached.length,
       prune: () => 0,
     } as unknown as SignalEngineDeps['indicators'],
+    params: SENSITIVE,
     newId: () => `sig-${++counter}`,
   }
 
@@ -166,7 +184,7 @@ describe('落库与去重', () => {
     createSignalEngine(h.deps).run(TICK)
     const row = h.rows[0]
     if (row) {
-      expect(row.engineVersion).toBe(engineVersionOf(DEFAULT_PARAMS))
+      expect(row.engineVersion).toBe(engineVersionOf(SENSITIVE))
       expect(row.priceAt).toBeGreaterThan(0)
       expect(row.evidence.indicatorsAt).toBeDefined()
     }
@@ -195,7 +213,7 @@ describe('指标缓存与确认轮', () => {
   it('收盘后缓存当日指标截面，键含引擎版本', () => {
     const h = harness()
     createSignalEngine(h.deps).run(TICK)
-    expect(h.cached[0]?.version).toBe(engineVersionOf(DEFAULT_PARAMS))
+    expect(h.cached[0]?.version).toBe(engineVersionOf(SENSITIVE))
   })
 
   it('参数变化 → 引擎版本变化 → 缓存键随之变化', () => {
@@ -205,7 +223,7 @@ describe('指标缓存与确认轮', () => {
       params: withParams({ macd: { preset: 'Classic', fast: 12, slow: 26, signal: 9 } }),
     })
     engine.run(TICK)
-    expect(h.cached[0]?.version).not.toBe(engineVersionOf(DEFAULT_PARAMS))
+    expect(h.cached[0]?.version).not.toBe(engineVersionOf(SENSITIVE))
   })
 
   it('启动时清理旧版本缓存', () => {
@@ -213,13 +231,19 @@ describe('指标缓存与确认轮', () => {
     expect(createSignalEngine(h.deps).purgeStaleCache()).toBe(3)
   })
 
-  it('收盘确认轮：当日已有 PROVISIONAL 行 → 推进为 CONFIRMED 或 INVALIDATED', () => {
-    const previous = {
+  /**
+   * 一条当日的 PROVISIONAL 历史行。方向由调用方给 —— **不要写死** ：
+   * 这条用例原先假定「这段是上涨突破，收盘结论不可能是 SELL」，
+   * 但 8 根 3.5% 拉升之后 RSI 深度超买，末根的最强子信号恰恰是 R1 的 SELL。
+   * 把 fixture 的偶然结论当成前提，用例就会在 fixture 一改动时报出一个误导性的失败。
+   */
+  function provisionalRow(direction: string): SignalRow {
+    return {
       id: 'old',
       code: 'SH600000',
       createdAt: 1,
       tradeDate: goldenCrossBreakout().candles.at(-1)?.date ?? '',
-      direction: 'SELL',
+      direction,
       score: 0.7,
       votes: 3,
       regime: 'TREND_UP',
@@ -240,11 +264,33 @@ describe('指标缓存与确认轮', () => {
         sufficiency: { bars: 0, limited: false, penalty: 1, note: null },
       },
     } as unknown as SignalRow
+  }
 
-    const h = harness({ latestOfDay: previous })
+  /** 本 fixture 末根的收盘结论。两条确认轮用例都以它为基准，而不是各自猜一个方向 */
+  function closingDirection(): string {
+    const h = harness()
+    const outcome = createSignalEngine(h.deps).run(TICK)[0]
+    return outcome?.evaluation.gated.direction ?? 'NONE'
+  }
+
+  it('收盘确认轮：方向与收盘结论一致 → CONFIRMED', () => {
+    const h = harness({ latestOfDay: provisionalRow(closingDirection()) })
     createSignalEngine(h.deps).run(TICK)
-    // 收盘结论不可能是 SELL（这段是上涨突破），所以那条盘中信号应被判为失效
+    expect(h.stageUpdates[0]).toEqual({ id: 'old', stage: 'CONFIRMED' })
+  })
+
+  it('收盘确认轮：方向与收盘结论不符 → INVALIDATED', () => {
+    const opposite = closingDirection() === 'SELL' ? 'BUY' : 'SELL'
+    const h = harness({ latestOfDay: provisionalRow(opposite) })
+    createSignalEngine(h.deps).run(TICK)
     expect(h.stageUpdates[0]).toEqual({ id: 'old', stage: 'INVALIDATED' })
+  })
+
+  it('失效时把撤销提示报给提醒层（docs/05 §3：信号失效通知属 L1）', () => {
+    const opposite = closingDirection() === 'SELL' ? 'BUY' : 'SELL'
+    const h = harness({ latestOfDay: provisionalRow(opposite) })
+    const outcome = createSignalEngine(h.deps).run(TICK)[0]
+    expect(outcome?.invalidated).toEqual({ signalId: 'old', direction: opposite })
   })
 
   it('持仓峰值在收盘轮按当日最高价更新（docs/05 §2.3）', () => {

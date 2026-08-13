@@ -21,6 +21,7 @@ import type {
   AlertRecord,
   AppearanceForm,
   AppSettings,
+  ConfigTransferResult,
   EngineStatus,
   PetSkinView,
   PetState,
@@ -42,7 +43,23 @@ import type { SignalOutcome } from './engine'
 import { log } from './logging'
 import { resourcesRoot, resUrl } from './resources'
 import type { TickContext } from './scheduler'
+import type { WatchEntry } from './storage/repositories/watchlist'
 import { DEFAULT_SETTINGS } from './settings/schema'
+import {
+  applyConfigBundle,
+  buildConfigBundle,
+  parseConfigBundle,
+  serializeConfigBundle,
+  type ConfigWatchEntry,
+} from './settings/transfer'
+import {
+  appVersion,
+  askOpenPath,
+  askSavePath,
+  confirmOverwrite,
+  readJsonFile,
+  writeTextFile,
+} from './settings/transfer-io'
 import { loadSkin, type SkinSource } from './skin/loader'
 import { isQuiet, quietUntil, type QuietPreset } from './util/quiet'
 import { WindowManager } from './windows/WindowManager'
@@ -55,6 +72,25 @@ import { WindowManager } from './windows/WindowManager'
  * 交付方把 28 个文件（docs/09 §8）放进 resources/pet/default/ 即可自动生效，不需要改代码。
  */
 const DEFAULT_SKIN_ID = 'default'
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** 仓储的 WatchEntry → 导出文件里的一行。isST 不落文件：它是从名称推出来的，会随摘帽变 */
+function toConfigWatchEntry(entry: WatchEntry): ConfigWatchEntry {
+  const row: ConfigWatchEntry = {
+    code: entry.profile.code,
+    name: entry.profile.name,
+    market: entry.profile.market,
+    board: entry.profile.board,
+    group: entry.group,
+    sortOrder: entry.sortOrder,
+    createdAt: entry.createdAt,
+  }
+  if (entry.profile.industry !== undefined) row.industry = entry.profile.industry
+  return row
+}
 
 export class AppController {
   private readonly windows = new WindowManager()
@@ -233,6 +269,90 @@ export class AppController {
 
   providerHealth(): ProviderHealth[] {
     return this.data?.health() ?? []
+  }
+
+  // ── 个人配置导入导出 ──────────────────────────────────────────────
+  //
+  // 「个人配置」只有三样：设置、自选（含分组与排序）、手工录入的持仓 —— 详见
+  // settings/transfer.ts 的头注释。两个方法都**不抛错**：取消、文件读坏、版本太新
+  // 都是用户能看懂的正常结局，走返回值报回面板，比让渲染层去解析 Electron 包过的
+  // Error 字符串好。真正的意外也收进 FAILED，面板会把原文显示出来（docs/02 §7）。
+
+  async exportConfig(): Promise<ConfigTransferResult> {
+    try {
+      const layer = this.requireData()
+      const now = Date.now()
+      const path = await askSavePath(this.windows.panelWindow.browserWindow, now)
+      if (path === null) return { status: 'CANCELED', warnings: [] }
+
+      const bundle = buildConfigBundle({
+        settings: layer.settings.get(),
+        watchlist: layer.storage.watchlist.list().map(toConfigWatchEntry),
+        positions: layer.storage.positions.list().map((held) => ({
+          code: held.code,
+          shares: held.shares,
+          cost: held.cost,
+          peakPrice: held.peakPrice,
+          openedAt: held.openedAt,
+        })),
+        now,
+        appVersion: appVersion(),
+      })
+      writeTextFile(path, serializeConfigBundle(bundle))
+
+      return {
+        status: 'DONE',
+        path,
+        counts: { watchlist: bundle.watchlist.length, positions: bundle.positions.length },
+        warnings: [],
+      }
+    } catch (error) {
+      log.warn('[config] 导出失败：', error)
+      return { status: 'FAILED', warnings: [], error: messageOf(error) }
+    }
+  }
+
+  async importConfig(): Promise<ConfigTransferResult> {
+    try {
+      const layer = this.requireData()
+      const win = this.windows.panelWindow.browserWindow
+      const path = await askOpenPath(win)
+      if (path === null) return { status: 'CANCELED', warnings: [] }
+
+      const { bundle, warnings } = parseConfigBundle(readJsonFile(path))
+      const confirmed = await confirmOverwrite(win, {
+        incomingWatch: bundle.watchlist.length,
+        incomingPositions: bundle.positions.length,
+        currentWatch: layer.storage.watchlist.count(),
+        currentPositions: layer.storage.positions.codes().size,
+      })
+      // 取消了也要把 warnings 带回去：用户可能正是看到「12 行被丢弃」才决定不导的
+      if (!confirmed) return { status: 'CANCELED', path, warnings }
+
+      // 整份放进一个事务：自选清了一半、持仓还是旧的，比什么都没做糟得多
+      const applied = layer.storage.db.transaction(() =>
+        applyConfigBundle(bundle, {
+          watchlist: layer.storage.watchlist,
+          positions: layer.storage.positions,
+        })
+      )
+      // 设置走 patchSettings 而不是直接写 store：换形态要重建窗口、换皮肤要重载资源
+      this.patchSettings(bundle.settings)
+      // 新导入的自选一根日线都没有，立刻补一轮，别让用户对着一屏「—」等 30 秒
+      void this.refreshData()
+      this.onStateChanged()
+
+      return {
+        status: 'DONE',
+        path,
+        counts: { watchlist: applied.watchlist, positions: applied.positions },
+        removed: { watchlist: applied.removedWatchlist, positions: applied.removedPositions },
+        warnings,
+      }
+    } catch (error) {
+      log.warn('[config] 导入失败：', error)
+      return { status: 'FAILED', warnings: [], error: messageOf(error) }
+    }
   }
 
   // ── 信号（M2）─────────────────────────────────────────────────────

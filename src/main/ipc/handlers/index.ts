@@ -80,6 +80,14 @@ export function registerHandlers(controller: AppController): void {
 
   handle('settings:patch', (_event, patch) => controller.patchSettings(patch))
 
+  // ── 个人配置导入导出 ──────────────────────────────────────────────
+  // 两条都不抛错：文件对话框被取消、文件读坏、版本太新都是**用户能看懂的正常结局**，
+  // 走返回值告诉面板（status + warnings），比让渲染层去解 Electron 包装过的 Error 好
+
+  handle('config:export', () => controller.exportConfig())
+
+  handle('config:import', () => controller.importConfig())
+
   handle('pet:getSkin', () => controller.currentSkin)
 
   handle('pet:setHitRegion', (_event, rects) => controller.setHitRects(rects))

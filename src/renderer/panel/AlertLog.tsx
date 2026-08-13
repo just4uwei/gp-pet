@@ -122,53 +122,60 @@ export function AlertLog({
 
   const silenced = records.filter((r) => r.channels.length === 0).length
 
+  // 收起时按内容给高，展开时最多吃掉右栏一半多一点并在内部滚动 ——
+  // 让它无限长会把上面的「今日信号」挤没
   return (
-    <section>
-      <button className="flex w-full items-baseline justify-between text-left" onClick={toggle}>
-        <h2 className="text-sm text-white/70">
-          提醒日志
-          {unread > 0 ? (
-            <span className="ml-2 rounded bg-rose-400/15 px-1.5 py-0.5 text-[11px] text-rose-200">
-              {unread} 条未读
-            </span>
-          ) : null}
-        </h2>
-        <span className="text-xs text-white/35">{open ? '收起' : '展开'}</span>
+    <section className={`gp-card ${open ? 'min-h-0 max-h-[55%]' : 'shrink-0'}`}>
+      <button className="gp-card-head w-full text-left" onClick={toggle}>
+        <h2 className="gp-card-title">提醒日志</h2>
+        {unread > 0 ? (
+          <span className="rounded bg-rose-400/15 px-1.5 py-0.5 text-[11px] text-rose-200">
+            {unread} 条未读
+          </span>
+        ) : null}
+        <span className="ml-auto text-xs text-white/35">{open ? '收起' : '展开'}</span>
       </button>
 
       {open ? (
         records.length === 0 ? (
-          <p className="py-6 text-center text-xs text-white/35">
+          <p className="px-3 py-8 text-center text-xs text-white/35">
             今日还没有任何提醒判定。引擎每轮都会记一笔，包括被静默的。
           </p>
         ) : (
           <>
-            <p className="mt-1 text-xs text-white/35">
+            <p className="shrink-0 border-b border-white/[0.06] px-3 py-2 text-xs text-white/35">
               今日 {records.length} 条判定，其中 {silenced} 条未发出。
-              这一列写的是分发器的原话，可据此调整灵敏度与静默时段。
+              下面写的是分发器的原话，可据此调整灵敏度与静默时段。
             </p>
-            <ul className="mt-1">
+            {/*
+              两行式而不是一行五列：右栏只有 ~330px 宽，
+              把「未提醒 · 同键冷却期内（剩 42 分钟）」这种原话塞进一个定宽列会被截断，
+              而那句话正是这个界面存在的理由 —— 宁可多占一行也不许省略它。
+            */}
+            <ul className="min-h-0 flex-1 overflow-y-auto px-3">
               {records.map((record) => (
-                <li key={record.id} className="flex items-baseline gap-3 border-b border-white/10 py-2 text-xs">
-                  <span className="w-10 shrink-0 font-mono text-white/45">{timeOf(record.createdAt)}</span>
-                  <span
-                    className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${DIRECTION_TONE[record.direction]}`}
-                  >
-                    {DIRECTION_LABEL[record.direction]}
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="text-sm text-white/85">{record.name}</span>
-                    <span className="ml-1.5 font-mono text-white/35">{record.code}</span>
-                    {record.headline ? (
-                      <span className="block truncate text-white/45">{record.headline}</span>
-                    ) : null}
-                  </span>
-                  <span className="w-16 shrink-0 text-right font-mono text-white/60">
-                    置信 {Math.round(record.score * 100)}%
-                  </span>
-                  <span className="w-56 shrink-0 text-right">
+                <li key={record.id} className="border-b border-white/[0.06] py-2 text-xs last:border-b-0">
+                  <div className="flex items-baseline gap-2">
+                    <span className="shrink-0 font-mono text-white/45">{timeOf(record.createdAt)}</span>
+                    <span
+                      className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${DIRECTION_TONE[record.direction]}`}
+                    >
+                      {DIRECTION_LABEL[record.direction]}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-sm text-white/85">
+                      {record.name}
+                      <span className="ml-1.5 font-mono text-xs text-white/35">{record.code}</span>
+                    </span>
+                    <span className="shrink-0 font-mono text-white/60">
+                      置信 {Math.round(record.score * 100)}%
+                    </span>
+                  </div>
+                  {record.headline ? (
+                    <p className="mt-0.5 truncate text-white/45">{record.headline}</p>
+                  ) : null}
+                  <p className="mt-0.5">
                     <Outcome record={record} />
-                  </span>
+                  </p>
                 </li>
               ))}
             </ul>
