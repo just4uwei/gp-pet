@@ -57,17 +57,15 @@ export default defineConfig({
       },
     },
   },
-  // 四个渲染入口。bar / pet / bubble 走透明窗口，panel 是常规窗口，详见 docs/06。
-  // bar 与 pet 是同一个悬浮窗口的两种形态（AppSettings.appearance），不会同时存在。
+  // 三个渲染入口。bar / bubble 走透明窗口，panel 是常规窗口，详见 docs/06。
   renderer: {
     plugins: [react(), tailwindcss()],
     resolve: { alias },
     build: {
       rollupOptions: {
         input: {
-          // bar 是出厂默认形态，pet 是可切换形态（AppSettings.appearance）
+          // bar 是常驻悬浮条（唯一形态）
           bar: resolve('src/renderer/bar/index.html'),
-          pet: resolve('src/renderer/pet/index.html'),
           panel: resolve('src/renderer/panel/index.html'),
           bubble: resolve('src/renderer/bubble/index.html'),
         },

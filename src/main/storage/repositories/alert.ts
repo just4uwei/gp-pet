@@ -7,10 +7,14 @@
  *
  * 两条与 001_init.sql 的既有列有关的说明：
  *
- * 1. **`channel` 存的是逗号分隔的渠道列表**（如 `PET,TRAY,BUBBLE`），不是单个值。
+ * 1. **`channel` 存的是逗号分隔的渠道列表**（如 `PET,BUBBLE`），不是单个值。
  *    列注释写的是 `PET | BUBBLE | TRAY | OS_NOTIFY`，那是设计早期「一条提醒一个渠道」
- *    的设想；实际一条 L3 会同时走四个渠道，拆成四行会让「今天提醒了几条」这个最基本的
+ *    的设想；实际一条提醒会同时走多个渠道，拆成多行会让「今天提醒了几条」这个最基本的
  *    计数变成需要去重的查询。被丢弃的候选存 `NONE`（列是 NOT NULL，不能存空）。
+ *
+ *    **`TRAY` 与 `OS_NOTIFY` 已于 2026-08-13 移除**（托盘角标、图标闪烁、系统通知一并删掉），
+ *    但历史行里还带着它们。`parseChannels` 因此**不做白名单过滤**：提醒日志只用
+ *    `channels.length` 判「发没发出去」，把旧值滤掉反而会让当时明明弹过的行看起来像被静默了。
  *
  * 2. **`level` 存的是最终生效的级别**。被丢弃时存候选原本的级别并在 `suppressed_reason`
  *    里写明原因 —— 「本来想发 L3，被当日冷却挡了」比「level 为空」有用得多。
@@ -23,7 +27,7 @@ import type { AlertLevel, GatedDirection, Regime, SecCode, SignalStage } from '@
 import type { Database } from '../db'
 
 /** 分发渠道。与 `src/main/alerts/dispatcher.ts` 的 `AlertChannel` 同一集合 */
-export type AlertChannelName = 'PET' | 'TRAY' | 'BUBBLE' | 'OS_NOTIFY'
+export type AlertChannelName = 'PET' | 'BUBBLE'
 
 /** 被丢弃的候选在 `channel` 列里的取值。列是 NOT NULL，不能用空串（空串与「没解析出来」分不开） */
 const NO_CHANNEL = 'NONE'
@@ -180,7 +184,7 @@ export class AlertRepo {
    * 标记已读。
    *
    * 只有**实际发出**的（channel ≠ NONE）才算未读 —— 被冷却挡掉的那条从来没打扰过用户，
-   * 把它算进角标只会让「未读数」变成「今天发生过的事情数」，那不是同一个概念。
+   * 把它算进未读数只会让它变成「今天发生过的事情数」，那不是同一个概念。
    */
   markRead(ids: readonly string[], at: number): number {
     if (ids.length === 0) return 0
@@ -196,7 +200,7 @@ export class AlertRepo {
       .run(at, NO_CHANNEL).changes
   }
 
-  /** 托盘角标的数字：实际发出过、且还没被看过的条数 */
+  /** 未读数：实际发出过、且还没被看过的条数（面板的提醒日志用它） */
   unreadCount(): number {
     return (
       this.db

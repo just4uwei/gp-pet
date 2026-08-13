@@ -19,8 +19,7 @@ import { TrayController } from './tray/TrayController'
 
 initLogging()
 registerResourceScheme()
-// Windows 用 AUMID 认应用身份。不设它，M3 的系统通知会显示成「electron.app.Electron」
-// —— 而这条路径只在打包后暴露，dev 里看不出来（见 identity.ts）。
+// Windows 用 AUMID 认应用身份（任务栏归组、跳转列表都看它）。
 // **不要顺手加 app.setName()**：userData 目录是按 name 算的，改名等于搬走整个数据目录。
 app.setAppUserModelId(APP_ID)
 
@@ -32,10 +31,9 @@ void app.whenReady().then(() => {
 
   controller = new AppController()
   tray = new TrayController(controller)
+  // 走回调而不是让 controller 直接持有 Tray：窗口与托盘的生命周期不同，
+  // controller 认识 Tray 会让退出顺序变得难以推理
   controller.onChange = () => tray?.refresh()
-  // L3 到达时闪一下托盘图标（docs/08 M3）。走回调而不是让 controller 直接持有 Tray：
-  // 窗口与托盘的生命周期不同，controller 认识 Tray 会让退出顺序变得难以推理
-  controller.onFlash = () => tray?.flash()
 
   registerHandlers(controller)
   reportUnimplementedChannels()
@@ -44,7 +42,7 @@ void app.whenReady().then(() => {
   tray.start()
 
   // 数据层装配是异步的（开库 + undici），故意排在窗口与托盘之后：
-  // 装配失败时用户至少还能看到桌宠与托盘菜单，而不是双击图标毫无反应
+  // 装配失败时用户至少还能看到悬浮条与托盘菜单，而不是双击图标毫无反应
   void createDataLayer({
     userDataDir: app.getPath('userData'),
     resourcesRoot: resourcesRoot(),
@@ -73,7 +71,7 @@ void app.whenReady().then(() => {
   log.info('[app] 窗口与托盘就绪，数据层装配中…')
 })
 
-// 桌宠隐藏或面板关闭后不退出 —— 退出只走托盘菜单（docs/02 §6）
+// 悬浮条隐藏或面板关闭后不退出 —— 退出只走托盘菜单（docs/02 §6）
 app.on('window-all-closed', () => {
   // 故意留空：托盘常驻
 })

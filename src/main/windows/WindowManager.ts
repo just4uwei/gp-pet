@@ -6,7 +6,7 @@
  */
 
 import { screen, type BrowserWindow } from 'electron'
-import type { AlertPayload, AppearanceForm, IpcPushMap } from '@shared/ipc-types'
+import type { AlertPayload, IpcPushMap } from '@shared/ipc-types'
 import { broadcast } from '../ipc/router'
 import { BubbleWindow } from './BubbleWindow'
 import { PanelWindow } from './PanelWindow'
@@ -18,9 +18,9 @@ export class WindowManager {
   private readonly bubble = new BubbleWindow()
   private onDisplayChange: (() => void) | null = null
 
-  createOverlay(form: AppearanceForm): OverlayWindow {
+  createOverlay(): OverlayWindow {
     if (!this.overlay) {
-      this.overlay = new OverlayWindow(form)
+      this.overlay = new OverlayWindow()
       if (!this.onDisplayChange) {
         this.onDisplayChange = () => this.overlay?.revalidatePosition()
         // 拔插外接屏 / 改分辨率后，存下来的坐标可能落在不存在的区域（docs/06 §4）
@@ -32,25 +32,6 @@ export class WindowManager {
     return this.overlay
   }
 
-  /**
-   * 切换形态：销毁旧窗口、按新形态重建。
-   *
-   * 不复用同一个 BrowserWindow 去 `setSize` + `loadURL`：两种形态的尺寸差 6 倍，
-   * 而且换渲染入口要重走一遍 preload 与 CSP —— 重建比原地改干净，
-   * 代价只是位置回到右下角（形态都换了，位置重置是可以接受的）。
-   * 显示器监听不重注册（回调只认 `this.overlay`，重建后自动指向新窗口）。
-   */
-  setOverlayForm(form: AppearanceForm): OverlayWindow {
-    if (this.overlay?.form === form) return this.overlay
-    const wasHidden = this.overlay !== null && !this.overlay.isVisible()
-    this.overlay?.destroy()
-    this.overlay = null
-    const next = this.createOverlay(form)
-    // C9：切形态不该把用户手动隐藏的窗口重新弹出来
-    if (wasHidden) next.setVisible(false)
-    return next
-  }
-
   get overlayWindow(): OverlayWindow | null {
     return this.overlay
   }
@@ -60,8 +41,9 @@ export class WindowManager {
   }
 
   /**
-   * 弹一个气泡（L2+）。锚点取悬浮窗口当前位置 ——
-   * 用户把条子拖到哪，气泡就跟到哪；条子被隐藏（C9）时退到主屏右下角，仍然要弹。
+   * 弹一个气泡（L2+）—— 提醒**唯一**的可见出口（托盘角标与系统通知已移除）。
+   * 锚点取悬浮条当前位置：用户把条子拖到哪，气泡就跟到哪；
+   * 条子被隐藏（C9）时退到主屏右下角，仍然要弹。
    */
   showBubble(payload: AlertPayload): void {
     const anchor = this.overlay?.isVisible() === true ? this.overlay.browserWindow.getBounds() : null

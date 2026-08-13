@@ -243,15 +243,16 @@ describe('③ 频率上限：超限降级而不是丢弃（docs/05 §4.3）', ()
 })
 
 describe('④ 免打扰：L2/L3 降为 L1（docs/05 §4.4）', () => {
-  it('免打扰期间降级并写明原因，仍然进面板与角标', () => {
+  it('免打扰期间降级并写明原因，仍然进面板与状态点', () => {
     const d = make()
     const c = candidate({ level: 'L3' })
     d.dispatch([c], T0, { quiet: true, quietReason: '全屏应用' })
     const got = d.dispatch([c], T0 + MIN, { quiet: true, quietReason: '全屏应用' })[0]
     expect(got?.level).toBe('L1')
     expect(got?.reason).toContain('全屏应用')
-    expect(got?.channels).not.toContain('OS_NOTIFY')
-    expect(got?.channels).toContain('TRAY')
+    // 降级的核心后果：不弹气泡（气泡是唯一的可见渠道），但状态点仍然点亮
+    expect(got?.channels).not.toContain('BUBBLE')
+    expect(got?.channels).toContain('PET')
   })
 
   it('免打扰期间的降级不占 L3 的每日额度', () => {

@@ -9,8 +9,8 @@
 #    哪天它换回 NAN，或者换了别的原生模块，这里要改回 true 并准备好 MSVC 工具链。
 # 2. **`.node` 必须从 asar 里解出来**（`asarUnpack`）：asar 里的动态库 dlopen 不了。
 # 3. **`resources/` 要原样进 `process.resourcesPath/resources`**：
-#    `src/main/resources.ts` 的 `resourcesRoot()` 就是这么找皮肤、托盘图标与节假日表的，
-#    路径对不上会走占位皮肤 + 兜底托盘图标的降级路径 —— 能跑，但看起来像资源丢了。
+#    `src/main/resources.ts` 的 `resourcesRoot()` 就是这么找托盘图标与节假日表的，
+#    路径对不上会走兜底托盘图标的降级路径 —— 能跑，但看起来像资源丢了。
 
 appId: com.gppet.desktop
 productName: GP Pet
@@ -18,7 +18,7 @@ copyright: GP Pet
 
 directories:
   output: release
-  buildResources: resources/icons/default
+  buildResources: resources/icons/app
 
 # out/ 是 electron-vite 的产物；node_modules 里的 production 依赖由 electron-builder 自行收集
 files:
@@ -52,7 +52,7 @@ win:
       arch: [x64]
     - target: portable
       arch: [x64]
-  icon: resources/icons/default/icon.ico
+  icon: resources/icons/app/icon.ico
   # 没有代码签名证书：安装时 SmartScreen 会拦一次「未知发布者」，属预期
   artifactName: gp-pet-${version}-${arch}.${ext}
 
@@ -64,8 +64,8 @@ nsis:
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: GP Pet
-  installerIcon: resources/icons/default/icon.ico
-  uninstallerIcon: resources/icons/default/icon.ico
+  installerIcon: resources/icons/app/icon.ico
+  uninstallerIcon: resources/icons/app/icon.ico
   # 卸载时**不**删数据目录：自选、持仓、信号历史都在 %APPDATA%/GP Pet 下，
   # 静默删掉用户自己录进去的持仓成本是不可逆的
   deleteAppDataOnUninstall: false

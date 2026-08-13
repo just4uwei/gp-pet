@@ -3,11 +3,12 @@
  *
  * ```
  * SignalOutcome[] ─▶ buildAlerts ─▶ AlertDispatcher（四道闸门）─┬─▶ alert_log（每一条裁决）
- *                                                              ├─▶ 桌宠 / 状态点（PET）
- *                                                              ├─▶ 托盘角标 + 闪烁（TRAY）
- *                                                              ├─▶ 气泡（BUBBLE）
- *                                                              └─▶ 系统通知（OS_NOTIFY）
+ *                                                              ├─▶ 悬浮条状态点（PET）
+ *                                                              └─▶ 气泡（BUBBLE）
  * ```
+ *
+ * **气泡是提醒唯一的可见出口**（2026-08-13）：托盘角标 + 图标闪烁与系统通知都已移除。
+ * 未读计数仍然算（面板的提醒日志要用），只是不再有人把它画成角标。
  *
  * ## 四条纪律
  *
@@ -15,8 +16,8 @@
  *    用户要能在提醒日志里回答「它是不是漏提醒了」。
  * 2. **一次最多弹一个气泡**：本轮得分最高的那条。气泡会互相替换而不是排队 ——
  *    排队意味着用户盯着一串过时提醒轮播，那比不弹更烦人。
- * 3. **渠道失败不影响记账**。通知发不出去（系统关了通知）时提醒仍算发过：
- *    面板与角标已经拿到它了，把整条判为失败会让它在下一轮重发。
+ * 3. **渠道失败不影响记账**。气泡窗口建不出来时提醒仍算发过：
+ *    面板与未读计数已经拿到它了，把整条判为失败会让它在下一轮重发。
  * 4. **不读时钟**：`at` 由调用方（tick）传入，与 AlertDispatcher / src/core 同一条纪律。
  *    「收盘 15:00 那一轮会不会重发」必须能写成用例。
  */
@@ -33,15 +34,11 @@ import { PetStateMachine } from './pet-state'
 
 /** 渠道执行端。controller 实现它 —— 这一层不认识 BrowserWindow 与 Tray */
 export interface AlertSink {
-  /** L2+：弹气泡（一次一个，本轮得分最高的那条） */
+  /** L2+：弹气泡（一次一个，本轮得分最高的那条）。**唯一的可见渠道** */
   bubble(payload: AlertPayload): void
-  /** L3：系统通知。`sound` 已经把 C5「默认无声」与用户设置算进去了 */
-  notify(payload: AlertPayload, sound: boolean): void
-  /** L3：托盘图标闪烁 */
-  flash(): void
-  /** 托盘角标：未读提醒数 */
+  /** 未读提醒数。面板的提醒日志用它，不再有托盘角标 */
   unread(count: number): void
-  /** 桌宠 / 状态点需要重推。`nextChangeAt` 非空时调用方要安排一次回落重推 */
+  /** 状态点需要重推。`nextChangeAt` 非空时调用方要安排一次回落重推 */
   petState(nextChangeAt: number | null): void
 }
 
@@ -145,7 +142,6 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
       let delivered = 0
       let bubble: AlertPayload | null = null
       let bubbleScore = -1
-      let flashed = false
 
       for (const decision of decisions) {
         if (decision.level === null) continue
@@ -161,17 +157,9 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
           bubbleScore = decision.candidate.score
           bubble = shown
         }
-        if (decision.channels.includes('OS_NOTIFY')) {
-          // C5：默认无声。只有用户显式开启且真的是 L3 才响
-          sink.notify(shown, app.soundEnabled && decision.level === 'L3')
-          if (!flashed) {
-            flashed = true
-            sink.flash()
-          }
-        }
       }
 
-      // 有候选但一条都没发出：够得上 WATCHING，够不上表情（闸门挡下的不点亮 EXCITED/ALERT）
+      // 有候选但一条都没发出：够得上 WATCHING，够不上高优先级状态（闸门挡下的不点亮 EXCITED/ALERT）
       if (delivered === 0) pet.onActivity(ctx.at)
       if (bubble) sink.bubble(bubble)
 

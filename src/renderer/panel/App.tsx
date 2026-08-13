@@ -25,7 +25,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type {
   EngineStatus,
-  PetSkinView,
   PositionView,
   ProviderHealth,
   QuoteTick,
@@ -266,7 +265,6 @@ export function App(): React.JSX.Element {
   const [quotes, setQuotes] = useState<QuoteTick[]>([])
   const [status, setStatus] = useState<EngineStatus | null>(null)
   const [health, setHealth] = useState<ProviderHealth[]>([])
-  const [skin, setSkin] = useState<PetSkinView | null>(null)
   const [positions, setPositions] = useState<PositionView[]>([])
   const [editing, setEditing] = useState<SecCode | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -293,7 +291,6 @@ export function App(): React.JSX.Element {
 
   useEffect(() => {
     void window.gp.invoke('app:engineStatus').then(setStatus)
-    void window.gp.invoke('pet:getSkin').then(setSkin)
     void reload()
 
     const offStatus = window.gp.on('push:engineStatus', (next) => {
@@ -381,7 +378,6 @@ export function App(): React.JSX.Element {
     status?.offline === true ||
     status?.stale === true ||
     status?.calendarUncertain === true ||
-    skin?.fallback === true ||
     transfer !== null
 
   return (
@@ -435,7 +431,6 @@ export function App(): React.JSX.Element {
           {status?.calendarUncertain ? (
             <Banner tone="info">交易日历尚未核对，休市判断可能不准（节假日会照常轮询）。</Banner>
           ) : null}
-          {skin?.fallback ? <Banner tone="info">皮肤已回退到占位形象：{skin.fallbackReason}</Banner> : null}
           {transfer ? (
             <ConfigTransferNotice outcome={transfer} onDismiss={() => setTransfer(null)} />
           ) : null}

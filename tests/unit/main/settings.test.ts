@@ -21,12 +21,12 @@ describe('sanitizeSettings', () => {
     const result = sanitizeSettings({
       pollIntervalSec: 3, // 低于 10s 是对免费接口的滥用
       sensitivity: 'CONSERVATIVE', // 合法，应保留
-      minimalMode: 'yes', // 类型错
+      autoLaunch: 'yes', // 类型错
     })
     expect(result.settings.pollIntervalSec).toBe(DEFAULT_SETTINGS.pollIntervalSec)
     expect(result.settings.sensitivity).toBe('CONSERVATIVE')
-    expect(result.settings.minimalMode).toBe(false)
-    expect(result.repaired.map((r) => r.field).sort()).toEqual(['minimalMode', 'pollIntervalSec'])
+    expect(result.settings.autoLaunch).toBe(false)
+    expect(result.repaired.map((r) => r.field).sort()).toEqual(['autoLaunch', 'pollIntervalSec'])
   })
 
   it('轮询频率上下界 10–120s', () => {
@@ -88,12 +88,12 @@ describe('SettingsStore', () => {
   it('patch 落盘，重新 load 能读回', () => {
     const first = store()
     first.load()
-    const patched = first.patch({ pollIntervalSec: 60, minimalMode: true })
+    const patched = first.patch({ pollIntervalSec: 60, autoLaunch: true })
     expect(patched.pollIntervalSec).toBe(60)
 
     const persisted = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
     expect(persisted['pollIntervalSec']).toBe(60)
-    expect(store().load().minimalMode).toBe(true)
+    expect(store().load().autoLaunch).toBe(true)
   })
 
   it('非法补丁被忽略且不污染已有取值', () => {
@@ -118,8 +118,8 @@ describe('SettingsStore', () => {
       logs.push(m)
     )
     broken.load()
-    expect(() => broken.patch({ minimalMode: true })).not.toThrow()
-    expect(broken.get().minimalMode).toBe(true)
+    expect(() => broken.patch({ autoLaunch: true })).not.toThrow()
+    expect(broken.get().autoLaunch).toBe(true)
     expect(logs.join()).toContain('写入失败')
   })
 })

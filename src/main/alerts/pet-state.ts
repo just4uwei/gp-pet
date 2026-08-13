@@ -1,21 +1,23 @@
 /**
- * 桌宠 / 状态点的状态机（docs/06 §3）。
+ * 悬浮条状态点的状态机（docs/06 §3）。
+ *
+ * 类名里的 `Pet` 是历史（本项目起初是桌宠形态）—— 桌宠已移除，判定职责没变。
  *
  * 状态优先级：`OFFLINE > ALERT > EXCITED > WATCHING > IDLE > SLEEPY`。
  * 前三态由**实际发出的提醒**驱动，后三态由数据层给（离线 / 休市 / 盘中）。
  *
  * ## 三条约束
  *
- * 1. **只有过了四道闸门的提醒才能点亮表情。** 这是 M2 期间反复写在注释里的那条纪律
- *    （src/renderer/bar/App.tsx、controller.ts）：表情是提醒的**表现层**，
+ * 1. **只有过了四道闸门的提醒才能点亮状态点。** 这是 M2 期间反复写在注释里的那条纪律
+ *    （src/renderer/bar/App.tsx、controller.ts）：状态点是提醒的**表现层**，
  *    绕过闸门直接点亮等于用一个没人管的通道骚扰用户。被丢弃与被降级的候选
- *    因此不进这里 —— 但**降级到 L1 的会进**，L1 的定义本来就是「只改表情 + 角标」。
+ *    因此不进这里 —— 但**降级到 L1 的会进**，L1 的定义本来就是「只改状态点」。
  *
  * 2. **高优先级状态有最短驻留（3s）。** 一轮 tick 30s，若不设驻留，
  *    一条 EXCITED 会一直挂到下一轮才回落，看起来像卡住了；而若立刻回落，
- *    动画根本来不及播完（docs/09 的 `minHold`）。
+ *    用户根本来不及看到那次变色。
  *
- * 3. **免打扰期间只做一次极轻微的表情变化，不进 WATCHING**（docs/05 §4.4 低调态）。
+ * 3. **免打扰期间只做一次极轻微的变化，不进 WATCHING**（docs/05 §4.4 低调态）。
  *    所以驻留期结束后直接回到 SLEEPY，不经过 WATCHING 那一档。
  *
  * 不读时钟：`now` 一律由调用方传入，与 AlertDispatcher 同一条纪律。
@@ -31,7 +33,7 @@ export interface PetStateOptions {
   watchingMs?: number
 }
 
-/** 卖出类给警戒，买入类给兴奋；明日观察这种降级方向不值得一个高优先级动画 */
+/** 卖出类给警戒，买入类给兴奋；明日观察这种降级方向不值得一个高优先级状态 */
 function highStateOf(direction: GatedDirection): 'ALERT' | 'EXCITED' | null {
   if (direction === 'SELL' || direction === 'REDUCE') return 'ALERT'
   if (direction === 'BUY') return 'EXCITED'
@@ -66,7 +68,7 @@ export class PetStateMachine {
     this.highUntil = now + this.minHoldMs
   }
 
-  /** 本轮有候选在算但一条都没发出（被闸门挡了）：够得上 WATCHING，够不上表情 */
+  /** 本轮有候选在算但一条都没发出（被闸门挡了）：够得上 WATCHING，够不上高优先级状态 */
   onActivity(now: number): void {
     if (this.watchUntil < now + this.watchingMs) this.watchUntil = now + this.watchingMs
   }

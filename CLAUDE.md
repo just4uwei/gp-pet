@@ -4,26 +4,36 @@
 
 ## 这是什么
 
-GP Pet：Windows 桌面桌宠，跟踪用户自选的 A 股，用量化策略判断买卖时机并以不打断工作的方式提醒。
+GP Pet：Windows 桌面悬浮条 + 托盘，跟踪用户自选的 A 股，用量化策略判断买卖时机并以不打断工作的方式提醒。
 Electron + React + TypeScript · 本地 SQLite · 免登录 · 无服务端 · **不接券商、不下单**。
 
 当前处于 **M3（提醒层）代码就绪**：五层引擎、回测 CLI、标定工具、面板列表（M2）之上，
 提醒分发已接线 —— `tick → SignalEngine → AlertService → 四道闸门（防抖/冷却/频率上限/免打扰）
-→ alert_log + 气泡 / 系统通知 / 托盘角标 / 状态点`。持仓录入、提醒日志视图、收盘失效提示、
+→ alert_log + 状态点 / 气泡`。持仓录入、提醒日志视图、收盘失效提示、
 静默时段与全屏探测都在。**出口条件（自用一周）未验**，逐条见
 [checklists/M3-提醒层验收](./docs/checklists/M3-提醒层验收.md)。
 
-**闸门是唯一的点亮路径。** 状态点与桌宠表情只认 `PetStateMachine`，而它只接受
+**闸门是唯一的点亮路径。** 状态点只认 `PetStateMachine`，而它只接受
 **过了四道闸门**的提醒（被降级成 L1 的算过了，被丢弃的不算）。不要在渲染层直接读
 `signal:history` 去点亮状态 —— 那是一条绕过闸门的旁路。`tests/unit/main/alert-service.test.ts`
 有两条用例钉着这件事。
 
-**⚠ 出厂形态是「托盘 + 悬浮条」，不是桌宠**（2026-08-13 改）。常驻置顶窗口有两种形态
-（`AppSettings.appearance`，出厂 `BAR`），**共用同一个窗口类** `OverlayWindow` 与同一套
-零干扰机制，只差尺寸与渲染入口（`src/renderer/bar/` 300×38 vs `src/renderer/pet/` 220×220）。
-托盘菜单「外观」可切换。这**不是** docs/08 决策点 1 那条退路被触发（C1/C2 还没真机验收），
-是产品选择；默认形态因此不依赖任何美术素材。IPC 通道名仍是 `pet:*`（改名要动 preload
-与两个渲染入口，无功能收益）。见 [docs/06 §2.1](./docs/06-桌宠交互与非干扰设计.md)。
+**⚠ 形态是「托盘 + 悬浮条」，桌宠与皮肤系统已整块删除**（2026-08-13）。常驻置顶窗口只有
+一种形态：`OverlayWindow` 加载 `src/renderer/bar/`，300×38。跟着一起删掉的有
+`src/main/skin/`、`src/renderer/pet/`、`resources/pet/`、`tools/asset-build/`、docs/09、
+`docs/skins/`、`pnpm assets:build` / `verify:assets`，以及 `AppSettings` 的
+`appearance` / `skin` / `minimalMode` 三个字段。**产品因此不依赖任何美术素材**；
+仍需图片的只剩托盘与应用图标（`resources/icons/app/`，静态文件，缺失时退到内置兜底图标）。
+这**不是** docs/08 决策点 1 那条退路被触发（C1/C2 还没真机验收），是产品选择。
+IPC 通道名、`PetState`、`PetStateMachine` 的名字仍带 `pet`（改名要动 preload 与渲染入口，
+无功能收益）—— **名字是历史，形态是现状**。见 [docs/06 §2.1](./docs/06-桌宠交互与非干扰设计.md)。
+
+**⚠ 提醒的可见出口只有气泡**（2026-08-13）。托盘角标、托盘图标闪烁、系统通知
+（连同「可发声」这件事本身与 `AppSettings.soundEnabled`）全部移除，`AlertChannel`
+只剩 `PET`（状态点）与 `BUBBLE`。**级别没有合并** —— L2 与 L3 表现相同，但同键冷却
+（2h vs 当日一次）与每日上限不同，那才是三级制在管的事，别因为 `CHANNELS_BY_LEVEL`
+里两行长得一样就去合并它们。历史 `alert_log` 行里仍有 `TRAY` / `OS_NOTIFY`，
+`parseChannels` **刻意不做白名单过滤**：滤掉会让当时真弹过的行看起来像被静默了。
 
 **两条出口条件尚未达成**：M1 的「跑满一个交易日 + 健康度 > 99%」要真机联网；
 M2 的「回测报告产出并据此确定出厂参数」还差大半 —— 但**它的读法已经明确**（2026-08-13）：
@@ -88,7 +98,7 @@ M2 的「回测报告产出并据此确定出厂参数」还差大半 —— 但
 2. **参数值不是事实。** [`src/core/params.ts`](./src/core/params.ts) 里的数值（MACD 12/17/9、8% 止损、0.6 得分阈值…）几乎全部来自需求文档的网络转述，**未经任何验证**。不要在文档、UI 或注释里把它们写成「经过验证的最优参数」。见 [ADR-0003](./docs/adr/ADR-0003-来源文档数值不作为出厂默认.md)。
    **唯一的例外是 `strategy.squeezeBbwPct = 20`**（2026-08-12 标定并人工复核，见 [CHANGELOG](./CHANGELOG.md)）。已标定清单以 `params.ts` 顶部那张清单为准 —— 往里加行要走清单 4.9a，**不要笼统地说「参数已验证」**，那会把一个参数的证据扩张成整套参数的背书。
 
-3. **零干扰契约是硬指标。** [docs/06 §1](./docs/06-桌宠交互与非干扰设计.md) 的 C1–C10，尤其 C1（永不抢焦点）与 C2（点击穿透）。任何为视觉效果牺牲它们的方案一律否决。Pet/Bubble 窗口的 `focusable: false` 不得改动。
+3. **零干扰契约是硬指标。** [docs/06 §1](./docs/06-桌宠交互与非干扰设计.md) 的 C1–C10，尤其 C1（永不抢焦点）与 C2（点击穿透）。任何为视觉效果牺牲它们的方案一律否决。Overlay/Bubble 窗口的 `focusable: false` 不得改动。注意 **C5 的口径已变**：提醒没有声音渠道了，那一条从「默认无声」读作「永不发声」。
 
 4. **指标序列的未定义值填 `null`，绝不填 0。** 用 0 冒充未预热的指标值是回测失真的经典来源。`noUncheckedIndexedAccess` 已开启，这会让指标代码写起来啰嗦一些 —— 那是刻意的。
 
@@ -130,8 +140,8 @@ src/backtest 回测 CLI，复用 src/core
 |---|---|
 | 写指标或策略 | [docs/04](./docs/04-指标与信号引擎.md)（公式与口径都在这，含与来源文档的差异说明） |
 | 接数据源 | [docs/03](./docs/03-数据源与存储设计.md) + [src/main/providers/README.md](./src/main/providers/README.md) |
-| 改窗口或交互 | [docs/06](./docs/06-桌宠交互与非干扰设计.md)（§2.1 两种形态共用一个窗口类） |
-| 做或验收美术资源 | [docs/09](./docs/09-美术资源规格.md)（形象无关的规格与验收标准；具体形象的设定放 `docs/skins/<skinName>.md`。资源是外包件，不在仓库里手搓） |
+| 改窗口或交互 | [docs/06](./docs/06-桌宠交互与非干扰设计.md)（§2.1 悬浮条，§5 皮肤系统已删的说明） |
+| 换托盘 / 应用图标 | [resources/icons/README.md](./resources/icons/README.md)（静态文件，不是生成件） |
 | 改提醒逻辑 | [docs/05](./docs/05-风控与提醒规则.md) |
 | 写测试或回测 | [docs/07](./docs/07-回测与验证方案.md)（回测陷阱清单必读） |
 
@@ -243,7 +253,6 @@ src/backtest 回测 CLI，复用 src/core
 - **主进程/preload 的外置依赖清单在 `electron.vite.config.ts`**，从 `package.json` 的 `dependencies` 派生。别用 `rollupOptions.external` 去覆盖它 —— 漏外置 `electron` 会让 `import { app } from 'electron'` 解析到 npm 上那个「返回 exe 路径」的启动器包，**构建照样成功，启动才炸**。
 - **preload 必须打成 CJS**：安全基线要求 `sandbox: true`，而沙箱化的 preload 不支持 ESM。electron-vite 5 默认输出 ESM，配置里已显式改回。
 - **改完主进程要真启一次**（`pnpm dev`）。typecheck + build 全绿也可能启动即崩 —— 上面两条就是这么发现的。
-- **默认皮肤「小猫」是生成件**，源在 `tools/asset-build/`，改素材要改代码再 `pnpm assets:build && pnpm verify:assets`，不要直接手改 PNG（下次重出就被覆盖）。
 - **造 K 线 fixture 时，横盘段的噪音必须没有周期。** 固定错拍的锯齿（旧 `chopCloses`）
   振幅够、看起来完全正常，但 +DM 与 −DM 长期抵消，320 根之后 **ADX ≈ 8**，
   而 `adxRange` 是 15–23 —— 于是 `T1_MA_CROSS:BUY` 与 `T4_ALIGNMENT` 在所有基于它的 fixture 里
@@ -262,12 +271,10 @@ src/backtest 回测 CLI，复用 src/core
   混用会在除权后凭空触发一次卖出提醒。
 - **`src/backtest` 用相对路径 import**（不用 `@core/*`）：CLI 由 tsx 直接跑，
   而根 `tsconfig.json` 是 solution 风格、不带 `paths`，别名在那里解析不到。
-- **悬浮条与桌宠是同一个窗口的两种形态**，不是两个窗口。改零干扰相关的东西
-  （`focusable`、`setIgnoreMouseEvents`、拖拽吸附、多屏校验）只有 `OverlayWindow` 一处，
-  两形态一起生效;改「窗口里画什么」才分 `src/renderer/bar/` 与 `src/renderer/pet/`。
-  **命中区的形状两者不同**：桌宠要描轮廓（窗口比本体大一圈），悬浮条是「整块减掉四个圆角」
-  ——`barHitRects` 的圆角半径必须与 `styles.css` 的 `border-radius` 一致，否则会盖到圆角外，
-  吞掉本该穿透的点击（C2 是底线）。
+- **悬浮条的命中区是「整块减掉四个圆角」**（窗口即本体，没有透明留白）。
+  `barHitRects` 的圆角半径必须与 `styles.css` 的 `border-radius` 一致，否则会盖到圆角外，
+  吞掉本该穿透的点击（C2 是底线）。零干扰相关的东西（`focusable`、`setIgnoreMouseEvents`、
+  拖拽吸附、多屏校验）全在 `OverlayWindow` 一处。
 - **移动 overlay 窗口不要用 `setPosition`，用 `OverlayWindow.moveTo`（把宽高一起写回）。**
   在缩放比不是 100% 的显示器上（Windows 的 125%/150% 是常态），Electron 会把 bounds 在
   DIP 与物理像素之间来回换算、两个方向都按「包住」取整，于是一次「只挪位置」的调用
@@ -294,17 +301,22 @@ src/backtest 回测 CLI，复用 src/core
   分发路径**只读缓存**（`probe.current()`，TTL 15s），绝不 await 它；连续 3 次失败即永久停用，
   停用后状态 `UNKNOWN` → **判为可以提醒**。不要「顺手」把它改成同步等待，
   那会让每轮 tick 卡 100–300ms。
-- **托盘菜单的「解除免打扰」与双击手势只管得着手动那一项**（`manualQuiet`）。
-  （双击说的是**桌宠形态**；悬浮条的双击 2026-08-13 起是开面板，免打扰退到右键菜单，见 docs/06 §4。）
-  用聚合的 `quiet` 去判，会让静默时段或全屏应用期间的双击变成「解除一个我没开过的开关」
-  —— 点了没反应。
+- **菜单里的「解除免打扰」只管得着手动那一项**（`manualQuiet`）。用聚合的 `quiet` 去判，
+  会让静默时段或全屏应用期间的点击变成「解除一个我没开过的开关」—— 点了没反应。
+  （悬浮条的双击是**开面板**，C8 的一键静默只在右键 / 托盘菜单里，见 docs/06 §4。）
+- **托盘不参与提醒。** `TrayController` 只剩「按免打扰状态换图标」+「挂菜单」两件事；
+  未读角标、tooltip 计数、L3 图标闪烁都已删除。**别把它们加回来** ——
+  提醒的可见出口只有气泡是刻意的（docs/05 §3）。tooltip 也刻意是静态的：
+  让一个常驻图标随行情变文字，本身就是一种低强度的持续打扰。
 - **从 agent / CI 的 shell 里跑 `pnpm dev` 会「启动即崩」**：这类环境常设
   `ELECTRON_RUN_AS_NODE=1`，于是 Electron 以纯 Node 模式启动，`require('electron')`
   解析到 npm 上那个「返回 exe 路径」的启动器包，第一个用到 `protocol` / `app` 的地方就炸
   （`Cannot read properties of undefined (reading 'registerSchemesAsPrivileged')`）。
   **这不是代码问题**，用 `env -u ELECTRON_RUN_AS_NODE pnpm dev`。
   症状与「漏外置 electron」完全一样，别照着那条去查构建配置。
-- **仍然不要假设皮肤存在**：缺资源时走占位皮肤 + 兜底托盘图标的降级路径，测试不许拿 `resources/pet/<skin>/` 当 fixture（用户皮肤、第三方皮肤都可能缺）。
+- **仍然不要假设托盘图标存在**：`resources/icons/app/` 读不到时走 `fallback-icon.ts` 的
+  内置兜底位图并打一条 warn，**不能让托盘建不出来** —— 退出与「显示悬浮条」只有托盘这一条路（C9）。
+  测试不许拿 `resources/icons/` 下的文件当 fixture。
 
 ## 措辞纪律
 

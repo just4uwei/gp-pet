@@ -29,14 +29,12 @@ export const INVOKE_CHANNELS = [
   'settings:patch',
   'config:export',
   'config:import',
-  'pet:getSkin',
   'pet:setHitRegion',
   'pet:setInteractive',
   'pet:dragBy',
   'pet:dragEnd',
   'pet:contextMenu',
   'pet:setDoNotDisturb',
-  'pet:toggleDoNotDisturb',
   'panel:toggle',
 ] as const satisfies readonly (keyof IpcInvokeMap)[]
 

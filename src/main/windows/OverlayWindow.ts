@@ -7,47 +7,37 @@
  *   skipTaskbar: true       → C3 不出现在任务栏与 Alt-Tab
  *   show: false + showInactive() → 首次出现也不得夺取焦点
  *
- * **两种形态共用这一个类**（2026-08-13）：出厂默认是「悬浮条」（`BAR`），
- * 桌宠（`PET`）退为可切换形态。形态之间**只差窗口尺寸与渲染入口** ——
- * 上面那四条以及拖拽增量、边缘吸附、多屏校验全部与「窗口里画什么」无关，
- * 所以换形态不需要重新实现、也不需要重新论证零干扰契约。
+ * **只剩悬浮条这一种形态**（2026-08-13 起）：桌宠形态与整套皮肤系统已移除，
+ * 于是这里不再有形态分支，尺寸与渲染入口都是常量。零干扰契约的落点一个没变 ——
+ * 上面那四条以及拖拽增量、边缘吸附、多屏校验本来就与「窗口里画什么」无关。
  *
  * IPC 通道名仍是 `pet:*`（`pet:setInteractive`、`pet:dragBy`…）：改通道名要同步动
- * preload、ipc-types 与两个渲染入口，而没有任何功能收益。**通道名是历史,形态是现状。**
+ * preload、ipc-types 与渲染入口，而没有任何功能收益。**通道名是历史，形态是现状。**
  */
 
 import { BrowserWindow, screen } from 'electron'
-import type { AppearanceForm } from '@shared/ipc-types'
-import { hardenWindow, loadRoute, PRELOAD_PATH, type RendererRoute } from './load-route'
+import { hardenWindow, loadRoute, PRELOAD_PATH } from './load-route'
 import { bottomRightOf, ensureVisible, snapToEdge, type Bounds } from '../util/geometry'
 
 /**
- * 各形态的窗口尺寸。
+ * 悬浮条的窗口尺寸。**窗口即本体**：没有留白，于是 C2 只剩四个圆角需要穿透
+ * （见渲染层上报的命中区）。
  *
- * `PET` 的 220 比皮肤 canvas（200）大一圈，给道具与跃起留余量（docs/09 §2.2）。
- * `BAR` 则是**窗口即本体**：没有留白，于是 C2 只剩四个圆角需要穿透（见渲染层上报的命中区）。
- *
- * `BAR` 的 300 是量出来的，不是拍的：一条要同时放下
+ * 300 是量出来的，不是拍的：一条要同时放下
  * 「状态点 + 名称 + 价格 + 涨跌 + 方向标注 + 信号条数」，240 会把最右边的方向标注裁掉半个字
  * —— 而在「减少动态效果」的系统上跑马灯不滚，那半个字就是**永久**裁掉的（2026-08-13 实测）。
  */
-export const OVERLAY_SIZE: Record<AppearanceForm, { width: number; height: number }> = {
-  PET: { width: 220, height: 220 },
-  BAR: { width: 300, height: 38 },
-}
-
-const ROUTE: Record<AppearanceForm, RendererRoute> = { PET: 'pet', BAR: 'bar' }
+export const OVERLAY_SIZE = { width: 300, height: 38 }
 
 export class OverlayWindow {
   private readonly win: BrowserWindow
   /** 当前是否关闭了点击穿透。缓存一份避免每次 mousemove 都跨进程重复设置 */
   private interactive = false
-  /** 形态的标称尺寸（DIP）。每次移动都按它把宽高重申一遍，见 `moveTo` */
-  private readonly size: { width: number; height: number }
+  /** 标称尺寸（DIP）。每次移动都按它把宽高重申一遍，见 `moveTo` */
+  private readonly size = OVERLAY_SIZE
 
-  constructor(readonly form: AppearanceForm) {
-    const size = OVERLAY_SIZE[form]
-    this.size = size
+  constructor() {
+    const size = this.size
     const primary = screen.getPrimaryDisplay()
     const origin = bottomRightOf(primary.workArea, size)
 
@@ -83,7 +73,7 @@ export class OverlayWindow {
     this.win.setIgnoreMouseEvents(true, { forward: true })
 
     hardenWindow(this.win)
-    loadRoute(this.win, ROUTE[form])
+    loadRoute(this.win, 'bar')
 
     this.win.once('ready-to-show', () => {
       // 必须是 showInactive：show() 会抢焦点，直接违反 C1
@@ -156,7 +146,7 @@ export class OverlayWindow {
     this.dragEnd()
   }
 
-  /** C9：托盘菜单「隐藏」后只保留托盘，功能不减 */
+  /** C9：托盘菜单「隐藏悬浮条」后只保留托盘，功能不减 */
   setVisible(visible: boolean): void {
     if (!this.alive) return
     if (visible) {

@@ -6,8 +6,8 @@ import { shell, type BrowserWindow } from 'electron'
 import { join } from 'node:path'
 import log from 'electron-log/main'
 
-/** `bar` 是出厂默认的悬浮条形态，`pet` 是可切换的桌宠形态（见 OverlayWindow） */
-export type RendererRoute = 'bar' | 'pet' | 'panel' | 'bubble'
+/** `bar` 是常驻悬浮条（唯一形态，见 OverlayWindow），另两个是面板与气泡 */
+export type RendererRoute = 'bar' | 'panel' | 'bubble'
 
 export const PRELOAD_PATH = join(__dirname, '../preload/index.js')
 

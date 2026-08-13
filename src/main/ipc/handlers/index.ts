@@ -88,8 +88,6 @@ export function registerHandlers(controller: AppController): void {
 
   handle('config:import', () => controller.importConfig())
 
-  handle('pet:getSkin', () => controller.currentSkin)
-
   handle('pet:setHitRegion', (_event, rects) => controller.setHitRects(rects))
 
   handle('pet:setInteractive', (_event, interactive) => controller.setOverlayInteractive(interactive))
@@ -99,13 +97,11 @@ export function registerHandlers(controller: AppController): void {
   handle('pet:dragEnd', () => controller.endOverlayDrag())
 
   handle('pet:contextMenu', () => {
-    // 桌宠右键与托盘右键共用同一份菜单（docs/06 §4）
+    // 悬浮条右键与托盘右键共用同一份菜单（docs/06 §4）
     buildContextMenu(controller).popup()
   })
 
   handle('pet:setDoNotDisturb', (_event, until) => controller.setQuietUntil(until))
-
-  handle('pet:toggleDoNotDisturb', () => controller.toggleQuiet())
 
   handle('panel:toggle', () => controller.togglePanel())
 

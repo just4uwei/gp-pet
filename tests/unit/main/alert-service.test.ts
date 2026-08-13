@@ -5,8 +5,8 @@
  *   - 每一条候选都写 alert_log，包括被丢弃的（docs/05 §4「不制造信息黑洞」）
  *   - 被丢弃的行记的是它**本来**要发的级别，channel 为空
  *   - 一次最多弹一个气泡，且给得分最高的那条
- *   - 系统通知的声音要同时看 `soundEnabled` 与「真的是 L3」（C5 默认无声）
- *   - 被降级成 L1 的仍然点亮表情、仍然进角标，只是不弹不响
+ *   - 气泡是**唯一**的可见渠道（2026-08-13 起托盘角标与系统通知已移除）
+ *   - 被降级成 L1 的仍然点亮状态点、仍然进未读计数，只是不弹气泡
  *   - 落库失败不能把提醒也一起吃掉
  */
 
@@ -64,29 +64,15 @@ function fakeRepo(): { repo: AlertRepo; rows: AlertRow[] } {
   return { repo, rows }
 }
 
-function fakeSink(): { sink: AlertSink; bubbles: AlertPayload[]; notices: { payload: AlertPayload; sound: boolean }[]; flashes: number; unread: number[] } {
+function fakeSink(): { sink: AlertSink; bubbles: AlertPayload[]; unread: number[] } {
   const bubbles: AlertPayload[] = []
-  const notices: { payload: AlertPayload; sound: boolean }[] = []
   const unread: number[] = []
-  let flashes = 0
   const sink: AlertSink = {
     bubble: (payload) => bubbles.push(payload),
-    notify: (payload, sound) => notices.push({ payload, sound }),
-    flash: () => {
-      flashes += 1
-    },
     unread: (count) => unread.push(count),
     petState: () => {},
   }
-  return {
-    sink,
-    bubbles,
-    notices,
-    unread,
-    get flashes() {
-      return flashes
-    },
-  }
+  return { sink, bubbles, unread }
 }
 
 function harness(settings: Partial<AppSettings> = {}) {
@@ -119,7 +105,7 @@ describe('不制造信息黑洞：每一条候选都留一行', () => {
     h.service.handle([outcome()], { at: T0, debounce: false })
     expect(h.rows).toHaveLength(1)
     expect(h.rows[0]?.level).toBe('L3')
-    expect(h.rows[0]?.channels).toEqual(['PET', 'TRAY', 'BUBBLE', 'OS_NOTIFY'])
+    expect(h.rows[0]?.channels).toEqual(['PET', 'BUBBLE'])
     expect(h.rows[0]?.suppressedReason).toBeNull()
   })
 
@@ -158,64 +144,56 @@ describe('渠道执行', () => {
     expect(h.sink.bubbles[0]?.code).toBe('SZ000001')
   })
 
-  it('C5：默认无声', () => {
-    const h = harness()
-    h.service.handle([outcome()], { at: T0, debounce: false })
-    expect(h.sink.notices).toHaveLength(1)
-    expect(h.sink.notices[0]?.sound).toBe(false)
-  })
-
-  it('用户打开声音后 L3 才响', () => {
-    const h = harness({ soundEnabled: true })
-    h.service.handle([outcome()], { at: T0, debounce: false })
-    expect(h.sink.notices[0]?.sound).toBe(true)
-  })
-
-  it('L2 不发系统通知、不闪图标', () => {
+  it('L2 与 L3 的渠道相同 —— 都是状态点 + 气泡，级别的区别在闸门②③上', () => {
     const h = harness()
     h.service.handle([outcome({ evaluation: evaluation({ level: 'L2' }) })], { at: T0, debounce: false })
-    expect(h.sink.notices).toHaveLength(0)
-    expect(h.sink.flashes).toBe(0)
+    expect(h.rows[0]?.channels).toEqual(['PET', 'BUBBLE'])
     expect(h.sink.bubbles).toHaveLength(1)
   })
 
-  it('同一轮多条 L3 只闪一次图标 —— 闪六次不会让人更看得见', () => {
+  /**
+   * 这条钉的是「气泡是唯一的可见渠道」：同一轮里两条都发出去了，
+   * 但只有得分最高的那条弹了气泡，另一条**没有任何别的出口**（旧版本会走系统通知）。
+   * 它变红意味着有人给 AlertSink 加了第二个可见渠道 —— 那要先过 docs/05 §3。
+   */
+  it('同一轮两条都发出，可见的仍然只有一个气泡', () => {
     const h = harness()
     h.service.handle(
       [
-        outcome({ evaluation: evaluation({ code: 'SH600000' as SecCode }), signalId: 'a' }),
-        outcome({ evaluation: evaluation({ code: 'SZ000001' as SecCode }), signalId: 'b' }),
+        outcome({ evaluation: evaluation({ code: 'SH600000' as SecCode, score: 0.7 }), signalId: 'a' }),
+        outcome({ evaluation: evaluation({ code: 'SZ000001' as SecCode, score: 0.9 }), signalId: 'b' }),
       ],
       { at: T0, debounce: false }
     )
-    expect(h.sink.notices).toHaveLength(2)
-    expect(h.sink.flashes).toBe(1)
+    expect(h.rows).toHaveLength(2)
+    expect(h.rows.every((row) => row.channels.length > 0)).toBe(true)
+    expect(h.sink.bubbles).toHaveLength(1)
+    expect(h.sink.bubbles[0]?.code).toBe('SZ000001')
   })
 })
 
 describe('免打扰下的降级（闸门④）', () => {
-  it('降为 L1：不弹不响，但仍写库、仍进角标，且原因写明', () => {
+  it('降为 L1：不弹气泡，但仍写库、仍进未读计数，且原因写明', () => {
     const h = harness()
     h.setQuiet({ quiet: true, reason: '演示模式' })
     const summary = h.service.handle([outcome()], { at: T0, debounce: false })
 
     expect(summary.delivered).toBe(1)
     expect(h.sink.bubbles).toHaveLength(0)
-    expect(h.sink.notices).toHaveLength(0)
     expect(h.rows[0]?.level).toBe('L1')
-    expect(h.rows[0]?.channels).toEqual(['PET', 'TRAY'])
+    expect(h.rows[0]?.channels).toEqual(['PET'])
     expect(h.rows[0]?.suppressedReason).toContain('演示模式')
   })
 })
 
-describe('桌宠状态只由实际发出的提醒驱动', () => {
-  it('发出去了就点亮表情', () => {
+describe('状态点只由实际发出的提醒驱动', () => {
+  it('发出去了就点亮高优先级状态', () => {
     const h = harness()
     h.service.handle([outcome()], { at: T0, debounce: false })
     expect(h.service.pet.resolve('IDLE', T0)).toBe('EXCITED')
   })
 
-  it('被闸门挡下时只到 WATCHING，不点亮表情', () => {
+  it('被闸门挡下时只到 WATCHING，不点亮高优先级状态', () => {
     const h = harness()
     h.service.handle([outcome()], { at: T0, debounce: false })
     h.service.handle([outcome()], { at: T0 + 60_000, debounce: false })
@@ -245,7 +223,7 @@ describe('落库失败不能把提醒一起吃掉', () => {
 
     const summary = service.handle([outcome()], { at: T0, debounce: false })
     expect(summary.delivered).toBe(1)
-    expect(sink.notices).toHaveLength(1)
+    expect(sink.bubbles).toHaveLength(1)
     expect(warn).toHaveBeenCalled()
   })
 })

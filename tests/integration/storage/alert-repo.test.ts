@@ -61,7 +61,7 @@ function alert(id: string, overrides: Partial<AlertRow> = {}): AlertRow {
     id,
     signalId: 'sig-1',
     level: 'L2',
-    channels: ['PET', 'TRAY', 'BUBBLE'],
+    channels: ['PET', 'BUBBLE'],
     suppressedReason: null,
     readAt: null,
     createdAt: T0,
@@ -76,7 +76,7 @@ describe('AlertRepo', () => {
     storage.alerts.insert(alert('a1'))
     storage.alerts.insert(alert('a2', { channels: [], suppressedReason: '同键冷却：还有 90 分钟' }))
 
-    expect(storage.alerts.get('a1')?.channels).toEqual(['PET', 'TRAY', 'BUBBLE'])
+    expect(storage.alerts.get('a1')?.channels).toEqual(['PET', 'BUBBLE'])
     expect(storage.alerts.get('a2')?.channels).toEqual([])
     expect(storage.alerts.get('a2')?.suppressedReason).toContain('冷却')
     storage.close()
@@ -88,7 +88,7 @@ describe('AlertRepo', () => {
     storage.alerts.insertMany([
       alert('a1'),
       alert('a2', { channels: [], suppressedReason: '防抖' }),
-      alert('a3', { channels: ['PET', 'TRAY'] }),
+      alert('a3', { channels: ['PET'] }),
     ])
 
     expect(storage.alerts.unreadCount()).toBe(2)

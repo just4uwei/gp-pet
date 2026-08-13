@@ -50,6 +50,13 @@ export interface SignalEvidence {
   indicatorsAt: Record<string, number | null>
 }
 
+/**
+ * 悬浮条左端那颗**状态点**的语义（docs/06 §3）。
+ *
+ * 名字里的 `Pet` 是历史（本项目起初是桌宠形态）—— 桌宠已移除，判定者仍是
+ * `PetStateMachine`，而它只接受**过了四道闸门**的提醒。渲染层不许自己从
+ * `signal:history` 推断这个值：那是一条绕过冷却与免打扰的旁路。
+ */
 export type PetState = 'SLEEPY' | 'IDLE' | 'WATCHING' | 'EXCITED' | 'ALERT' | 'OFFLINE'
 
 /** 气泡与系统通知的展示载荷。四段结构见 docs/05 §5 */
@@ -68,8 +75,15 @@ export interface AlertPayload {
   at: number
 }
 
-/** 分发渠道。与 `src/main/alerts/dispatcher.ts` 的 `AlertChannel` 同一集合 */
-export type AlertChannelName = 'PET' | 'TRAY' | 'BUBBLE' | 'OS_NOTIFY'
+/**
+ * 分发渠道。与 `src/main/alerts/dispatcher.ts` 的 `AlertChannel` 同一集合。
+ *
+ * 只剩两个（2026-08-13）：`PET` 是悬浮条上的状态点（名字是历史，见 PetState），
+ * `BUBBLE` 是气泡。托盘角标（`TRAY`）与系统通知（`OS_NOTIFY`）已移除 ——
+ * 提醒的唯一可见出口是气泡。**历史库里仍有带这两个值的行**，
+ * 提醒日志按原样显示即可（见 storage/repositories/alert.ts）。
+ */
+export type AlertChannelName = 'PET' | 'BUBBLE'
 
 /**
  * 提醒日志的一行（docs/05 §6）。
@@ -155,51 +169,6 @@ export interface Rect {
   h: number
 }
 
-// ─────────────────────────── 皮肤（见 docs/06 §5、docs/09） ───────────────────────────
-
-/** 九个动画 key 是跨皮肤契约，缺一即整套皮肤作废（docs/09 §1.2） */
-export const PET_ANIMATION_KEYS = [
-  'idle',
-  'blink',
-  'look',
-  'watching',
-  'excited',
-  'alert',
-  'sleepy',
-  'offline',
-  'shush',
-] as const
-
-export type PetAnimationKey = (typeof PET_ANIMATION_KEYS)[number]
-
-export interface PetAnimation {
-  sheet: string
-  frames: number
-  fps: number
-  loop: boolean
-  minHold?: number
-  /** 主进程解析出的可加载 URL（res:// 协议）；图集缺失时为 null，渲染层退化为占位形状 */
-  url: string | null
-  /** @2x 图集（docs/09 §2.1）。缺失时为 null，渲染层退回 @1x 而不是请求一个 404 */
-  url2x: string | null
-}
-
-/** 主进程投影给渲染层的皮肤视图 —— 渲染层不碰文件系统 */
-export interface PetSkinView {
-  /** 目录名，等于 AppSettings.skin */
-  id: string
-  name: string
-  canvas: { width: number; height: number }
-  anchor: { bubbleX: number; bubbleY: number }
-  /** 矩形命中区（docs/06 §2.2 方案 1），坐标相对 canvas 左上角 */
-  hitRects: Rect[]
-  states: Record<PetAnimationKey, PetAnimation>
-  /** true 表示皮肤校验失败已回退到内置占位皮肤。按 docs/06 §5：面板提示，不弹窗 */
-  fallback: boolean
-  /** 校验失败原因，供面板展示 */
-  fallbackReason?: string
-}
-
 // ─────────────────────────── 通道契约 ───────────────────────────
 
 /** 请求-响应：渲染层 → 主进程 */
@@ -230,10 +199,9 @@ export interface IpcInvokeMap {
   'config:import': () => ConfigTransferResult
   'app:providerHealth': () => ProviderHealth[]
   'app:engineStatus': () => EngineStatus
-  'pet:getSkin': () => PetSkinView
   'pet:setHitRegion': (rects: Rect[]) => void
   /**
-   * 渲染层完成命中判定后上报：鼠标是否落在桌宠本体上。
+   * 渲染层完成命中判定后上报：鼠标是否落在悬浮条本体上。
    * true → 主进程关掉点击穿透；false → 恢复穿透（见 docs/06 §2.2）。
    */
   'pet:setInteractive': (interactive: boolean) => void
@@ -244,8 +212,6 @@ export interface IpcInvokeMap {
   /** 右键唤起上下文菜单（与托盘菜单同一份，见 docs/06 §4） */
   'pet:contextMenu': () => void
   'pet:setDoNotDisturb': (until: number | null) => void
-  /** 双击桌宠切换免打扰（C8），返回切换后的截止时间 */
-  'pet:toggleDoNotDisturb': () => number | null
   'panel:toggle': () => void
 }
 
@@ -272,27 +238,20 @@ export interface GpBridge {
 // ─────────────────────────── 设置 ───────────────────────────
 
 /**
- * 常驻悬浮窗口的形态（docs/06 §2.1）。
+ * 常驻悬浮窗口只有一种形态：**悬浮条**（300×38，配托盘）。
  *
- * `BAR` 是出厂默认：一条 300×38 的轻量悬浮条，配托盘。
- * `PET` 是桌宠形态，需要皮肤资源（缺资源会回退到占位皮肤）。
- * 两者共用同一个窗口类与同一套零干扰机制，只差尺寸与渲染入口。
+ * 2026-08-13 起桌宠形态与整套皮肤系统已移除，`appearance` / `skin` / `minimalMode`
+ * 三个字段随之删掉 —— 旧 settings.json 里残留的这几个键会被 `sanitizeSettings` 忽略
+ * （它只认 schema 里有的键），不需要迁移。
  */
-export type AppearanceForm = 'BAR' | 'PET'
-
 export interface AppSettings {
-  /** 出厂 'BAR'。改这个值会重建悬浮窗口（位置回到右下角） */
-  appearance: AppearanceForm
   pollIntervalSec: number
   sensitivity: 'SENSITIVE' | 'BALANCED' | 'CONSERVATIVE'
   alertLevelOffset: -1 | 0 | 1
-  soundEnabled: boolean
   quietHours: { start: string; end: string }[]
   respectFullscreen: boolean
   /** 与 src/main/providers/types.ts 的 ProviderId 同集合（同一 union，跨层不引用） */
   providerPriority: ('eastmoney' | 'sina' | 'tencent')[]
   autoLaunch: boolean
-  skin: string
-  minimalMode: boolean
   dataDir?: string
 }

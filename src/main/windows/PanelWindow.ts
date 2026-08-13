@@ -3,7 +3,7 @@
  *
  * 正常窗口：有边框、可聚焦、出现在任务栏。它是「主动查看」的场所，
  * 不受零干扰契约约束 —— 需要键盘输入的场景（搜股票、改设置）都放在这里，
- * 这样 Pet 窗口才敢一直保持 focusable: false。
+ * 这样悬浮条窗口才敢一直保持 focusable: false。
  *
  * 懒加载：首次打开才创建；关闭时 hide() 而非 destroy()，避免反复重建 React 应用。
  */
@@ -18,12 +18,12 @@ import { enableDevShortcuts, hardenWindow, loadRoute, PRELOAD_PATH } from './loa
  *
  * 不设它，开发期任务栏显示的是 **Electron 的原子徽标** —— 打包后 electron-builder 会把
  * exe 图标塞进去，所以这个问题只在 dev 里暴露，很容易被当成「反正打包就好了」而留着。
- * 取 `icons/default/`（不跟皮肤走）：托盘图标按皮肤换是 docs/09 §6.2 的规定，
- * 但任务栏图标是**应用身份**，跟着皮肤变只会让用户在 Alt-Tab 里找不到自己的窗口。
- * 缺图返回 undefined，交给 Electron 的默认行为，不为了图标让窗口建不出来。
+ * 路径 `icons/app/` 与托盘图标同一个目录（`TrayController` 也写死这个常量）。
+ * 缺图返回 undefined，交给 Electron 的默认行为，不为了图标让窗口建不出来 ——
+ * 面板是常规窗口，图标不对最多难看，不像托盘那样会切断唯一的逃生通道。
  */
 function appIcon(): Electron.NativeImage | undefined {
-  const image = nativeImage.createFromPath(join(resourcesRoot(), 'icons', 'default', 'icon.png'))
+  const image = nativeImage.createFromPath(join(resourcesRoot(), 'icons', 'app', 'icon.png'))
   return image.isEmpty() ? undefined : image
 }
 

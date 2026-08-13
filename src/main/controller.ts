@@ -1,29 +1,25 @@
 /**
- * 应用编排：把窗口、托盘、皮肤、免打扰状态、数据层与**提醒分发**串起来（docs/02 §2）。
+ * 应用编排：把窗口、托盘、免打扰状态、数据层与**提醒分发**串起来（docs/02 §2）。
  *
- * 常驻悬浮窗口有两种形态（`AppSettings.appearance`，出厂 `BAR` 悬浮条）。
- * 下面的 `*Overlay*` 方法对两种形态一视同仁；IPC 通道名仍是 `pet:*`（见 OverlayWindow 头注释）。
+ * 常驻悬浮窗口只有一种形态：悬浮条。IPC 通道名仍是 `pet:*`（见 OverlayWindow 头注释）。
  *
  * ## M3 起，信号有了第二个出口
  *
- * M2 时信号的唯一出口是面板列表，桌宠状态只由「免打扰 / 是否开市 / 数据源是否全挂」决定。
+ * M2 时信号的唯一出口是面板列表，状态点只由「免打扰 / 是否开市 / 数据源是否全挂」决定。
  * 现在 `onSignals()` 会把评估结果交给 `AlertService` —— 四道闸门（防抖 / 冷却 / 频率上限 /
- * 免打扰）之后才轮到气泡、通知、角标与表情。**闸门仍然是唯一的点亮路径**：
- * 这里不允许出现「顺手把表情点亮一下」的旁路，那等于绕过闸门直接骚扰用户。
+ * 免打扰）之后才轮到气泡与状态点。**闸门仍然是唯一的点亮路径**：
+ * 这里不允许出现「顺手把状态点点亮一下」的旁路，那等于绕过闸门直接骚扰用户。
  *
  * 免打扰在这一层聚合（`quietVerdict()`）：手动截止时间 + 静默时段 + 锁屏 + 系统态探测。
  * 判定本身是纯函数（alerts/dnd.ts），这里只负责把四个输入凑齐。
  */
 
 import { app, powerMonitor } from 'electron'
-import { join } from 'node:path'
 import type {
   AlertRecord,
-  AppearanceForm,
   AppSettings,
   ConfigTransferResult,
   EngineStatus,
-  PetSkinView,
   PetState,
   PositionView,
   ProviderHealth,
@@ -37,11 +33,9 @@ import { createAlertService, type AlertService, type AlertSink } from './alerts/
 import type { QuoteView } from './alerts/candidates'
 import { resolveQuiet, type QuietVerdict } from './alerts/dnd'
 import { createNotificationStateProbe, type NotificationStateProbe } from './alerts/notification-state'
-import { showAlertNotification } from './alerts/notify'
 import type { DataLayer } from './data-layer'
 import type { SignalOutcome } from './engine'
 import { log } from './logging'
-import { resourcesRoot, resUrl } from './resources'
 import type { TickContext } from './scheduler'
 import type { WatchEntry } from './storage/repositories/watchlist'
 import { DEFAULT_SETTINGS } from './settings/schema'
@@ -60,18 +54,8 @@ import {
   readJsonFile,
   writeTextFile,
 } from './settings/transfer-io'
-import { loadSkin, type SkinSource } from './skin/loader'
 import { isQuiet, quietUntil, type QuietPreset } from './util/quiet'
 import { WindowManager } from './windows/WindowManager'
-
-/**
- * 出厂皮肤目录名。真正的取值来自 AppSettings.skin，而 SettingsStore 属 M1 —— 在此之前用常量。
- *
- * 美术资源是外包件，不在仓库里手搓（CLAUDE.md）—— 所以 resources/pet/default/ 眼下是空目录，
- * 启动会一路回退到内置占位皮肤。这条回退路径是常态而非异常，必须保持可用。
- * 交付方把 28 个文件（docs/09 §8）放进 resources/pet/default/ 即可自动生效，不需要改代码。
- */
-const DEFAULT_SKIN_ID = 'default'
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -94,7 +78,6 @@ function toConfigWatchEntry(entry: WatchEntry): ConfigWatchEntry {
 
 export class AppController {
   private readonly windows = new WindowManager()
-  private skin: PetSkinView
   private quietUntilAt: number | null = null
   /** 渲染层上报的命中区，仅用于诊断；真正的判定在渲染层完成（docs/06 §2.2） */
   private reportedHitRects: Rect[] = []
@@ -106,11 +89,10 @@ export class AppController {
   /** 锁屏 / 会话断开（docs/05 §4.4）。powerMonitor 是事件式的，这里只存最后一次结论 */
   private screenLocked = false
   private unread = 0
-  /** 桌宠高优先级状态的回落定时器（最短驻留 3s，而 tick 每 30s 才来一次） */
+  /** 状态点高优先级状态的回落定时器（最短驻留 3s，而 tick 每 30s 才来一次） */
   private petFallbackTimer: NodeJS.Timeout | null = null
 
   constructor() {
-    this.skin = this.loadSkin(DEFAULT_SKIN_ID)
     this.probe = createNotificationStateProbe({ log })
     powerMonitor.on('lock-screen', () => this.setScreenLocked(true))
     powerMonitor.on('unlock-screen', () => this.setScreenLocked(false))
@@ -124,13 +106,10 @@ export class AppController {
 
   /**
    * 接入数据层。装配是异步的（要开库、要初始化 undici），所以不放构造函数里
-   * —— 窗口与托盘必须先起来：数据层装配失败时用户至少还能看到桌宠和托盘菜单。
+   * —— 窗口与托盘必须先起来：数据层装配失败时用户至少还能看到悬浮条和托盘菜单。
    */
   attachDataLayer(layer: DataLayer): void {
     this.data = layer
-    // 皮肤取值这时才有设置可依（此前用常量），换皮肤要重载一次
-    const skinId = layer.settings.get().skin
-    if (skinId && skinId !== this.skin.id) this.skin = this.loadSkin(skinId)
 
     this.alerts = createAlertService({
       repo: layer.storage.alerts,
@@ -148,14 +127,6 @@ export class AppController {
   private alertSink(): AlertSink {
     return {
       bubble: (payload) => this.windows.showBubble(payload),
-      notify: (payload, sound) =>
-        void showAlertNotification(payload, {
-          sound,
-          // 点通知只打开面板 —— 本产品不下单，通知里不该有看起来可执行的动作
-          onClick: () => this.showPanel(),
-          log,
-        }),
-      flash: () => this.onFlash?.(),
       unread: (count) => {
         this.unread = count
         this.onChange?.()
@@ -168,10 +139,10 @@ export class AppController {
   }
 
   /**
-   * 高优先级表情的回落重推。
+   * 高优先级状态的回落重推。
    *
    * 状态机是时间驱动的（3s 最短驻留），而 tick 每 30s 才来一次 —— 不补这一下，
-   * 一个 3s 的动画会挂满半分钟，看起来像卡住了。
+   * 一个 3s 的状态会挂满半分钟，看起来像卡住了。
    */
   private schedulePetFallback(at: number | null): void {
     if (this.petFallbackTimer) {
@@ -188,7 +159,7 @@ export class AppController {
     }, delay)
   }
 
-  /** 气泡与通知里的现价/涨跌用最新快照，拿不到就由 candidates.ts 退回 K 线收盘价 */
+  /** 气泡里的现价/涨跌用最新快照，拿不到就由 candidates.ts 退回 K 线收盘价 */
   private quoteViews(): ReadonlyMap<SecCode, QuoteView> {
     const map = new Map<SecCode, QuoteView>()
     for (const tick of this.data?.quoteTicks() ?? []) {
@@ -250,19 +221,8 @@ export class AppController {
 
   patchSettings(patch: Partial<AppSettings>): AppSettings {
     const layer = this.requireData()
-    const previous = layer.settings.get()
     const next = layer.settings.patch(patch)
     layer.applySettings(next)
-    if (next.appearance !== previous.appearance) {
-      // 形态变了要重建窗口。放在 applySettings 之后：新窗口 ready-to-show 时
-      // 渲染层会立刻来问一轮状态，这时设置必须已经生效
-      this.windows.setOverlayForm(next.appearance)
-    }
-    if (next.skin !== this.skin.id) {
-      this.skin = this.loadSkin(next.skin)
-      // 皮肤换了要让渲染层重取：pet:getSkin 是 invoke，只能靠状态推送触发它再问一次
-      this.windows.push('push:petState', this.petState)
-    }
     this.onStateChanged()
     return next
   }
@@ -336,7 +296,7 @@ export class AppController {
           positions: layer.storage.positions,
         })
       )
-      // 设置走 patchSettings 而不是直接写 store：换形态要重建窗口、换皮肤要重载资源
+      // 设置走 patchSettings 而不是直接写 store：轮询间隔、灵敏度等要立刻作用到数据层
       this.patchSettings(bundle.settings)
       // 新导入的自选一根日线都没有，立刻补一轮，别让用户对着一屏「—」等 30 秒
       void this.refreshData()
@@ -427,9 +387,6 @@ export class AppController {
     return this.unread
   }
 
-  /** 托盘图标闪烁（L3 到达）。由 main/index.ts 接到 TrayController 上 */
-  onFlash: (() => void) | null = null
-
   private requireData(): DataLayer {
     if (!this.data) throw new Error('数据层尚未就绪，请稍后重试')
     return this.data
@@ -439,25 +396,11 @@ export class AppController {
     // 数据层没起来时不该让设置面板整个报错，返回默认值先把界面画出来。
     // 但**不允许**写入 —— patchSettings 走 requireData() 会明确抛错，
     // 免得用户改了设置以为存下了
-    return { ...DEFAULT_SETTINGS, skin: this.skin.id }
-  }
-
-  private loadSkin(id: string): PetSkinView {
-    // M4 再加入用户皮肤源（%APPDATA%/gp-pet/skins，同名覆盖内置，见 docs/06 §5）。
-    // 那需要给 res:// 增加第二个 host，因为用户目录不在 resources/ 内。
-    const sources: SkinSource[] = [
-      { dir: join(resourcesRoot(), 'pet', id), urlBase: resUrl(`pet/${id}`) },
-    ]
-    // 校验失败只写日志 + 面板提示，不弹窗（docs/06 §5）
-    return loadSkin(id, sources, (reason) => log.warn('[skin]', reason))
-  }
-
-  get currentSkin(): PetSkinView {
-    return this.skin
+    return { ...DEFAULT_SETTINGS }
   }
 
   start(): void {
-    this.windows.createOverlay(this.getSettings().appearance)
+    this.windows.createOverlay()
     this.pushPetState()
   }
 
@@ -471,21 +414,11 @@ export class AppController {
     this.windows.panelWindow.show()
   }
 
-  /** 当前形态（悬浮条 / 桌宠）。托盘菜单据此改写标签 */
-  get appearance(): AppearanceForm {
-    return this.windows.overlayWindow?.form ?? this.getSettings().appearance
-  }
-
-  setAppearance(form: AppearanceForm): void {
-    // 走 patchSettings 而不是直接 setOverlayForm：形态要落盘，否则重启就回去了
-    this.patchSettings({ appearance: form })
-  }
-
   get overlayVisible(): boolean {
     return this.windows.overlayWindow?.isVisible() ?? false
   }
 
-  /** C9：隐藏悬浮窗口后只保留托盘，功能不减 */
+  /** C9：隐藏悬浮条后只保留托盘，功能不减 */
   setOverlayVisible(visible: boolean): void {
     this.windows.overlayWindow?.setVisible(visible)
     this.onStateChanged()
@@ -533,7 +466,7 @@ export class AppController {
     })
   }
 
-  /** 任一来源成立即为真。托盘图标、桌宠低调态、面板横幅都看这个 */
+  /** 任一来源成立即为真。托盘图标、状态点低调态、面板横幅都看这个 */
   get quiet(): boolean {
     return this.quietVerdict().quiet
   }
@@ -554,17 +487,6 @@ export class AppController {
 
   setQuietPreset(preset: QuietPreset): void {
     this.setQuietUntil(quietUntil(Date.now(), preset))
-  }
-
-  /**
-   * C8：双击桌宠一键静默/解除。
-   *
-   * 判据是 `manualQuiet` 而不是聚合的 `quiet`：正处在静默时段或全屏应用里时，
-   * 聚合值为真，用聚合值判会让双击变成「解除一个我没开过的开关」—— 点了没反应。
-   */
-  toggleQuiet(): number | null {
-    this.setQuietUntil(this.manualQuiet ? null : quietUntil(Date.now(), 'untilClose'))
-    return this.quietUntilAt
   }
 
   // ── 状态推送 ──────────────────────────────────────────────────────

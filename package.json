@@ -2,7 +2,7 @@
   "name": "gp-pet",
   "version": "0.0.0",
   "private": true,
-  "description": "桌宠形态的 A 股量化信号提醒工具 · 本地存储 · 免登录 · 不下单",
+  "description": "悬浮条形态的 A 股量化信号提醒工具 · 本地存储 · 免登录 · 不下单",
   "main": "./out/main/index.js",
   "author": "",
   "license": "UNLICENSED",
@@ -27,8 +27,6 @@
     "verify:indicators": "node scripts/verify/run.mjs",
     "fixtures:record": "node scripts/record-fixtures.mjs",
     "fetch:history": "node scripts/fetch-history.mjs",
-    "assets:build": "node tools/asset-build/build-skin.mjs",
-    "verify:assets": "node tools/asset-build/verify-assets.mjs",
     "build:universe": "node scripts/build-universe.mjs"
   },
   "dependencies": {

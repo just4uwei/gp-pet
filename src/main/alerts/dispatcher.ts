@@ -9,6 +9,10 @@
  *   ③ 频率上限：单标的每日 L2+L3 ≤ 4；全局每小时 L2+L3 ≤ 6；全局每日 L3 ≤ 10
  *   ④ 免打扰：静默时段 / 全屏 / 专注助手 / 手动免打扰 / 锁屏 → L2/L3 降为 L1
  *
+ * 三个级别的**表现**只剩两档（2026-08-13 起托盘角标与系统通知已移除）：
+ * L1 只改状态点，L2/L3 额外弹一个气泡。但级别本身仍然有区别 ——
+ * 冷却窗口（L1 30min / L2 2h / L3 当日一次）与频率上限都是按级别算的。
+ *
  * ## 三条实现纪律
  *
  * 1. **不读时钟。** `now` 由调用方传入，跨日与跨小时的边界都用它算。理由与 src/core 相同：
@@ -16,21 +20,32 @@
  * 2. **批量而不是逐条。** ③ 里「全局每小时超限时**按得分排序保留最高的**」这条规则
  *    需要同时看到本轮全部候选 —— 逐条 API 做不到（先到的低分信号会占掉配额）。
  *    ① 也需要：本轮没出现的键要清零，只有拿到全量才知道谁没出现。
- * 3. **闸门③④是降级，①②是丢弃。** 降级的仍然会发（变成 L1 进面板与角标），
+ * 3. **闸门③④是降级，①②是丢弃。** 降级的仍然会发（变成 L1 进面板与未读计数），
  *    丢弃的只写 `alert_log.suppressed_reason`。**两者都不能悄悄消失** ——
  *    docs/05 §4 的原话是「不制造信息黑洞」，用户要能在面板里看到「今日被静默的 N 条」。
  */
 
 import type { AlertLevel, GatedDirection, SecCode } from '@core/types'
 
-/** 分发渠道，与 `alert_log.channel` 的取值一致 */
-export type AlertChannel = 'PET' | 'TRAY' | 'BUBBLE' | 'OS_NOTIFY'
+/**
+ * 分发渠道，与 `alert_log.channel` 的取值一致。
+ *
+ * `PET` 是悬浮条上的状态点（名字是历史，见 `PetState`），`BUBBLE` 是气泡。
+ * `TRAY`（托盘角标 + 图标闪烁）与 `OS_NOTIFY`（系统通知）已移除 —— 历史库里
+ * 仍有带这两个值的行，只读不再产出。
+ */
+export type AlertChannel = 'PET' | 'BUBBLE'
 
-/** 各级别对应的渠道（docs/05 §3）。高级别包含低级别的表现 */
+/**
+ * 各级别对应的渠道（docs/05 §3）。高级别包含低级别的表现。
+ *
+ * L2 与 L3 现在**渠道相同**（都是状态点 + 气泡）—— 区别落在闸门②③上：
+ * L3 当日只发一次、且受全局每日 L3 上限约束。别因为这两行长得一样就把级别合并掉。
+ */
 export const CHANNELS_BY_LEVEL: Record<AlertLevel, readonly AlertChannel[]> = {
-  L1: ['PET', 'TRAY'],
-  L2: ['PET', 'TRAY', 'BUBBLE'],
-  L3: ['PET', 'TRAY', 'BUBBLE', 'OS_NOTIFY'],
+  L1: ['PET'],
+  L2: ['PET', 'BUBBLE'],
+  L3: ['PET', 'BUBBLE'],
 }
 
 export interface AlertCandidate {
@@ -176,7 +191,7 @@ export class AlertDispatcher {
       let level = candidate.level
       const reasons: string[] = []
 
-      // ④ 免打扰：L2/L3 一律降为 L1，累积到托盘
+      // ④ 免打扰：L2/L3 一律降为 L1（不弹气泡，只改状态点 + 进未读计数）
       if (ctx.quiet && level !== 'L1') {
         reasons.push(`免打扰${ctx.quietReason ? `（${ctx.quietReason}）` : ''}，降为 L1`)
         level = 'L1'
