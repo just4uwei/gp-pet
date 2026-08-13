@@ -14,7 +14,7 @@
     "dev": "electron-vite dev",
     "build": "pnpm typecheck && electron-vite build",
     "preview": "electron-vite preview",
-    "package": "pnpm build && electron-builder --win --config electron-builder.yml",
+    "package": "pnpm build && node scripts/package.mjs",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
     "lint": "eslint . --max-warnings 0",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"docs/**/*.md\"",

@@ -79,7 +79,7 @@ describe('bottomRightOf', () => {
  */
 describe('anchorAbove', () => {
   const BUBBLE = { width: 300, height: 116 }
-  /** 悬浮条出厂位置：主屏右下角，240×38，留白 24 */
+  /** 一条悬浮条停在主屏右下角、留白 24。宽高是这组用例的固定输入，不必跟 OVERLAY_SIZE 走 */
   const BAR: Bounds = { x: 1656, y: 978, width: 240, height: 38 }
 
   it('贴在上方、右边对齐', () => {

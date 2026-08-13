@@ -117,6 +117,11 @@ body,
   }
 }
 
+/*
+ * 兜底：系统要求减少动态效果时，渲染层根本不会加 .track--scroll（改走「一次一只」的
+ * .lap--step，见 App.tsx 的 usePrefersReducedMotion）。这条留着是为了「万一走到了」——
+ * **但别指望它** ：只关掉动画会让用户永远只看得到第一只，那是这条规则单独存在时的实际后果。
+ */
 @media (prefers-reduced-motion: reduce) {
   .track--scroll {
     animation: none;
@@ -126,6 +131,24 @@ body,
 .lap {
   display: flex;
   align-items: center;
+}
+
+/* 一次只显示一只：不需要条目间距，名称太长就省略号，别被右边框裁掉 */
+.lap--step {
+  width: 100%;
+  min-width: 0;
+}
+
+.lap--step .item {
+  min-width: 0;
+  padding-right: 0;
+}
+
+.lap--step .name {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .item {

@@ -26,10 +26,14 @@ import { bottomRightOf, ensureVisible, snapToEdge, type Bounds } from '../util/g
  *
  * `PET` 的 220 比皮肤 canvas（200）大一圈，给道具与跃起留余量（docs/09 §2.2）。
  * `BAR` 则是**窗口即本体**：没有留白，于是 C2 只剩四个圆角需要穿透（见渲染层上报的命中区）。
+ *
+ * `BAR` 的 300 是量出来的，不是拍的：一条要同时放下
+ * 「状态点 + 名称 + 价格 + 涨跌 + 方向标注 + 信号条数」，240 会把最右边的方向标注裁掉半个字
+ * —— 而在「减少动态效果」的系统上跑马灯不滚，那半个字就是**永久**裁掉的（2026-08-13 实测）。
  */
 export const OVERLAY_SIZE: Record<AppearanceForm, { width: number; height: number }> = {
   PET: { width: 220, height: 220 },
-  BAR: { width: 240, height: 38 },
+  BAR: { width: 300, height: 38 },
 }
 
 const ROUTE: Record<AppearanceForm, RendererRoute> = { PET: 'pet', BAR: 'bar' }
@@ -117,7 +121,7 @@ export class OverlayWindow {
    * Electron 会把当前 bounds 在 DIP 与物理像素之间来回换算，两个方向都按「包住」
    * 取整（ScaleToEnclosingRect）—— 于是一次「只挪位置」的调用也可能把宽高各撑大 1px。
    * 一次拖拽会发出几百次 `dragBy`，条子因此越拖越大；而渲染层挂载时算出的命中区
-   * 还是 240×38，盖不住撑大后的窗口，鼠标压在窗口上却判成穿透，
+   * 还是出厂的 300×38，盖不住撑大后的窗口，鼠标压在窗口上却判成穿透，
    * 表现就是「拖完之后点什么都没反应」。把宽高显式写回常量即可截断这个累积。
    */
   private moveTo(x: number, y: number): void {

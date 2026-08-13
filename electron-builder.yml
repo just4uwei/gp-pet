@@ -1,0 +1,75 @@
+# electron-builder 打包配置（Windows：NSIS 安装包 + 免安装 portable，docs/02 §1）
+#
+# 三条与本项目强相关、改之前先看的：
+#
+# 1. **`npmRebuild: false` 是刻意的。** better-sqlite3 从 v13 起随包发 N-API 预编译产物
+#    （`node_modules/better-sqlite3/prebuilds/win32-x64.node`），N-API 与 ABI 无关，
+#    在 Electron 43 下**不需要 electron-rebuild**（已实测：electron 里 require 得到、能建表能查）。
+#    `pnpm-workspace.yaml` 跳过它的默认构建也是同一个原因。
+#    哪天它换回 NAN，或者换了别的原生模块，这里要改回 true 并准备好 MSVC 工具链。
+# 2. **`.node` 必须从 asar 里解出来**（`asarUnpack`）：asar 里的动态库 dlopen 不了。
+# 3. **`resources/` 要原样进 `process.resourcesPath/resources`**：
+#    `src/main/resources.ts` 的 `resourcesRoot()` 就是这么找皮肤、托盘图标与节假日表的，
+#    路径对不上会走占位皮肤 + 兜底托盘图标的降级路径 —— 能跑，但看起来像资源丢了。
+
+appId: com.gppet.desktop
+productName: GP Pet
+copyright: GP Pet
+
+directories:
+  output: release
+  buildResources: resources/icons/default
+
+# out/ 是 electron-vite 的产物；node_modules 里的 production 依赖由 electron-builder 自行收集
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+
+extraResources:
+  - from: resources
+    to: resources
+
+asar: true
+asarUnpack:
+  - '**/*.node'
+
+# 见文件头第 1 条
+npmRebuild: false
+
+# 直接用 node_modules 里那份**已经解压好**的 Electron（就是 `pnpm dev` 跑的那一份，
+# 版本同样由 package.json 的 electron 决定）。
+#
+# 这不是为了省下载：默认路径是「下载 zip → 解压到 release/win-unpacked.tmp → rename 成
+# release/win-unpacked」，而 Windows 上刚落盘的几百个 exe/dll 会被 Defender 一类的东西
+# 按住句柄，那个 rename 于是**间歇性** EPERM（同一份配置，跑三次成一次）。
+# 指向已解压目录后整条「解压 + rename」都不发生，这个失败模式随之消失。
+electronDist: node_modules/electron/dist
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  icon: resources/icons/default/icon.ico
+  # 没有代码签名证书：安装时 SmartScreen 会拦一次「未知发布者」，属预期
+  artifactName: gp-pet-${version}-${arch}.${ext}
+
+nsis:
+  # 走带界面的安装流程而不是 oneClick：自用工具也该让人看清装到哪、能不能改路径
+  oneClick: false
+  perMachine: false # 每用户安装 → 不弹 UAC
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: GP Pet
+  installerIcon: resources/icons/default/icon.ico
+  uninstallerIcon: resources/icons/default/icon.ico
+  # 卸载时**不**删数据目录：自选、持仓、信号历史都在 %APPDATA%/GP Pet 下，
+  # 静默删掉用户自己录进去的持仓成本是不可逆的
+  deleteAppDataOnUninstall: false
+  artifactName: gp-pet-${version}-setup-${arch}.${ext}
+
+portable:
+  artifactName: gp-pet-${version}-portable-${arch}.${ext}

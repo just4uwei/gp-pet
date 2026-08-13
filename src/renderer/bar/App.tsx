@@ -37,6 +37,8 @@ const CORNER_RADIUS = 8
 const DRAG_SLOP_PX = 4
 /** 跑马灯速度。慢到能读完一只票，快到不必等太久 */
 const SCROLL_PX_PER_SEC = 28
+/** 减少动态效果时改为「一次一只、定时换」，这是换一只的间隔 */
+const STEP_MS = 4500
 
 const DOT_CLASS: Record<PetState, string> = {
   OFFLINE: 'dot--offline',
@@ -109,6 +111,28 @@ function changeClass(value: number): string {
   if (value > 0) return 'change--up'
   if (value < 0) return 'change--down'
   return 'change--flat'
+}
+
+/**
+ * 系统是否要求「减少动态效果」。
+ *
+ * Windows 的「显示动画」关掉（设置 → 辅助功能 → 视觉效果，**远程桌面会话里默认就是关的**）
+ * 会让 Chromium 报 `prefers-reduced-motion: reduce`。这在本项目里不是小事：
+ * 跑马灯一旦不滚，用户**永远只看得到第一只**，而且它还被右边框裁掉一半 ——
+ * 「滚动显示全部自选」这个功能在那台机器上等于不存在（2026-08-13 在打包版上实测到）。
+ * 所以这里不是「关掉动画就完了」，而是换一种不连续运动的表达：**一次显示一只，定时换**。
+ */
+function usePrefersReducedMotion(): boolean {
+  const [reduced, setReduced] = useState(
+    () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  )
+  useEffect(() => {
+    const query = window.matchMedia('(prefers-reduced-motion: reduce)')
+    const onChange = (): void => setReduced(query.matches)
+    query.addEventListener('change', onChange)
+    return () => query.removeEventListener('change', onChange)
+  }, [])
+  return reduced
 }
 
 /**
@@ -314,21 +338,36 @@ export function App(): React.JSX.Element {
    * 内容比可视区宽才滚；装得下就静止 —— 一条常驻置顶的条子，
    * 没必要为了「有动效」而一直动（C7 的精神）。
    */
+  const reducedMotion = usePrefersReducedMotion()
   const viewportRef = useRef<HTMLDivElement | null>(null)
   const lapRef = useRef<HTMLDivElement | null>(null)
   const [scrollSec, setScrollSec] = useState(0)
   useLayoutEffect(() => {
     const lap = lapRef.current
     const view = viewportRef.current
-    if (lap === null || view === null) return
+    if (lap === null || view === null || reducedMotion) return
     // 一份内容的宽度就是滚一圈的距离。量的是第一份，所以「加不加第二份」不会反过来影响测量
     const width = lap.scrollWidth
     const next = width > view.clientWidth ? width / SCROLL_PX_PER_SEC : 0
     setScrollSec((prev) => (Math.abs(prev - next) < 0.05 ? prev : next))
-  }, [entries, hasAdvice, viewport])
+  }, [entries, hasAdvice, reducedMotion, viewport])
 
   // 休市 / 离线 / 免打扰时停下（C7 休市零开销）
   const paused = petState === 'SLEEPY' || petState === 'OFFLINE' || status?.doNotDisturb === true
+
+  /**
+   * 减少动态效果时的轮播：一次一只，到点换下一只。
+   * 免责小字排在最后一张，与滚动模式里它跟在队尾是同一回事。
+   */
+  const cardCount = entries.length + (hasAdvice ? 1 : 0)
+  const [step, setStep] = useState(0)
+  useEffect(() => {
+    if (!reducedMotion || paused || cardCount <= 1) return
+    const timer = window.setInterval(() => setStep((prev) => prev + 1), STEP_MS)
+    return () => window.clearInterval(timer)
+  }, [reducedMotion, paused, cardCount])
+  const stepIndex = cardCount > 0 ? step % cardCount : 0
+  const stepEntry = entries[stepIndex]
 
   return (
     <div
@@ -348,20 +387,31 @@ export function App(): React.JSX.Element {
 
       {entries.length > 0 ? (
         <div className="viewport" ref={viewportRef}>
-          <div
-            className={`track${scrollSec > 0 ? ' track--scroll' : ''}${paused ? ' track--paused' : ''}`}
-            style={scrollSec > 0 ? { animationDuration: `${scrollSec.toFixed(1)}s` } : undefined}
-          >
-            <div className="lap" ref={lapRef}>
-              <Lap entries={entries} disclaimer={hasAdvice} />
+          {reducedMotion ? (
+            // 系统要求减少动态效果：不连续滚动，改成一次一只、定时换（见 usePrefersReducedMotion）
+            <div className="lap lap--step">
+              {stepEntry === undefined ? (
+                <span className="item disclaimer">仅供参考，非投资建议</span>
+              ) : (
+                <Item entry={stepEntry} />
+              )}
             </div>
-            {/* 第二份是为了首尾相接地循环；装得下时不渲染，否则会露在空白处 */}
-            {scrollSec > 0 ? (
-              <div className="lap" aria-hidden>
+          ) : (
+            <div
+              className={`track${scrollSec > 0 ? ' track--scroll' : ''}${paused ? ' track--paused' : ''}`}
+              style={scrollSec > 0 ? { animationDuration: `${scrollSec.toFixed(1)}s` } : undefined}
+            >
+              <div className="lap" ref={lapRef}>
                 <Lap entries={entries} disclaimer={hasAdvice} />
               </div>
-            ) : null}
-          </div>
+              {/* 第二份是为了首尾相接地循环；装得下时不渲染，否则会露在空白处 */}
+              {scrollSec > 0 ? (
+                <div className="lap" aria-hidden>
+                  <Lap entries={entries} disclaimer={hasAdvice} />
+                </div>
+              ) : null}
+            </div>
+          )}
         </div>
       ) : (
         // 还没有报价时不显示任何数字（docs/03：没有报价 ≠ 报价为 0）

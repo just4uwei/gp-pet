@@ -4,6 +4,7 @@
 
 import { shell, type BrowserWindow } from 'electron'
 import { join } from 'node:path'
+import log from 'electron-log/main'
 
 /** `bar` 是出厂默认的悬浮条形态，`pet` 是可切换的桌宠形态（见 OverlayWindow） */
 export type RendererRoute = 'bar' | 'pet' | 'panel' | 'bubble'
@@ -49,7 +50,40 @@ export function enableDevShortcuts(win: BrowserWindow): void {
   })
 }
 
+/**
+ * 渲染层加载失败要留下证据。
+ *
+ * 打包版最典型的坏结局是「主进程日志一切正常、窗口一片空白」：路径错一层、
+ * CSP 把 file:// 下的相对资源拦掉、preload 抛异常 —— 这三件事都不会让主进程报错，
+ * 而悬浮条与气泡**没有开发者工具**（`focusable: false` 收不到键盘，打包版也没挂快捷键），
+ * 于是现场只剩「它就是不显示」。这四个事件是那种情况下唯一的线索，别删。
+ */
+function logLoadFailures(win: BrowserWindow, route: RendererRoute): void {
+  const { webContents } = win
+
+  webContents.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
+    log.error(`[window] ${route} 加载失败 code=${code} ${description} url=${url} main=${isMainFrame}`)
+  })
+
+  webContents.on('preload-error', (_event, preloadPath, error) => {
+    log.error(`[window] ${route} preload 异常 ${preloadPath}`, error)
+  })
+
+  webContents.on('render-process-gone', (_event, details) => {
+    log.error(`[window] ${route} 渲染进程退出 reason=${details.reason} code=${details.exitCode}`)
+  })
+
+  // CSP 拦截、模块加载失败都只体现在渲染层控制台里 —— 只转发 error 级，不做日志噪音
+  webContents.on('console-message', (details) => {
+    if (details.level === 'error') {
+      log.error(`[window] ${route} 控制台错误：${details.message} (${details.sourceId}:${details.lineNumber})`)
+    }
+  })
+}
+
 export function loadRoute(win: BrowserWindow, route: RendererRoute): void {
+  logLoadFailures(win, route)
+
   const devServer = process.env['ELECTRON_RENDERER_URL']
   if (devServer) {
     void win.loadURL(`${devServer}/${route}/index.html`)
