@@ -13,7 +13,8 @@ M4 补齐了**影子运行**（前向模拟绩效，schema v2）、**设置页�
 **数据库周期备份**、**首启免责声明引导**与 **Playwright E2E**（6 条，真启 Electron）。
 **M3 的出口条件（自用一周）与 M4 的三项真机验收都未做** ——
 逐条见 [M3 验收](./docs/checklists/M3-提醒层验收.md) 与 [M4 验收](./docs/checklists/M4-打磨验收.md)。
-M4 剩下的三项是：125%/150% DPI 走查、真跑一次 `pnpm package` 并安装、代码签名（无证书）。
+M4 剩下的是：125%/150% DPI 走查、**装一遍 / 卸一遍**、代码签名（无证书）——
+`pnpm package` 本身已经真跑过，产物能起来且没走回退驱动（见 M4 清单 §5）。
 
 **影子运行是「量策略值不值钱」的那把尺子，它的可信度全靠「真的是前向的」这一条。**
 所以 `src/main/shadow/` 里写死了四条纪律：不补跑历史（补出来的叫回测）、
@@ -281,6 +282,19 @@ src/backtest 回测 CLI，复用 src/core
 - **穿越只在相邻两根间判定一次**，不做「N 日内曾金叉」的模糊匹配；去重是提醒层的职责，不是指标层的。
 - **better-sqlite3 是原生模块**，需在 Electron ABI 下重建（`electron-rebuild`）。`pnpm-workspace.yaml` 里已显式跳过它的默认构建。
 - **主进程/preload 的外置依赖清单在 `electron.vite.config.ts`**，从 `package.json` 的 `dependencies` 派生。别用 `rollupOptions.external` 去覆盖它 —— 漏外置 `electron` 会让 `import { app } from 'electron'` 解析到 npm 上那个「返回 exe 路径」的启动器包，**构建照样成功，启动才炸**。
+- **`electron-builder.yml` 的 `files` 里不许出现正向的 `node_modules/...` 条目。**
+  只要有一条，electron-builder 26 就会**原地改写源码树里的 `package.json`** ——
+  `scripts` 与 `devDependencies` 整块消失，接着 pnpm 按「没有 devDependencies」
+  把开发依赖整批剪掉（`node_modules/electron` 被删），下一次打包报
+  `The specified electronDist does not exist`，**看起来像 electronDist 配错了**。
+  这不是产物被改，是仓库被改。要排除 node_modules 里的东西一律用排除式 glob
+  （`'!node_modules/x/!(keep).node'`）。恢复：`git checkout -- package.json pnpm-lock.yaml`
+  → `pnpm install --frozen-lockfile` → `node node_modules/electron/install.js`
+  （electron 的 `dist/` 要单独解压，`pnpm install` 不会补它）。
+- **`files` 别写 `out/**`。** `out/` 下不只有运行时产物：三个 tsconfig 的 `outDir` 也在那儿
+  （`out/types/*.tsbuildinfo`，约 220 KB，里面记着全部源文件与测试文件的清单）。
+  写成 `out/main/** out/preload/** out/renderer/**` 三条白名单，
+  日后谁再往 `out/` 下加中间产物也不会静默跟着进包。
 - **preload 必须打成 CJS**：安全基线要求 `sandbox: true`，而沙箱化的 preload 不支持 ESM。electron-vite 5 默认输出 ESM，配置里已显式改回。
 - **改完主进程要真启一次**（`pnpm dev`）。typecheck + build 全绿也可能启动即崩 —— 上面两条就是这么发现的。
 - **造 K 线 fixture 时，横盘段的噪音必须没有周期。** 固定错拍的锯齿（旧 `chopCloses`）

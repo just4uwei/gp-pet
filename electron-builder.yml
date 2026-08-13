@@ -20,15 +20,46 @@ directories:
   output: release
   buildResources: resources/icons/app
 
-# out/ 是 electron-vite 的产物；node_modules 里的 production 依赖由 electron-builder 自行收集
+# out/ 是 electron-vite 的产物；node_modules 里的 production 依赖由 electron-builder 自行收集。
+#
+# **逐个列出三个入口目录，不写 `out/**`。** `out/` 下不只有运行时产物：
+# 三个 tsconfig 的 `outDir` 也在那儿（`out/types/*.tsbuildinfo`，约 220 KB），
+# 那是 TypeScript 的增量构建元数据，里面记着**全部源文件与测试文件的清单**。
+# 装到用户机器上毫无用处，而 `out/**` 会把它一起扫进 asar。
+# 写成白名单还有一层好处：日后谁再往 `out/` 下加个中间产物目录，不会静默地跟着进包。
 files:
-  - out/**
+  - out/main/**
+  - out/preload/**
+  - out/renderer/**
   - package.json
   - '!**/*.map'
+  # better-sqlite3 随包发 8 个平台的 N-API 预编译产物（各约 2 MB）。
+  # 本项目只出 win x64，另外 7 个是纯死重量 —— `lib/binding.js` 按
+  # `process.platform`-`process.arch` 拼文件名，运行时只会去找 win32-x64.node。
+  # **改 win.target 的架构时这一行要一起改**，否则会打出一个找不到 .node 的包。
+  #
+  # ⚠ 必须写成**排除式**的 extglob（`!(win32-x64)`），不能写成
+  # 「先排除整个目录，再正向列出 win32-x64.node」那两行 —— 只要 `files` 里出现一条
+  # **正向的 `node_modules/...` 条目**，electron-builder 26 就会走另一条依赖收集路径，
+  # 并把**源码树里的 `package.json` 原地改写**（`scripts` 与 `devDependencies` 整块删掉）。
+  # 那不是打包产物被改，是仓库被改，`git checkout -- package.json` 才能恢复。实测踩过一次。
+  - '!node_modules/better-sqlite3/prebuilds/!(win32-x64).node'
+  # `deps/`（sqlite3.c 合并源码 + gyp 配置，约 10 MB）与 `src/`（C++ 源）只在
+  # **从源码编译**时用得到，而文件头第 1 条说了 `npmRebuild: false`：我们用预编译产物。
+  # 这两条与那一条是配套的 —— 哪天改回 `npmRebuild: true`，这里要一起删。
+  - '!node_modules/better-sqlite3/deps/**'
+  - '!node_modules/better-sqlite3/src/**'
 
+# `resources/` 原样进 `process.resourcesPath/resources`（见文件头第 3 条），
+# 但**两类给开发者看的文件不进**：README 是写给改代码的人的，`.gitkeep` 是占位符。
+# 不排除它们不会出错，只是让用户的安装目录里多两个解释不了的文件。
 extraResources:
   - from: resources
     to: resources
+    filter:
+      - '**/*'
+      - '!**/README.md'
+      - '!**/.gitkeep'
 
 asar: true
 asarUnpack:
