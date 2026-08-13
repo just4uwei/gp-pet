@@ -3,6 +3,9 @@
  *
  * M2：数据层与信号引擎（SignalEngine）已接入，AlertDispatcher 仍未实现。
  *
+ * 常驻悬浮窗口有两种形态（`AppSettings.appearance`，出厂 `BAR` 悬浮条）。
+ * 下面的 `*Overlay*` 方法对两种形态一视同仁；IPC 通道名仍是 `pet:*`（见 OverlayWindow 头注释）。
+ *
  * 因此桌宠状态**仍然**只由「免打扰 / 是否开市 / 数据源是否全挂」决定，不出现 EXCITED / ALERT：
  * 那两态属于提醒分级的表现层，而分级要经过防抖、冷却、频率上限与免打扰探测
  * （docs/05 §4）才算数 —— 那整套是 M3。信号在 M2 的唯一出口是**面板列表**。
@@ -12,6 +15,7 @@
 import { app } from 'electron'
 import { join } from 'node:path'
 import type {
+  AppearanceForm,
   AppSettings,
   EngineStatus,
   PetSkinView,
@@ -107,8 +111,14 @@ export class AppController {
 
   patchSettings(patch: Partial<AppSettings>): AppSettings {
     const layer = this.requireData()
+    const previous = layer.settings.get()
     const next = layer.settings.patch(patch)
     layer.applySettings(next)
+    if (next.appearance !== previous.appearance) {
+      // 形态变了要重建窗口。放在 applySettings 之后：新窗口 ready-to-show 时
+      // 渲染层会立刻来问一轮状态，这时设置必须已经生效
+      this.windows.setOverlayForm(next.appearance)
+    }
     if (next.skin !== this.skin.id) {
       this.skin = this.loadSkin(next.skin)
       // 皮肤换了要让渲染层重取：pet:getSkin 是 invoke，只能靠状态推送触发它再问一次
@@ -191,7 +201,7 @@ export class AppController {
   }
 
   start(): void {
-    this.windows.createPet()
+    this.windows.createOverlay(this.getSettings().appearance)
     this.pushPetState()
   }
 
@@ -205,26 +215,36 @@ export class AppController {
     this.windows.panelWindow.show()
   }
 
-  get petVisible(): boolean {
-    return this.windows.petWindow?.isVisible() ?? false
+  /** 当前形态（悬浮条 / 桌宠）。托盘菜单据此改写标签 */
+  get appearance(): AppearanceForm {
+    return this.windows.overlayWindow?.form ?? this.getSettings().appearance
   }
 
-  /** C9：隐藏桌宠后只保留托盘，功能不减 */
-  setPetVisible(visible: boolean): void {
-    this.windows.petWindow?.setVisible(visible)
+  setAppearance(form: AppearanceForm): void {
+    // 走 patchSettings 而不是直接 setOverlayForm：形态要落盘，否则重启就回去了
+    this.patchSettings({ appearance: form })
+  }
+
+  get overlayVisible(): boolean {
+    return this.windows.overlayWindow?.isVisible() ?? false
+  }
+
+  /** C9：隐藏悬浮窗口后只保留托盘，功能不减 */
+  setOverlayVisible(visible: boolean): void {
+    this.windows.overlayWindow?.setVisible(visible)
     this.onStateChanged()
   }
 
-  setPetInteractive(interactive: boolean): void {
-    this.windows.petWindow?.setInteractive(interactive)
+  setOverlayInteractive(interactive: boolean): void {
+    this.windows.overlayWindow?.setInteractive(interactive)
   }
 
-  dragPetBy(dx: number, dy: number): void {
-    this.windows.petWindow?.dragBy(dx, dy)
+  dragOverlayBy(dx: number, dy: number): void {
+    this.windows.overlayWindow?.dragBy(dx, dy)
   }
 
-  endPetDrag(): void {
-    this.windows.petWindow?.dragEnd()
+  endOverlayDrag(): void {
+    this.windows.overlayWindow?.dragEnd()
   }
 
   setHitRects(rects: Rect[]): void {
@@ -302,8 +322,8 @@ export class AppController {
     this.onChange?.()
   }
 
-  revalidatePetPosition(): void {
-    this.windows.petWindow?.revalidatePosition()
+  revalidateOverlayPosition(): void {
+    this.windows.overlayWindow?.revalidatePosition()
   }
 
   quit(): void {

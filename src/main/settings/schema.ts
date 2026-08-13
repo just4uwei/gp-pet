@@ -13,6 +13,7 @@ import type { AppSettings } from '@shared/ipc-types'
 const TimeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, '时间格式应为 HH:MM')
 
 export const AppSettingsSchema = z.object({
+  appearance: z.enum(['BAR', 'PET']),
   // 10–120s：低于 10s 对免费接口是滥用（docs/03 §2.4）
   pollIntervalSec: z.number().int().min(10).max(120),
   sensitivity: z.enum(['SENSITIVE', 'BALANCED', 'CONSERVATIVE']),
@@ -28,6 +29,9 @@ export const AppSettingsSchema = z.object({
 })
 
 export const DEFAULT_SETTINGS: AppSettings = {
+  // 出厂是悬浮条而不是桌宠（2026-08-13）：默认形态因此不依赖任何美术素材。
+  // 桌宠没有被删，切到 'PET' 即可 —— 判据与理由见 docs/06 §2.1 与 docs/08 决策点 1
+  appearance: 'BAR',
   pollIntervalSec: 30,
   sensitivity: 'BALANCED',
   alertLevelOffset: 0,

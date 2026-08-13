@@ -1,0 +1,157 @@
+{
+  "multiTf": [
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 2,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 5,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 8,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 40,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 50,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 55,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 45,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 65,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 20,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 30,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 15,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 25,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.05,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.2,
+      "falseBreakoutDelta": -0.15
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.05
+    },
+    {
+      "weekCrossLookback": 3,
+      "dayRsiBuyMax": 45,
+      "dayRsiSellMin": 55,
+      "weekAdxConfirm": 25,
+      "weekAdxWeak": 20,
+      "resonanceDelta": 0.1,
+      "falseBreakoutDelta": -0.3
+    }
+  ]
+}

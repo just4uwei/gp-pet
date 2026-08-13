@@ -1,0 +1,164 @@
+{
+  "risk": [
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.05,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.06,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.1,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.12,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.05,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.1,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.14,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.03,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.08,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.12,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.01,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.04,
+      "trailingStopPct": 0.03,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.02,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.05,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    },
+    {
+      "stopLossPct": 0.08,
+      "drawdownReducePct": 0.07,
+      "profitProtectTrigger": 0.05,
+      "profitProtectFallback": 0.02,
+      "trailingStopPct": 0.08,
+      "industryConcentrationCap": 0.2,
+      "newListingMinBars": 60,
+      "lateBuyCutoffMinutes": 320
+    }
+  ]
+}

@@ -17,12 +17,14 @@ import type { BacktestTrade, CodeResult } from './simulate'
 import {
   annualizedReturn,
   averageExposure,
+  groupPositions,
   informationRatio,
   maxDrawdown,
   returnsOf,
   sharpeRatio,
   summarizeTrades,
   type EquityPoint,
+  type PositionStats,
   type TradeStats,
 } from './metrics'
 
@@ -44,6 +46,14 @@ export interface PerformanceBlock {
    */
   exposure: number | null
   trades: TradeStats
+  /**
+   * 建仓级统计（把减仓拆出来的多行归并回一次建仓）。
+   *
+   * **「胜率」要看这个，不要看 `trades.winRate`。** 后者按行算，而回撤减仓会把一次建仓
+   * 拆成两三行 —— 实测出厂参数下按行 33.16%、按建仓 49.3%，差了 16 个百分点。
+   * 用户体验到的是「我按提醒买了一次，最后赚没赚」，那是建仓级（M2 §5.18）。
+   */
+  positions: PositionStats
 }
 
 export interface RegimeAttribution {
@@ -54,6 +64,10 @@ export interface RegimeAttribution {
   totalPnl: number
   /** 处于该状态的判定根数，用于判断样本是否足够 */
   bars: number
+  /** 按建仓市值加权的平均收益。**读这个，不要读 `avgPnlPct`**（见 TradeStats 的注释） */
+  weightedPnlPct: number | null
+  /** 该状态下的建仓级胜率 */
+  positionWinRate: number | null
 }
 
 export interface BacktestReport {
@@ -83,6 +97,8 @@ export interface BacktestReport {
     limitBlocked: number
   }[]
   suppressions: { rule: string; count: number }[]
+  /** 离场规则分布（按次数降序）—— 回答「是策略在卖还是风控在卖」 */
+  exitRules: { rule: string; count: number }[]
   trades: BacktestTrade[]
   equity: EquityPoint[]
   warnings: string[]
@@ -164,6 +180,7 @@ export function performanceOf(equity: readonly EquityPoint[], trades: readonly B
       benchmarkReturns.length > 0 ? informationRatio(strategyReturns, benchmarkReturns) : null,
     exposure: averageExposure(trades, first, equity.length),
     trades: summarizeTrades(trades),
+    positions: groupPositions(trades),
   }
 }
 
@@ -175,12 +192,15 @@ export function attributeByRegime(
   return regimes.map((regime) => {
     const subset = trades.filter((t) => t.regimeAtEntry === regime)
     const stats = summarizeTrades(subset)
+    const positions = groupPositions(subset)
     const bars = results.reduce((sum, r) => sum + (r.regimeBars.get(regime) ?? 0), 0)
     return {
       regime,
       trades: stats.count,
       winRate: stats.winRate,
       avgPnlPct: stats.avgPnlPct,
+      weightedPnlPct: stats.weightedPnlPct,
+      positionWinRate: positions.winRate,
       totalPnl: stats.totalPnl,
       bars,
     }
@@ -204,6 +224,9 @@ export function assembleReport(input: AssembleInput): BacktestReport {
       suppressions.set(rule, (suppressions.get(rule) ?? 0) + count)
     }
   }
+
+  const exitRules = new Map<string, number>()
+  for (const trade of trades) exitRules.set(trade.exitRule, (exitRules.get(trade.exitRule) ?? 0) + 1)
 
   const warnings: string[] = []
   // docs/07 §3 的过拟合红线之一：全样本交易 < 30 笔在统计上无意义
@@ -238,6 +261,9 @@ export function assembleReport(input: AssembleInput): BacktestReport {
       }
     }),
     suppressions: [...suppressions.entries()]
+      .map(([rule, count]) => ({ rule, count }))
+      .sort((a, b) => b.count - a.count),
+    exitRules: [...exitRules.entries()]
       .map(([rule, count]) => ({ rule, count }))
       .sort((a, b) => b.count - a.count),
     trades,
@@ -281,21 +307,38 @@ export function renderReport(report: BacktestReport): string {
   lines.push(`  平均资金占用 ${pct(p.exposure)}（基准为满仓 100%，超额收益须结合本行读）`)
   lines.push(`  夏普 ${num(p.sharpe)}（rf = 0）`)
   lines.push(
-    `  交易 ${p.trades.count} 笔  胜率 ${pct(p.trades.winRate)}  盈亏比 ${num(p.trades.profitFactor)}  平均持仓 ${num(
-      p.trades.avgHoldingBars,
-      1
-    )} 日`
+    `  卖出 ${p.trades.count} 笔  逐笔胜率 ${pct(p.trades.winRate)}  盈亏比 ${num(
+      p.trades.profitFactor
+    )}  平均持仓 ${num(p.trades.avgHoldingBars, 1)} 日`
+  )
+  // 建仓级紧跟着逐笔打：两个「胜率」差十几个百分点，缺了这一行前者一定会被当成用户口径读
+  lines.push(
+    `  建仓 ${p.positions.count} 次  **建仓胜率 ${pct(p.positions.winRate)}**  盈亏比 ${num(
+      p.positions.payoffRatio
+    )}  平均每次 ${num(p.positions.avgPnl, 0)} 元（${pct(p.positions.avgReturn)}）  中途减仓 ${
+      p.positions.reduced
+    } 次`
   )
   lines.push(`  累计成本 ${num(p.trades.totalCosts, 0)} 元  净盈亏 ${num(p.trades.totalPnl, 0)} 元`)
 
   lines.push('')
-  lines.push('【分市场状态归因】（按建仓时的状态）')
+  lines.push('【分市场状态归因】（按建仓时的状态；平均按仓位加权，胜率按建仓）')
   for (const row of report.regimeAttribution) {
     lines.push(
-      `  ${row.regime.padEnd(12)} ${String(row.trades).padStart(4)} 笔  胜率 ${pct(row.winRate).padStart(7)}  平均 ${pct(
-        row.avgPnlPct
-      ).padStart(8)}  判定 ${row.bars} 根`
+      `  ${row.regime.padEnd(12)} ${String(row.trades).padStart(4)} 笔  建仓胜率 ${pct(
+        row.positionWinRate
+      ).padStart(7)}  平均 ${pct(row.weightedPnlPct).padStart(8)}  盈亏 ${num(row.totalPnl, 0).padStart(
+        9
+      )} 元  判定 ${row.bars} 根`
     )
+  }
+
+  if (report.exitRules.length > 0) {
+    lines.push('')
+    // 这一栏是「谁在决定离场」。实测 743/769 由风控规则触发、策略卖出信号只占 26 笔 ——
+    // 想改「卖点」就得改 risk 块，改策略的卖出子信号几乎没有作用（M2 §5.18）
+    lines.push('【离场规则分布】')
+    for (const row of report.exitRules) lines.push(`  ${row.rule.padEnd(22)} ${row.count}`)
   }
 
   if (report.suppressions.length > 0) {

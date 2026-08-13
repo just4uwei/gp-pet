@@ -56,9 +56,19 @@ function block(annualized: number | null, trades = 50): PerformanceBlock {
       winRate: 0.4,
       profitFactor: 1.5,
       avgPnlPct: 0.01,
+      weightedPnlPct: 0.01,
       avgHoldingBars: 5,
       totalPnl: 1000,
       totalCosts: 100,
+    },
+    positions: {
+      count: 10,
+      wins: 5,
+      winRate: 0.5,
+      avgPnl: 100,
+      avgReturn: 0.01,
+      payoffRatio: 1.4,
+      reduced: 5,
     },
   }
 }
@@ -232,6 +242,25 @@ describe('三态裁决', () => {
     expect(report.winner).toBeNull()
     expect(report.notes.join(' ')).toContain('这是结论')
     expect(report.resolution?.requiredCells).toBeGreaterThan(report.resolution?.cells ?? 0)
+  })
+
+  /**
+   * KEEP 有两种强度，报告必须分开说 —— 否则会把「有正面证据」读成「测不出差别」，
+   * 白扔掉这个项目最缺的那种证据：
+   * ① `combine` 块：15 个候选全部 t < 1.5，出厂值只是没被推翻（M2 §5.15）；
+   * ② `adx`/`regime`：6 个候选显著更差、t 最高 4.1，**往任一方向动都有代价**（M2 §5.16）。
+   */
+  it('KEEP 且有候选显著更差 ⇒ 额外说明「出厂值不是随便取的也一样」', () => {
+    const report = calibrateThresholds({
+      // 稳定地差一截：t 很大，方向朝下
+      '0.5': { overall: 0.3, cells: [0.02, 0.0, 0.01, 0.03] },
+      // 正负交替：够不着写回门槛
+      '0.55': { overall: 0.31, cells: [0.6, -0.3, 0.5, -0.2] },
+    })
+    expect(report.verdict).toBe('KEEP')
+    const notes = report.notes.join(' ')
+    expect(notes).toContain('显著更差')
+    expect(notes).toContain('正面证据')
   })
 
   it('INCONCLUSIVE：出厂值自己被红线淘汰时，KEEP 与 WRITE_BACK 都不能说', () => {

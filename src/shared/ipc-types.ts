@@ -197,7 +197,18 @@ export interface GpBridge {
 
 // ─────────────────────────── 设置 ───────────────────────────
 
+/**
+ * 常驻悬浮窗口的形态（docs/06 §2.1）。
+ *
+ * `BAR` 是出厂默认：一条 240×38 的轻量悬浮条，配托盘。
+ * `PET` 是桌宠形态，需要皮肤资源（缺资源会回退到占位皮肤）。
+ * 两者共用同一个窗口类与同一套零干扰机制，只差尺寸与渲染入口。
+ */
+export type AppearanceForm = 'BAR' | 'PET'
+
 export interface AppSettings {
+  /** 出厂 'BAR'。改这个值会重建悬浮窗口（位置回到右下角） */
+  appearance: AppearanceForm
   pollIntervalSec: number
   sensitivity: 'SENSITIVE' | 'BALANCED' | 'CONSERVATIVE'
   alertLevelOffset: -1 | 0 | 1

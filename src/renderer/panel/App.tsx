@@ -352,8 +352,14 @@ export function App(): React.JSX.Element {
         {items.length > 0 ? <SignalList refreshKey={signalKey} onError={setError} /> : null}
       </section>
 
+      {/*
+        页脚这一行以前写的是「M2：信号只进面板，尚无气泡与系统通知（提醒分发是 M3）」。
+        里程碑编号是我们的记账方式，对用户没有意义 —— 但**能力边界对用户有意义**，
+        所以这句话保留，只换成用户读得懂的说法。提醒分发接上之后（M3）这一行就该删掉，
+        否则它会变成一句过时的假话。
+      */}
       <footer className="mt-4 shrink-0 text-xs text-white/40">
-        <p>M2：信号只进面板，尚无气泡与系统通知（提醒分发是 M3）。</p>
+        <p>信号目前只在这个列表里显示，还不会弹气泡或发系统通知。</p>
         <p className="mt-1">仅供参考，非投资建议</p>
       </footer>
     </main>

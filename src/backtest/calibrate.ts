@@ -39,6 +39,10 @@
  *    「定不下来」因此变成一句可执行的话（要么扩样本到那个量级，要么承认这个参数在这个
  *    数据量下不可标定，按 M2 清单 4.9c 归档）。
  *
+ * 写回门槛除了「改进大于抖动」还有两条**不许变差**：整池验证集 Calmar、
+ * 以及**建仓级胜率**（2026-08-13 加，见 `passable` 的注释 ——「提高胜率」单独作为目标
+ * 是可以被机械满足的，必须与收益一起卡）。
+ *
  * 三条过拟合红线仍在这里执行（docs/07 §3）：
  *   - 交易次数 < 30 笔 → 直接淘汰
  *   - 验证集绩效相对训练集断崖下跌 → 标记为疑似过拟合
@@ -581,6 +585,7 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
   for (const candidate of clean) candidate.flags.push(...plateauFlags(candidate, candidates, input.base))
 
   const incumbentScore = incumbent?.score ?? null
+  const incumbentWinRate = incumbent?.validation?.positions.winRate ?? null
   const passable = clean
     .filter((c) => c.flags.length === 0)
     .filter((c) => {
@@ -588,6 +593,15 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
       if (!delta) return false
       // ① 风险调整后不能比出厂值差：折上比的是总收益，Calmar 这一关在这里守
       if (incumbentScore !== null && (c.score ?? -Infinity) < incumbentScore) return false
+      // ①b **建仓级胜率不能比出厂值低**（2026-08-13 加）。
+      //
+      // 「提高胜率」这个目标可以被机械满足：把 profitProtectTrigger 调低（小赚就跑）
+      // 能把胜率做到 70%，同时把盈亏比压到 0.5 —— 那是更差的系统。反过来也成立：
+      // 只按收益排名会放过「胜率掉一大截、靠一两笔大赚拉回来」的候选。
+      // 两个门槛一起卡，方向就唯一了：**胜率不降 + 收益显著提高**。
+      // 注意口径是**建仓级**（把减仓拆出来的多行归并回一次建仓），不是逐行 —— 见 PositionStats。
+      const winRate = c.validation?.positions.winRate ?? null
+      if (incumbentWinRate !== null && winRate !== null && winRate < incumbentWinRate) return false
       // ② 至少要有三折真的被改动，否则「改善」只是一两折的巧合
       if (delta.affected < 3) return false
       // ③ 改善要稳定、且大于它自己的抖动
@@ -636,11 +650,30 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
           '整池 Calmar 不低于出厂值，且邻域不断崖。仍需人工复核后写回（M2 清单 4.9a）。'
       )
       break
-    case 'KEEP':
+    case 'KEEP': {
       notes.push(
         '裁决 KEEP：**出厂值保持不变，这是结论而不是「没跑出来」** —— ' +
           '没有挑战者的改进大于它自己的折间抖动。写回任何一个都是用噪音替换猜测（ADR-0003）。'
       )
+      // KEEP 有两种强度，差别很大，必须分开说：
+      // ①「怎么动都测不出差别」（combine 块：全部 t < 1.5，M2 §5.15）——
+      //    出厂值只是没有被推翻，本身没有任何正面证据；
+      // ②「往任一方向动都显著更差」（adx/regime：t 最高 4.1，M2 §5.16）——
+      //    出厂值落在一个测得出边界的区域里，这是**支持这个转述值**的正面证据。
+      // 只印「没有候选够格」会把 ② 读成 ①，白扔掉这个项目最缺的那种证据。
+      const worse = candidates.filter(
+        (c) => !c.incumbent && c.delta !== null && c.delta.mean < 0 && (c.delta.t ?? 0) >= minDeltaT
+      )
+      if (worse.length > 0) {
+        notes.push(
+          `**但出厂值不是「随便取的也一样」**：${worse.length} 个候选显著更差` +
+            `（Δ < 0 且 |Δ|/标准误 ≥ ${minDeltaT}，最差 ${pp(
+              Math.min(...worse.map((c) => c.delta?.mean ?? 0))
+            )}）。` +
+            '也就是说往这些方向动是测得出代价的 —— 这是支持当前出厂值的正面证据，' +
+            '与「怎么动都测不出差别」的 KEEP 不是一回事，归档时要分开写。'
+        )
+      }
       if (resolution?.requiredCells !== null && resolution?.requiredCells !== undefined) {
         notes.push(
           `分辨率（折上口径 = 本折总收益）：观测到的最大改进 Δ = ${pp(resolution.bestDelta)}，` +
@@ -651,6 +684,7 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
         )
       }
       break
+    }
     case 'INCONCLUSIVE':
       notes.push(
         '裁决 INCONCLUSIVE：出厂值本身被红线淘汰、或折数不足以估离散度。' +

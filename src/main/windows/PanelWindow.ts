@@ -8,8 +8,24 @@
  * 懒加载：首次打开才创建；关闭时 hide() 而非 destroy()，避免反复重建 React 应用。
  */
 
-import { BrowserWindow } from 'electron'
-import { hardenWindow, loadRoute, PRELOAD_PATH } from './load-route'
+import { BrowserWindow, nativeImage } from 'electron'
+import { join } from 'node:path'
+import { resourcesRoot } from '../resources'
+import { enableDevShortcuts, hardenWindow, loadRoute, PRELOAD_PATH } from './load-route'
+
+/**
+ * 任务栏与标题栏图标。
+ *
+ * 不设它，开发期任务栏显示的是 **Electron 的原子徽标** —— 打包后 electron-builder 会把
+ * exe 图标塞进去，所以这个问题只在 dev 里暴露，很容易被当成「反正打包就好了」而留着。
+ * 取 `icons/default/`（不跟皮肤走）：托盘图标按皮肤换是 docs/09 §6.2 的规定，
+ * 但任务栏图标是**应用身份**，跟着皮肤变只会让用户在 Alt-Tab 里找不到自己的窗口。
+ * 缺图返回 undefined，交给 Electron 的默认行为，不为了图标让窗口建不出来。
+ */
+function appIcon(): Electron.NativeImage | undefined {
+  const image = nativeImage.createFromPath(join(resourcesRoot(), 'icons', 'default', 'icon.png'))
+  return image.isEmpty() ? undefined : image
+}
 
 export class PanelWindow {
   private win: BrowserWindow | null = null
@@ -17,6 +33,7 @@ export class PanelWindow {
   private ensure(): BrowserWindow {
     if (this.win && !this.win.isDestroyed()) return this.win
 
+    const icon = appIcon()
     const win = new BrowserWindow({
       width: 920,
       height: 640,
@@ -24,6 +41,7 @@ export class PanelWindow {
       minHeight: 480,
       show: false,
       title: 'GP Pet',
+      ...(icon ? { icon } : {}),
       backgroundColor: '#101216',
       webPreferences: {
         preload: PRELOAD_PATH,
@@ -34,6 +52,8 @@ export class PanelWindow {
     })
 
     hardenWindow(win)
+    // 应用菜单被无条件收掉了，Ctrl+R / F12 在这里挂回来（仅 dev）
+    enableDevShortcuts(win)
     loadRoute(win, 'panel')
 
     win.once('ready-to-show', () => win.show())

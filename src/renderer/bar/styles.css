@@ -1,0 +1,137 @@
+/*
+ * 悬浮条样式。
+ *
+ * 窗口是 transparent 的，所以 html/body 必须彻底透明 —— 任何背景色都会变成一块
+ * 始终置顶的实心矩形，把圆角外的四个角也涂上。条子本体的背景画在 .bar 上。
+ */
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  /* 拖拽时选中文本会留下高亮残影 */
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+  font: 12px/1 -apple-system, "Segoe UI", system-ui, sans-serif;
+}
+
+.bar {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 100%;
+  padding: 0 10px;
+  /* 半透明深色 + 细边：压在任何桌面上都读得出，又不像一块实心挡板 */
+  background: rgb(16 18 22 / 88%);
+  border: 1px solid rgb(255 255 255 / 12%);
+  border-radius: 8px;
+  color: rgb(255 255 255 / 92%);
+  white-space: nowrap;
+}
+
+/* 状态点。**M3 之前只表达数据层状态**（休市 / 盯盘 / 离线），不表达信号强度 */
+.dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6b7280;
+}
+
+.dot--idle {
+  background: #34d399;
+}
+
+.dot--sleepy {
+  background: #6b7280;
+}
+
+.dot--offline {
+  background: #f87171;
+}
+
+/* 信号驱动的三态（WATCHING / EXCITED / ALERT）在 M3 打开，届时这三条才会被用到 */
+.dot--watching {
+  background: #60a5fa;
+}
+
+.dot--excited {
+  background: #fbbf24;
+}
+
+.dot--alert {
+  background: #fb7185;
+}
+
+.name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: rgb(255 255 255 / 88%);
+}
+
+.price {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+  color: rgb(255 255 255 / 70%);
+}
+
+.change {
+  flex: none;
+  width: 52px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* A 股习惯：红涨绿跌 */
+.change--up {
+  color: #fb7185;
+}
+
+.change--down {
+  color: #34d399;
+}
+
+.change--flat {
+  color: rgb(255 255 255 / 45%);
+}
+
+/* 价格取自缓存时灰显，绝不假装实时（docs/03 的 stale 纪律） */
+.stale {
+  color: rgb(255 255 255 / 35%) !important;
+}
+
+/* 今日信号条数。与面板列表同源，属 docs/05 §3 的 L1（托盘角标同级） */
+.badge {
+  flex: none;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: rgb(255 255 255 / 14%);
+  color: rgb(255 255 255 / 80%);
+  font-size: 10px;
+  line-height: 14px;
+  text-align: center;
+}
+
+.empty {
+  flex: 1 1 auto;
+  color: rgb(255 255 255 / 40%);
+}
+
+/* 免打扰时整条压暗，一眼能看出「它现在不会说话」（C8 的反馈） */
+.bar--quiet {
+  opacity: 0.55;
+}

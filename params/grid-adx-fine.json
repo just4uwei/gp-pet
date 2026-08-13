@@ -1,0 +1,12 @@
+{
+  "adx": [
+    { "period": 14, "baseThreshold": 16, "volScale": 8, "maxThreshold": 28 },
+    { "period": 14, "baseThreshold": 18, "volScale": 8, "maxThreshold": 28 },
+    { "period": 14, "baseThreshold": 22, "volScale": 8, "maxThreshold": 28 },
+    { "period": 14, "baseThreshold": 24, "volScale": 8, "maxThreshold": 28 },
+    { "period": 14, "baseThreshold": 20, "volScale": 6, "maxThreshold": 28 },
+    { "period": 14, "baseThreshold": 20, "volScale": 10, "maxThreshold": 28 },
+    { "period": 14, "baseThreshold": 20, "volScale": 8, "maxThreshold": 24 },
+    { "period": 14, "baseThreshold": 20, "volScale": 8, "maxThreshold": 26 }
+  ]
+}

@@ -258,9 +258,19 @@ function block(overrides: { annualized?: number | null; maxDrawdown?: number; tr
       winRate: 0.6,
       profitFactor: 1.5,
       avgPnlPct: 0.02,
+      weightedPnlPct: 0.02,
       avgHoldingBars: 4,
       totalPnl: 20_000,
       totalCosts: 500,
+    },
+    positions: {
+      count: 30,
+      wins: 15,
+      winRate: 0.5,
+      avgPnl: 660,
+      avgReturn: 0.0066,
+      payoffRatio: 1.4,
+      reduced: 12,
     },
   }
 }

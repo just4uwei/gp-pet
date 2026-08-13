@@ -56,7 +56,24 @@ JSON 没有注释，网格文件里也**不要**塞 `_comment` / `_label` 之类
 | `grid-mean-reversion-squeeze.json` | `strategy.squeezeBbwPct` | 上一格发现最优点落在网格边界后的扩网格；结论（写回 20）见 CHANGELOG |
 | `grid-r2-lookback.json` | `strategy.revertLookback` | R2 口径改写后验证参数是否真的活了。**五个候选的验证集结果逐位相同**，原因在组合层的票数线（M2 §5.11） |
 | `grid-combine-ofat.json` | `combine` 四数（OFAT 16 组） | 跑过两轮，两轮都是**保持出厂值**：旧工具人工判（M2 §5.14），新工具**裁决 `KEEP`**、无一处需人判（M2 §5.15）。`downtrendBuyPenalty` 的幅度与 `conflictBand` 已按 4.9c 归档为不可标定（逐折动 0/12 与 2/12），**别再重跑** |
-| `grid-regime.json` | `adx` × `regime`（7 × 3 = 21 组） | **尚未跑，且是当前性价比最高的一轮** —— `adx`/`regime` 是一阶参数（决定有没有信号），`combine` 是二阶（决定已有信号怎么合，效应量实测比噪音小一个量级，M2 §5.15）。必须在 2026-08-13 的工具上跑 |
+| `grid-risk.json` | `risk` 五数（OFAT 16 组） | **已跑：`KEEP`。** 96.6% 的离场由这五个数决定，是「提高胜率」的主杠杆。`profitProtectTrigger` 验证集 Calmar 翻倍但**训练集反向 + 胜率下降 + 非单调 = 陷阱**（被胜率门槛自动挡下）；`drawdownReducePct` 7%→10% 四个口径同向但 t = 0.77。M2 §5.18 |
+| `grid-risk-fine.json` | `profitProtectTrigger` × `drawdownReducePct`（11 组） | 上一格两条促销线的加宽网格。结论：前者非单调（噪音），后者 **≥0.12 饱和**（0.12/0.16/0.20 逐位相同）⇒ 真正的问题是二值的「7% 太紧吗」。**扩池到 ~250 只后第一个重跑这个** |
+| `grid-multitf.json` | `multiTf` 七数（OFAT 17 组） | **已跑：`KEEP`，且大半取值动 0/12 折**（改了等于没改）—— 按 4.9c 归档为惰性。唯一动得多的是 `weekAdxWeak = 25`（Δ +0.15pp / t 1.8），落在边界，留待加宽 |
+| `grid-adx-fine.json` | `adx` 三数（OFAT 8 组） | **已跑：`KEEP`，8 个候选没有一个 Δ 为正**（16/18 让训练集亏钱被淘汰，22 −0.17pp 且被判孤峰，24 −0.48pp / t 2.2 被淘汰，volScale 6 与 10 各 −0.16pp，maxThreshold 24 −0.18pp、26 −0.05pp）⇒ 出厂 20 / 8 / 28 三个数**都有正面证据**（M2 §5.17 读数 1）。`maxThreshold` 只扫了下侧，上侧算术无效（§5.16）。**这一轴已经扫到两侧红线，别再跑** |
+| `grid-regime-fine.json` | `regime` 两数（OFAT 8 组） | **已跑：`KEEP`。`hysteresisDays` 1 是 −0.34pp，2–5 分辨不出；`rangeMidBand` 四个取值全负但非单调、t ≤ 1.6 = 噪音**（M2 §5.17 读数 3/4）。这一轮 `hysteresisDays` 的最高分（5）压在上边界，因此又补了下面那张 —— `rangeMidBand` 两侧都测到了，不必再跑 |
+| `grid-regime-hysteresis-wide.json` | `regime.hysteresisDays` 3–12（7 组） | 上一张的边界补跑。**已跑：`KEEP`。整条轴的形状是单峰** —— 1 更差 / 2–6 一片高原（顶点 6 = 0.599 对出厂 2 只有 +0.06pp、t 0.4）/ 8 转负并被判孤峰 / 10 触发过拟合红线 / 12 验证集年化为负。**上边界的疑问已消掉，别再往上扫。** 触发笔数随迟滞单调下降（489 → 406 → 279），M3 若为「少改口」上调迟滞，上限是 6（M2 §5.17 读数 3）。注意 3/4/5 与上一张重复是**故意**的：同一条轴必须落在同一份报告里，见下面的方框 |
+| `grid-regime.json` | `adx` × `regime`（7 × 3 = 21 组） | **已跑（2026-08-13）：裁决 `KEEP`，但有正面证据** —— 4 个候选被红线淘汰、3 个显著更差（最差 `baseThreshold = 16`：−1.06pp / t 4.1），出厂 20 的两侧邻居都更差。`maxThreshold` 上侧**算术无效**别再扫。**这张网格每维只有中心 ± 一档，唯一的正向候选落在边界上不能用** —— 要加宽重跑（M2 §5.16 给了取值） |
+
+> **同一条轴上的候选必须落在同一份报告里。** `plateauFlags()` 判「孤峰 / 该侧邻域未测」
+> 是在**本次报告的候选集合**里找同轴的相邻取值 —— 把 `hysteresisDays = 1` 与 `3/4/5`
+> 拆成两次跑，出厂值 2 就永远看不见它的下侧邻居，孤峰判据形同虚设。
+> `grid-regime-hysteresis-wide.json` 明知 3/4/5 上一张已经跑过还是重跑一遍，就是为了这个：
+> 少了它们，8 的下侧邻居就成了空的，「8 是孤峰」这条判不出来。
+>
+> 这也是上面三张网格按「一次只动一个块、另一个块钉在出厂值」拆开、
+> 而不是照 `grid-regime.json` 做笛卡尔积的原因：**8 + 8 = 16 组能把两条轴都扫全，
+> 而 8 × 8 = 64 组只是把同样的信息买贵四倍。**跨块的交互效应确实测不到了，
+> 但 §5.16 那 21 组笛卡尔积里没有一处交互项大过主效应，先不为它付这个价。
 
 `grid-mean-reversion.json` 里 `strategy` 块用的是**一次一因子**（OFAT）而不是 3×3×3 全展开：
 ① 全展开要跑两个多小时，而这一层的效应量本来就在噪音带附近；
@@ -107,8 +124,9 @@ JSON 没有注释，网格文件里也**不要**塞 `_comment` / `_label` 之类
 | 裁决 | 归档动作 | 例子 |
 |---|---|---|
 | `WRITE_BACK` | 下面的 4.9a 流程：改值 + 递增版本号 + CHANGELOG | `strategy.squeezeBbwPct` 10 → 20 |
-| `KEEP` | **不改值**，在偏差报告里记「已测、保持出厂值」与依据；`ENGINE_VERSION` 不动 | `combine` 四数（M2 §5.14） |
-| 参数惰性 | 记为「不可标定」（清单 4.9c），**不要反复重跑** —— 先用 `audit:*` 找结构原因 | `downtrendBuyPenalty` 的幅度、`revertLookback` |
+| `KEEP`（测不出差别） | **不改值**，记「已测、保持出厂值」与依据；`ENGINE_VERSION` 不动 | `combine` 四数（§5.14 / §5.15，15 个候选最大 t = 1.4） |
+| `KEEP`（**有正面证据**） | 同上，但要写明「往哪些方向动、代价多大」—— 这比上一档强一档，**别混写** | `adx.baseThreshold = 20` / `volScale = 8`（§5.16，邻居 −1.06pp / t 4.1） |
+| 参数惰性 / 算术无效 | 记为「不可标定」（清单 4.9c），**不要反复重跑** —— 先用 `audit:*` 或读公式找结构原因 | `downtrendBuyPenalty` 的幅度、`revertLookback`、`adx.maxThreshold` 的上侧 |
 
 `KEEP` 与「惰性」都**不**递增 `ENGINE_VERSION`：没有改行为，就没有要失效的缓存。
 但它们都要留下记录，否则下一轮会有人把同一个网格再跑一遍。

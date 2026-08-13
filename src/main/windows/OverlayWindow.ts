@@ -1,31 +1,51 @@
 /**
- * 桌宠窗口 —— 零干扰契约 C1/C2/C3/C10 的落点（docs/06 §1、§2.1、§2.2）。
+ * 常驻置顶的悬浮窗口 —— 零干扰契约 C1/C2/C3/C10 的落点（docs/06 §1、§2.1、§2.2）。
  *
  * 这个类里的每一处配置都对应一条硬性验收项，改动前先看 docs/06 §1：
  *   focusable: false        → C1 永不抢焦点（结构性保证，不是运行时小心翼翼）
  *   setIgnoreMouseEvents    → C2 非本体区域鼠标事件穿透
  *   skipTaskbar: true       → C3 不出现在任务栏与 Alt-Tab
  *   show: false + showInactive() → 首次出现也不得夺取焦点
+ *
+ * **两种形态共用这一个类**（2026-08-13）：出厂默认是「悬浮条」（`BAR`），
+ * 桌宠（`PET`）退为可切换形态。形态之间**只差窗口尺寸与渲染入口** ——
+ * 上面那四条以及拖拽增量、边缘吸附、多屏校验全部与「窗口里画什么」无关，
+ * 所以换形态不需要重新实现、也不需要重新论证零干扰契约。
+ *
+ * IPC 通道名仍是 `pet:*`（`pet:setInteractive`、`pet:dragBy`…）：改通道名要同步动
+ * preload、ipc-types 与两个渲染入口，而没有任何功能收益。**通道名是历史,形态是现状。**
  */
 
 import { BrowserWindow, screen } from 'electron'
-import { hardenWindow, loadRoute, PRELOAD_PATH } from './load-route'
+import type { AppearanceForm } from '@shared/ipc-types'
+import { hardenWindow, loadRoute, PRELOAD_PATH, type RendererRoute } from './load-route'
 import { bottomRightOf, ensureVisible, snapToEdge, type Bounds } from '../util/geometry'
 
-/** docs/06 §2.1。比皮肤 canvas（200）大一圈，给道具与跃起留余量（docs/09 §2.2） */
-export const PET_WINDOW_SIZE = { width: 220, height: 220 } as const
+/**
+ * 各形态的窗口尺寸。
+ *
+ * `PET` 的 220 比皮肤 canvas（200）大一圈，给道具与跃起留余量（docs/09 §2.2）。
+ * `BAR` 则是**窗口即本体**：没有留白，于是 C2 只剩四个圆角需要穿透（见渲染层上报的命中区）。
+ */
+export const OVERLAY_SIZE: Record<AppearanceForm, { width: number; height: number }> = {
+  PET: { width: 220, height: 220 },
+  BAR: { width: 240, height: 38 },
+}
 
-export class PetWindow {
+const ROUTE: Record<AppearanceForm, RendererRoute> = { PET: 'pet', BAR: 'bar' }
+
+export class OverlayWindow {
   private readonly win: BrowserWindow
   /** 当前是否关闭了点击穿透。缓存一份避免每次 mousemove 都跨进程重复设置 */
   private interactive = false
 
-  constructor() {
+  constructor(readonly form: AppearanceForm) {
+    const size = OVERLAY_SIZE[form]
     const primary = screen.getPrimaryDisplay()
-    const origin = bottomRightOf(primary.workArea, PET_WINDOW_SIZE)
+    const origin = bottomRightOf(primary.workArea, size)
 
     this.win = new BrowserWindow({
-      ...PET_WINDOW_SIZE,
+      ...size,
       x: origin.x,
       y: origin.y,
       transparent: true,
@@ -56,7 +76,7 @@ export class PetWindow {
     this.win.setIgnoreMouseEvents(true, { forward: true })
 
     hardenWindow(this.win)
-    loadRoute(this.win, 'pet')
+    loadRoute(this.win, ROUTE[form])
 
     this.win.once('ready-to-show', () => {
       // 必须是 showInactive：show() 会抢焦点，直接违反 C1
@@ -74,7 +94,7 @@ export class PetWindow {
 
   /**
    * 渲染层完成命中判定后调用。
-   * 判定在渲染层做是因为主进程拿不到「鼠标是否压在桌宠本体上」这个信息 ——
+   * 判定在渲染层做是因为主进程拿不到「鼠标是否压在本体上」这个信息 ——
    * Electron 只有窗口级的 setIgnoreMouseEvents，没有像素级命中测试（docs/06 §2.2）。
    */
   setInteractive(interactive: boolean): void {
@@ -113,7 +133,7 @@ export class PetWindow {
     this.dragEnd()
   }
 
-  /** C9：托盘菜单「隐藏桌宠」后只保留托盘，功能不减 */
+  /** C9：托盘菜单「隐藏」后只保留托盘，功能不减 */
   setVisible(visible: boolean): void {
     if (!this.alive) return
     if (visible) {

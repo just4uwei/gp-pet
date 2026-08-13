@@ -6,6 +6,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import type { TradeDate } from '@core/types'
 import {
   DEFAULT_COSTS,
   LOT_SIZE,
@@ -26,8 +27,79 @@ import {
   sampleStdev,
   sharpeRatio,
   summarizeTrades,
+  groupPositions,
   type EquityPoint,
 } from '@backtest/metrics'
+
+/**
+ * 建仓级归并（`groupPositions`）—— 「胜率」的用户口径。
+ *
+ * 逐行胜率回答「每一次卖出动作赚不赚」，建仓级回答「我按提醒买了一次，最后赚没赚」。
+ * 实测出厂参数下前者 33.16%、后者 49.3%，差 16 个百分点 —— 拿前者对用户说「胜率」
+ * 是低估，拿它当标定目标则会把优化方向带偏（M2 §5.18）。
+ */
+describe('建仓级归并', () => {
+  const row = (
+    code: string,
+    entryDate: string,
+    pnl: number,
+    partial = false,
+    shares = 1000
+  ): { code: string; entryDate: TradeDate; entryPrice: number; shares: number; pnl: number; partial: boolean } => ({
+    code,
+    entryDate: entryDate as TradeDate,
+    entryPrice: 10,
+    shares,
+    pnl,
+    partial,
+  })
+
+  it('同标的同建仓日的多行合成一次建仓，按合计盈亏判胜负', () => {
+    // 一次建仓：先减仓亏 500，再清仓赚 900 → 合计 +400，算**赢**
+    const stats = groupPositions([
+      row('SH600000', '2024-01-02', -500, true, 500),
+      row('SH600000', '2024-01-02', 900, false, 500),
+    ])
+    expect(stats.count).toBe(1)
+    expect(stats.wins).toBe(1)
+    expect(stats.winRate).toBe(1)
+    expect(stats.reduced).toBe(1)
+    expect(stats.avgPnl).toBe(400)
+  })
+
+  it('同标的不同建仓日算两次建仓', () => {
+    const stats = groupPositions([row('SH600000', '2024-01-02', 100), row('SH600000', '2024-03-05', -200)])
+    expect(stats.count).toBe(2)
+    expect(stats.winRate).toBeCloseTo(0.5, 10)
+  })
+
+  it('逐行胜率与建仓级胜率可以差很多 —— 这正是要分开算的原因', () => {
+    // 三次建仓，每次都是「减仓亏一点 + 清仓赚回来」：逐行 3 赢 3 亏 = 50%，建仓级 100%
+    const rows = ['2024-01-02', '2024-02-02', '2024-03-02'].flatMap((date) => [
+      row('SH600000', date, -100, true, 500),
+      row('SH600000', date, 300, false, 500),
+    ])
+    expect(groupPositions(rows).winRate).toBe(1)
+    expect(summarizeTrades(rows.map((r) => ({ ...r, pnlPct: r.pnl / 5000, holdingBars: 3, costs: 0 }))).winRate)
+      .toBeCloseTo(0.5, 10)
+  })
+
+  it('平仓盈亏恰好为 0 算亏（不算赢）—— 扣掉成本后没赚就是没赚', () => {
+    expect(groupPositions([row('SH600000', '2024-01-02', 0)]).winRate).toBe(0)
+  })
+
+  it('没有交易时各项为 null，不是 0', () => {
+    const stats = groupPositions([])
+    expect(stats.count).toBe(0)
+    expect(stats.winRate).toBeNull()
+    expect(stats.avgPnl).toBeNull()
+    expect(stats.payoffRatio).toBeNull()
+  })
+
+  it('没有亏损建仓时盈亏比给 null 而不是 Infinity', () => {
+    expect(groupPositions([row('SH600000', '2024-01-02', 100)]).payoffRatio).toBeNull()
+  })
+})
 
 describe('成本模型', () => {
   it('滑点一律朝不利方向：买贵、卖便宜', () => {
@@ -137,6 +209,32 @@ describe('绩效指标', () => {
     expect(stats.avgHoldingBars).toBeCloseTo(4, 10)
     expect(stats.totalPnl).toBe(500)
     expect(stats.totalCosts).toBe(30)
+  })
+
+  /**
+   * 这一条是 2026-08-13 的回归：报告里四种市况的「平均」都打出 −1.2% ~ −1.6%，
+   * 而净盈亏是 +231,154 元。**两个数都没算错**，错的是把未加权的逐行百分比
+   * 当成「平均一笔赚多少」读 —— 回撤减仓把一次建仓拆成大小不同的两行，
+   * 未加权平均于是把半仓那一行和满仓那一行等同看待。
+   * 下面这三行就是那个形状的最小复现：加权是 +1%，未加权是 −1%。
+   */
+  it('未加权 avgPnlPct 的符号可以与净盈亏相反 —— 所以另给一个按仓位加权的', () => {
+    const stats = summarizeTrades([
+      // 满仓赚 3%：+3000 元
+      { pnl: 3000, pnlPct: 0.03, holdingBars: 5, costs: 10, entryPrice: 10, shares: 10_000 },
+      // 减仓后的小仓位各亏 5%：合计 −1000 元
+      { pnl: -500, pnlPct: -0.05, holdingBars: 2, costs: 5, entryPrice: 10, shares: 1000 },
+      { pnl: -500, pnlPct: -0.05, holdingBars: 2, costs: 5, entryPrice: 10, shares: 1000 },
+    ])
+    expect(stats.totalPnl).toBe(2000)
+    // 未加权：(3 − 5 − 5) / 3 = −2.33%，与赚钱的事实相反
+    expect(stats.avgPnlPct).toBeLessThan(0)
+    // 加权：2000 / 120000 = +1.67%
+    expect(stats.weightedPnlPct).toBeCloseTo(2000 / 120_000, 10)
+  })
+
+  it('缺仓位字段时 weightedPnlPct 为 null，不用未加权的值冒充', () => {
+    expect(summarizeTrades([{ pnl: 1, pnlPct: 0.01, holdingBars: 1, costs: 0 }]).weightedPnlPct).toBeNull()
   })
 
   it('没有亏损交易时盈亏比给 null 而不是 Infinity', () => {

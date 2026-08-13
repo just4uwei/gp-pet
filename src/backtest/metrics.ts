@@ -145,7 +145,19 @@ export interface TradeStats {
   winRate: number | null
   /** 平均盈利 / 平均亏损，均为绝对值；无亏损交易时为 null（不是 Infinity） */
   profitFactor: number | null
+  /**
+   * 逐行**未加权**的平均百分比收益。
+   *
+   * ⚠ **这个数的符号可以与 `totalPnl` 相反，不要用它判断赚没赚。** 一行是一次卖出，
+   * 而回撤减仓会把一次建仓拆成「先卖一半、后卖一半」两行，两行的仓位差一倍 ——
+   * 未加权平均于是把小仓位的那一行和大仓位的那一行等同看待。
+   * 实测：出厂参数下四种市况的这个数都是 −1.2% ~ −1.6%，而净盈亏是 **+231,154 元**
+   * （M2 §5.18）。要看「平均一笔赚多少」用下面的 `weightedPnlPct`，
+   * 要看「一次出手赚不赚」用 `groupPositions()`。
+   */
   avgPnlPct: number | null
+  /** 按建仓市值加权的百分比收益 = Σpnl ÷ Σ(entryPrice × shares)；缺仓位字段时为 null */
+  weightedPnlPct: number | null
   avgHoldingBars: number | null
   totalPnl: number
   totalCosts: number
@@ -156,6 +168,9 @@ export interface TradeLike {
   pnlPct: number
   holdingBars: number
   costs: number
+  /** 建仓价与股数。两者齐备才算得出 `weightedPnlPct` */
+  entryPrice?: number
+  shares?: number
 }
 
 export interface ExposureLike {
@@ -186,6 +201,83 @@ export function averageExposure(
   return positionBarValue / (startCapital * bars)
 }
 
+/**
+ * 一次**建仓**（同一标的、同一建仓日的全部平仓行合起来）。
+ *
+ * 为什么必须有这个口径：`trades` 里一行是**一次卖出**，而回撤减仓 / 部分止盈会把一次建仓
+ * 拆成两三行。于是逐行统计出来的「胜率」与用户体验到的「我按提醒买了一次，最后赚没赚」
+ * 完全不是一回事 —— 实测出厂参数下逐行胜率 **33.16%**，而按建仓归并是 **49.3%**
+ * （769 行 → 278 次建仓）。两个数都对，回答的是不同问题：
+ *   逐行：每一次卖出动作赚不赚 —— 用来看止损止盈规则本身
+ *   建仓：一次出手最后赚不赚 —— **用户口径**，也是「提高胜率」该盯的那个数
+ * 所以报告两个都给，且都标明口径（M2 §5.18）。
+ */
+export interface PositionStats {
+  /** 建仓次数 */
+  count: number
+  /** 最终净盈亏 > 0 的建仓数 */
+  wins: number
+  /** 0..1；`count === 0` 时为 null（不是 0 —— 0 会被读成「一次都没赢」） */
+  winRate: number | null
+  /** 平均每次建仓的净盈亏（元） */
+  avgPnl: number | null
+  /** 平均每次建仓的净盈亏 ÷ 该次建仓的建仓市值，按次等权 */
+  avgReturn: number | null
+  /** 赚钱建仓的平均盈利 ÷ 亏钱建仓的平均亏损；无亏损时为 null（不是 Infinity） */
+  payoffRatio: number | null
+  /** 中途触发过部分卖出（回撤减仓 / 部分止盈）的建仓数 —— 「建仓后先亏」的直接度量 */
+  reduced: number
+}
+
+export interface PositionRowLike {
+  code: string
+  entryDate: TradeDate
+  entryPrice: number
+  shares: number
+  pnl: number
+  partial: boolean
+}
+
+/**
+ * 按 `code + entryDate` 把平仓行归并成建仓。
+ *
+ * 用建仓日而不是持仓 id 是因为回测里一只标的同时只有一个仓位（M2 §3.3），
+ * 所以「同一标的、同一天建的仓」唯一确定一次建仓。若将来允许同标的多仓并存，
+ * 这里要改成显式的持仓 id —— 到那时这个函数会静默地把两个仓位合成一个，
+ * 而单测里那条「同标的不同建仓日算两次」拦不住它。
+ */
+export function groupPositions(rows: readonly PositionRowLike[]): PositionStats {
+  const groups = new Map<string, { pnl: number; cost: number; reduced: boolean }>()
+  for (const row of rows) {
+    const key = `${row.code}@${row.entryDate}`
+    const group = groups.get(key) ?? { pnl: 0, cost: 0, reduced: false }
+    group.pnl += row.pnl
+    group.cost += row.entryPrice * row.shares
+    if (row.partial) group.reduced = true
+    groups.set(key, group)
+  }
+
+  const all = [...groups.values()]
+  if (all.length === 0) {
+    return { count: 0, wins: 0, winRate: null, avgPnl: null, avgReturn: null, payoffRatio: null, reduced: 0 }
+  }
+  const wins = all.filter((g) => g.pnl > 0)
+  const losses = all.filter((g) => g.pnl <= 0)
+  const avgWin = wins.length > 0 ? mean(wins.map((g) => g.pnl)) : 0
+  const avgLoss = losses.length > 0 ? Math.abs(mean(losses.map((g) => g.pnl))) : 0
+
+  return {
+    count: all.length,
+    wins: wins.length,
+    winRate: wins.length / all.length,
+    avgPnl: mean(all.map((g) => g.pnl)),
+    // 按次等权而不是按金额加权：这里问的是「一次出手的回报」，不是组合收益率
+    avgReturn: mean(all.filter((g) => g.cost > 0).map((g) => g.pnl / g.cost)),
+    payoffRatio: avgLoss > 0 ? avgWin / avgLoss : null,
+    reduced: all.filter((g) => g.reduced).length,
+  }
+}
+
 export function summarizeTrades(trades: readonly TradeLike[]): TradeStats {
   if (trades.length === 0) {
     return {
@@ -195,6 +287,7 @@ export function summarizeTrades(trades: readonly TradeLike[]): TradeStats {
       winRate: null,
       profitFactor: null,
       avgPnlPct: null,
+      weightedPnlPct: null,
       avgHoldingBars: null,
       totalPnl: 0,
       totalCosts: 0,
@@ -206,6 +299,12 @@ export function summarizeTrades(trades: readonly TradeLike[]): TradeStats {
   const avgWin = wins.length > 0 ? mean(wins.map((t) => t.pnl)) : 0
   const avgLoss = losses.length > 0 ? Math.abs(mean(losses.map((t) => t.pnl))) : 0
 
+  const notional = trades.reduce(
+    (sum, t) => sum + (t.entryPrice !== undefined && t.shares !== undefined ? t.entryPrice * t.shares : 0),
+    0
+  )
+  const totalPnl = trades.reduce((sum, t) => sum + t.pnl, 0)
+
   return {
     count: trades.length,
     wins: wins.length,
@@ -213,8 +312,9 @@ export function summarizeTrades(trades: readonly TradeLike[]): TradeStats {
     winRate: wins.length / trades.length,
     profitFactor: avgLoss > 0 ? avgWin / avgLoss : null,
     avgPnlPct: mean(trades.map((t) => t.pnlPct)),
+    weightedPnlPct: notional > 0 ? totalPnl / notional : null,
     avgHoldingBars: mean(trades.map((t) => t.holdingBars)),
-    totalPnl: trades.reduce((sum, t) => sum + t.pnl, 0),
+    totalPnl,
     totalCosts: trades.reduce((sum, t) => sum + t.costs, 0),
   }
 }

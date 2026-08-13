@@ -2,13 +2,14 @@
  * 主进程入口（docs/02 §6 生命周期）。
  *
  * 启动顺序有硬性约束：
- *   1. registerSchemesAsPrivileged 必须在 app ready **之前**
+ *   1. registerSchemesAsPrivileged 与 setAppUserModelId 必须在 app ready **之前**
  *   2. protocol.handle 必须在 app ready **之后**
  *   3. 窗口创建在协议就绪之后 —— 否则首帧的 res:// 请求会落空
  */
 
 import { app, powerMonitor } from 'electron'
 import { AppController } from './controller'
+import { APP_ID } from './identity'
 import { createDataLayer } from './data-layer'
 import { registerHandlers } from './ipc/handlers'
 import { reportUnimplementedChannels } from './ipc/router'
@@ -18,6 +19,10 @@ import { TrayController } from './tray/TrayController'
 
 initLogging()
 registerResourceScheme()
+// Windows 用 AUMID 认应用身份。不设它，M3 的系统通知会显示成「electron.app.Electron」
+// —— 而这条路径只在打包后暴露，dev 里看不出来（见 identity.ts）。
+// **不要顺手加 app.setName()**：userData 目录是按 name 算的，改名等于搬走整个数据目录。
+app.setAppUserModelId(APP_ID)
 
 let controller: AppController | null = null
 let tray: TrayController | null = null
@@ -59,10 +64,12 @@ void app.whenReady().then(() => {
   // 休眠唤醒后重新校验窗口位置：合盖期间可能换过显示器拓扑（docs/02 §6）
   powerMonitor.on('resume', () => {
     log.info('[power] resume')
-    controller?.revalidatePetPosition()
+    controller?.revalidateOverlayPosition()
   })
 
-  log.info('[app] 就绪。M0 骨架：无数据源、无引擎、无提醒。')
+  // 这一行只说「窗口与托盘已起来」。数据层是异步装配的，它自己会再打一行 ——
+  // 两行分开打是有用的：只看到这一行就说明装配还没回来或失败了
+  log.info('[app] 窗口与托盘就绪，数据层装配中…')
 })
 
 // 桌宠隐藏或面板关闭后不退出 —— 退出只走托盘菜单（docs/02 §6）

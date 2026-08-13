@@ -1,0 +1,299 @@
+/**
+ * 提醒分发的四道闸门（docs/05 §4）。
+ *
+ * 引擎给出的 `GatedSignal` 已经带了 `level`（L1/L2/L3，由风控层按 docs/05 §3 定）。
+ * 这里管的是**要不要真的发出去**，四道闸门依次通过，任一不过就记原因后丢弃：
+ *
+ *   ① 防抖：盘中信号必须连续 N 个 tick 成立（默认 2，约 60s）
+ *   ② 同键冷却：同 `code:direction` 在冷却期内不重复（L1 30min / L2 2h / L3 当日一次）
+ *   ③ 频率上限：单标的每日 L2+L3 ≤ 4；全局每小时 L2+L3 ≤ 6；全局每日 L3 ≤ 10
+ *   ④ 免打扰：静默时段 / 全屏 / 专注助手 / 手动免打扰 / 锁屏 → L2/L3 降为 L1
+ *
+ * ## 三条实现纪律
+ *
+ * 1. **不读时钟。** `now` 由调用方传入，跨日与跨小时的边界都用它算。理由与 src/core 相同：
+ *    「提醒会不会在 15:00 之后重发」这种事必须能在单测里写出来，而不是靠改系统时间试。
+ * 2. **批量而不是逐条。** ③ 里「全局每小时超限时**按得分排序保留最高的**」这条规则
+ *    需要同时看到本轮全部候选 —— 逐条 API 做不到（先到的低分信号会占掉配额）。
+ *    ① 也需要：本轮没出现的键要清零，只有拿到全量才知道谁没出现。
+ * 3. **闸门③④是降级，①②是丢弃。** 降级的仍然会发（变成 L1 进面板与角标），
+ *    丢弃的只写 `alert_log.suppressed_reason`。**两者都不能悄悄消失** ——
+ *    docs/05 §4 的原话是「不制造信息黑洞」，用户要能在面板里看到「今日被静默的 N 条」。
+ */
+
+import type { AlertLevel, GatedDirection, SecCode } from '@core/types'
+
+/** 分发渠道，与 `alert_log.channel` 的取值一致 */
+export type AlertChannel = 'PET' | 'TRAY' | 'BUBBLE' | 'OS_NOTIFY'
+
+/** 各级别对应的渠道（docs/05 §3）。高级别包含低级别的表现 */
+export const CHANNELS_BY_LEVEL: Record<AlertLevel, readonly AlertChannel[]> = {
+  L1: ['PET', 'TRAY'],
+  L2: ['PET', 'TRAY', 'BUBBLE'],
+  L3: ['PET', 'TRAY', 'BUBBLE', 'OS_NOTIFY'],
+}
+
+export interface AlertCandidate {
+  signalId: string
+  code: SecCode
+  direction: GatedDirection
+  level: AlertLevel
+  /** 0..1，用于频率上限超限时的排序 */
+  score: number
+  /** 防抖键的一部分：本轮得分最高的子信号 ID */
+  topSubSignalId: string
+  /**
+   * 持仓强制类（止损 / 移动止损 / 回撤减仓）。
+   * docs/05 §4.2：**不受冷却限制**，改为「每次跌幅每扩大 2% 提醒一次」。
+   */
+  forced?: boolean
+  /** `forced` 时的当前浮亏幅度（负数，如 −0.086）。用于那条 2% 的台阶判定 */
+  lossPct?: number
+}
+
+export interface DispatchContext {
+  /** 免打扰生效中（静默时段 / 全屏 / 专注助手 / 手动 / 锁屏 任一成立） */
+  quiet: boolean
+  /** 免打扰的具体原因，写进 alert_log 便于用户理解「为什么没弹」 */
+  quietReason?: string
+  /** 盘中 tick 之外的场合（收盘确认轮）可关掉防抖 —— 那时没有「连续 N 个 tick」可言 */
+  debounce?: boolean
+}
+
+export interface AlertDecision {
+  candidate: AlertCandidate
+  /** 最终级别（可能被降级）；被丢弃时为 null */
+  level: AlertLevel | null
+  channels: readonly AlertChannel[]
+  /** 非空表示被抑制/降级及原因，一律写 alert_log（docs/05 §6） */
+  reason: string | null
+}
+
+export interface DispatcherOptions {
+  /** 防抖需要的连续 tick 数（docs/05 §4.1，默认 2） */
+  debounceTicks?: number
+  /** 同键冷却毫秒数，按级别（docs/05 §4.2） */
+  cooldownMs?: Record<AlertLevel, number>
+  /** 单标的每日 L2+L3 上限（默认 4） */
+  perCodeDailyLimit?: number
+  /** 全局每小时 L2+L3 上限（默认 6） */
+  hourlyLimit?: number
+  /** 全局每日 L3 上限（默认 10） */
+  dailyL3Limit?: number
+  /** 强制类提醒的复发台阶：跌幅每扩大这么多才再提醒一次（默认 0.02） */
+  forcedStepPct?: number
+  /** 本地零点。默认按运行环境的本地时区算；注入是为了让单测不受时区影响 */
+  startOfDay?: (ts: number) => number
+}
+
+const HOUR = 60 * 60 * 1000
+
+const DEFAULT_COOLDOWN: Record<AlertLevel, number> = {
+  L1: 30 * 60 * 1000,
+  L2: 2 * HOUR,
+  // 「当日一次」不能写成 24h：那会让今天 23:00 发过之后，明天 09:30 开盘还在冷却里。
+  // 用 Infinity + 跨日重置来表达（见 rollDay）
+  L3: Number.POSITIVE_INFINITY,
+}
+
+function localStartOfDay(ts: number): number {
+  const at = new Date(ts)
+  return new Date(at.getFullYear(), at.getMonth(), at.getDate()).getTime()
+}
+
+/**
+ * 分发器。**有状态**（防抖计数、冷却时间、各级计数器），所以整个应用只应有一个实例。
+ * 状态全部在内存里：重启后冷却清零是可以接受的（用户重启应用时本来就期待看到当前状态），
+ * 而把它们落库会让「重启后被冷却挡住、什么都不弹」变成一个很难查的问题。
+ */
+export class AlertDispatcher {
+  private readonly debounceTicks: number
+  private readonly cooldownMs: Record<AlertLevel, number>
+  private readonly perCodeDailyLimit: number
+  private readonly hourlyLimit: number
+  private readonly dailyL3Limit: number
+  private readonly forcedStepPct: number
+  private readonly startOfDay: (ts: number) => number
+
+  /** 防抖：`code:direction:topSubSignalId` → 连续成立的 tick 数 */
+  private streaks = new Map<string, number>()
+  /** 冷却：`code:direction` → { level, at } 最近一次实际发出的提醒 */
+  private lastSent = new Map<string, { level: AlertLevel; at: number }>()
+  /** 强制类的台阶：`code` → 上次提醒时的浮亏幅度 */
+  private lastForcedLoss = new Map<SecCode, number>()
+  /** 滑动窗口：最近一小时内实际发出的 L2/L3 时间戳 */
+  private recentHigh: number[] = []
+  /** 当日计数 */
+  private day = -1
+  private perCodeToday = new Map<SecCode, number>()
+  private l3Today = 0
+
+  constructor(options: DispatcherOptions = {}) {
+    this.debounceTicks = options.debounceTicks ?? 2
+    this.cooldownMs = options.cooldownMs ?? DEFAULT_COOLDOWN
+    this.perCodeDailyLimit = options.perCodeDailyLimit ?? 4
+    this.hourlyLimit = options.hourlyLimit ?? 6
+    this.dailyL3Limit = options.dailyL3Limit ?? 10
+    this.forcedStepPct = options.forcedStepPct ?? 0.02
+    this.startOfDay = options.startOfDay ?? localStartOfDay
+  }
+
+  /**
+   * 跑一轮分发。**返回本轮全部候选的裁决**（含被丢弃的），调用方按 `reason` 决定
+   * 是发出去还是只写 alert_log。
+   */
+  dispatch(candidates: readonly AlertCandidate[], now: number, ctx: DispatchContext): AlertDecision[] {
+    this.rollDay(now)
+    this.pruneHourly(now)
+
+    const decisions: AlertDecision[] = []
+    // 闸门①②：逐条判，先把「不该发」的丢掉
+    const survivors: AlertCandidate[] = []
+    const seen = new Set<string>()
+
+    for (const candidate of candidates) {
+      const debounceKey = `${candidate.code}:${candidate.direction}:${candidate.topSubSignalId}`
+      seen.add(debounceKey)
+
+      const gate1 = this.checkDebounce(candidate, debounceKey, ctx)
+      if (gate1) {
+        decisions.push(drop(candidate, gate1))
+        continue
+      }
+      const gate2 = this.checkCooldown(candidate, now)
+      if (gate2) {
+        decisions.push(drop(candidate, gate2))
+        continue
+      }
+      survivors.push(candidate)
+    }
+
+    // 本轮没出现的防抖键清零 —— 指标在阈值附近抖动时，「消失过」就得重新连续 N 次
+    for (const key of [...this.streaks.keys()]) if (!seen.has(key)) this.streaks.delete(key)
+
+    // 闸门③④：降级。**按得分降序处理**，这样配额留给最值得发的那条（docs/05 §4.3）
+    for (const candidate of [...survivors].sort((a, b) => b.score - a.score)) {
+      let level = candidate.level
+      const reasons: string[] = []
+
+      // ④ 免打扰：L2/L3 一律降为 L1，累积到托盘
+      if (ctx.quiet && level !== 'L1') {
+        reasons.push(`免打扰${ctx.quietReason ? `（${ctx.quietReason}）` : ''}，降为 L1`)
+        level = 'L1'
+      }
+
+      // ③ 频率上限：三条各自判，都是降级而不是丢弃
+      if (level !== 'L1') {
+        const cap = this.checkCaps(candidate, level)
+        if (cap) {
+          reasons.push(cap)
+          level = 'L1'
+        }
+      }
+
+      this.commit(candidate, level, now)
+      decisions.push({
+        candidate,
+        level,
+        channels: CHANNELS_BY_LEVEL[level],
+        reason: reasons.length > 0 ? reasons.join('；') : null,
+      })
+    }
+
+    return decisions
+  }
+
+  /** ① 防抖（docs/05 §4.1）。强制类不防抖：止损晚一个 tick 是真金白银 */
+  private checkDebounce(candidate: AlertCandidate, key: string, ctx: DispatchContext): string | null {
+    if (candidate.forced === true || ctx.debounce === false || this.debounceTicks <= 1) {
+      this.streaks.set(key, this.debounceTicks)
+      return null
+    }
+    const next = (this.streaks.get(key) ?? 0) + 1
+    this.streaks.set(key, next)
+    if (next < this.debounceTicks) {
+      return `防抖：连续成立 ${next}/${this.debounceTicks} 个 tick，未达确认次数`
+    }
+    return null
+  }
+
+  /** ② 同键冷却（docs/05 §4.2） */
+  private checkCooldown(candidate: AlertCandidate, now: number): string | null {
+    if (candidate.forced === true) {
+      // 持仓强制类不受冷却，改为「跌幅每扩大 forcedStepPct 提醒一次」——
+      // 既不骚扰（不是每 tick 都喊）也不漏报（跌得更深时一定会再喊一次）
+      const loss = candidate.lossPct
+      if (loss === undefined) return null
+      const previous = this.lastForcedLoss.get(candidate.code)
+      if (previous !== undefined && loss > previous - this.forcedStepPct) {
+        return `强制提醒台阶：跌幅 ${(loss * 100).toFixed(1)}% 未比上次（${(previous * 100).toFixed(
+          1
+        )}%）再扩大 ${(this.forcedStepPct * 100).toFixed(0)}%`
+      }
+      return null
+    }
+
+    const key = `${candidate.code}:${candidate.direction}`
+    const last = this.lastSent.get(key)
+    if (!last) return null
+    // 冷却期按**上次实际发出的级别**算：L3 发过之后当日不再重复，即便这次只是 L1
+    const window = this.cooldownMs[last.level]
+    if (now - last.at >= window) return null
+    const minutes = Math.round((window - (now - last.at)) / 60000)
+    return window === Number.POSITIVE_INFINITY
+      ? `同键冷却：${key} 今日已发过 ${last.level}`
+      : `同键冷却：${key} 上次 ${last.level} 提醒后还有 ${minutes} 分钟`
+  }
+
+  /** ③ 频率上限（docs/05 §4.3）。返回非空表示要降级 */
+  private checkCaps(candidate: AlertCandidate, level: AlertLevel): string | null {
+    if ((this.perCodeToday.get(candidate.code) ?? 0) >= this.perCodeDailyLimit) {
+      return `频率上限：${candidate.code} 今日 L2+L3 已达 ${this.perCodeDailyLimit} 条，降为 L1`
+    }
+    if (this.recentHigh.length >= this.hourlyLimit) {
+      return `频率上限：全局每小时 L2+L3 已达 ${this.hourlyLimit} 条，降为 L1`
+    }
+    if (level === 'L3' && this.l3Today >= this.dailyL3Limit) {
+      return `频率上限：全局今日 L3 已达 ${this.dailyL3Limit} 条，降为 L1`
+    }
+    return null
+  }
+
+  /** 记账。只有**实际发出**的才计入冷却与配额 —— 被降级成 L1 的不占 L2/L3 的额度 */
+  private commit(candidate: AlertCandidate, level: AlertLevel, now: number): void {
+    this.lastSent.set(`${candidate.code}:${candidate.direction}`, { level, at: now })
+    if (candidate.forced === true && candidate.lossPct !== undefined) {
+      this.lastForcedLoss.set(candidate.code, candidate.lossPct)
+    }
+    if (level === 'L1') return
+    this.recentHigh.push(now)
+    this.perCodeToday.set(candidate.code, (this.perCodeToday.get(candidate.code) ?? 0) + 1)
+    if (level === 'L3') this.l3Today++
+  }
+
+  /** 跨日重置：当日计数、L3 的「当日一次」冷却、强制类台阶 */
+  private rollDay(now: number): void {
+    const day = this.startOfDay(now)
+    if (day === this.day) return
+    this.day = day
+    this.perCodeToday.clear()
+    this.l3Today = 0
+    this.lastForcedLoss.clear()
+    // L3 的冷却是 Infinity（当日一次），跨日必须清掉，否则永远发不出第二条
+    for (const [key, last] of [...this.lastSent.entries()]) {
+      if (last.at < day) this.lastSent.delete(key)
+    }
+  }
+
+  /**
+   * 「每小时 ≤ 6」用**滑动窗口**而不是整点桶。
+   * 整点桶会允许 10:59 发 6 条、11:00 再发 6 条 —— 用户体验到的是「两分钟内 12 条」。
+   */
+  private pruneHourly(now: number): void {
+    this.recentHigh = this.recentHigh.filter((at) => now - at < HOUR)
+  }
+}
+
+function drop(candidate: AlertCandidate, reason: string): AlertDecision {
+  return { candidate, level: null, channels: [], reason }
+}

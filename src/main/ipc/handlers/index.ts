@@ -67,11 +67,11 @@ export function registerHandlers(controller: AppController): void {
 
   handle('pet:setHitRegion', (_event, rects) => controller.setHitRects(rects))
 
-  handle('pet:setInteractive', (_event, interactive) => controller.setPetInteractive(interactive))
+  handle('pet:setInteractive', (_event, interactive) => controller.setOverlayInteractive(interactive))
 
-  handle('pet:dragBy', (_event, dx, dy) => controller.dragPetBy(dx, dy))
+  handle('pet:dragBy', (_event, dx, dy) => controller.dragOverlayBy(dx, dy))
 
-  handle('pet:dragEnd', () => controller.endPetDrag())
+  handle('pet:dragEnd', () => controller.endOverlayDrag())
 
   handle('pet:contextMenu', () => {
     // 桌宠右键与托盘右键共用同一份菜单（docs/06 §4）
@@ -84,7 +84,11 @@ export function registerHandlers(controller: AppController): void {
 
   handle('panel:toggle', () => controller.togglePanel())
 
-  // 桌宠窗口 focusable: false，拿不到键盘 —— 但 Panel 是正常窗口，
-  // 没有菜单栏时 Ctrl+R / F12 也一并没了。开发期保留默认菜单，打包时再收（M4）。
-  if (!process.env['ELECTRON_RENDERER_URL']) Menu.setApplicationMenu(null)
+  // **无条件**收掉 Electron 的默认菜单（2026-08-13）。
+  //
+  // 以前这里只在打包后收，开发期留着它换 Ctrl+R / F12 —— 代价是 `pnpm dev` 的面板顶着
+  // 一整条 File/Edit/View/Window/Help，里面还有 "Learn More" 直通 electronjs.org。
+  // 那是**用户会看到的界面**（面板是唯一的常规窗口），不是开发者的调试面板。
+  // 开发期的两个快捷键改由 `enableDevShortcuts()` 显式注册，不靠菜单栏（见 load-route.ts）。
+  Menu.setApplicationMenu(null)
 }

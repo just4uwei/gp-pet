@@ -1,0 +1,11 @@
+{
+  "regime": [
+    { "hysteresisDays": 3, "rangeMidBand": 0.03 },
+    { "hysteresisDays": 4, "rangeMidBand": 0.03 },
+    { "hysteresisDays": 5, "rangeMidBand": 0.03 },
+    { "hysteresisDays": 6, "rangeMidBand": 0.03 },
+    { "hysteresisDays": 8, "rangeMidBand": 0.03 },
+    { "hysteresisDays": 10, "rangeMidBand": 0.03 },
+    { "hysteresisDays": 12, "rangeMidBand": 0.03 }
+  ]
+}
