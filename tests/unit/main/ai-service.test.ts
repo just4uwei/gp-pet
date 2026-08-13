@@ -18,6 +18,7 @@ import type { AiConfig } from '@main/ai/types'
 const CONFIG: AiConfig = {
   enabled: true,
   baseUrl: 'https://example.com/v1',
+  protocol: 'openai',
   model: 'm',
   timeoutMs: 30_000,
   maxTokens: 512,

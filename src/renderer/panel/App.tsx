@@ -40,17 +40,22 @@ import { PositionEditor } from './PositionEditor'
 import { Settings } from './Settings'
 import { ShadowPanel } from './ShadowPanel'
 import { SignalList } from './SignalList'
+import { WatchPoints } from './WatchPoints'
 
 /**
- * 三个标签页。**不做路由** —— 面板只有三屏，`useState` 比引一个 router 便宜得多。
+ * 四个标签页。**不做路由** —— 面板只有四屏，`useState` 比引一个 router 便宜得多。
  *
- * 「概览」是默认页且是唯一有推送的一屏（行情每轮都在变）；影子运行与设置都是
+ * 「概览」是默认页且是唯一有推送的一屏（行情每轮都在变）；其余三个标签页都是
  * 「打开看一眼」的性质，所以它们**不订阅推送**，只在切进来时拉一次。
+ *
+ * 「观察点」的标题带 ACTIVE 计数 —— 那是「软件现在在盯什么」最直接的回答，
+ * 而这个功能的全部意义就在于让用户看得见它在盯。
  */
-type Tab = 'OVERVIEW' | 'SHADOW' | 'SETTINGS'
+type Tab = 'OVERVIEW' | 'WATCH' | 'SHADOW' | 'SETTINGS'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'OVERVIEW', label: '概览' },
+  { id: 'WATCH', label: '观察点' },
   { id: 'SHADOW', label: '影子运行' },
   { id: 'SETTINGS', label: '设置' },
 ]
@@ -298,6 +303,34 @@ export function App(): React.JSX.Element {
   const [transfer, setTransfer] = useState<TransferOutcome | null>(null)
   // 引擎每轮跑完会推一次 engineStatus；用它当信号与提醒日志的重取信号
   const [signalKey, setSignalKey] = useState(0)
+  /**
+   * AI 解读是否可用（已启用 + 有 key + 有模型名）。
+   *
+   * **状态提到 App 这一层是必须的。** 它原来放在 SignalList 里、只在挂载时读一次 ——
+   * 而概览页是**常驻挂载**的（只切 display），面板窗口又是懒建之后一直留着的，
+   * 于是「读一次」= 整个应用生命周期读一次：用户在设置页打开 AI 再切回概览，
+   * 入口永远不出现，看起来就是「开了但没有功能入口」。
+   * 现在切回概览时重读，设置页改完也会主动回调重读。
+   */
+  const [aiReady, setAiReady] = useState(false)
+  /** ACTIVE 观察点数，显示在标签上 —— 「软件在盯什么」要一眼看见 */
+  const [watchActive, setWatchActive] = useState(0)
+  const [watchKey, setWatchKey] = useState(0)
+
+  const refreshWatch = useCallback((): void => {
+    setWatchKey((key) => key + 1)
+    void window.gp
+      .invoke('watch:list', { status: 'ACTIVE', limit: 200 })
+      .then((rows) => setWatchActive(rows.length))
+      .catch(() => setWatchActive(0))
+  }, [])
+
+  const refreshAiReady = useCallback((): void => {
+    void window.gp
+      .invoke('ai:config')
+      .then((config) => setAiReady(config.enabled && config.hasKey && config.model !== ''))
+      .catch(() => setAiReady(false))
+  }, [])
 
   const reload = useCallback(async (): Promise<void> => {
     try {
@@ -350,6 +383,14 @@ export function App(): React.JSX.Element {
       offQuotes()
     }
   }, [reload])
+
+  // 切回概览时重读一次 AI 可用性 —— 概览是常驻挂载的，指望它自己重挂是指望不到的
+  useEffect(() => {
+    if (tab === 'OVERVIEW') refreshAiReady()
+  }, [tab, refreshAiReady])
+
+  // 观察点计数跟着引擎每轮走：命中会让 ACTIVE 少一个，标签上的数要跟上
+  useEffect(refreshWatch, [refreshWatch, signalKey])
 
   const quoteOf = useMemo(() => new Map(quotes.map((q) => [q.code, q])), [quotes])
   const positionOf = useMemo(() => new Map(positions.map((p) => [p.code, p])), [positions])
@@ -481,6 +522,12 @@ export function App(): React.JSX.Element {
               onClick={() => setTab(item.id)}
             >
               {item.label}
+              {/* 「软件在盯 N 个条件」要一眼看见 —— 这是这个功能的全部意义 */}
+              {item.id === 'WATCH' && watchActive > 0 ? (
+                <span className="ml-1 rounded bg-sky-400/20 px-1 text-[10px] text-sky-200">
+                  {watchActive}
+                </span>
+              ) : null}
             </button>
           ))}
         </div>
@@ -505,6 +552,11 @@ export function App(): React.JSX.Element {
       ) : null}
 
       {/* 影子运行与设置是单栏长内容，交给这一层滚动 */}
+      {tab === 'WATCH' ? (
+        <div className="min-h-0 flex-1 overflow-y-auto p-5">
+          <WatchPoints refreshKey={watchKey} onChanged={refreshWatch} onError={setError} />
+        </div>
+      ) : null}
       {tab === 'SHADOW' ? (
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
           <ShadowPanel refreshKey={signalKey} onError={setError} />
@@ -512,7 +564,8 @@ export function App(): React.JSX.Element {
       ) : null}
       {tab === 'SETTINGS' ? (
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
-          <Settings onError={setError} />
+          {/* onAiChanged：改完立刻重算入口可见性，不用等切回概览 */}
+          <Settings onError={setError} onAiChanged={refreshAiReady} />
         </div>
       ) : null}
 
@@ -566,7 +619,12 @@ export function App(): React.JSX.Element {
 
         <div className="flex min-h-0 flex-col gap-4">
           {/* 信号是流水，占掉右栏剩下的全部高度；提醒日志是按需展开的，按内容给高 */}
-          <SignalList refreshKey={signalKey} onError={setError} />
+          <SignalList
+            refreshKey={signalKey}
+            aiReady={aiReady}
+            onWatchCreated={refreshWatch}
+            onError={setError}
+          />
           <AlertLog
             refreshKey={signalKey}
             unread={status?.unreadAlerts ?? 0}

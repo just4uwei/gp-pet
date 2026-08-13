@@ -253,7 +253,14 @@ function ParamsTable(): React.JSX.Element {
   )
 }
 
-export function Settings({ onError }: { onError: (message: string) => void }): React.JSX.Element {
+export function Settings({
+  onError,
+  onAiChanged,
+}: {
+  onError: (message: string) => void
+  /** AI 配置改动后通知 App 重算入口可见性（概览页常驻挂载，不会自己重读） */
+  onAiChanged: () => void
+}): React.JSX.Element {
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [about, setAbout] = useState<AboutInfo | null>(null)
   const [notice, setNotice] = useState<MaintenanceResult | null>(null)
@@ -436,7 +443,7 @@ export function Settings({ onError }: { onError: (message: string) => void }): R
 
       {/* AI 解读是**只读的解释层**：它不参与信号、闸门、状态点与影子运行。
           配置整块住在 ai.json，不在 AppSettings 里 —— 见 AiSettings.tsx 头注释 */}
-      <AiSettings onError={onError} />
+      <AiSettings onError={onError} onChanged={onAiChanged} />
 
       <Section title="系统">
         <Row label="开机自启" hint="开发模式下不写注册表（会注册成一个裸 Electron），要验请先打包">

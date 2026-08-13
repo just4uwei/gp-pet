@@ -15,6 +15,7 @@
  */
 
 import { app, powerMonitor, shell } from 'electron'
+import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type {
@@ -38,6 +39,8 @@ import type {
   SignalEvidence,
   SignalRecord,
   WatchItem,
+  WatchPointDraft,
+  WatchPointView,
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
 import { engineVersionOf, withSensitivity } from '@core/params'
@@ -91,10 +94,50 @@ import { BACKUP_DIR_NAME, DEFAULT_BACKUP_POLICY, backupNow } from './storage/bac
 import { SHADOW_KEYS } from './storage/repositories/shadow'
 import { pruneAll, vacuum } from './storage/retention'
 import { isQuiet, quietUntil, type QuietPreset } from './util/quiet'
+import { evaluateWatchPoints, type WatchHit } from './watch/evaluate'
+import { isWatchMetric } from './watch/metrics'
+import type { WatchPointRow } from './storage/repositories/watch'
 import { WindowManager } from './windows/WindowManager'
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** 观察点默认有效期。20 个交易日 ≈ 四周，按自然日折算给足余量 */
+const DEFAULT_WATCH_DAYS = 28
+
+/**
+ * 落库行 → 渲染层视图。
+ *
+ * `staleEngineVersion` 只对**指标类**给：换过灵敏度之后 rsi 周期一类的东西变了，
+ * 同一个阈值不再是同一件事。而 PRICE 是不复权现价，与引擎参数无关，不该报警。
+ */
+function toWatchPointView(
+  row: WatchPointRow,
+  currentEngineVersion: string,
+  nameOf: (code: SecCode) => string
+): WatchPointView {
+  const view: WatchPointView = {
+    id: row.id,
+    code: row.code,
+    name: nameOf(row.code),
+    signalId: row.signalId,
+    source: row.source,
+    metric: row.metric,
+    op: row.op,
+    threshold: row.threshold,
+    meaning: row.meaning,
+    createdAt: row.createdAt,
+    expiresAt: row.expiresAt,
+    status: row.status,
+  }
+  if (row.note !== undefined) view.note = row.note
+  if (row.hitAt !== undefined) view.hitAt = row.hitAt
+  if (row.hitValue !== undefined) view.hitValue = row.hitValue
+  if (row.metric !== 'PRICE' && row.engineVersion !== currentEngineVersion) {
+    view.staleEngineVersion = row.engineVersion
+  }
+  return view
 }
 
 /** 数据层未就绪时报的引擎版本：出厂参数的那一个（此时也确实还没有别的） */
@@ -580,10 +623,13 @@ export class AppController {
    */
   onSignals(ctx?: TickContext, outcomes?: readonly SignalOutcome[]): void {
     if (!this.data) return
+    // 观察点先判：命中的要跟着这一轮一起过闸门（见 candidates.ts 的 watchHitAlert）
+    const watchHits = ctx && outcomes ? this.evaluateWatchPoints(ctx, outcomes) : []
+
     if (this.alerts && ctx && outcomes) {
       try {
         const debounce = ctx.session === 'CONTINUOUS_AM' || ctx.session === 'CONTINUOUS_PM'
-        const summary = this.alerts.handle(outcomes, { at: ctx.at, debounce })
+        const summary = this.alerts.handle(outcomes, { at: ctx.at, debounce, watchHits })
         if (summary.decisions.length > 0) {
           log.info(`[alert] ${ctx.date} ${ctx.session}：发出 ${summary.delivered} 条，静默 ${summary.suppressed} 条`)
         }
@@ -593,6 +639,101 @@ export class AppController {
       }
     }
     this.windows.push('push:engineStatus', this.engineStatus())
+  }
+
+  // ── 观察点（P2 续）────────────────────────────────────────────────
+  //
+  // **它不是策略参数。** 观察点是用户自己拥有的一次性盯盘条件（AI 建议 → 人确认），
+  // 判定是一次纯比较、不涉及模型；命中后走**正常的四道闸门**。
+  // 边界与理由见 storage/migrations/003_watch.sql 的头注释。
+
+  /**
+   * 判一轮观察点，落库状态，返回命中的（交给 AlertService 一起过闸门）。
+   *
+   * 判定挂在引擎跑完之后 —— 那一刻 `evaluation.candle` + `indicators` + 最新报价都在手上。
+   * 引擎在竞价时段之外返回空数组，所以观察点只在盘中被判，这是对的。
+   */
+  private evaluateWatchPoints(ctx: TickContext, outcomes: readonly SignalOutcome[]): WatchHit[] {
+    const layer = this.data
+    if (!layer) return []
+    try {
+      const repo = layer.storage.watchPoints
+      const points = repo.active()
+      if (points.length === 0) return []
+
+      const result = evaluateWatchPoints({
+        points,
+        outcomes,
+        quotes: this.quoteViews(),
+        at: ctx.at,
+      })
+
+      // markHit 带 `status = 'ACTIVE'` 条件，是幂等闸门：盘后会跑好几轮，
+      // 少了它同一个观察点会被反复记成命中
+      const hits = result.hits.filter((hit) => repo.markHit(hit.point.id, ctx.at, hit.value))
+      for (const point of result.expired) {
+        if (repo.markExpired(point.id)) {
+          // 过期**不发气泡**：到期未兑现是个结论，但一天几十条「你那个猜错了」是骚扰
+          log.info(`[watch] ${point.code} 观察点到期未命中（${point.metric} ${point.op} ${point.threshold}）`)
+        }
+      }
+      for (const hit of hits) {
+        log.info(`[watch] ${hit.point.code} 命中：${hit.point.metric} ${hit.point.op} ${hit.point.threshold}，实际 ${hit.value}`)
+      }
+      return hits
+    } catch (error) {
+      // 观察点判定挂了不该连带把提醒与面板吃掉（docs/02 §7）
+      log.warn('[watch] 判定失败：', error)
+      return []
+    }
+  }
+
+  watchPoints(query: { status?: WatchPointView['status']; limit?: number } = {}): WatchPointView[] {
+    const layer = this.data
+    if (!layer) return []
+    const current = layer.signals.engineVersion
+    return layer.storage.watchPoints.list(query).map((row) => toWatchPointView(row, current, (code) =>
+      layer.storage.watchlist.get(code)?.profile.name ?? code
+    ))
+  }
+
+  /** 新建。数值一律是**用户确认过**的 —— 模型的建议只走到表单预填那一步 */
+  createWatchPoint(draft: WatchPointDraft): WatchPointView {
+    const layer = this.requireData()
+    if (!isWatchMetric(draft.metric)) throw new Error(`不支持盯这个指标：${draft.metric}`)
+    if (!Number.isFinite(draft.threshold)) throw new Error('阈值必须是一个数')
+
+    const evidence = layer.explainSignal(draft.signalId)
+    if (!evidence) throw new Error('来源信号已不在库中，无法挂观察点')
+    const record = layer.signalHistory({ limit: 500 }).find((row) => row.id === draft.signalId)
+    if (!record) throw new Error('来源信号已不在最近的记录里')
+
+    const now = Date.now()
+    const days = Math.min(Math.max(Math.trunc(draft.days ?? DEFAULT_WATCH_DAYS), 1), 365)
+    const row = {
+      id: randomUUID(),
+      code: record.code,
+      signalId: draft.signalId,
+      source: draft.edited === true ? ('USER_EDITED' as const) : ('AI_SUGGESTED' as const),
+      metric: draft.metric,
+      op: draft.op,
+      threshold: draft.threshold,
+      meaning: draft.meaning,
+      ...(draft.note === undefined || draft.note === '' ? {} : { note: draft.note.slice(0, 500) }),
+      engineVersion: layer.signals.engineVersion,
+      createdAt: now,
+      expiresAt: now + days * 24 * 60 * 60 * 1000,
+      status: 'ACTIVE' as const,
+    }
+    layer.storage.watchPoints.insert(row)
+    log.info(`[watch] 新增：${row.code} ${row.metric} ${row.op} ${row.threshold}（${days} 天，${row.source}）`)
+    this.onStateChanged()
+    return toWatchPointView(row, layer.signals.engineVersion, () => record.name)
+  }
+
+  cancelWatchPoint(id: string): void {
+    this.requireData().storage.watchPoints.cancel(id)
+    this.onStateChanged()
   }
 
   // ── 提醒（M3）─────────────────────────────────────────────────────

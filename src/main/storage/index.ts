@@ -14,6 +14,7 @@ import { MetaRepo } from './repositories/meta'
 import { PositionRepo } from './repositories/position'
 import { ShadowRepo } from './repositories/shadow'
 import { SignalRepo } from './repositories/signal'
+import { WatchPointRepo } from './repositories/watch'
 import { WatchlistRepo } from './repositories/watchlist'
 
 export interface Storage {
@@ -28,6 +29,8 @@ export interface Storage {
   readonly positions: PositionRepo
   /** 影子运行的账本（M4，docs/07 §2.3） */
   readonly shadow: ShadowRepo
+  /** 观察点：用户确认的一次性盯盘条件（**不是策略参数**，见 003_watch.sql） */
+  readonly watchPoints: WatchPointRepo
   readonly meta: MetaRepo
   close(): void
 }
@@ -44,6 +47,7 @@ export function createStorage(db: Database): Storage {
     health: new ProviderHealthRepo(db),
     positions: new PositionRepo(db),
     shadow: new ShadowRepo(db),
+    watchPoints: new WatchPointRepo(db),
     meta: new MetaRepo(db),
     close: () => db.close(),
   }

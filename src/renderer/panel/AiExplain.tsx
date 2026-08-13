@@ -11,12 +11,36 @@
  *    否则用户已经不看了，钱还在烧。
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { SecCode } from '@core/types'
+import type { WatchSuggestion } from '@shared/ipc-types'
 import { FOOTER_NOTE } from './disclaimer'
+import { WatchPointForm } from './WatchPointForm'
 
 type Phase = 'idle' | 'running' | 'done' | 'error'
 
-export function AiExplain({ signalId }: { signalId: string }): React.JSX.Element {
+/**
+ * 建议块是给程序读的，不显示给用户。
+ *
+ * 与主进程的 `stripSuggestionBlock()` 同一个正则 —— 抽取在主进程做（那边有白名单校验），
+ * 这边只负责别把它印出来：它长得像「系统给的结论」，与「本段由外部模型生成」的定位冲突。
+ */
+const SUGGESTION_BLOCK = /<观察点建议>[\s\S]*?<\/观察点建议>/g
+
+export function AiExplain({
+  signalId,
+  code,
+  name,
+  onWatchCreated,
+  onError,
+}: {
+  signalId: string
+  code: SecCode
+  name: string
+  /** 新建成功后通知上层刷新「观察点」页与计数 */
+  onWatchCreated: () => void
+  onError: (message: string) => void
+}): React.JSX.Element {
   const [phase, setPhase] = useState<Phase>('idle')
   const [text, setText] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -27,6 +51,13 @@ export function AiExplain({ signalId }: { signalId: string }): React.JSX.Element
    * 那样每开一次就多累积一个监听器，正是 preload 头注释警告的那件事。
    */
   const offRef = useRef<(() => void) | null>(null)
+  const [suggestions, setSuggestions] = useState<WatchSuggestion[]>([])
+  const [formOpen, setFormOpen] = useState(false)
+  /** 累积正文。用 ref 而不是从 state 里读：done 那一刻要拿到**全量**去抽建议 */
+  const textRef = useRef('')
+
+  /** 显示给用户的正文：把机器读的建议块摘掉 */
+  const visibleText = useMemo(() => text.replace(SUGGESTION_BLOCK, '').trimEnd(), [text])
 
   const stop = useCallback((): void => {
     offRef.current?.()
@@ -50,8 +81,11 @@ export function AiExplain({ signalId }: { signalId: string }): React.JSX.Element
       offRef.current = null
 
       setPhase('running')
+      textRef.current = ''
       setText('')
       setError(null)
+      setSuggestions([])
+      setFormOpen(false)
 
       const finish = (): void => {
         offRef.current?.()
@@ -67,10 +101,18 @@ export function AiExplain({ signalId }: { signalId: string }): React.JSX.Element
           finish()
           return
         }
-        if (chunk.delta !== undefined) setText((current) => current + chunk.delta)
+        if (chunk.delta !== undefined) {
+          textRef.current += chunk.delta
+          setText(textRef.current)
+        }
         if (chunk.done === true) {
           setPhase('done')
           finish()
+          // 全文到齐才抽建议：流式过程中那一块可能只到一半，抽出来的阈值会缺位
+          void window.gp
+            .invoke('watch:suggest', textRef.current)
+            .then(setSuggestions)
+            .catch(() => setSuggestions([]))
         }
       })
 
@@ -80,9 +122,14 @@ export function AiExplain({ signalId }: { signalId: string }): React.JSX.Element
           requestRef.current = started.requestId
           if (started.cached !== undefined) {
             // 命中主进程内存缓存：不会再有任何推送
+            textRef.current = started.cached
             setText(started.cached)
             setPhase('done')
             finish()
+            void window.gp
+              .invoke('watch:suggest', started.cached)
+              .then(setSuggestions)
+              .catch(() => setSuggestions([]))
           }
         })
         .catch((err: unknown) => {
@@ -112,12 +159,43 @@ export function AiExplain({ signalId }: { signalId: string }): React.JSX.Element
 
       {error === null ? (
         <p className="whitespace-pre-wrap leading-relaxed text-white/75">
-          {text}
+          {visibleText}
           {phase === 'running' ? <span className="animate-pulse text-white/40">▍</span> : null}
         </p>
       ) : (
         <p className="leading-relaxed text-rose-200/80">{error}</p>
       )}
+
+      {/*
+        把第 4 段（失效条件）变成可跟踪的东西。**只在生成完之后出现**：
+        流式过程中建议块可能只到一半。抽不到建议时按钮照样在 —— 表单空着让用户自己填，
+        模型不照格式输出是常态，不该因此让这条路走不通。
+      */}
+      {phase === 'done' && error === null ? (
+        formOpen ? (
+          <WatchPointForm
+            signalId={signalId}
+            code={code}
+            name={name}
+            suggestions={suggestions}
+            onDone={() => {
+              setFormOpen(false)
+              onWatchCreated()
+            }}
+            onCancel={() => setFormOpen(false)}
+            onError={onError}
+          />
+        ) : (
+          <button
+            className="gp-btn mt-2 w-full justify-center text-[11px]"
+            onClick={() => setFormOpen(true)}
+          >
+            {suggestions.length > 0
+              ? `设为观察点（模型建议了 ${suggestions.length} 条，需你确认）`
+              : '设为观察点（自己填条件）'}
+          </button>
+        )
+      ) : null}
 
       <div className="mt-2 flex items-center gap-2 border-t border-white/10 pt-1.5">
         <span className="text-[10px] text-white/30">{FOOTER_NOTE}</span>

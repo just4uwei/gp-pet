@@ -103,7 +103,7 @@ test.describe('首次启动引导', () => {
   })
 })
 
-test.describe('面板三屏', () => {
+test.describe('面板四屏', () => {
   let userData = ''
   let app: ElectronApplication | null = null
 
@@ -150,5 +150,49 @@ test.describe('面板三屏', () => {
 
     // 免责声明在「关于」里随时可查（docs/01 §8）
     await expect(panel.getByText('不构成任何投资建议')).toBeVisible()
+  })
+
+  /**
+   * AI 解读的入口链路。真实回归：`aiReady` 原来只在概览页挂载时读一次，而概览页
+   * 是**常驻挂载**的，于是「设置页开启 → 切回概览」永远看不到入口 ——
+   * 用户报的就是「开启后没看到可以操作的功能入口」。
+   *
+   * 这里只验「配置入口在、开关能改、切回概览不炸」—— 真发请求要凭据，E2E 保持离线。
+   */
+  test('AI 分析：设置页有配置入口，开关改动后切回概览不报错', async () => {
+    const panel = await openPanel(app as ElectronApplication)
+    await panel.getByRole('button', { name: '设置' }).click()
+
+    await expect(panel.getByText('AI 分析', { exact: true })).toBeVisible()
+    for (const label of ['接口地址', '接口协议', '模型名', 'API key']) {
+      await expect(panel.getByText(label, { exact: true })).toBeVisible()
+    }
+
+    // 开关按 aria-label 定位 —— 设置页上有好几个文案是「已关闭」的按钮
+    const toggle = panel.getByRole('button', { name: '启用 AI 解读' })
+    await expect(toggle).toHaveText('已关闭')
+    await toggle.click()
+    await expect(toggle).toHaveText('已开启')
+
+    // 切回概览：这一步会触发 refreshAiReady()，早先的实现在这里什么都不会发生
+    await panel.getByRole('button', { name: '概览' }).click()
+    await expect(panel.getByText('今日信号')).toBeVisible()
+  })
+
+  /**
+   * 观察点页的空态。**离线**：不发任何模型请求 ——
+   * 这里验的是「页在、schema v3 迁移过了、空态说清了怎么用」，
+   * 而不是判定逻辑（那些在 watch-evaluate / watch-repo 的单测里）。
+   *
+   * 空态文案是这一页最重要的部分：没有观察点时，用户需要被告诉**怎么创建第一个**。
+   */
+  test('观察点：页面能打开，空态说清了从哪创建', async () => {
+    const panel = await openPanel(app as ElectronApplication)
+    await panel.getByRole('button', { name: '观察点' }).click()
+
+    // 「不是策略参数」这条边界必须摆在页面上，不能只写在文档里
+    await expect(panel.getByText(/不是策略参数/)).toBeVisible()
+    await expect(panel.getByText(/还没有观察点/)).toBeVisible()
+    await expect(panel.getByText(/让 AI 解读一次/)).toBeVisible()
   })
 })

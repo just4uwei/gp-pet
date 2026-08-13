@@ -205,3 +205,79 @@ describe('收盘失效提示（docs/04 §6、docs/05 §3）', () => {
     expect(items.map((i) => i.candidate.direction)).toEqual(['NONE', 'SELL'])
   })
 })
+
+/**
+ * 观察点命中 —— 提醒层的**第三类来源**（信号 / 收盘失效 / 观察点命中）。
+ *
+ * 四个字段各有理由，逐条钉住：挂来源信号（外键）、方向 NONE（避开冷却串味）、
+ * L2（照过闸门而不是绕过）、文案说清「这是你设的，不是策略让你卖」。
+ */
+describe('观察点命中（P2 续）', () => {
+  const hit = {
+    point: {
+      id: 'w1',
+      code: 'SH600000' as SecCode,
+      signalId: 'sig-source',
+      source: 'AI_SUGGESTED' as const,
+      metric: 'PRICE',
+      op: 'LTE' as const,
+      threshold: 8.2,
+      meaning: 'INVALIDATE' as const,
+      note: '跌破 20 日均线支撑',
+      engineVersion: '0.2.6-unvalidated',
+      createdAt: AT - 86_400_000,
+      expiresAt: AT + 86_400_000,
+      status: 'ACTIVE' as const,
+    },
+    value: 8.15,
+    name: '浦发银行',
+    price: 8.15,
+    changePct: -2.1,
+  }
+
+  it('挂来源信号的 id —— alert_log.signal_id 是 NOT NULL 外键，不用改表结构', () => {
+    const [item] = buildAlerts([], { at: AT, watchHits: [hit] })
+    expect(item?.candidate.signalId).toBe('sig-source')
+  })
+
+  it('方向用 NONE：沿用原方向会被那条买入提醒的 2h 冷却吃掉', () => {
+    const [item] = buildAlerts([], { at: AT, watchHits: [hit] })
+    expect(item?.candidate.direction).toBe('NONE')
+  })
+
+  it('级别 L2 —— 够得上气泡，但**照过四道闸门**，不是强制类', () => {
+    const [item] = buildAlerts([], { at: AT, watchHits: [hit] })
+    expect(item?.candidate.level).toBe('L2')
+    expect(item?.candidate.forced).toBeUndefined()
+    expect(item?.candidate.topSubSignalId).toBe('WATCH_HIT')
+  })
+
+  it('文案说清这是用户自己设的，不是策略给的新信号', () => {
+    const [item] = buildAlerts([], { at: AT, watchHits: [hit] })
+    expect(item?.payload.headline).toContain('失效条件')
+    expect(item?.payload.reasons.join(' ')).toContain('不是新的策略信号')
+    // 措辞纪律：不许出现「快卖」这类情绪化表达
+    expect(item?.payload.headline).not.toContain('卖')
+  })
+
+  it('CONFIRM 类的措辞不同 —— 命中意味着判断被确认，不是失效', () => {
+    const confirm = { ...hit, point: { ...hit.point, meaning: 'CONFIRM' as const } }
+    const [item] = buildAlerts([], { at: AT, watchHits: [confirm] })
+    expect(item?.payload.headline).toContain('观察条件已满足')
+  })
+
+  it('命中排在信号之前：用户亲自设的东西优先于引擎自己发现的', () => {
+    const items = buildAlerts([outcome({ evaluation: evaluation({ direction: 'BUY' }) })], {
+      at: AT,
+      watchHits: [hit],
+    })
+    expect(items).toHaveLength(2)
+    expect(items[0]?.candidate.topSubSignalId).toBe('WATCH_HIT')
+    expect(items[1]?.candidate.direction).toBe('BUY')
+  })
+
+  it('没有命中时不多出任何候选', () => {
+    expect(buildAlerts([], { at: AT, watchHits: [] })).toHaveLength(0)
+    expect(buildAlerts([], { at: AT })).toHaveLength(0)
+  })
+})

@@ -24,6 +24,8 @@ import type { Evaluation } from '@core/engine'
 import type { AlertLevel, GatedDirection, SecCode, SubSignal } from '@core/types'
 import type { AlertPayload } from '@shared/ipc-types'
 import type { InvalidationNotice, SignalOutcome } from '../engine/signals'
+import type { WatchHit } from '../watch/evaluate'
+import { metricLabel } from '../watch/metrics'
 import type { AlertCandidate } from './dispatcher'
 
 const LEVELS: readonly AlertLevel[] = ['L1', 'L2', 'L3']
@@ -53,6 +55,11 @@ export interface BuildOptions {
   quotes?: ReadonlyMap<SecCode, QuoteView>
   /** 触发时刻（墙上时间）。不读时钟，与 src/core 同一条纪律 */
   at: number
+  /**
+   * 本轮命中的观察点（P2 续）。它们与信号**走同一套闸门** ——
+   * 不新开分发路径，状态点仍只由闸门点亮。
+   */
+  watchHits?: readonly WatchHit[]
 }
 
 /** 持仓强制通道：这些裁决绕过组合层得分，不受冷却限制（docs/05 §2.3、§4.2） */
@@ -133,9 +140,71 @@ function invalidationAlert(
   }
 }
 
+/**
+ * 观察点命中（P2 续）。**提醒层的第三类来源**：信号 / 收盘失效 / 观察点命中。
+ *
+ * 四个字段的取值都不是随手定的：
+ *
+ * - `signalId` 用观察点的**来源信号** —— `alert_log.signal_id` 是 NOT NULL 外键，
+ *   而观察点命中不产生新信号。挂来源信号既满足外键，又让「这条提醒是哪来的」可追溯，
+ *   于是**不用动 alert_log 的表结构**。
+ * - `direction` 刻意用 **`NONE`**：同键冷却的键是 `code:direction`，沿用原方向会让
+ *   上午那条买入提醒的 2h 冷却把这条命中提示一起吃掉 —— 与失效提示同一条理由。
+ * - `level` 是 **L2**：用户亲自确认要盯的东西够得上气泡，但**照过四道闸门**
+ *   （防抖 / 冷却 / 上限 / 免打扰）。这不是强制类，不该绕过限流。
+ * - 文案说的是「你设的观察点到了」而**不是**「策略让你卖」。措辞纪律：
+ *   `INVALIDATE` 写成「原判断的失效条件已出现」，不许写成「快卖」。
+ */
+function watchHitAlert(hit: WatchHit, at: number): PreparedAlert {
+  const { point } = hit
+  const opLabel = point.op === 'LTE' ? '跌破' : '升破'
+  const subject = `${metricLabel(point.metric)}${opLabel} ${point.threshold}`
+  const headline =
+    point.meaning === 'INVALIDATE'
+      ? `你设的失效条件已出现：${subject}`
+      : `你设的观察条件已满足：${subject}`
+
+  const reasons = [`当前 ${metricLabel(point.metric)} ${hit.value}`]
+  if (point.note !== undefined && point.note !== '') reasons.push(point.note)
+  reasons.push(
+    point.meaning === 'INVALIDATE'
+      ? '这是你当时确认的「判断错了会先看到什么」，不是新的策略信号'
+      : '这是你当时确认的观察条件，不是新的策略信号'
+  )
+
+  return {
+    candidate: {
+      signalId: point.signalId,
+      code: point.code,
+      direction: 'NONE',
+      level: 'L2',
+      // 观察点没有得分。给 0 会让它在超限排序里永远垫底，
+      // 给 1 会让它挤掉真信号 —— 取中间值，且它本来就受冷却与上限管着
+      score: 0.5,
+      topSubSignalId: 'WATCH_HIT',
+    },
+    payload: {
+      signalId: point.signalId,
+      level: 'L2',
+      direction: 'NONE',
+      headline,
+      reasons,
+      code: point.code,
+      name: hit.name,
+      price: hit.price,
+      changePct: hit.changePct,
+      score: 0.5,
+      at,
+    },
+  }
+}
+
 export function buildAlerts(outcomes: readonly SignalOutcome[], options: BuildOptions): PreparedAlert[] {
-  const { levelOffset = 0, quotes, at } = options
+  const { levelOffset = 0, quotes, at, watchHits = [] } = options
   const prepared: PreparedAlert[] = []
+
+  // 观察点命中排在信号之前：用户亲自设的东西优先于引擎自己发现的
+  for (const hit of watchHits) prepared.push(watchHitAlert(hit, at))
 
   for (const outcome of outcomes) {
     const evaluation = outcome.evaluation

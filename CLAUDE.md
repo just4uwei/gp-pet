@@ -10,7 +10,7 @@ Electron + React + TypeScript · 本地 SQLite · 免登录 · 无服务端 · *
 当前处于 **M4（打磨）代码就绪**：五层引擎、回测 CLI、标定工具、面板列表（M2）、
 提醒分发（M3：`tick → SignalEngine → AlertService → 四道闸门 → alert_log + 状态点 / 气泡`）之上，
 M4 补齐了**影子运行**（前向模拟绩效，schema v2）、**设置页全项**（含只读参数表）、
-**数据库周期备份**、**首启免责声明引导**与 **Playwright E2E**（6 条，真启 Electron）。
+**数据库周期备份**、**首启免责声明引导**与 **Playwright E2E**（8 条，真启 Electron）。
 **M3 的出口条件（自用一周）与 M4 的三项真机验收都未做** ——
 逐条见 [M3 验收](./docs/checklists/M3-提醒层验收.md) 与 [M4 验收](./docs/checklists/M4-打磨验收.md)。
 M4 剩下的是：125%/150% DPI 走查、**装一遍 / 卸一遍**、代码签名（无证书）——
@@ -65,11 +65,15 @@ M2 的「回测报告产出并据此确定出厂参数」还差大半 —— 但
 `staleSnapshotMs`）是**日线回测原理上测不到**的，归影子运行与 M3，不属于这条出口条件。
 （M3 接线后，`alert.bubbleScore` 的依据来源已经有了：提醒日志里「今天发出的几条值不值得
 被打断」，见 [M3 验收清单 §4](./docs/checklists/M3-提醒层验收.md)。判据是日志，不是回测 Calmar。）
-目前：写回 1 项、已测保持出厂值 8 项（`combine` 四数 + `adx` 两数 + `regime` 两数；
-`adx.baseThreshold = 20` / `volScale = 8` **有正面证据** —— ±2 邻域里每个方向都更差，
-两个邻居还被训练集红线淘汰）、已判惰性或算术无效 3 项，
-而 `risk` / `multiTf` / `macd` / `boll` / `volume` **一个网格都还没跑过**。
+目前 59 个叶子参数：**写回 1 项**、已测保持出厂值 **17 项**（`adx` 4 + `regime` 2 +
+`combine` 4 + `risk` 7；其中 `adx.baseThreshold = 20` / `volScale = 8` **有正面证据** ——
+±2 邻域里每个方向都更差，两个邻居还被训练集红线淘汰）、已判惰性或算术无效 **10 项**
+（`multiTf` 整块 7 个 + 3 个零散）、日线回测测不到 **4 项**，
+而 `macd` / `boll` / `rsi` / `volume` / `ma` 与 `strategy`/`regime`/`data` 的零散项
+**共 27 项一个网格都还没跑过**。
 `src/core/params.ts` 里的数值因此仍整体是未标定的初始猜测（见约束 2）。
+**以 `src/main/settings/params-view.ts` 的 `STATUS` 表为准**（有用例钉着），
+这里的概述会过期 —— 补完计划见 [docs/09](./docs/09-下一阶段开发计划.md)。
 
 **数据现状（2026-08-12 实测）**：三家接口都能用。**eastmoney 不是被封，是间歇性的**
 —— undici（应用用的客户端）成功率约 78%，失败症状 `other side closed`，重试能过；
@@ -133,7 +137,7 @@ M2 的「回测报告产出并据此确定出厂参数」还差大半 —— 但
 pnpm dev              # 启动开发环境（electron-vite）
 pnpm test             # 单元 + 集成测试（Vitest，不需要启动 Electron）
 pnpm test:cov         # 覆盖率；src/core 门槛 90%，其余 60%
-pnpm test:e2e         # Playwright E2E：先 build，再真启 Electron 跑 6 条（workers=1）
+pnpm test:e2e         # Playwright E2E：先 build，再真启 Electron 跑 8 条（workers=1）
 pnpm typecheck        # 三个 tsconfig（node / web / e2e）分别校验
 pnpm lint
 pnpm verify:indicators           # 重出指标黄金用例；加 -- --check 只校验不重写
@@ -149,7 +153,7 @@ pnpm package          # electron-builder 打包 Windows
 
 ```
 src/core     纯引擎：指标 → 市场状态 → 策略 → 组合 → 风控。零依赖、可回测
-src/main     Electron 主进程：窗口、调度、数据源、存储、提醒编排、影子运行、AI 解读
+src/main     Electron 主进程：窗口、调度、数据源、存储、提醒编排、影子运行、AI 解读、观察点
 src/preload  contextBridge 窄接口
 src/renderer pet / panel / bubble 三个独立入口
 src/shared   主/渲染共享的纯类型
@@ -174,7 +178,8 @@ src/backtest 回测 CLI，复用 src/core
 | 改提醒逻辑 | [docs/05](./docs/05-风控与提醒规则.md) |
 | 改影子运行 | [docs/07 §2.3](./docs/07-回测与验证方案.md)（四条前向纪律 + 记账口径） |
 | 改设置页 / 参数表 | [docs/01 §5.5](./docs/01-产品需求与范围.md) + [ADR-0003](./docs/adr/ADR-0003-来源文档数值不作为出厂默认.md) |
-| 改 AI 解读 | [src/main/ai/index.ts](./src/main/ai/index.ts) 头注释（四条纪律）+ [docs/08 §后续](./docs/08-开发路线图.md) |
+| 改 AI 解读 | [src/main/ai/index.ts](./src/main/ai/index.ts) 头注释（五条纪律）+ [docs/08 §后续](./docs/08-开发路线图.md) |
+| 改观察点 | [003_watch.sql](./src/main/storage/migrations/003_watch.sql) 头注释（它不是什么）+ [docs/05 §3.1](./docs/05-风控与提醒规则.md) |
 | 写测试或回测 | [docs/07](./docs/07-回测与验证方案.md)（回测陷阱清单必读） |
 
 ## 容易踩的坑
@@ -418,16 +423,50 @@ src/backtest 回测 CLI，复用 src/core
   盘中每 30 秒一轮的 tick 就会饿死 —— 症状是「行情突然不动了」，
   而没人会想到是刚才点了 AI 解读。`src/main/ai/client.ts` 另起一套：POST + SSE、
   自己的超时、并发 1。**全市场扫描要做也得走这条路**（见 [P2 评估 §1.2](./docs/notes/P2-全市场扫描评估.md)）。
-- **AI 解读是只读的解释层，不许回流。** 它不参与信号、闸门、状态点与影子运行。
-  状态点只认 `PetStateMachine`，而它只接受**过了四道闸门**的提醒 ——
-  让一段模型输出去点亮状态点，等于绕过冷却与免打扰。
+- **AI 解读仍是只读的解释层：它不改参数、不动引擎、不进影子运行。**
+  唯一的例外形状是**观察点**（P2 续）—— 而它不是「AI 回流」：
+  模型只给一个**建议值**，人在表单里确认（可改）之后落成 `watch_point` 一行，
+  判定是每轮的一次**纯比较**（不涉及模型），命中后走**正常的四道闸门**。
+  状态点仍只认 `PetStateMachine`，仍只接受过了闸门的提醒。
+- **观察点不是策略参数，别把它往 `params.ts` 或参数表里靠。**
+  `params.ts` 是引擎的、全局的、长期的，依据必须是本地回测标定（ADR-0003）；
+  观察点是用户的、单标的、一次性、会过期，依据是「用户确认」。
+  往 `params-view.ts` 那张标定状态表里掺进用户随手确认的阈值，那张表就废了 ——
+  它的全部价值就在于「哪个数有依据」。边界写在 `003_watch.sql` 头注释里。
+- **观察点的 `PRICE` 必须用不复权价。** 用前复权价会让除权那天凭空命中或凭空不命中，
+  而症状是「明明没跌到就提醒我了」，用户只会认为软件算错了 ——
+  与「持仓成本用不复权」是同一个坑。
+- **观察点判定里 `null` 指标一律跳过，绝不当 0**（约束 4）。未预热的 `rsi` 是 null；
+  当 0 会让所有 `rsi <= 30` 的观察点在预热期**全部命中**。
+- **`watch_point` 的两个外键带来两处删除顺序**（错了就是运行时
+  `FOREIGN KEY constraint failed`）：① `WatchlistRepo.remove()` 先清观察点再删自选；
+  ② `pruneAll()` 先清**已结束**的观察点再删信号，而**还被观察点引着的信号不能删** ——
+  ACTIVE 的观察点刻意不裁剪，于是它的来源信号也要留下。
+  这一条是写用例时才发现的，`watch-repo.test.ts` 三条钉着。
+- **命中提醒的方向必须是 `NONE`、级别是 L2 且照过闸门。** 方向沿用原方向会被那条买入提醒的
+  2h 冷却吃掉（与收盘失效提示同一条理由）；而它**不是强制类** ——
+  少发一条用户自己设的观察点，用户在观察点页里看得见，与漏一条止损不是同一量级。
 - **发给模型的上下文必须带参数标定状态。** 缺了它，模型会**默认**引擎结论经过验证，
   然后用非常有说服力的语气把一套未标定的转述阈值讲成定论（ADR-0003 要防的正是这件事），
   而从输出上完全看不出是上下文漏了一块。`tests/unit/main/ai-context.test.ts` 钉着这一块。
   同理**免责与来源标注不靠提示词**：模型可能不照做，那两行是渲染层固定的 DOM。
-- **Anthropic 没有 OpenAI 兼容端点。** 现在只实现了 OpenAI 兼容的
-  `/chat/completions`（DeepSeek、Kimi、智谱、通义、Ollama、OpenRouter 都在这一形状里）。
-  要支持 Claude 得另写一个走 `/v1/messages` 的 adapter，别指望改个 base URL 就能用。
+- **AI 接口协议是按「路径形状」选的，不是按厂商选的。** 两种都支持：
+  OpenAI 兼容（`{base}/chat/completions`）与 Anthropic 兼容（`{base}/v1/messages`），
+  差异只有四个点（路径 / 鉴权头 / system 放顶层还是放 messages / 增量字段名），全在
+  `src/main/ai/protocols.ts`。**同一家服务可能两条路都提供且形状不同** ——
+  火山方舟 `…/api/coding` 是 Anthropic 协议，`…/api/coding/v3` 才是 OpenAI 兼容
+  （实测两条路都存在，返回 401 而非 404），而 coding 与 plan 两种订阅的 key 还互不通用。
+  填地址时 `detectProtocol()` 会自动识别，识别结果显示在设置页选择器上、可手动改回。
+- **选错协议的症状有一个是「HTTP 200 但一个字都没有」。** 用 OpenAI 的取字逻辑去读
+  Anthropic 的流，每一帧都取不出增量 —— 不报错、不断流，就是没字。所以
+  `createAiClient` 在 `sawAny === false` 时**必须抛错并点名协议**，不许静默返回空串。
+  `tests/unit/main/ai-client.test.ts` 有一条用例专门跑这个交叉组合。
+- **Anthropic 协议的 `system` 是顶层字段，不是 `messages` 里的一条。**
+  它的 role 只有 `user` / `assistant`，塞一条 `role: 'system'` 进去会被拒。
+  两种协议的报文形状各有一条用例钉着。
+- **Anthropic 协议只发 `x-api-key`，不要同时发 `Authorization: Bearer`。**
+  实测火山方舟两种都认，但真 Anthropic 同时收到两种凭据会拒绝请求 ——
+  `x-api-key` 是唯一一个两边都能用的选择。
 
 ## 措辞纪律
 

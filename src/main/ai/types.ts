@@ -8,11 +8,25 @@
  * 好让配置解析与上下文构造能在 Vitest 里直接跑。
  */
 
+/**
+ * 接口协议。两者只差四个点（路径 / 鉴权头 / system 放哪 / 增量字段），
+ * 逐条见 `protocols.ts`。
+ *
+ * 同一家服务可能两种都提供且**路径不同** —— 火山方舟 `…/api/coding` 是 Anthropic，
+ * `…/api/coding/v3` 是 OpenAI 兼容。所以这不是「选一个厂商」，是「选一条路径的形状」。
+ */
+export type AiProtocol = 'openai' | 'anthropic'
+
 /** 落盘的非密字段。API key 单独存（加密），不在这里 */
 export interface AiConfig {
   enabled: boolean
-  /** OpenAI 兼容的 base URL，如 `https://api.deepseek.com/v1`。末尾斜杠会被归一化掉 */
+  /**
+   * base URL。**不含**末尾的 `/chat/completions` 或 `/v1/messages`（拼上去的时候会判重）。
+   * 例：`https://api.deepseek.com/v1`（OpenAI）、
+   * `https://ark.cn-beijing.volces.com/api/coding`（Anthropic）。
+   */
   baseUrl: string
+  protocol: AiProtocol
   model: string
   /** 单次请求的总超时。首字超时另算（见 client.ts） */
   timeoutMs: number

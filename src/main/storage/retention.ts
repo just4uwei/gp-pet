@@ -20,6 +20,8 @@ export interface RetentionPolicy {
   signalDays: number
   alertDays: number
   healthDays: number
+  /** 已结束的观察点（命中/过期/取消）保留多久。ACTIVE 的永不裁剪 */
+  watchDays: number
 }
 
 export const DEFAULT_RETENTION: RetentionPolicy = {
@@ -28,6 +30,9 @@ export const DEFAULT_RETENTION: RetentionPolicy = {
   signalDays: 730,
   alertDays: 365,
   healthDays: 30,
+  // 与 alert_log 同一档：观察点的历史是「我当时押了什么、押中没有」，
+  // 比信号日志更值得留一年 —— 它是用户自己的判断记录
+  watchDays: 365,
 }
 
 export interface RetentionReport {
@@ -35,6 +40,7 @@ export interface RetentionReport {
   indicatorDeleted: number
   signalDeleted: number
   alertDeleted: number
+  watchDeleted: number
   healthDeleted: number
 }
 
@@ -81,13 +87,39 @@ export function pruneAll(
     )
     .run(now - policy.alertDays * DAY_MS, signalCutoff).changes
 
-  const signalDeleted = db.prepare(`DELETE FROM signal WHERE created_at < ?`).run(signalCutoff).changes
+  // watch_point.signal_id 同样是指向 signal 的外键，同一条纪律、同一个顺序。
+  // 只清**已经结束**的（HIT / EXPIRED / CANCELED）：ACTIVE 的还在盯，
+  // 哪怕它的来源信号快被裁掉了也不能删 —— 那是用户明确要跟踪的东西。
+  // 实践上撞不上（观察点几周就过期，信号留 2 年），但顺序错了的代价是启动即崩，
+  // 所以照抄那条 NOT IN 兜底
+  const watchCutoff = now - policy.watchDays * DAY_MS
+  const watchDeleted = db
+    .prepare(
+      `DELETE FROM watch_point
+       WHERE status != 'ACTIVE'
+         AND (created_at < ?
+              OR signal_id IN (SELECT id FROM signal WHERE created_at < ?)
+              OR signal_id NOT IN (SELECT id FROM signal))`
+    )
+    .run(watchCutoff, signalCutoff).changes
+
+  // **还被观察点引着的信号不能删。** 上面那一步刻意留下了 ACTIVE 的观察点
+  // （那是用户明确要跟踪的东西），于是它们的来源信号也必须跟着留 —— 否则这一句
+  // 直接撞 FOREIGN KEY constraint。留几行两年前的 signal 是很便宜的代价，
+  // 而崩在裁剪里会让每轮 tick 都报错
+  const signalDeleted = db
+    .prepare(
+      `DELETE FROM signal
+       WHERE created_at < ?
+         AND id NOT IN (SELECT signal_id FROM watch_point)`
+    )
+    .run(signalCutoff).changes
 
   const healthDeleted = health.prune(now - policy.healthDays * DAY_MS)
 
   meta.setNumber(META_KEYS.lastPruneAt, now)
 
-  return { klineDeleted, indicatorDeleted, signalDeleted, alertDeleted, healthDeleted }
+  return { klineDeleted, indicatorDeleted, signalDeleted, alertDeleted, watchDeleted, healthDeleted }
 }
 
 /**

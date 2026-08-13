@@ -169,6 +169,103 @@ describe('AiConfigStore', () => {
   })
 })
 
+describe('协议识别', () => {
+  it('只填地址时自动识别协议 —— 用户不该再手动猜一次', () => {
+    const store = new AiConfigStore(tempFile(), fakeCrypto())
+    store.load()
+
+    // 火山方舟 coding 路径不带 /v3 → Anthropic
+    expect(store.patch({ baseUrl: 'https://ark.cn-beijing.volces.com/api/coding' }).protocol).toBe(
+      'anthropic'
+    )
+    // 带 /v3 → OpenAI 兼容
+    expect(
+      store.patch({ baseUrl: 'https://ark.cn-beijing.volces.com/api/coding/v3' }).protocol
+    ).toBe('openai')
+  })
+
+  /**
+   * 真实回归：加 `protocol` 字段之前写下的 ai.json 是没有这个键的
+   * （本机 `%APPDATA%/gp-pet/ai.json` 就是这个形状）。
+   * 它必须**静默**升级成默认协议 —— 冒一条「已回到默认值」的告警会让用户以为配置坏了。
+   */
+  it('旧版 ai.json（没有 protocol 键）静默升级为 openai，不冒告警', () => {
+    const file = tempFile()
+    writeFileSync(
+      file,
+      JSON.stringify({
+        enabled: true,
+        baseUrl: 'https://api.deepseek.com/v1',
+        model: 'deepseek-chat',
+        timeoutMs: 60_000,
+        maxTokens: 1200,
+      }),
+      'utf8'
+    )
+    const view = new AiConfigStore(file, fakeCrypto()).load()
+
+    expect(view.protocol).toBe('openai')
+    expect(view.repaired).toEqual([])
+    expect(view.model).toBe('deepseek-chat')
+    expect(view.endpoint).toBe('https://api.deepseek.com/v1/chat/completions')
+  })
+
+  /**
+   * 方舟编程套餐的额度按官方说明**只允许在 AI 编程工具里用**，
+   * 拿它做别的 API 调用可能被判滥用（订阅停用甚至封号）。
+   * 本应用不是编程工具 —— 这条提示必须能到界面上，不能只写在文档里。
+   */
+  it('填了方舟编程套餐地址时给出封号风险提示', () => {
+    const store = new AiConfigStore(tempFile(), fakeCrypto())
+    store.load()
+
+    for (const url of [
+      'https://ark.cn-beijing.volces.com/api/coding',
+      'https://ark.cn-beijing.volces.com/api/coding/v3',
+      'https://ark.cn-beijing.volces.com/api/plan',
+    ]) {
+      const view = store.patch({ baseUrl: url })
+      expect(view.advisory, url).toContain('封禁')
+      expect(view.advisory, url).toContain('/api/v3')
+    }
+  })
+
+  it('通用接口与其他服务不给这条提示 —— 提示滥用会让人无视它', () => {
+    const store = new AiConfigStore(tempFile(), fakeCrypto())
+    store.load()
+    expect(store.patch({ baseUrl: 'https://ark.cn-beijing.volces.com/api/v3' }).advisory).toBeUndefined()
+    expect(store.patch({ baseUrl: 'https://api.deepseek.com/v1' }).advisory).toBeUndefined()
+  })
+
+  it('endpoint 由主进程算，与真正发出去的地址同源', () => {
+    const store = new AiConfigStore(tempFile(), fakeCrypto())
+    store.load()
+    expect(store.view().endpoint).toBe('') // 没填地址时是空串，不是拼出个坏 URL
+    expect(store.patch({ baseUrl: 'https://ark.cn-beijing.volces.com/api/coding' }).endpoint).toBe(
+      'https://ark.cn-beijing.volces.com/api/coding/v1/messages'
+    )
+  })
+
+  it('补丁里显式带了 protocol 就不覆盖 —— 那是用户的手动选择', () => {
+    const store = new AiConfigStore(tempFile(), fakeCrypto())
+    store.load()
+    const view = store.patch({
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/coding',
+      protocol: 'openai',
+    })
+    expect(view.protocol).toBe('openai')
+  })
+
+  it('只改协议不改地址时，地址不动', () => {
+    const store = new AiConfigStore(tempFile(), fakeCrypto())
+    store.load()
+    store.patch({ baseUrl: 'https://api.deepseek.com/v1' })
+    const view = store.patch({ protocol: 'anthropic' })
+    expect(view.baseUrl).toBe('https://api.deepseek.com/v1')
+    expect(view.protocol).toBe('anthropic')
+  })
+})
+
 describe('sanitizeAiConfig', () => {
   it('整份不是对象时全部回默认值并留痕', () => {
     const { config, repaired } = sanitizeAiConfig('[]')

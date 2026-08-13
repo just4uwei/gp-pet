@@ -23,12 +23,15 @@ import { dirname, join } from 'node:path'
 import { z } from 'zod'
 import type { AiConfigPatch, AiConfigView } from '@shared/ipc-types'
 import type { AiConfig, AiConfigFile, SecretCrypto } from './types'
+import { adapterOf, detectProtocol, endpointAdvisory } from './protocols'
 
 export const AI_CONFIG_FILE = 'ai.json'
 
 export const DEFAULT_AI_CONFIG: AiConfig = {
   enabled: false,
   baseUrl: '',
+  // 国内绝大多数服务是 OpenAI 兼容形状；填地址时会按 detectProtocol 自动纠正
+  protocol: 'openai',
   model: '',
   // 一次解读要跑几十秒是常态；60s 是「还在生成」与「对面挂了」的分界
   timeoutMs: 60_000,
@@ -57,6 +60,7 @@ const BaseUrlSchema = z
 const AiConfigSchema = z.object({
   enabled: z.boolean(),
   baseUrl: BaseUrlSchema,
+  protocol: z.enum(['openai', 'anthropic']),
   model: z.string().trim().max(200),
   // 下限 5s：比这更短的超时会把正常的首字等待判成失败
   timeoutMs: z.number().int().min(5_000).max(600_000),
@@ -187,6 +191,7 @@ export class AiConfigStore {
     return {
       enabled: this.current.enabled,
       baseUrl: this.current.baseUrl,
+      protocol: this.current.protocol,
       model: this.current.model,
       timeoutMs: this.current.timeoutMs,
       maxTokens: this.current.maxTokens,
@@ -203,9 +208,20 @@ export class AiConfigStore {
     )
   }
 
-  /** 合并补丁 → 校验 → 落盘。非法字段被忽略（回到原值），返回最终生效的视图 */
+  /**
+   * 合并补丁 → 校验 → 落盘。非法字段被忽略（回到原值），返回最终生效的视图。
+   *
+   * **只改地址不改协议时会自动识别协议**（`detectProtocol`）。理由：同一家服务的两种
+   * 协议往往只差一截路径（火山方舟 `…/api/coding` 是 Anthropic、`…/api/coding/v3` 是
+   * OpenAI 兼容），用户从哪个页面复制的地址决定了他拿到哪条 —— 让他再手动去猜一次协议
+   * 是没必要的。识别结果会显示在设置页的选择器上，用户看得见也改得回；
+   * 补丁里**显式带了 `protocol` 时不覆盖**，那是用户的手动选择。
+   */
   patch(patch: AiConfigPatch): AiConfigView {
     const { apiKey, ...rest } = patch
+    if (rest.baseUrl !== undefined && rest.protocol === undefined) {
+      rest.protocol = detectProtocol(rest.baseUrl)
+    }
     const merged = { ...this.current, ...rest }
     const { config, repaired } = sanitizeAiConfig(merged)
     // 上一轮 load 的修复提示不该一直挂着：这一轮的结果覆盖它
@@ -262,6 +278,12 @@ export class AiConfigStore {
     const view: AiConfigView = {
       enabled: this.current.enabled,
       baseUrl: this.current.baseUrl,
+      protocol: this.current.protocol,
+      // 用真正发请求的那段代码算，保证「所见即所发」
+      endpoint:
+        normalizeBaseUrl(this.current.baseUrl) === ''
+          ? ''
+          : adapterOf(this.current.protocol).endpoint(this.current.baseUrl),
       model: this.current.model,
       timeoutMs: this.current.timeoutMs,
       maxTokens: this.current.maxTokens,
@@ -271,6 +293,8 @@ export class AiConfigStore {
     }
     const hint = this.plainKey === null ? undefined : keyHintOf(this.plainKey)
     if (hint !== undefined) view.keyHint = hint
+    const advisory = endpointAdvisory(this.current.baseUrl)
+    if (advisory !== null) view.advisory = advisory
     return view
   }
 }

@@ -27,6 +27,7 @@ import type { SecCode } from '@core/types'
 import type { AlertRecord, AlertPayload, AppSettings } from '@shared/ipc-types'
 import type { SignalOutcome } from '../engine/signals'
 import type { AlertRepo, AlertRow } from '../storage/repositories/alert'
+import type { WatchHit } from '../watch/evaluate'
 import { buildAlerts, type QuoteView } from './candidates'
 import { AlertDispatcher, type AlertCandidate, type AlertDecision } from './dispatcher'
 import type { QuietVerdict } from './dnd'
@@ -66,7 +67,10 @@ export interface DispatchSummary {
 export interface AlertService {
   readonly pet: PetStateMachine
   /** 跑一轮分发。`debounce` 在收盘确认轮要传 false（那时没有「连续 N 个 tick」可言） */
-  handle(outcomes: readonly SignalOutcome[], ctx: { at: number; debounce: boolean }): DispatchSummary
+  handle(
+    outcomes: readonly SignalOutcome[],
+    ctx: { at: number; debounce: boolean; watchHits?: readonly WatchHit[] }
+  ): DispatchSummary
   history(query: { code?: SecCode; from?: number; to?: number; limit?: number }): AlertRecord[]
   /** 空数组 = 全部已读 */
   markRead(ids: readonly string[], at: number): number
@@ -111,6 +115,8 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
         levelOffset: app.alertLevelOffset,
         ...(quotes ? { quotes: quotes() } : {}),
         at: ctx.at,
+        // 观察点命中与信号走同一套闸门 —— 不新开分发路径（见 candidates.ts 的 watchHitAlert）
+        ...(ctx.watchHits === undefined ? {} : { watchHits: ctx.watchHits }),
       })
 
       if (prepared.length === 0) {

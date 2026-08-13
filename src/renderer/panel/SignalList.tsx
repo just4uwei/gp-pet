@@ -138,6 +138,8 @@ function SignalRow({
   expanded,
   evidence,
   aiReady,
+  onWatchCreated,
+  onError,
   onToggle,
 }: {
   record: SignalRecord
@@ -145,6 +147,8 @@ function SignalRow({
   evidence: SignalEvidence | null
   /** AI 已配置且已启用。false → 整块不渲染，而不是渲染一个点了报错的按钮 */
   aiReady: boolean
+  onWatchCreated: () => void
+  onError: (message: string) => void
   onToggle: (id: string) => void
 }): React.JSX.Element {
   const suppressed = record.suppressedReason !== undefined
@@ -179,6 +183,16 @@ function SignalRow({
             {record.votes} 票 · {timeOf(record.createdAt)} · {numberText(record.priceAt)}
           </span>
         </span>
+
+        {/*
+          可展开的提示。整行本来就是按钮，但看不出来 ——「AI 分析开了却找不到入口」
+          有一半是这个原因：入口藏在展开区里，而没有任何东西说这行能点。
+          开了 AI 就多标一个 AI 字，让入口自己露个头。
+        */}
+        <span className="shrink-0 self-start pt-0.5 text-[10px] leading-none text-white/25">
+          {aiReady ? <span className="mr-1 text-violet-300/50">AI</span> : null}
+          <span className="inline-block">{expanded ? '▾' : '▸'}</span>
+        </span>
       </button>
 
       {expanded ? (
@@ -187,7 +201,15 @@ function SignalRow({
             <Evidence evidence={evidence} />
             {/* AI 解读是**只读的解释层**：它不参与闸门，也不点亮状态点。
                 未配置时整块不渲染 —— 一个点了就报错的按钮比没有按钮更烦人 */}
-            {aiReady ? <AiExplain signalId={record.id} /> : null}
+            {aiReady ? (
+              <AiExplain
+                signalId={record.id}
+                code={record.code}
+                name={record.name}
+                onWatchCreated={onWatchCreated}
+                onError={onError}
+              />
+            ) : null}
           </>
         ) : (
           <p className="mt-2 text-xs text-white/40">依据加载中…</p>
@@ -205,26 +227,25 @@ function startOfToday(): number {
 
 export function SignalList({
   refreshKey,
+  aiReady,
+  onWatchCreated,
   onError,
 }: {
   /** 每轮引擎跑完后由父组件递增，触发重新拉取 */
   refreshKey: number
+  /**
+   * AI 解读是否可用。**由 App 传进来而不是自己读** —— 概览页常驻挂载，
+   * 自己读就只会在应用启动时读那一次（见 App 里 `aiReady` 的注释）。
+   */
+  aiReady: boolean
+  /** 新建观察点成功后通知上层刷新计数与「观察点」页 */
+  onWatchCreated: () => void
   onError: (message: string) => void
 }): React.JSX.Element {
   const [records, setRecords] = useState<SignalRecord[]>([])
   const [showSuppressed, setShowSuppressed] = useState(true)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [evidence, setEvidence] = useState<Record<string, SignalEvidence>>({})
-  const [aiReady, setAiReady] = useState(false)
-
-  // AI 配置只在挂载时读一次：它改动很少，而这个列表每轮引擎跑完都会重拉。
-  // 用户在设置页改完回来时面板会重挂，够用了
-  useEffect(() => {
-    void window.gp
-      .invoke('ai:config')
-      .then((config) => setAiReady(config.enabled && config.hasKey && config.model !== ''))
-      .catch(() => setAiReady(false))
-  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -292,6 +313,8 @@ export function SignalList({
               expanded={expandedId === record.id}
               evidence={evidence[record.id] ?? null}
               aiReady={aiReady}
+              onWatchCreated={onWatchCreated}
+              onError={onError}
               onToggle={toggle}
             />
           ))}

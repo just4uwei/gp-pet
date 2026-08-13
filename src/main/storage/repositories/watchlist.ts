@@ -110,8 +110,10 @@ export class WatchlistRepo {
   }
 
   remove(code: SecCode): boolean {
-    // 持仓外键指向 watchlist，先清持仓再删自选，否则 foreign_keys = ON 会拒绝
+    // 持仓与观察点的外键都指向 watchlist，先清它们再删自选，否则 foreign_keys = ON 会拒绝。
+    // 观察点跟着标的走是对的：不再关注这只票，「盯它跌破 8.20」也就没有意义了
     this.db.prepare(`DELETE FROM position WHERE code = ?`).run(code)
+    this.db.prepare(`DELETE FROM watch_point WHERE code = ?`).run(code)
     return this.db.prepare(`DELETE FROM watchlist WHERE code = ?`).run(code).changes > 0
   }
 

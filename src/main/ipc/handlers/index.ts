@@ -10,6 +10,7 @@ import { Menu } from 'electron'
 import { normalizeCode } from '@core/code'
 import type { AppController } from '../../controller'
 import { buildContextMenu } from '../../tray/menu'
+import { parseWatchSuggestions } from '../../watch/suggestion'
 import { handle } from '../router'
 
 export function registerHandlers(controller: AppController): void {
@@ -128,6 +129,18 @@ export function registerHandlers(controller: AppController): void {
   handle('ai:explain', (_event, signalId, force) => controller.explainWithAi(signalId, force ?? false))
 
   handle('ai:cancel', (_event, requestId) => controller.cancelAi(requestId))
+
+  // ── 观察点（P2 续）─────────────────────────────────────────────────
+  // 用户确认的一次性盯盘条件。**不是策略参数** —— 边界见 003_watch.sql 的头注释。
+  // `watch:suggest` 只做解析（纯函数），不落库：数值要经过用户在表单里确认才算。
+
+  handle('watch:list', (_event, query) => controller.watchPoints(query ?? {}))
+
+  handle('watch:create', (_event, draft) => controller.createWatchPoint(draft))
+
+  handle('watch:cancel', (_event, id) => controller.cancelWatchPoint(id))
+
+  handle('watch:suggest', (_event, text) => parseWatchSuggestions(text))
 
   handle('pet:setHitRegion', (_event, rects) => controller.setHitRects(rects))
 

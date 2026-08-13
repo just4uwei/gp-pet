@@ -20,6 +20,19 @@ import { Row, Section } from './Settings'
 /** 常见 OpenAI 兼容端点，只作占位提示 —— 不预置、不推荐、不代填 */
 const BASE_URL_PLACEHOLDER = 'https://api.deepseek.com/v1'
 
+const PROTOCOLS: { value: AiConfigView['protocol']; label: string; detail: string }[] = [
+  {
+    value: 'openai',
+    label: 'OpenAI 兼容',
+    detail: '发到 {地址}/chat/completions。DeepSeek、Kimi、智谱、通义、Ollama、OpenRouter 都是这一种',
+  },
+  {
+    value: 'anthropic',
+    label: 'Anthropic 兼容',
+    detail: '发到 {地址}/v1/messages。火山方舟的 /api/coding（不带 /v3）与 Claude 官方接口是这一种',
+  },
+]
+
 function TextRow({
   label,
   hint,
@@ -58,7 +71,14 @@ function TextRow({
   )
 }
 
-export function AiSettings({ onError }: { onError: (message: string) => void }): React.JSX.Element {
+export function AiSettings({
+  onError,
+  onChanged,
+}: {
+  onError: (message: string) => void
+  /** 每次配置真的落盘后调用，让 App 重算「信号行要不要显示 AI 入口」 */
+  onChanged: () => void
+}): React.JSX.Element {
   const [config, setConfig] = useState<AiConfigView | null>(null)
   const [keyDraft, setKeyDraft] = useState('')
   const [test, setTest] = useState<AiTestResult | null>(null)
@@ -76,10 +96,13 @@ export function AiSettings({ onError }: { onError: (message: string) => void }):
       setTest(null)
       void window.gp
         .invoke('ai:setConfig', delta)
-        .then(setConfig)
+        .then((next) => {
+          setConfig(next)
+          onChanged()
+        })
         .catch((err: unknown) => onError(err instanceof Error ? err.message : String(err)))
     },
-    [onError]
+    [onError, onChanged]
   )
 
   if (!config) {
@@ -110,6 +133,14 @@ export function AiSettings({ onError }: { onError: (message: string) => void }):
         </p>
       )}
 
+      {/* 地址层面的风险提示。这不是「配置错了」，是「用这个地址可能被封号」——
+          比 repaired 那一档更要紧，所以排在它前面、用更重的颜色 */}
+      {config.advisory === undefined ? null : (
+        <p className="mx-3.5 mt-3 rounded border border-rose-500/40 bg-rose-500/10 px-2.5 py-2 text-[11px] leading-relaxed text-rose-200">
+          ⚠ {config.advisory}
+        </p>
+      )}
+
       {config.repaired.length > 0 ? (
         <ul className="mx-3.5 mt-3 space-y-1 rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-[11px] leading-relaxed text-amber-100/80">
           {config.repaired.map((item, i) => (
@@ -122,8 +153,11 @@ export function AiSettings({ onError }: { onError: (message: string) => void }):
         label="启用 AI 解读"
         hint="关闭后信号列表里不再出现「AI 解读」按钮，已保存的配置保留"
       >
+        {/* aria-label 是刻意的：设置页上有好几个「已关闭」按钮，
+            没有它这个开关既不好读屏也不好定位（E2E 会撞上多个同名按钮） */}
         <button
           className="gp-btn"
+          aria-label="启用 AI 解读"
           disabled={!config.encryptionAvailable}
           onClick={() => patch({ enabled: !config.enabled })}
         >
@@ -133,11 +167,42 @@ export function AiSettings({ onError }: { onError: (message: string) => void }):
 
       <TextRow
         label="接口地址"
-        hint={`OpenAI 兼容的 base URL。本机 Ollama 一类的 http 地址可以直接填；非本机地址必须用 https，否则会拒绝发送 key`}
+        hint={
+          '填到 base URL 为止，末尾的 /chat/completions 或 /v1/messages 会自动补。' +
+          '本机 Ollama 一类的 http 地址可以直接填；非本机地址必须用 https，否则会拒绝发送 key'
+        }
         value={config.baseUrl}
         placeholder={BASE_URL_PLACEHOLDER}
         onCommit={(baseUrl) => patch({ baseUrl })}
       />
+
+      {/* 协议不是「选厂商」而是「选路径形状」：同一家可能两种都提供且路径不同。
+          填地址时自动识别，识别结果就显示在这里，用户看得见也改得回 */}
+      <Row
+        label="接口协议"
+        hint="填完地址会自动识别。识别错了在这里改 —— 选错的症状是 401 / 404，或者「返回 200 但一个字都没有」"
+      >
+        {PROTOCOLS.map((item) => (
+          <button
+            key={item.value}
+            className={`gp-btn ${config.protocol === item.value ? 'border-white/40 text-white' : ''}`}
+            title={item.detail}
+            onClick={() => patch({ protocol: item.value })}
+          >
+            {item.label}
+          </button>
+        ))}
+      </Row>
+
+      <p className="px-3.5 pb-2 text-[10px] leading-snug text-white/30">
+        {PROTOCOLS.find((item) => item.value === config.protocol)?.detail}
+        {config.endpoint === '' ? null : (
+          <>
+            <br />
+            实际会发到：<span className="font-mono text-white/45">{config.endpoint}</span>
+          </>
+        )}
+      </p>
 
       <TextRow
         label="模型名"

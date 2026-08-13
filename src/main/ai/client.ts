@@ -1,18 +1,12 @@
 /**
- * OpenAI 兼容 `/chat/completions` 的流式客户端（P2）。
+ * 流式对话客户端（P2）。**协议无关** —— 具体形状在 `protocols.ts`，
+ * 这一层只管超时、鉴权前置检查、SSE 分帧与错误归类。
  *
  * ## 为什么不复用 net/http.ts
  *
  * 那一层只有 `get()`、默认 3s 超时、GBK 解码，**而且它的限流器与行情取数共用**。
  * 一次 40 秒的 LLM 调用挂上去会把 tick 饿死 —— 盘中每 30 秒要取一轮行情，
  * 而全局并发只有 4。所以这里另起一套：POST + SSE、自己的超时、并发 1。
- *
- * ## 为什么只做 OpenAI 兼容这一种形状
- *
- * DeepSeek、Kimi、智谱、通义、Ollama、OpenRouter 全在这一形状里，一份实现全覆盖。
- * **Anthropic 没有 OpenAI 兼容端点**，要支持 Claude 得另写一个走 `/v1/messages` 的
- * adapter（`x-api-key` + `anthropic-version` 头，SSE 事件形状也不同）。
- * 这一轮不做，`AiTransport` 与本文件的分层留着口子。
  *
  * ## 明文 http 不发 key
  *
@@ -21,6 +15,7 @@
  */
 
 import type { AiConfig, AiHttpResponse, AiTransport } from './types'
+import { adapterOf, protocolHint, type ProtocolAdapter } from './protocols'
 import { normalizeBaseUrl } from './config'
 
 /** 首字超时。对面接受了连接却一个 token 都不吐，多半是挂了而不是在想 */
@@ -39,14 +34,12 @@ export class AiError extends Error {
 }
 
 /**
- * 拼 endpoint。base URL 已经带 `/v1` 时不重复追加 ——
- * 用户填 `https://api.deepseek.com/v1` 与 `https://api.deepseek.com` 都要能用。
+ * 拼 endpoint。协议决定后缀，`ProtocolAdapter.endpoint` 自己判重 ——
+ * 用户把完整路径整个粘进来时不该拼两遍。
  */
-export function chatCompletionsUrl(baseUrl: string): string {
-  const base = normalizeBaseUrl(baseUrl)
-  if (base === '') throw new AiError('还没有填接口地址', 'config')
-  if (/\/chat\/completions$/.test(base)) return base
-  return `${base}/chat/completions`
+export function endpointUrl(config: Pick<AiConfig, 'baseUrl' | 'protocol'>): string {
+  if (normalizeBaseUrl(config.baseUrl) === '') throw new AiError('还没有填接口地址', 'config')
+  return adapterOf(config.protocol).endpoint(config.baseUrl)
 }
 
 /** 非回环地址 + 明文 http + 带 key = 拒发。返回 null 表示放行 */
@@ -73,8 +66,11 @@ export interface AiChatRequest {
 /**
  * SSE 行解析。**必须按行缓冲** —— 一个 `data:` 帧被 TCP 切成两半是常态，
  * 按到达的分片直接 JSON.parse 会随机报错，而且症状是「偶尔解读到一半就断」。
+ *
+ * 分帧对两种协议是一样的（都是按行、`data:` 前缀），差异只在「怎么从一帧里取字」，
+ * 所以把取字的那一步作为参数传进来 —— 容易写错的是分帧，那部分只写一份。
  */
-export function createSseParser(): {
+export function createSseParser(extract: (parsed: unknown) => string | null): {
   push(chunk: string): string[]
   /** 流结束时把残留缓冲吐出来（有些实现最后一帧不带换行） */
   flush(): string[]
@@ -85,6 +81,8 @@ export function createSseParser(): {
     const deltas: string[] = []
     for (const raw of lines) {
       const line = raw.trim()
+      // `event:` 行不带内容（Anthropic 每帧都会先发一行），跳过即可 ——
+      // 类型信息在 data 的 JSON 里也有一份
       if (line === '' || !line.startsWith('data:')) continue
       const payload = line.slice(5).trim()
       if (payload === '[DONE]') continue
@@ -95,7 +93,7 @@ export function createSseParser(): {
         // 单帧解不开不该终止整段解读：跳过并继续
         continue
       }
-      const delta = deltaOf(parsed)
+      const delta = extract(parsed)
       if (delta !== null) deltas.push(delta)
     }
     return deltas
@@ -116,20 +114,17 @@ export function createSseParser(): {
   }
 }
 
-function deltaOf(parsed: unknown): string | null {
-  if (parsed === null || typeof parsed !== 'object') return null
-  const choices = (parsed as { choices?: unknown }).choices
-  if (!Array.isArray(choices) || choices.length === 0) return null
-  const first = choices[0]
-  if (first === null || typeof first !== 'object') return null
-  const delta = (first as { delta?: unknown }).delta
-  if (delta === null || typeof delta !== 'object') return null
-  const content = (delta as { content?: unknown }).content
-  return typeof content === 'string' && content !== '' ? content : null
-}
-
-/** 从错误响应体里挖出人能看懂的一句话。挖不到就原样截断 */
-export function errorMessageOf(status: number, body: string): string {
+/**
+ * 从错误响应体里挖出人能看懂的一句话。挖不到就原样截断。
+ *
+ * 401/404 额外附一句协议提示：**同一家服务的两种协议路径不同**，
+ * 而选错协议的症状恰恰就是这两个码（火山方舟的 `/api/coding` 与 `/api/coding/v3`）。
+ */
+export function errorMessageOf(
+  status: number,
+  body: string,
+  config?: Pick<AiConfig, 'baseUrl' | 'protocol'>
+): string {
   let detail = body.trim().slice(0, 300)
   try {
     const parsed = JSON.parse(body) as { error?: { message?: unknown }; message?: unknown }
@@ -138,8 +133,14 @@ export function errorMessageOf(status: number, body: string): string {
   } catch {
     // 不是 JSON，用截断的原文
   }
-  if (status === 401 || status === 403) return `鉴权失败（HTTP ${status}）：${detail}`
-  if (status === 404) return `接口地址或模型名不对（HTTP 404）：${detail}`
+
+  const hint =
+    config !== undefined && (status === 401 || status === 403 || status === 404)
+      ? `\n${protocolHint(config.protocol, config.baseUrl)}`
+      : ''
+
+  if (status === 401 || status === 403) return `鉴权失败（HTTP ${status}）：${detail}${hint}`
+  if (status === 404) return `接口地址或模型名不对（HTTP 404）：${detail}${hint}`
   if (status === 429) return `对面限流（HTTP 429）：${detail}`
   return `HTTP ${status}：${detail}`
 }
@@ -155,32 +156,21 @@ export function createAiClient(transport: AiTransport): AiClient {
       const { config, apiKey, system, user, signal } = request
       if (config.model.trim() === '') throw new AiError('还没有填模型名', 'config')
 
-      const url = chatCompletionsUrl(config.baseUrl)
+      const adapter: ProtocolAdapter = adapterOf(config.protocol)
+      const url = endpointUrl(config)
       if (apiKey !== null) {
         const refusal = insecureKeyTransport(url)
         if (refusal !== null) throw new AiError(refusal, 'config')
       }
 
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream',
-      }
-      // Ollama 之类不需要 key，缺省时就不发这个头（有些实现见到空 Bearer 会 400）
-      if (apiKey !== null) headers.Authorization = `Bearer ${apiKey}`
-
-      const body = JSON.stringify({
-        model: config.model.trim(),
-        stream: true,
-        max_tokens: config.maxTokens,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-      })
-
       let response: AiHttpResponse
       try {
-        response = await transport({ url, headers, body, signal })
+        response = await transport({
+          url,
+          headers: adapter.headers(apiKey),
+          body: adapter.body(config, system, user),
+          signal,
+        })
       } catch (error) {
         if (signal.aborted) throw new AiError('已取消', 'canceled')
         throw new AiError(`连不上 ${url}：${messageOf(error)}`, 'network')
@@ -197,23 +187,30 @@ export function createAiClient(transport: AiTransport): AiClient {
           // 错误体都读不出来，只能报状态码
         }
         const kind = response.status === 401 || response.status === 403 ? 'auth' : 'status'
-        throw new AiError(errorMessageOf(response.status, raw), kind)
+        throw new AiError(errorMessageOf(response.status, raw, config), kind)
       }
 
-      const parser = createSseParser()
+      const parser = createSseParser(adapter.delta)
       let sawAny = false
-      let first = true
+      /**
+       * 还没取到任何增量时留一份原文。
+       *
+       * 早先这里什么都不留，于是「200 但一个字都没有」这条错误**把唯一的证据扔了**
+       * —— 用户和排查的人都只能靠猜。留 4KB 足够看清是非 SSE 的整包 JSON、
+       * 是错误对象，还是一种没见过的帧。取到第一个增量后就不再累积（正文可能很长）。
+       */
+      let preview = ''
       const startedAt = Date.now()
 
       try {
         for await (const chunk of response.chunks) {
           // 首字超时单独看：连接建起来了却一直不吐字，与「全程超时」是两种故障
-          if (first && !sawAny && Date.now() - startedAt > FIRST_TOKEN_TIMEOUT_MS) {
+          if (!sawAny && Date.now() - startedAt > FIRST_TOKEN_TIMEOUT_MS) {
             throw new AiError(`等了 ${FIRST_TOKEN_TIMEOUT_MS / 1000} 秒没有任何输出`, 'timeout')
           }
+          if (!sawAny && preview.length < 4000) preview += chunk
           for (const delta of parser.push(chunk)) {
             sawAny = true
-            first = false
             yield delta
           }
         }
@@ -227,16 +224,47 @@ export function createAiClient(transport: AiTransport): AiClient {
         throw new AiError(`读取响应中断：${messageOf(error)}`, 'network')
       }
 
-      if (!sawAny) {
-        // 200 但一个字都没有：多半是 base URL 指到了别的服务，或模型名不对而对面静默返回空
-        throw new AiError('对面返回了 200，但没有任何内容 —— 检查接口地址与模型名', 'status')
+      if (sawAny) return
+
+      // ── 一个增量都没取到 ────────────────────────────────────────────
+      // 先试「对面根本没按流式返回」这一种：有些兼容网关不认 stream: true，
+      // 照样回一整个 JSON。内容其实就在那儿，不该报成空
+      const whole = tryParseJson(preview)
+      if (whole !== null) {
+        const text = adapter.fullText(whole)
+        if (text !== null) {
+          yield text
+          return
+        }
+        // 是 JSON 但取不出文本 —— 多半是错误对象，把里面那句话捞出来比原样贴强
+        const message = errorMessageOf(200, preview, config)
+        throw new AiError(`对面返回了 200，但没有可用内容：${message}`, 'status')
       }
+
+      throw new AiError(
+        `对面返回了 200，但没有解析出任何内容。\n` +
+          `${protocolHint(config.protocol, config.baseUrl)}\n` +
+          `实际发到：${url}\n` +
+          `响应开头：${preview.trim().slice(0, 300) || '(空)'}`,
+        'status'
+      )
     },
   }
 }
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** 整包是不是一个 JSON（即「对面没按流式返回」）。不是就返回 null */
+function tryParseJson(raw: string): unknown {
+  const text = raw.trim()
+  if (text === '' || (!text.startsWith('{') && !text.startsWith('['))) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
 }
 
 /**

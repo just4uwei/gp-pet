@@ -315,9 +315,28 @@ export interface AboutInfo {
  * JSON 文件，key 放进去就等于跟着导出文件走。它单独落 `<数据目录>/ai.json`，
  * key 用 OS 凭据存储加密。
  */
+/**
+ * 接口协议。**不是「选厂商」，是「选路径形状」** —— 同一家可能两种都提供且路径不同
+ * （火山方舟 `…/api/coding` 是 Anthropic、`…/api/coding/v3` 是 OpenAI 兼容）。
+ * 填地址时会自动识别，识别结果显示在选择器上，可手动改回。
+ */
+export type AiProtocolName = 'openai' | 'anthropic'
+
 export interface AiConfigView {
   enabled: boolean
   baseUrl: string
+  protocol: AiProtocolName
+  /**
+   * 实际会 POST 到的完整地址，**由主进程用真正发请求的那段代码算出来**。
+   * 不让渲染层自己拼：那样两处逻辑会各自演化，而这一行的全部价值就在于「所见即所发」。
+   * 地址为空时是空串。
+   */
+  endpoint: string
+  /**
+   * 地址层面的风险提示（不是错误）。目前唯一一条：方舟编程套餐地址按官方说明
+   * 只允许在 AI 编程工具里用，用在别处可能被判滥用。非空时界面必须显示。
+   */
+  advisory?: string
   model: string
   timeoutMs: number
   maxTokens: number
@@ -338,6 +357,8 @@ export interface AiConfigView {
 export interface AiConfigPatch {
   enabled?: boolean
   baseUrl?: string
+  /** 缺省时按 `baseUrl` 自动识别；显式给了就用给的（那是用户的手动选择） */
+  protocol?: AiProtocolName
   model?: string
   timeoutMs?: number
   maxTokens?: number
@@ -368,6 +389,71 @@ export interface AiChunk {
   delta?: string
   done?: boolean
   error?: string
+}
+
+// ─────────────────────── 观察点（AI 解读的失效条件落地）───────────────────────
+
+/**
+ * 观察点：**用户自己拥有的一次性盯盘条件**。
+ *
+ * 由 AI 解读的「失效条件」那一段给出建议 → 用户确认（可改数值）→ 引擎每轮机械比较
+ * → 命中后走**正常的四道闸门**发提醒。触发时刻不涉及模型，判定是一次纯比较。
+ *
+ * **它不是策略参数。** `src/core/params.ts` 是引擎的、全局的、长期的，依据必须是本地
+ * 回测标定（ADR-0003）；观察点是用户的、单标的、一次性、会过期，依据是「用户确认」。
+ * 两者混在一起会污染设置页那张标定状态表。
+ */
+export interface WatchPointView {
+  id: string
+  code: SecCode
+  name: string
+  /** 来源信号 id。命中提醒复用它当 alert_log 的外键 */
+  signalId: string
+  source: 'AI_SUGGESTED' | 'USER_EDITED'
+  /** `PRICE` 或指标键（白名单见 src/main/watch/metrics.ts） */
+  metric: string
+  op: 'LTE' | 'GTE'
+  threshold: number
+  /** 命中意味着什么：原判断失效，还是得到确认 */
+  meaning: 'INVALIDATE' | 'CONFIRM'
+  note?: string
+  createdAt: number
+  expiresAt: number
+  status: 'ACTIVE' | 'HIT' | 'EXPIRED' | 'CANCELED'
+  hitAt?: number
+  hitValue?: number
+  /**
+   * 非空 = 创建时的引擎版本与当前不一致，且这是个**指标类**观察点 ——
+   * 换过灵敏度后 rsi 周期一类的东西变了，同一个阈值不再是同一件事。
+   * PRICE 类不受影响，所以这里恒为空。
+   */
+  staleEngineVersion?: string
+}
+
+/** 新建观察点的入参。数值一律由用户确认后传入 —— 模型的建议只是表单预填值 */
+export interface WatchPointDraft {
+  signalId: string
+  metric: string
+  op: 'LTE' | 'GTE'
+  threshold: number
+  meaning: 'INVALIDATE' | 'CONFIRM'
+  note?: string
+  /** 有效期天数。缺省按 20 个交易日折算 */
+  days?: number
+  /** true = 用户改过模型给的数值 */
+  edited?: boolean
+}
+
+/**
+ * 从一段 AI 解读里抽出来的观察点建议，用于**预填表单**。
+ * 抽不到就是空数组 —— 那时表单留空让用户自己填，功能仍然可用。
+ */
+export interface WatchSuggestion {
+  metric: string
+  op: 'LTE' | 'GTE'
+  threshold: number
+  meaning: 'INVALIDATE' | 'CONFIRM'
+  note?: string
 }
 
 /** 数据维护动作（清缓存 / 备份 / 选数据目录）的结果 */
@@ -466,6 +552,15 @@ export interface IpcInvokeMap {
    */
   'ai:explain': (signalId: string, force?: boolean) => AiExplainStart
   'ai:cancel': (requestId: string) => void
+  /**
+   * 观察点（P2 续）。`create` 的数值一律是**用户确认过**的 ——
+   * 模型的建议只走到表单预填那一步，不会自己落库。
+   */
+  'watch:list': (query?: { status?: WatchPointView['status']; limit?: number }) => WatchPointView[]
+  'watch:create': (draft: WatchPointDraft) => WatchPointView
+  'watch:cancel': (id: string) => void
+  /** 从一段解读正文里抽建议，用于预填表单。抽不到返回空数组 */
+  'watch:suggest': (text: string) => WatchSuggestion[]
   'pet:setHitRegion': (rects: Rect[]) => void
   /**
    * 渲染层完成命中判定后上报：鼠标是否落在悬浮条本体上。
