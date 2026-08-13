@@ -14,6 +14,7 @@
  * 看起来在工作而实际没有数据。
  */
 
+import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import type {
   AppSettings,
@@ -24,6 +25,7 @@ import type {
   SignalRecord,
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
+import { withSensitivity } from '@core/params'
 import {
   BENCHMARK_CODE,
   createMarketDataService,
@@ -57,7 +59,9 @@ import {
   type TradingCalendar,
 } from './scheduler'
 import { SettingsStore } from './settings/store'
+import { createShadowRunner, type ShadowRunner } from './shadow'
 import { createStorage, openMarketDatabase, type Storage } from './storage'
+import { BACKUP_DIR_NAME, DEFAULT_BACKUP_POLICY, backupIfDue } from './storage/backup'
 import { pruneIfDue } from './storage/retention'
 
 /** 健康度统计窗口。出口条件「成功率 > 99%」按当日统计，取 24h（docs/08 M1） */
@@ -85,6 +89,10 @@ export interface DataLayer {
   readonly watchlist: WatchlistService
   readonly signals: SignalEngine
   readonly scheduler: Scheduler
+  /** 影子运行（M4，docs/07 §2.3） */
+  readonly shadow: ShadowRunner
+  /** market.db 所在目录与备份目录 —— 设置页「关于」与「打开数据目录」要用 */
+  readonly paths: { dataDir: string; backupDir: string }
 
   start(): void
   /** 用户点「立即刷新」：跑一轮完整 tick */
@@ -126,6 +134,7 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
   let settings = settingsStore.load()
   // dataDir 只影响 market.db：settings.json 必须留在默认位置，否则改坏了就找不回来了
   const dataDir = settings.dataDir ?? userDataDir
+  const backupDir = join(dataDir, BACKUP_DIR_NAME)
   const db = await openMarketDatabase(join(dataDir, 'market.db'), (m) => log.info(m))
   const storage = createStorage(db)
 
@@ -189,19 +198,48 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
   })
 
   // ── 信号编排（M2）───────────────────────────────────────────────
-  // 参数取出厂默认值：用户可改参数属 M4 的设置页，改完只需在这里换一个 params
-  const signals = createSignalEngine({
-    market,
-    watchlist: storage.watchlist,
-    positions: storage.positions,
-    signals: storage.signals,
-    indicators: storage.indicators,
-    lookback: market.options.initialBars,
-    log,
-  })
+  //
+  // 参数按用户设置的**灵敏度档位**构造（M4）。在这之前 `AppSettings.sensitivity`
+  // 是个死设置：schema 里有、没人读 —— 与 `autoLaunch` 曾经的问题同一类，
+  // 而这一个更隐蔽（开机自启不生效用户能发现，灵敏度不生效发现不了）。
+  //
+  // `withSensitivity` 只动 `combine` 的得分线与票数线，其余保持出厂值；
+  // 换档会改变参数指纹 → `engineVersionOf` 变 → 指标缓存作废重算、影子运行暂停。
+  // 那不是副作用，是**必须**如此：两套参数下的指标与绩效不可比（docs/03 §4.2）。
+  const buildEngine = (tier: AppSettings['sensitivity']): SignalEngine =>
+    createSignalEngine({
+      market,
+      watchlist: storage.watchlist,
+      positions: storage.positions,
+      signals: storage.signals,
+      indicators: storage.indicators,
+      lookback: market.options.initialBars,
+      params: withSensitivity(tier),
+      log,
+    })
+
+  // `let` 而不是 `const`：换灵敏度档位要**整个重建**引擎。
+  // 引擎版本是在构造时算的（它是缓存键与落库字段），做成运行时可变的会让
+  // 「这一行 signal 是哪套参数下产出的」失去答案 —— 重建一个干净得多。
+  let signals = buildEngine(settings.sensitivity)
   // 参数或算法变了 → 旧的指标缓存不再可比，启动时清一次（docs/03 §4.2）
   const purged = signals.purgeStaleCache()
   if (purged > 0) log.info(`[engine] 引擎版本 ${signals.engineVersion}，已清理 ${purged} 条旧指标缓存`)
+
+  // ── 影子运行（M4，docs/07 §2.3）────────────────────────────────
+  const shadow = createShadowRunner({
+    repo: storage.shadow,
+    meta: storage.meta,
+    klines: storage.klines,
+    engineVersion: () => signals.engineVersion,
+    trackedCodes: () => new Set(storage.watchlist.list().map((entry) => entry.profile.code)),
+    profileOf: (code) => {
+      const entry = storage.watchlist.get(code)
+      return entry ? { board: entry.profile.board, isST: entry.profile.isST } : null
+    },
+    newId: () => randomUUID(),
+    log,
+  })
 
   // ── tick 流水线 ────────────────────────────────────────────────
   // 行为都在 engine/tick.ts 里（那儿有测试）；这里只负责把真实依赖递进去
@@ -212,8 +250,12 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     meta: storage.meta,
     auxCodes: () => [BENCHMARK_CODE],
     prune: (at) => pruneIfDue(db, at),
+    backup: (at) => backupIfDue(db, backupDir, at, DEFAULT_BACKUP_POLICY, (m) => log.info(m)),
     log,
-    engine: signals,
+    // 转发而不是直接给 `signals`：换灵敏度会重建引擎，直接给的话
+    // 流水线会一直握着**旧那个**（换完档以后信号还按旧参数出，几乎无从发现）
+    engine: { run: (tick) => signals.run(tick) },
+    shadow,
     ...(onQuotes ? { onQuotes } : {}),
     ...(onSignals ? { onSignals } : {}),
   })
@@ -236,8 +278,13 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     calendar,
     market,
     watchlist,
-    signals,
+    // getter：换灵敏度会重建引擎，快照式的字段会把旧实例的 engineVersion 冻在这里
+    get signals() {
+      return signals
+    },
     scheduler,
+    shadow,
+    paths: { dataDir, backupDir },
 
     start() {
       scheduler.start()
@@ -248,8 +295,22 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     },
 
     applySettings(next) {
+      const previous = settings
       settings = next
       registry.setPriority(next.providerPriority)
+
+      // 灵敏度换档 = 换一套引擎参数。整个重建，并清掉按旧指纹缓存的指标 ——
+      // 不清的话新参数会读到旧参数算出来的指标值，而两者在库里长得一模一样
+      if (next.sensitivity !== previous.sensitivity) {
+        signals = buildEngine(next.sensitivity)
+        const stale = signals.purgeStaleCache()
+        log.info(
+          `[engine] 灵敏度 ${previous.sensitivity} → ${next.sensitivity}，` +
+            `引擎版本 ${signals.engineVersion}，已清理 ${stale} 条旧指标缓存`
+        )
+      }
+      // dataDir 改动**不在这里生效**：market.db 是启动时打开的，
+      // 中途换目录要么搬库要么重开连接，两者都比「提示重启」更容易出错（见 IPC 处理）
     },
 
     status() {

@@ -88,6 +88,33 @@ export function registerHandlers(controller: AppController): void {
 
   handle('config:import', () => controller.importConfig())
 
+  // ── 影子运行（M4，docs/07 §2.3）───────────────────────────────────
+  // 只读两条 + 一条重置。**推进不走 IPC**：它挂在 tick 上，因为
+  // 「一个交易日推进一次」是数据层的节奏，给渲染层一个「推进」按钮
+  // 等于让界面能凭空多造一根净值点
+
+  handle('shadow:summary', () => controller.shadowSummary())
+
+  handle('shadow:trades', (_event, query) => controller.shadowTrades(query.limit))
+
+  handle('shadow:reset', () => controller.resetShadow())
+
+  // ── 设置页与数据维护（M4，docs/01 §5.5）───────────────────────────
+  // 四条维护动作都**不抛错**，走 MaintenanceResult 的 status + message：
+  // 取消、文件已存在、组策略锁目录都是用户能看懂的正常结局（与 config:* 同一做法）
+
+  handle('app:params', () => controller.paramRows())
+
+  handle('app:about', () => controller.about())
+
+  handle('app:backupDatabase', () => controller.backupDatabase())
+
+  handle('app:clearCache', () => controller.clearCache())
+
+  handle('app:chooseDataDir', () => controller.chooseDataDir())
+
+  handle('app:revealPath', (_event, which) => controller.revealPath(which))
+
   handle('pet:setHitRegion', (_event, rects) => controller.setHitRects(rects))
 
   handle('pet:setInteractive', (_event, interactive) => controller.setOverlayInteractive(interactive))

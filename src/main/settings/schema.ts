@@ -22,6 +22,9 @@ export const AppSettingsSchema = z.object({
   providerPriority: z.array(z.enum(['eastmoney', 'sina', 'tencent'])).min(1),
   autoLaunch: z.boolean(),
   dataDir: z.string().min(1).optional(),
+  // 免责声明确认时刻。正整数毫秒 —— 0 或负数按「没确认过」处理，会再弹一次引导，
+  // 那比信一个明显坏掉的时间戳安全（多看一次声明的代价远小于漏看）
+  disclaimerAcceptedAt: z.number().int().positive().optional(),
 })
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -69,8 +72,10 @@ export function sanitizeSettings(raw: unknown): SanitizeResult {
     }
   }
 
-  // dataDir 缺省时不要留一个 undefined 键：exactOptionalPropertyTypes 下它与「没有这个键」不等价
+  // 可选字段缺省时不要留一个 undefined 键：
+  // exactOptionalPropertyTypes 下它与「没有这个键」不等价
   if (settings.dataDir === undefined) delete settings.dataDir
+  if (settings.disclaimerAcceptedAt === undefined) delete settings.disclaimerAcceptedAt
 
   return { settings, repaired }
 }

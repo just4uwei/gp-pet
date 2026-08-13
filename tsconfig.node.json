@@ -11,6 +11,10 @@
     "vitest.config.mts",
     "package.json"
   ],
+  // e2e 用例里有跑在**浏览器上下文**里的回调（page.evaluate），需要 DOM 类型。
+  // 它们归 tsconfig.e2e.json 单独校验 —— 给整个主进程项目加上 DOM lib
+  // 会让 `document` / `window` 在主进程代码里也变成合法的，那正是要防的事
+  "exclude": ["tests/e2e/**"],
   "compilerOptions": {
     "composite": true,
     "lib": ["ES2022"],

@@ -24,6 +24,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type {
+  AppSettings,
   EngineStatus,
   PositionView,
   ProviderHealth,
@@ -33,8 +34,26 @@ import type {
 import type { SecCode } from '@core/types'
 import { AlertLog } from './AlertLog'
 import { ConfigTransferButtons, ConfigTransferNotice, type TransferOutcome } from './ConfigTransfer'
+import { FOOTER_NOTE } from './disclaimer'
+import { Onboarding } from './Onboarding'
 import { PositionEditor } from './PositionEditor'
+import { Settings } from './Settings'
+import { ShadowPanel } from './ShadowPanel'
 import { SignalList } from './SignalList'
+
+/**
+ * 三个标签页。**不做路由** —— 面板只有三屏，`useState` 比引一个 router 便宜得多。
+ *
+ * 「概览」是默认页且是唯一有推送的一屏（行情每轮都在变）；影子运行与设置都是
+ * 「打开看一眼」的性质，所以它们**不订阅推送**，只在切进来时拉一次。
+ */
+type Tab = 'OVERVIEW' | 'SHADOW' | 'SETTINGS'
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'OVERVIEW', label: '概览' },
+  { id: 'SHADOW', label: '影子运行' },
+  { id: 'SETTINGS', label: '设置' },
+]
 
 const SESSION_LABEL: Record<string, string> = {
   CLOSED: '休市',
@@ -261,6 +280,14 @@ function WatchRow({
 }
 
 export function App(): React.JSX.Element {
+  /**
+   * 免责声明闸门（docs/01 §8）。三态：
+   *   null  还没读到设置 —— 什么都别画，避免引导闪一下又消失
+   *   false 没确认过 → 只画引导
+   *   true  可以进主界面
+   */
+  const [accepted, setAccepted] = useState<boolean | null>(null)
+  const [tab, setTab] = useState<Tab>('OVERVIEW')
   const [items, setItems] = useState<WatchItem[]>([])
   const [quotes, setQuotes] = useState<QuoteTick[]>([])
   const [status, setStatus] = useState<EngineStatus | null>(null)
@@ -287,6 +314,22 @@ export function App(): React.JSX.Element {
       // 数据层装配失败时 watchlist:list 会抛「数据层尚未就绪」—— 如实显示，不吞
       setError(errorText(err))
     }
+  }, [])
+
+  useEffect(() => {
+    // 设置读失败也要能进主界面：把用户锁在引导页外面（或里面）比少弹一次声明糟得多。
+    // 声明本身在「设置 → 关于」里随时可查，所以这条兜底不会让它彻底看不到
+    void window.gp
+      .invoke('settings:get')
+      .then((next: AppSettings) => setAccepted(next.disclaimerAcceptedAt !== undefined))
+      .catch(() => setAccepted(true))
+  }, [])
+
+  const acceptDisclaimer = useCallback(async (): Promise<void> => {
+    const next = await window.gp.invoke('settings:patch', { disclaimerAcceptedAt: Date.now() })
+    // 以主进程回写的结果为准，不是「点了就算」：写盘失败时 Onboarding 会显示错误并留在原地
+    if (next.disclaimerAcceptedAt === undefined) throw new Error('设置没能保存下来，请检查数据目录是否可写')
+    setAccepted(true)
   }, [])
 
   useEffect(() => {
@@ -380,6 +423,10 @@ export function App(): React.JSX.Element {
     status?.calendarUncertain === true ||
     transfer !== null
 
+  // 还没读到设置：画一屏空白而不是先画引导。引导闪一下又消失比多等 20ms 难看得多
+  if (accepted === null) return <main className="h-full bg-[var(--gp-bg)]" />
+  if (!accepted) return <Onboarding onAccept={acceptDisclaimer} />
+
   return (
     <main className="flex h-full flex-col overflow-hidden">
       {/*
@@ -417,6 +464,26 @@ export function App(): React.JSX.Element {
         <div className="mt-2.5" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
           <StatusBar status={status} health={health} />
         </div>
+
+        {/* 标签页。按钮当然不能落在拖拽区里（否则点它等于拖窗口） */}
+        <div
+          className="-mb-3 mt-2.5 flex gap-4"
+          style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+        >
+          {TABS.map((item) => (
+            <button
+              key={item.id}
+              className={`border-b-2 pb-1.5 text-xs transition-colors ${
+                tab === item.id
+                  ? 'border-sky-400/70 text-white'
+                  : 'border-transparent text-white/40 hover:text-white/70'
+              }`}
+              onClick={() => setTab(item.id)}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
       </header>
 
       {/* 横幅区：只在真有话说时占高度，空着时一个像素都不留 */}
@@ -437,12 +504,34 @@ export function App(): React.JSX.Element {
         </div>
       ) : null}
 
+      {/* 影子运行与设置是单栏长内容，交给这一层滚动 */}
+      {tab === 'SHADOW' ? (
+        <div className="min-h-0 flex-1 overflow-y-auto p-5">
+          <ShadowPanel refreshKey={signalKey} onError={setError} />
+        </div>
+      ) : null}
+      {tab === 'SETTINGS' ? (
+        <div className="min-h-0 flex-1 overflow-y-auto p-5">
+          <Settings onError={setError} />
+        </div>
+      ) : null}
+
       {/*
         两栏。md 以下退回单列并交给这一层滚动；md 及以上两栏各自内部滚动。
         左栏权重稍大（1.4 : 1）—— 自选那一行要放名称、代码、行业、价格、涨跌与四个按钮，
         右栏的信号行短得多。
       */}
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 overflow-y-auto p-5 md:grid-cols-[minmax(0,1.4fr)_minmax(300px,1fr)] md:overflow-hidden">
+      {/*
+        概览**保持挂载**（只用 display 切换）而不是条件渲染：它订阅了 push:quoteTick /
+        push:engineStatus，卸载再装回来会丢掉滚动位置与正在编辑的持仓行。
+        不能用 `hidden` 属性 —— Tailwind 的 `grid` 类会盖掉它带来的 `display: none`，
+        这是 Tailwind 下很常见的一个坑，所以这里显式切 `grid` / `hidden` 两个类。
+      */}
+      <div
+        className={`min-h-0 flex-1 grid-cols-1 gap-4 overflow-y-auto p-5 md:grid-cols-[minmax(0,1.4fr)_minmax(300px,1fr)] md:overflow-hidden ${
+          tab === 'OVERVIEW' ? 'grid' : 'hidden'
+        }`}
+      >
         <section className="gp-card max-h-full">
           <div className="gp-card-head">
             <h2 className="gp-card-title">自选股</h2>
@@ -494,7 +583,7 @@ export function App(): React.JSX.Element {
         比页脚上一句静态的话诚实得多。
       */}
       <footer className="shrink-0 border-t border-white/10 px-5 py-2 text-xs text-white/35">
-        仅供参考，非投资建议
+        {FOOTER_NOTE}
       </footer>
     </main>
   )

@@ -12,6 +12,7 @@ import { IndicatorRepo } from './repositories/indicator'
 import { KlineRepo } from './repositories/kline'
 import { MetaRepo } from './repositories/meta'
 import { PositionRepo } from './repositories/position'
+import { ShadowRepo } from './repositories/shadow'
 import { SignalRepo } from './repositories/signal'
 import { WatchlistRepo } from './repositories/watchlist'
 
@@ -25,6 +26,8 @@ export interface Storage {
   readonly calendar: CalendarRepo
   readonly health: ProviderHealthRepo
   readonly positions: PositionRepo
+  /** 影子运行的账本（M4，docs/07 §2.3） */
+  readonly shadow: ShadowRepo
   readonly meta: MetaRepo
   close(): void
 }
@@ -40,6 +43,7 @@ export function createStorage(db: Database): Storage {
     calendar: new CalendarRepo(db),
     health: new ProviderHealthRepo(db),
     positions: new PositionRepo(db),
+    shadow: new ShadowRepo(db),
     meta: new MetaRepo(db),
     close: () => db.close(),
   }

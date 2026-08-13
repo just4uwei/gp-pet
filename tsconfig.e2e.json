@@ -1,0 +1,15 @@
+{
+  // Playwright E2E 单独一个项目：用例文件里同时存在 Node 上下文（启动、读文件）
+  // 与**浏览器上下文**（page.evaluate 里的 window / document），所以要 DOM lib。
+  //
+  // 不把 DOM 加到 tsconfig.node.json 里，是为了让主进程代码里写 `document`
+  // 仍然是一个编译错误 —— 那是分层的一部分，不是配置洁癖。
+  "extends": "./tsconfig.base.json",
+  "include": ["tests/e2e/**/*", "playwright.config.ts", "src/shared/**/*", "src/core/**/*"],
+  "compilerOptions": {
+    "composite": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "outDir": "./out/types/e2e"
+  }
+}

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_PARAMS, ENGINE_VERSION } from '@core/params'
+import {
+  DEFAULT_PARAMS,
+  ENGINE_VERSION,
+  SENSITIVITY_PRESETS,
+  engineVersionOf,
+  withSensitivity,
+} from '@core/params'
 
 /**
  * 这些用例断言的是**参数之间的内在一致性**，不是「这些数值是对的」。
@@ -133,5 +139,71 @@ describe('ENGINE_VERSION', () => {
     // M2 的标定流程产出出厂默认值后，这条用例应连同后缀一起删除，
     // 并在 CHANGELOG 记录标定依据 —— 删它是一个需要有意识做出的动作。
     expect(ENGINE_VERSION).toContain('-unvalidated')
+  })
+})
+
+/**
+ * 三档灵敏度（M4 接线 `AppSettings.sensitivity` 之后，主进程与回测共用这张表）。
+ *
+ * 同一条纪律：**不断言「0.60 是对的」**，只断言三档之间的关系与换档的机制后果。
+ */
+describe('SENSITIVITY_PRESETS', () => {
+  it('均衡档恰好等于出厂 combine —— 否则「出厂档位」这个说法在 UI 上是假的', () => {
+    expect(SENSITIVITY_PRESETS.BALANCED.scoreThreshold).toBe(DEFAULT_PARAMS.combine.scoreThreshold)
+    expect(SENSITIVITY_PRESETS.BALANCED.voteThreshold).toEqual({
+      trend: DEFAULT_PARAMS.combine.voteThreshold.trend,
+      meanReversion: DEFAULT_PARAMS.combine.voteThreshold.meanReversion,
+    })
+  })
+
+  it('得分线与票数线随档位单调收紧', () => {
+    const { SENSITIVE, BALANCED, CONSERVATIVE } = SENSITIVITY_PRESETS
+    expect(SENSITIVE.scoreThreshold).toBeLessThan(BALANCED.scoreThreshold)
+    expect(BALANCED.scoreThreshold).toBeLessThan(CONSERVATIVE.scoreThreshold)
+    expect(SENSITIVE.voteThreshold.trend).toBeLessThan(BALANCED.voteThreshold.trend)
+    expect(BALANCED.voteThreshold.trend).toBeLessThan(CONSERVATIVE.voteThreshold.trend)
+    expect(BALANCED.voteThreshold.meanReversion).toBeLessThanOrEqual(
+      CONSERVATIVE.voteThreshold.meanReversion
+    )
+  })
+
+  it('票数线不超过各策略的子信号数（趋势 5 条、均值回归 4 条）', () => {
+    for (const preset of Object.values(SENSITIVITY_PRESETS)) {
+      expect(preset.voteThreshold.trend).toBeGreaterThan(0)
+      expect(preset.voteThreshold.trend).toBeLessThanOrEqual(5)
+      expect(preset.voteThreshold.meanReversion).toBeGreaterThan(0)
+      expect(preset.voteThreshold.meanReversion).toBeLessThanOrEqual(4)
+    }
+  })
+})
+
+describe('withSensitivity', () => {
+  it('只动 combine 的两条线，其余整体不变', () => {
+    const conservative = withSensitivity('CONSERVATIVE')
+    expect(conservative.combine.scoreThreshold).toBe(SENSITIVITY_PRESETS.CONSERVATIVE.scoreThreshold)
+    // 「换灵敏度怎么把止损也改了」必须无从发生
+    expect(conservative.risk).toEqual(DEFAULT_PARAMS.risk)
+    expect(conservative.regime).toEqual(DEFAULT_PARAMS.regime)
+    expect(conservative.strategy).toEqual(DEFAULT_PARAMS.strategy)
+    expect(conservative.macd).toEqual(DEFAULT_PARAMS.macd)
+    // combine 块里没被预设覆盖的两个数也要留着
+    expect(conservative.combine.conflictBand).toBe(DEFAULT_PARAMS.combine.conflictBand)
+    expect(conservative.combine.downtrendBuyPenalty).toBe(DEFAULT_PARAMS.combine.downtrendBuyPenalty)
+  })
+
+  it('均衡档与出厂参数逐位相同 —— 默认档不该悄悄换掉引擎版本', () => {
+    expect(engineVersionOf(withSensitivity('BALANCED'))).toBe(engineVersionOf(DEFAULT_PARAMS))
+  })
+
+  it('换档会改变引擎版本 —— 指标缓存据此失效、影子运行据此暂停', () => {
+    const balanced = engineVersionOf(withSensitivity('BALANCED'))
+    expect(engineVersionOf(withSensitivity('SENSITIVE'))).not.toBe(balanced)
+    expect(engineVersionOf(withSensitivity('CONSERVATIVE'))).not.toBe(balanced)
+  })
+
+  it('不改写传入的基准参数集（纯函数）', () => {
+    const before = JSON.stringify(DEFAULT_PARAMS)
+    withSensitivity('SENSITIVE')
+    expect(JSON.stringify(DEFAULT_PARAMS)).toBe(before)
   })
 })

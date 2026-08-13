@@ -119,6 +119,26 @@ export class KlineRepo {
       .map(toCandle)
   }
 
+  /**
+   * 截至 `through`（含）的最近 limit 根，**升序**返回。
+   *
+   * 与 `recent()` 的区别只有一个字：**它不假设库里最新那根就是你要的那根**。
+   * 影子运行要的是「`date` 这一根 + 它的前一根」，用 `recent(2)` 得到的是
+   * 「库里最后两根」—— 平时两者相同，但只要库里多了一根（补数据、跨日唤醒、
+   * 测试预置），拿到的就是错的那两根，而症状是「委托莫名不成交」。
+   */
+  recentThrough(code: SecCode, through: TradeDate, limit: number): Candle[] {
+    return this.db
+      .prepare(
+        `SELECT ${SELECT_COLUMNS} FROM (
+           SELECT ${SELECT_COLUMNS} FROM kline_daily
+           WHERE code = ? AND trade_date <= ? ORDER BY trade_date DESC LIMIT ?
+         ) ORDER BY trade_date ASC`
+      )
+      .all<Row>(code, through, Math.max(0, Math.floor(limit)))
+      .map(toCandle)
+  }
+
   range(code: SecCode, from: TradeDate, to: TradeDate): Candle[] {
     return this.db
       .prepare(

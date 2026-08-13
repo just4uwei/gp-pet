@@ -70,6 +70,43 @@ export async function confirmOverwrite(
   return result.response === 0
 }
 
+/**
+ * 通用的「不可撤销动作」确认框（M4 设置页：清空影子记录）。
+ *
+ * 与 `confirmOverwrite` 同一条纪律：**默认按钮是取消**。
+ * 这类框会被回车掉，而它清掉的东西找不回来。
+ */
+export async function confirmDestructive(
+  win: BrowserWindow | null,
+  spec: { title: string; message: string; detail: string; confirmLabel: string }
+): Promise<boolean> {
+  const options: Electron.MessageBoxOptions = {
+    type: 'warning',
+    title: spec.title,
+    message: spec.message,
+    detail: spec.detail,
+    buttons: [spec.confirmLabel, '取消'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  }
+  const result = win ? await dialog.showMessageBox(win, options) : await dialog.showMessageBox(options)
+  return result.response === 0
+}
+
+/** 选一个目录（换数据目录用）。用户取消返回 null */
+export async function askDirectory(win: BrowserWindow | null, defaultPath: string): Promise<string | null> {
+  const options: Electron.OpenDialogOptions = {
+    title: '选择数据目录',
+    defaultPath,
+    // createDirectory 让用户能在对话框里新建一个 —— 否则得先去资源管理器建好再回来
+    properties: ['openDirectory', 'createDirectory'],
+  }
+  const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+  const picked = result.filePaths[0]
+  return result.canceled || picked === undefined ? null : picked
+}
+
 export function writeTextFile(path: string, text: string): void {
   writeFileSync(path, text, 'utf8')
 }

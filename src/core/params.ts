@@ -186,6 +186,32 @@ export type EngineParams = Calibratable<typeof DEFAULT_PARAMS>
 /** 逐块覆盖。块内是整体替换而非深合并 —— 半个 weights 块比写错的参数更难发现 */
 export type ParamOverrides = { [K in keyof EngineParams]?: Partial<EngineParams[K]> }
 
+/** 设置页与回测 CLI 共用的三档灵敏度（`AppSettings.sensitivity`、`--sensitivity`） */
+export type SensitivityTier = 'SENSITIVE' | 'BALANCED' | 'CONSERVATIVE'
+
+/**
+ * 三档灵敏度预设：灵敏 0.50/(2,2) · 均衡 0.60/(3,2) · 保守 0.72/(4,3)。
+ *
+ * 换算依据见上面 `combine` 块的注释（票数按同一比例分策略取整）。
+ *
+ * **这三档不是三套标定过的参数**，是同一组转述猜测上的三个松紧档位 ——
+ * `BALANCED` 恰好等于 `DEFAULT_PARAMS.combine` 的出厂值，而出厂值本身
+ * 已经上过网格、裁决 `KEEP`（M2 §5.15：15 个候选最大 t = 1.4）。
+ * 另外两档一格都没跑过，改档等于换一个**未测**的工作点，UI 上不得写成
+ * 「更准」或「更稳」，只能如实说「出信号更多 / 更少」。
+ *
+ * 住在 core 而不是 `src/backtest/args.ts` 的理由：主进程要按用户设置构造参数集，
+ * 而 `main → backtest` 不是既有的依赖边，参数预设本来就该归参数的唯一来源管。
+ */
+export const SENSITIVITY_PRESETS: Record<
+  SensitivityTier,
+  { scoreThreshold: number; voteThreshold: { trend: number; meanReversion: number } }
+> = {
+  SENSITIVE: { scoreThreshold: 0.5, voteThreshold: { trend: 2, meanReversion: 2 } },
+  BALANCED: { scoreThreshold: 0.6, voteThreshold: { trend: 3, meanReversion: 2 } },
+  CONSERVATIVE: { scoreThreshold: 0.72, voteThreshold: { trend: 4, meanReversion: 3 } },
+}
+
 /**
  * 构造候选参数集。回测的 `--params` 与网格搜索都经由这里，
  * 保证「候选参数」与「出厂参数」是同一个结构，指纹也就可比。
@@ -204,6 +230,24 @@ export function withParams(
         : patch
   }
   return next as EngineParams
+}
+
+/**
+ * 按灵敏度档位构造参数集。**只动 `combine` 的两条线**，其余一律保持出厂值。
+ *
+ * 刻意窄：档位是「要多少信号」的旋钮，不是「换一套策略」。如果哪天想让某一档
+ * 顺带放宽 `risk` 或 `regime`，那是新增一个显式机制、要单独标定，
+ * 不能藏在这个函数里 —— 否则「我把灵敏度调低了怎么止损也跟着变了」无从解释。
+ */
+export function withSensitivity(
+  tier: SensitivityTier,
+  base: EngineParams = DEFAULT_PARAMS
+): EngineParams {
+  const preset = SENSITIVITY_PRESETS[tier]
+  return withParams(
+    { combine: { scoreThreshold: preset.scoreThreshold, voteThreshold: { ...preset.voteThreshold } } },
+    base
+  )
 }
 
 /**

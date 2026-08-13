@@ -7,11 +7,33 @@
 GP Pet：Windows 桌面悬浮条 + 托盘，跟踪用户自选的 A 股，用量化策略判断买卖时机并以不打断工作的方式提醒。
 Electron + React + TypeScript · 本地 SQLite · 免登录 · 无服务端 · **不接券商、不下单**。
 
-当前处于 **M3（提醒层）代码就绪**：五层引擎、回测 CLI、标定工具、面板列表（M2）之上，
-提醒分发已接线 —— `tick → SignalEngine → AlertService → 四道闸门（防抖/冷却/频率上限/免打扰）
-→ alert_log + 状态点 / 气泡`。持仓录入、提醒日志视图、收盘失效提示、
-静默时段与全屏探测都在。**出口条件（自用一周）未验**，逐条见
-[checklists/M3-提醒层验收](./docs/checklists/M3-提醒层验收.md)。
+当前处于 **M4（打磨）代码就绪**：五层引擎、回测 CLI、标定工具、面板列表（M2）、
+提醒分发（M3：`tick → SignalEngine → AlertService → 四道闸门 → alert_log + 状态点 / 气泡`）之上，
+M4 补齐了**影子运行**（前向模拟绩效，schema v2）、**设置页全项**（含只读参数表）、
+**数据库周期备份**、**首启免责声明引导**与 **Playwright E2E**（6 条，真启 Electron）。
+**M3 的出口条件（自用一周）与 M4 的三项真机验收都未做** ——
+逐条见 [M3 验收](./docs/checklists/M3-提醒层验收.md) 与 [M4 验收](./docs/checklists/M4-打磨验收.md)。
+M4 剩下的三项是：125%/150% DPI 走查、真跑一次 `pnpm package` 并安装、代码签名（无证书）。
+
+**影子运行是「量策略值不值钱」的那把尺子，它的可信度全靠「真的是前向的」这一条。**
+所以 `src/main/shadow/` 里写死了四条纪律：不补跑历史（补出来的叫回测）、
+成交价用**次日开盘**（当日收盘价在 15:00 之后已经买不到了）、成本照扣（复用 `backtest/costs.ts`）、
+只吃 CONFIRMED（盘中信号会抖、还可能被收盘轮判失效，按它下单等于把提醒层的抖动记成策略绩效）。
+**引擎参数一变立刻停止累积**，不是继续 —— 混进去的曲线不属于任何一套参数，而它无法事后拆开。
+被提醒闸门挡掉的信号**照样**进影子组合（影子量策略，不量提醒策略），
+但**风控硬抑制的不进**（那是「无执行意义」）—— 这两句看着像一回事，是相反的两个决定。
+
+**`AppSettings.sensitivity` 到 M4 之前是死设置**（schema 里有、没人读），与 `autoLaunch` 曾经的
+问题同一类，但更隐蔽：开机自启不生效用户能发现，灵敏度不生效发现不了。现在
+`withSensitivity()`（住在 `src/core/params.ts`，与回测 `--sensitivity` **共用同一张表**）
+真的重建引擎参数 —— 于是**换档会递增引擎版本 → 指标缓存作废重算 → 影子运行暂停**。
+这不是副作用而是必须如此，UI 上先弹确认框说明这个代价。
+
+**设置页不给参数编辑框**（2026-08-13 的取舍，docs/01 §5.5 已改）。只给一张逐项标注标定状态的
+只读表（`src/main/settings/params-view.ts`）。判据是约束 2：真正标定过并写回的**只有一项**，
+一张不分档的表会让二十来个转述猜测看起来同等可信。
+`tests/unit/main/params-view.test.ts` 钉住「`CALIBRATED` 恰好只有 `strategy.squeezeBbwPct`」——
+往那一档加行就是把一个参数的证据扩张成整套参数的背书，要加得走 M2 清单 4.9a。
 
 **闸门是唯一的点亮路径。** 状态点只认 `PetStateMachine`，而它只接受
 **过了四道闸门**的提醒（被降级成 L1 的算过了，被丢弃的不算）。不要在渲染层直接读
@@ -110,7 +132,8 @@ M2 的「回测报告产出并据此确定出厂参数」还差大半 —— 但
 pnpm dev              # 启动开发环境（electron-vite）
 pnpm test             # 单元 + 集成测试（Vitest，不需要启动 Electron）
 pnpm test:cov         # 覆盖率；src/core 门槛 90%，其余 60%
-pnpm typecheck        # 双 tsconfig（node / web）分别校验
+pnpm test:e2e         # Playwright E2E：先 build，再真启 Electron 跑 6 条（workers=1）
+pnpm typecheck        # 三个 tsconfig（node / web / e2e）分别校验
 pnpm lint
 pnpm verify:indicators           # 重出指标黄金用例；加 -- --check 只校验不重写
 pnpm fetch:history -- --codes SH600000,SZ000001 --from 2018-01-01   # 拉真实日线 → data/history/
@@ -125,7 +148,7 @@ pnpm package          # electron-builder 打包 Windows
 
 ```
 src/core     纯引擎：指标 → 市场状态 → 策略 → 组合 → 风控。零依赖、可回测
-src/main     Electron 主进程：窗口、调度、数据源、存储、提醒编排
+src/main     Electron 主进程：窗口、调度、数据源、存储、提醒编排、影子运行
 src/preload  contextBridge 窄接口
 src/renderer pet / panel / bubble 三个独立入口
 src/shared   主/渲染共享的纯类型
@@ -133,6 +156,11 @@ src/backtest 回测 CLI，复用 src/core
 ```
 
 依赖方向单向：`main → core`、`renderer → shared`。反向依赖一律禁止。
+
+**M4 新增了一条横向边：`main/shadow → backtest`**（只碰 `costs.ts` 与 `metrics.ts` 两个纯模块）。
+这不是反向依赖，是 `src/backtest/index.ts` 头注释里本来就写着的「供……应用内影子运行复用」。
+理由：影子运行与回测量的是同一件事，成本模型、手数取整、绩效口径各写一份，两边数字就再也对不上，
+而「回测说赚、影子说亏」到底是策略退化还是口径差异会变成一个查不清的问题。
 
 ## 上手前先读
 
@@ -143,6 +171,8 @@ src/backtest 回测 CLI，复用 src/core
 | 改窗口或交互 | [docs/06](./docs/06-桌宠交互与非干扰设计.md)（§2.1 悬浮条，§5 皮肤系统已删的说明） |
 | 换托盘 / 应用图标 | [resources/icons/README.md](./resources/icons/README.md)（静态文件，不是生成件） |
 | 改提醒逻辑 | [docs/05](./docs/05-风控与提醒规则.md) |
+| 改影子运行 | [docs/07 §2.3](./docs/07-回测与验证方案.md)（四条前向纪律 + 记账口径） |
+| 改设置页 / 参数表 | [docs/01 §5.5](./docs/01-产品需求与范围.md) + [ADR-0003](./docs/adr/ADR-0003-来源文档数值不作为出厂默认.md) |
 | 写测试或回测 | [docs/07](./docs/07-回测与验证方案.md)（回测陷阱清单必读） |
 
 ## 容易踩的坑
@@ -333,6 +363,36 @@ src/backtest 回测 CLI，复用 src/core
 - **仍然不要假设托盘图标存在**：`resources/icons/app/` 读不到时走 `fallback-icon.ts` 的
   内置兜底位图并打一条 warn，**不能让托盘建不出来** —— 退出与「显示悬浮条」只有托盘这一条路（C9）。
   测试不许拿 `resources/icons/` 下的文件当 fixture。
+- **影子运行取 K 线要用 `klines.recentThrough(code, date, n)`，不是 `recent(code, n)`。**
+  后者取的是「库里最后 n 根」，它隐含「最新那根就是今天」这个假设 —— 只要库里存在比目标日
+  更新的行（跨日唤醒后一次补多天、测试预置数据），拿到的就是错的那两根，
+  而症状是「委托莫名不成交」，从净值上完全看不出来。这条是写用例时才发现的。
+- **备份不能拷 `market.db` 文件，要用 `VACUUM INTO`。** WAL 下主文件不是自足的（最近的写还在
+  `-wal` 里），拷出来的库**少了最后几分钟数据却照样能打开** —— 这种备份最坏，因为它看起来
+  成功了。`VACUUM INTO` 由 SQLite 保证一致性快照且能在运行中做。另外它挂在**休市维护**里
+  （与裁剪同一处），别挪到盘中：它要读全库，会和取数抢同一个 SQLite 连接。
+- **影子账本不进保留策略，`shadow_trade` 也不加指向 `signal(id)` 的外键。**
+  `signal` 按 2 年裁剪，而影子是**无法重建**的前向绩效记录（用历史 K 线补出来的叫回测）。
+  加外键等于把绩效记录挂在日志保留策略上，裁剪那天会连带删掉它。
+  同理「清缓存」刻意很窄：只动指标缓存 + 过期日志 + VACUUM，**不动** K 线、自选、持仓、影子账本。
+- **`shadow_equity.trade_date` 是主键，这就是推进的幂等闸门。** 盘后会跑好几轮 tick，
+  少了这道闸门每轮都会多加一根净值点 —— 而净值曲线「多了一段」这件事从收益率上看不出来。
+- **换灵敏度必须重建整个 `SignalEngine`，不能只换 params。** 引擎版本是构造时算的（它是缓存键
+  与落库字段），做成运行时可变的会让「这一行 signal 是哪套参数下产出的」失去答案。
+  data-layer 因此把 `signals` 存成 `let` 并给 pipeline 传 `{ run: (t) => signals.run(t) }` 转发 ——
+  **直接把 `signals` 传进去的话，流水线会一直握着旧那个**，换完档以后信号还按旧参数出，
+  几乎无从发现。
+- **面板的概览页保持挂载、只切 `display`，而且不能用 `hidden` 属性。** Tailwind 的 `grid` 类
+  会盖掉 `hidden` 带来的 `display: none`（v4 下常见的坑），所以是显式切 `grid` / `hidden` 两个类。
+  保持挂载是因为它订阅了 `push:quoteTick`，卸载再装回来会丢掉滚动位置与正在编辑的持仓行。
+- **E2E 里面板要走 `panel:toggle` 打开，不能去 `BrowserWindow.getAllWindows()` 里找。**
+  `PanelWindow` 是懒加载的（首次打开才建），直接找会等到超时。
+  同理测「第二个实例」要用 `spawn` 而不是 `electron.launch`：拿不到锁的实例在建任何窗口之前就
+  退出了，而 Playwright 会把那个**正确行为**报成「进程退出得太早」。
+- **E2E 不要断言悬浮条高度等于 38。** 实测 150% 缩放下 `getSize()` 报 300×**40** ——
+  缩放比不是 100% 时 Electron 在 DIP 与物理像素之间两个方向都按「包住」取整。
+  这不影响 C2（命中区在渲染层按 `window.innerHeight` 实测重算），写死 38 只会让用例
+  在任何非 100% 缩放的机器上红。
 
 ## 措辞纪律
 

@@ -45,12 +45,25 @@ export interface TickPipelineDeps {
   auxCodes?: () => SecCode[]
   /** 保留策略裁剪。返回 null 表示这次没到点 */
   prune?: (at: number) => unknown
+  /**
+   * `market.db` 的周期备份（M4）。返回 null 表示这次没到点。
+   *
+   * 与裁剪一起挂在**休市维护**里，不挂在竞价那条路上：`VACUUM INTO` 要读全库，
+   * 放在盘中会和取数抢同一个 SQLite 连接（storage/backup.ts 头注释）。
+   */
+  backup?: (at: number) => unknown
   log?: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void }
   onQuotes?: (ctx: TickContext, snapshots: SnapshotOutcome) => void
   /** M2 引擎。不传则整轮退化为 M1 行为（只取数、不算信号） */
   engine?: Pick<SignalEngine, 'run'>
   /** 引擎跑完一轮后的去处：controller 拿它跑提醒分发并刷新面板 */
   onSignals?: (ctx: TickContext, outcomes: SignalOutcome[]) => void
+  /**
+   * 影子运行推进（M4，docs/07 §2.3）。排在提醒**之后**且**单独 try**：
+   * 模拟账本记错了不该连带把提醒吃掉，两者的重要性差一个量级。
+   * 它自己判幂等（一个交易日只推进一次），所以这里每轮都调无妨。
+   */
+  shadow?: { advance(input: { date: string; at: number; outcomes: readonly SignalOutcome[] }): unknown }
   maintenanceIntervalMs?: number
 }
 
@@ -76,10 +89,12 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
     meta,
     auxCodes,
     prune,
+    backup,
     log = { info: () => {}, warn: () => {} },
     onQuotes,
     engine,
     onSignals,
+    shadow,
     maintenanceIntervalMs = MAINTENANCE_INTERVAL_MS,
   } = deps
 
@@ -111,6 +126,9 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
 
     const pruned = prune?.(at)
     if (pruned) log.info(`[retention] 裁剪：${JSON.stringify(pruned)}`)
+
+    // 备份排在裁剪**之后**：先删掉过期数据再快照，备份文件小一圈
+    backup?.(at)
   }
 
   return {
@@ -168,6 +186,15 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
         } catch (error) {
           // 引擎整体失败（单只失败已在引擎内部兜住）：行情照常上报，本轮没有信号
           log.warn(`[signal] ${ctx.date} ${ctx.session} 引擎异常：${String(error)}`)
+        }
+
+        // 影子运行（M4）。单独 try：账本出错不该把上面的提醒一起带走
+        if (shadow) {
+          try {
+            shadow.advance({ date: ctx.date, at: ctx.at, outcomes: lastSignals })
+          } catch (error) {
+            log.warn(`[shadow] ${ctx.date} 推进失败：${String(error)}`)
+          }
         }
       }
     },

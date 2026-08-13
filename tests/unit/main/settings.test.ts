@@ -123,3 +123,42 @@ describe('SettingsStore', () => {
     expect(logs.join()).toContain('写入失败')
   })
 })
+
+/**
+ * 免责声明确认时刻（M4，docs/01 §8）。
+ *
+ * 存**时刻**而不是布尔值：声明文本将来若实质性变更，可以按时间戳判断
+ * 「他确认的是哪一版」，而 `true` 什么都答不了。
+ */
+describe('disclaimerAcceptedAt', () => {
+  it('缺省时**不留 undefined 键** —— exactOptionalPropertyTypes 下它与「没有这个键」不等价', () => {
+    const { settings } = sanitizeSettings({})
+    expect('disclaimerAcceptedAt' in settings).toBe(false)
+  })
+
+  it('正整数毫秒被保留', () => {
+    const at = Date.UTC(2026, 7, 13)
+    expect(sanitizeSettings({ disclaimerAcceptedAt: at }).settings.disclaimerAcceptedAt).toBe(at)
+  })
+
+  it('0 / 负数 / 小数一律回到「没确认过」—— 会再弹一次引导，那比信一个坏时间戳安全', () => {
+    for (const bad of [0, -1, 1.5]) {
+      const result = sanitizeSettings({ disclaimerAcceptedAt: bad })
+      expect('disclaimerAcceptedAt' in result.settings).toBe(false)
+      expect(result.repaired.map((r) => r.field)).toContain('disclaimerAcceptedAt')
+    }
+  })
+
+  it('确认过之后 patch 别的字段不会把它抹掉', () => {
+    const at = Date.UTC(2026, 7, 13)
+    const home = mkdtempSync(join(tmpdir(), 'gp-disclaimer-'))
+    try {
+      const s = new SettingsStore(join(home, 'settings.json'))
+      s.load()
+      s.patch({ disclaimerAcceptedAt: at })
+      expect(s.patch({ pollIntervalSec: 45 }).disclaimerAcceptedAt).toBe(at)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+})

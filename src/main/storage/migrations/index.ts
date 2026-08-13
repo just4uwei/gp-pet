@@ -8,6 +8,7 @@
  */
 
 import init001 from './001_init.sql?raw'
+import shadow002 from './002_shadow.sql?raw'
 
 export interface Migration {
   version: number
@@ -15,6 +16,9 @@ export interface Migration {
   sql: string
 }
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, name: '001_init', sql: init001 }]
+export const MIGRATIONS: readonly Migration[] = [
+  { version: 1, name: '001_init', sql: init001 },
+  { version: 2, name: '002_shadow', sql: shadow002 },
+]
 
 export const LATEST_SCHEMA_VERSION = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)

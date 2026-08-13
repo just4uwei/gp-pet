@@ -35,3 +35,8 @@ strategy*.txt
 
 # 覆盖率报告是构建产物
 coverage/
+
+# Playwright E2E 的产物（trace / 截图 / HTML 报告）
+test-results/
+playwright-report/
+.playwright/

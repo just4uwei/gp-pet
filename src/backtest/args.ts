@@ -6,6 +6,7 @@
  * 会让人以为跑了一次含滑点的回测。
  */
 
+import type { SensitivityTier } from '../core/params'
 import type { TradeDate } from '../core/types'
 
 export interface CliOptions {
@@ -29,7 +30,7 @@ export interface CliOptions {
     transferFeeRate?: number
     slippage?: number
   }
-  sensitivity?: 'SENSITIVE' | 'BALANCED' | 'CONSERVATIVE'
+  sensitivity?: SensitivityTier
   /** 标定：横截面折数（标的子集），默认 4 */
   codeFolds: number
   /** 标定：验证窗口内的时间片数，默认 3 */
@@ -233,14 +234,9 @@ export function parseArgs(argv: readonly string[]): CliOptions | 'help' {
 /**
  * 三档灵敏度预设（docs/04 §4.2）：灵敏 0.50/(2,2) · 均衡 0.60/(3,2) · 保守 0.72/(4,3)。
  *
- * 票数线按策略分开，两个数由**同一个比例**换算：趋势 2/3/4 票是 5 个子信号的 40%/60%/80%，
- * 均值回归 4 个子信号按同比例取整得 2/2/3。理由见 params.ts 的 `combine` 注释。
+ * **定义已搬到 `src/core/params.ts`**（2026-08-13，M4 接线 `AppSettings.sensitivity`）：
+ * 主进程也要按用户设置构造参数集，而 `main → backtest` 不是既有的依赖边。
+ * 这里只重导出，保证 `--sensitivity` 与设置页三档**永远是同一张表** ——
+ * 抄一份到主进程会让「回测里的均衡档」与「用户设置里的均衡档」悄悄分叉。
  */
-export const SENSITIVITY_PRESETS: Record<
-  NonNullable<CliOptions['sensitivity']>,
-  { scoreThreshold: number; voteThreshold: { trend: number; meanReversion: number } }
-> = {
-  SENSITIVE: { scoreThreshold: 0.5, voteThreshold: { trend: 2, meanReversion: 2 } },
-  BALANCED: { scoreThreshold: 0.6, voteThreshold: { trend: 3, meanReversion: 2 } },
-  CONSERVATIVE: { scoreThreshold: 0.72, voteThreshold: { trend: 4, meanReversion: 3 } },
-}
+export { SENSITIVITY_PRESETS } from '../core/params'

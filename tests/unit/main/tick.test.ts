@@ -291,4 +291,61 @@ describe('createTickPipeline', () => {
 
     expect(pipeline.state().lastSnapshots).toBe(first)
   })
+
+  // ── M4 挂上来的两件事 ────────────────────────────────────────────
+
+  it('影子运行拿到本轮的评估结果，排在提醒之后', async () => {
+    const order: string[] = []
+    const advance = vi.fn(() => order.push('shadow'))
+    const engine = { run: vi.fn(() => [{ tag: 'outcome' }] as never) }
+    const h = harness({
+      engine,
+      onSignals: () => order.push('alerts'),
+      shadow: { advance },
+    })
+    await createTickPipeline(h.deps).run(ctxOf())
+
+    expect(advance).toHaveBeenCalledWith({
+      date: '2026-03-10',
+      at: AT,
+      outcomes: [{ tag: 'outcome' }],
+    })
+    // 提醒先、影子后：模拟账本比提醒次要，不该抢在它前面
+    expect(order).toEqual(['alerts', 'shadow'])
+  })
+
+  it('影子推进抛错不影响提醒与取数 —— 两者重要性差一个量级', async () => {
+    const onSignals = vi.fn()
+    const h = harness({
+      engine: { run: vi.fn(() => [] as never) },
+      onSignals,
+      shadow: {
+        advance: () => {
+          throw new Error('账本炸了')
+        },
+      },
+    })
+    const pipeline = createTickPipeline(h.deps)
+    await expect(pipeline.run(ctxOf())).resolves.toBeUndefined()
+    expect(onSignals).toHaveBeenCalledOnce()
+    expect(h.refreshSnapshots).toHaveBeenCalledOnce()
+  })
+
+  it('引擎未接入时影子也不推进（没有评估结果可喂）', async () => {
+    const advance = vi.fn()
+    const h = harness({ shadow: { advance } })
+    await createTickPipeline(h.deps).run(ctxOf())
+    expect(advance).not.toHaveBeenCalled()
+  })
+
+  it('备份挂在休市维护里，盘中不跑 —— VACUUM INTO 要读全库，会和取数抢连接', async () => {
+    const backup = vi.fn()
+    const h = harness({ backup })
+
+    await createTickPipeline(h.deps).run(ctxOf())
+    expect(backup).not.toHaveBeenCalled()
+
+    await createTickPipeline(h.deps).run(ctxOf({ session: 'CLOSED', needsQuotes: false }))
+    expect(backup).toHaveBeenCalledWith(AT)
+  })
 })

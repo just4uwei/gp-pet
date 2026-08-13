@@ -14,21 +14,29 @@
  * 判定本身是纯函数（alerts/dnd.ts），这里只负责把四个输入凑齐。
  */
 
-import { app, powerMonitor } from 'electron'
+import { app, powerMonitor, shell } from 'electron'
+import { mkdirSync } from 'node:fs'
+import { join } from 'node:path'
 import type {
+  AboutInfo,
   AlertRecord,
   AppSettings,
   ConfigTransferResult,
   EngineStatus,
+  MaintenanceResult,
+  ParamRow,
   PetState,
   PositionView,
   ProviderHealth,
   Rect,
+  ShadowSummary,
+  ShadowTradeView,
   SignalEvidence,
   SignalRecord,
   WatchItem,
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
+import { engineVersionOf, withSensitivity } from '@core/params'
 import { electronAutoLaunchDeps, syncAutoLaunch } from './auto-launch'
 import { createAlertService, type AlertService, type AlertSink } from './alerts/service'
 import type { QuoteView } from './alerts/candidates'
@@ -49,18 +57,33 @@ import {
 } from './settings/transfer'
 import {
   appVersion,
+  askDirectory,
   askOpenPath,
   askSavePath,
+  confirmDestructive,
   confirmOverwrite,
   readJsonFile,
   writeTextFile,
 } from './settings/transfer-io'
+import { paramRows } from './settings/params-view'
+import {
+  DEFAULT_SHADOW_CAPITAL,
+  emptyShadowSummary,
+  summarize,
+  toTradeView,
+} from './shadow'
+import { BACKUP_DIR_NAME, DEFAULT_BACKUP_POLICY, backupNow } from './storage/backup'
+import { SHADOW_KEYS } from './storage/repositories/shadow'
+import { pruneAll, vacuum } from './storage/retention'
 import { isQuiet, quietUntil, type QuietPreset } from './util/quiet'
 import { WindowManager } from './windows/WindowManager'
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
+
+/** 数据层未就绪时报的引擎版本：出厂参数的那一个（此时也确实还没有别的） */
+const DEFAULT_PARAMS_VERSION = engineVersionOf()
 
 /** 仓储的 WatchEntry → 导出文件里的一行。isST 不落文件：它是从名称推出来的，会随摘帽变 */
 function toConfigWatchEntry(entry: WatchEntry): ConfigWatchEntry {
@@ -320,6 +343,177 @@ export class AppController {
       log.warn('[config] 导入失败：', error)
       return { status: 'FAILED', warnings: [], error: messageOf(error) }
     }
+  }
+
+  // ── 影子运行（M4，docs/07 §2.3）───────────────────────────────────
+  //
+  // 面板只读这两条 + 一条重置。推进不在这里：它挂在 tick 上（engine/tick.ts），
+  // 因为「一个交易日推进一次」是数据层的节奏，不是 UI 的。
+
+  shadowSummary(): ShadowSummary {
+    const layer = this.data
+    if (!layer) return emptyShadowSummary(DEFAULT_PARAMS_VERSION)
+    const meta = layer.storage.meta
+    const recorded = meta.get(SHADOW_KEYS.engineVersion)
+    const current = layer.signals.engineVersion
+    return summarize({
+      startedAt: meta.getNumber(SHADOW_KEYS.startedAt),
+      startedDate: meta.get(SHADOW_KEYS.startedDate),
+      startCapital: meta.getNumber(SHADOW_KEYS.startCapital) ?? DEFAULT_SHADOW_CAPITAL,
+      equity: layer.storage.shadow.equity(),
+      trades: layer.storage.shadow.trades(),
+      positions: layer.storage.shadow.positions(),
+      orders: layer.storage.shadow.orders(),
+      skippedNoCash: meta.getNumber(SHADOW_KEYS.skippedNoCash) ?? 0,
+      limitBlocked: meta.getNumber(SHADOW_KEYS.limitBlocked) ?? 0,
+      engineVersion: current,
+      // 只有「记过、且不一致」才算暂停。从未记过（还没开始）不是暂停
+      stalledEngineVersion: recorded !== null && recorded !== current ? recorded : null,
+      now: Date.now(),
+    })
+  }
+
+  shadowTrades(limit = 50): ShadowTradeView[] {
+    const layer = this.data
+    if (!layer) return []
+    return layer.storage.shadow
+      .trades(limit)
+      .map((trade) => toTradeView(trade, layer.storage.watchlist.get(trade.code)?.profile.name ?? trade.code))
+      .reverse()
+  }
+
+  /**
+   * 清空影子账本并重新开始。**走系统确认框** —— 丢掉的是一段无法重建的前向记录，
+   * 不该是一个点了就没的按钮（历史 K 线补出来的那个叫回测，见 ShadowRepo.reset）。
+   */
+  async resetShadow(): Promise<MaintenanceResult> {
+    try {
+      const layer = this.requireData()
+      const summary = this.shadowSummary()
+      const confirmed = await confirmDestructive(this.windows.panelWindow.browserWindow, {
+        title: '重新开始影子运行',
+        message: '清空模拟持仓与绩效记录，从下一个交易日重新累积？',
+        detail:
+          `将丢弃 ${summary.bars} 个交易日、${summary.entries.count} 次模拟建仓的记录。\n\n` +
+          '这段记录是前向累积的，删掉之后无法重建 —— 用历史行情补出来的是回测，不是影子运行。',
+        confirmLabel: '清空并重新开始',
+      })
+      if (!confirmed) return { status: 'CANCELED', message: '已取消，影子记录未改动' }
+      layer.shadow.reset()
+      this.onStateChanged()
+      return { status: 'DONE', message: '影子记录已清空，将在下一个交易日重新开始累积' }
+    } catch (error) {
+      log.warn('[shadow] 重置失败：', error)
+      return { status: 'FAILED', message: '重置失败', error: messageOf(error) }
+    }
+  }
+
+  // ── 数据维护（M4 设置页）──────────────────────────────────────────
+
+  /** 只读参数表。摊的是**当前生效的**参数集（含灵敏度换档后的值），不是硬编码的出厂值 */
+  paramRows(): ParamRow[] {
+    return paramRows(withSensitivity(this.getSettings().sensitivity))
+  }
+
+  about(): AboutInfo {
+    const layer = this.data
+    return {
+      appVersion: appVersion(),
+      electronVersion: process.versions.electron ?? '未知',
+      engineVersion: layer?.signals.engineVersion ?? DEFAULT_PARAMS_VERSION,
+      schemaVersion: layer?.storage.db.schemaVersion ?? 0,
+      dataDir: layer?.paths.dataDir ?? app.getPath('userData'),
+      logDir: app.getPath('logs'),
+      backupDir: layer?.paths.backupDir ?? join(app.getPath('userData'), BACKUP_DIR_NAME),
+    }
+  }
+
+  backupDatabase(): MaintenanceResult {
+    try {
+      const layer = this.requireData()
+      const result = backupNow(
+        layer.storage.db,
+        layer.paths.backupDir,
+        Date.now(),
+        DEFAULT_BACKUP_POLICY,
+        (m) => log.info(m)
+      )
+      return {
+        status: 'DONE',
+        message: `已备份 ${(result.bytes / 1024 / 1024).toFixed(1)} MB（保留最近 ${DEFAULT_BACKUP_POLICY.keep} 份）`,
+        path: result.path,
+      }
+    } catch (error) {
+      // 手动备份失败必须把原因显示出来：同一分钟内点两次会撞「文件已存在」，
+      // 而那是用户自己能理解并绕开的
+      log.warn('[backup] 手动备份失败：', error)
+      return { status: 'FAILED', message: '备份失败', error: messageOf(error) }
+    }
+  }
+
+  /**
+   * 清缓存。**动的只有派生物**：指标缓存 + 到期裁剪 + VACUUM。
+   *
+   * 不动 K 线（重拉要花掉几百个请求）、不动自选与持仓（那是用户输入）、
+   * **不动影子账本**（那是无法重建的前向记录）。「清缓存」在别的软件里常常
+   * 顺手把一切都清掉 —— 这里刻意窄，因为这三样里有两样删了就回不来。
+   */
+  clearCache(): MaintenanceResult {
+    try {
+      const layer = this.requireData()
+      const indicators = layer.storage.indicators.purgeOtherVersions('')
+      const pruned = pruneAll(layer.storage.db, Date.now())
+      vacuum(layer.storage.db)
+      const parts = [
+        `指标缓存 ${indicators} 条`,
+        pruned.signalDeleted > 0 ? `过期信号 ${pruned.signalDeleted} 条` : null,
+        pruned.alertDeleted > 0 ? `过期提醒 ${pruned.alertDeleted} 条` : null,
+        pruned.healthDeleted > 0 ? `健康度 ${pruned.healthDeleted} 条` : null,
+      ].filter((part): part is string => part !== null)
+      return {
+        status: 'DONE',
+        message: `已清理 ${parts.join('、')}，并整理了数据库。K 线、自选、持仓与影子记录未受影响`,
+      }
+    } catch (error) {
+      log.warn('[cache] 清缓存失败：', error)
+      return { status: 'FAILED', message: '清缓存失败', error: messageOf(error) }
+    }
+  }
+
+  /**
+   * 换数据目录。**只写设置、不搬库**，需要重启才生效。
+   *
+   * 为什么不当场搬：`market.db` 是启动时打开的单连接，中途换目录要么复制整库
+   * 要么重开连接并重建全部仓储 —— 而这条路上任何一步失败都会让用户处在
+   * 「一半数据在旧目录、一半在新目录」的状态。提示重启笨一点，但不会丢数据。
+   * 旧目录里的文件**不删**：用户可以自己搬过去，也可以改回来。
+   */
+  async chooseDataDir(): Promise<MaintenanceResult> {
+    try {
+      const current = this.about().dataDir
+      const picked = await askDirectory(this.windows.panelWindow.browserWindow, current)
+      if (picked === null) return { status: 'CANCELED', message: '已取消，数据目录未改动' }
+      if (picked === current) return { status: 'CANCELED', message: '选的就是当前目录，未改动' }
+      this.patchSettings({ dataDir: picked })
+      return {
+        status: 'DONE',
+        message: '数据目录已保存，重启后生效。旧目录里的文件没有动，需要的话请手工搬过去',
+        path: picked,
+        needsRestart: true,
+      }
+    } catch (error) {
+      log.warn('[settings] 选择数据目录失败：', error)
+      return { status: 'FAILED', message: '选择数据目录失败', error: messageOf(error) }
+    }
+  }
+
+  revealPath(which: 'data' | 'logs' | 'backups'): void {
+    const info = this.about()
+    const target =
+      which === 'logs' ? info.logDir : which === 'backups' ? info.backupDir : info.dataDir
+    // 目录可能还不存在（一次都没备份过）—— 先建再开，否则 openPath 静默失败
+    mkdirSync(target, { recursive: true })
+    void shell.openPath(target)
   }
 
   // ── 信号（M2）─────────────────────────────────────────────────────
