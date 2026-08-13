@@ -19,6 +19,10 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type {
   AboutInfo,
+  AiConfigPatch,
+  AiConfigView,
+  AiExplainStart,
+  AiTestResult,
   AlertRecord,
   AppSettings,
   ConfigTransferResult,
@@ -37,6 +41,17 @@ import type {
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
 import { engineVersionOf, withSensitivity } from '@core/params'
+import {
+  AI_CONFIG_FILE,
+  AiConfigStore,
+  buildSignalContext,
+  createAiClient,
+  createAiService,
+  createUndiciAiTransport,
+  electronSecretCrypto,
+  renderContext,
+  type AiService,
+} from './ai'
 import { electronAutoLaunchDeps, syncAutoLaunch } from './auto-launch'
 import { createAlertService, type AlertService, type AlertSink } from './alerts/service'
 import type { QuoteView } from './alerts/candidates'
@@ -115,6 +130,13 @@ export class AppController {
   private unread = 0
   /** 状态点高优先级状态的回落定时器（最短驻留 3s，而 tick 每 30s 才来一次） */
   private petFallbackTimer: NodeJS.Timeout | null = null
+
+  /**
+   * AI 解读（P2）。**不依赖数据层** —— 设置页要能在数据层装配失败时照常配置。
+   * 真正解读时才需要信号，那一步走 `requireData()`。
+   */
+  private aiStore: AiConfigStore | null = null
+  private ai: AiService | null = null
 
   constructor() {
     this.probe = createNotificationStateProbe({ log })
@@ -603,6 +625,108 @@ export class AppController {
   start(): void {
     this.windows.createOverlay()
     this.pushPetState()
+    this.startAi()
+  }
+
+  // ── AI 解读（P2，docs/08 §后续）─────────────────────────────────────
+  //
+  // 三条必须守住的边界：
+  //   ① **只读的解释层**：结果不回流到信号、闸门、状态点或影子运行。
+  //      这里绝不调用 pushPetState()，那会开一条绕过四道闸门的旁路。
+  //   ② **key 不进 AppSettings**：ai.json 与 settings.json 并列，都留在**默认**
+  //      用户数据目录（不跟 dataDir 走）—— 配置改坏了得找得回来。
+  //   ③ **不复用 net/http.ts**：那个限流器与行情取数共用（全局并发 4），
+  //      一次 40 秒的 LLM 调用挂上去会把盘中每 30 秒一轮的 tick 饿死。
+
+  private startAi(): void {
+    const file = join(app.getPath('userData'), AI_CONFIG_FILE)
+    const store = new AiConfigStore(file, electronSecretCrypto(), (m) => log.info(m))
+    const view = store.load()
+    this.aiStore = store
+
+    for (const item of view.repaired) log.warn(`[ai] ${item}`)
+    // 启动时打一行状态。加密可用性是这块唯一「装不上就整块用不了」的前提，
+    // 而它在不同 OS / 会话下会变 —— 不打这一行，用户只会看到「保存了没反应」
+    log.info(
+      `[ai] 就绪：${view.enabled ? '已启用' : '未启用'}，` +
+        `${view.hasKey ? '已配置 key' : '无 key'}，凭据加密${view.encryptionAvailable ? '可用' : '不可用'}`
+    )
+
+    this.ai = createAiService({
+      store,
+      client: createAiClient(createUndiciAiTransport(store.config().timeoutMs)),
+      emit: (chunk) => this.windows.push('push:aiChunk', chunk),
+      buildUserMessage: (signalId) => this.aiUserMessage(signalId),
+      log: { info: (m) => log.info(m), warn: (m, e) => log.warn(m, e) },
+    })
+  }
+
+  /** 把一条信号摊成发给模型的正文。拿不到信号就抛错 —— 让 service 报成一次失败 */
+  private aiUserMessage(signalId: string): string {
+    const layer = this.requireData()
+    const evidence = layer.explainSignal(signalId)
+    if (!evidence) throw new Error('该信号已不在库中（可能已被保留策略裁剪）')
+
+    // signal:history 按时间倒查即可：一条信号的 id 是唯一的，
+    // 这里不新开一条按 id 查的仓储方法（那要动 storage 接口，收益不抵成本）
+    const record = layer.signalHistory({ limit: 500 }).find((row) => row.id === signalId)
+    if (!record) throw new Error('该信号已不在最近的记录里')
+
+    const alert = this.alertHistory({ code: record.code, limit: 200 }).find(
+      (row) => row.signalId === signalId
+    )
+    const position = layer.storage.positions.list().find((held) => held.code === record.code)
+
+    const context = buildSignalContext({
+      record,
+      evidence,
+      ...(alert === undefined
+        ? {}
+        : {
+            gate: {
+              delivered: alert.channels.length > 0,
+              ...(alert.reason === undefined ? {} : { reason: alert.reason }),
+            },
+          }),
+      ...(position === undefined ? {} : { position }),
+      params: this.paramRows(),
+      engineVersion: layer.signals.engineVersion,
+      at: new Date(record.createdAt).toLocaleString('zh-CN'),
+    })
+    return renderContext(context)
+  }
+
+  aiConfig(): AiConfigView {
+    if (!this.aiStore) throw new Error('AI 模块尚未就绪')
+    return this.aiStore.view()
+  }
+
+  setAiConfig(patch: AiConfigPatch): AiConfigView {
+    if (!this.aiStore) throw new Error('AI 模块尚未就绪')
+    const view = this.aiStore.patch(patch)
+    // 超时改了要让下一次请求用上新值：客户端持有的 transport 是按超时构造的
+    this.ai = createAiService({
+      store: this.aiStore,
+      client: createAiClient(createUndiciAiTransport(this.aiStore.config().timeoutMs)),
+      emit: (chunk) => this.windows.push('push:aiChunk', chunk),
+      buildUserMessage: (signalId) => this.aiUserMessage(signalId),
+      log: { info: (m) => log.info(m), warn: (m, e) => log.warn(m, e) },
+    })
+    return view
+  }
+
+  async testAi(): Promise<AiTestResult> {
+    if (!this.ai) return { ok: false, message: 'AI 模块尚未就绪' }
+    return this.ai.test()
+  }
+
+  explainWithAi(signalId: string, force = false): AiExplainStart {
+    if (!this.ai) throw new Error('AI 模块尚未就绪')
+    return this.ai.explain(signalId, force)
+  }
+
+  cancelAi(requestId: string): void {
+    this.ai?.cancel(requestId)
   }
 
   // ── 窗口 ──────────────────────────────────────────────────────────
@@ -757,6 +881,9 @@ export class AppController {
     }
     powerMonitor.removeAllListeners('lock-screen')
     powerMonitor.removeAllListeners('unlock-screen')
+    // 在跑的 AI 请求要断掉，否则 undici 的连接会把进程吊住几十秒
+    this.ai?.dispose()
+    this.ai = null
     // 先停调度再关库：反过来会让正在写库的那一轮 tick 撞上已关闭的连接
     this.data?.dispose()
     this.data = null

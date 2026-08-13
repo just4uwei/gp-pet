@@ -305,6 +305,71 @@ export interface AboutInfo {
   backupDir: string
 }
 
+// ─────────────────────── AI 分析（P2，docs/08 §后续）───────────────────────
+
+/**
+ * AI 配置的**渲染层视图**。注意它与主进程存的东西不是一回事：
+ * 明文 API key 只能单向流进主进程，**永远不回传**（见 `AiConfigPatch`）。
+ *
+ * 整块配置也不住在 `AppSettings` 里 —— `config:export` 会把设置原样写进用户选的
+ * JSON 文件，key 放进去就等于跟着导出文件走。它单独落 `<数据目录>/ai.json`，
+ * key 用 OS 凭据存储加密。
+ */
+export interface AiConfigView {
+  enabled: boolean
+  baseUrl: string
+  model: string
+  timeoutMs: number
+  maxTokens: number
+  /** 是否已保存 key。真值本身不回传 */
+  hasKey: boolean
+  /** 脱敏尾巴（如 `••••4f2a`），仅供用户确认「我存的是哪一把」 */
+  keyHint?: string
+  /**
+   * OS 凭据加密是否可用。false → **拒绝保存 key**，功能整块不可用。
+   * 退化成明文落盘是「看起来成功了」的那一类失败，不做。
+   */
+  encryptionAvailable: boolean
+  /** 配置文件被修复或丢弃的字段，必须显示（不静默，docs/02 §7） */
+  repaired: string[]
+}
+
+/** 配置补丁。缺省的键 = 不动 */
+export interface AiConfigPatch {
+  enabled?: boolean
+  baseUrl?: string
+  model?: string
+  timeoutMs?: number
+  maxTokens?: number
+  /** 明文 key，单向流入。`null` = 清除已存的 key；缺省 = 保持不变 */
+  apiKey?: string | null
+}
+
+/** 「测试连接」的结果。不抛错 —— 连不上是用户能看懂的正常结局 */
+export interface AiTestResult {
+  ok: boolean
+  message: string
+  latencyMs?: number
+}
+
+/**
+ * `ai:explain` 的即时返回。正文走 `push:aiChunk` 流式推送 ——
+ * 一次 invoke 等 40 秒，界面上就是一个转不完的圈。
+ */
+export interface AiExplainStart {
+  requestId: string
+  /** 命中内存缓存时直接给全文，此时不会再有任何 `push:aiChunk` */
+  cached?: string
+}
+
+/** 流式分片。`done` 与 `error` 互斥，二者之一到达即本次请求结束 */
+export interface AiChunk {
+  requestId: string
+  delta?: string
+  done?: boolean
+  error?: string
+}
+
 /** 数据维护动作（清缓存 / 备份 / 选数据目录）的结果 */
 export interface MaintenanceResult {
   status: 'DONE' | 'CANCELED' | 'FAILED'
@@ -390,6 +455,17 @@ export interface IpcInvokeMap {
   'app:revealPath': (which: 'data' | 'logs' | 'backups') => void
   /** 版本、数据目录、日志目录、schema 版本 —— 设置页「关于」那一块 */
   'app:about': () => AboutInfo
+  /** AI 配置（P2）。**返回值里没有明文 key**，只有 hasKey + 脱敏尾巴 */
+  'ai:config': () => AiConfigView
+  'ai:setConfig': (patch: AiConfigPatch) => AiConfigView
+  /** 拿当前配置发一次最小请求验证连通性。不抛错，走 ok + message */
+  'ai:test': () => AiTestResult
+  /**
+   * 对一条信号求 AI 解读。正文走 `push:aiChunk`。
+   * **它是只读的解释层** —— 结果不回流到信号、闸门、状态点或影子运行。
+   */
+  'ai:explain': (signalId: string, force?: boolean) => AiExplainStart
+  'ai:cancel': (requestId: string) => void
   'pet:setHitRegion': (rects: Rect[]) => void
   /**
    * 渲染层完成命中判定后上报：鼠标是否落在悬浮条本体上。
@@ -412,6 +488,8 @@ export interface IpcPushMap {
   'push:alert': AlertPayload
   'push:quoteTick': QuoteTick[]
   'push:engineStatus': EngineStatus
+  /** AI 解读的流式分片（P2）。与提醒无关，不经过四道闸门 */
+  'push:aiChunk': AiChunk
 }
 
 /**

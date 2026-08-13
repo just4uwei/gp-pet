@@ -34,6 +34,11 @@ export const INVOKE_CHANNELS = [
   'shadow:reset',
   'app:params',
   'app:about',
+  'ai:config',
+  'ai:setConfig',
+  'ai:test',
+  'ai:explain',
+  'ai:cancel',
   'app:backupDatabase',
   'app:clearCache',
   'app:chooseDataDir',
@@ -53,6 +58,7 @@ export const PUSH_CHANNELS = [
   'push:alert',
   'push:quoteTick',
   'push:engineStatus',
+  'push:aiChunk',
 ] as const satisfies readonly (keyof IpcPushMap)[]
 
 export type InvokeChannel = (typeof INVOKE_CHANNELS)[number]

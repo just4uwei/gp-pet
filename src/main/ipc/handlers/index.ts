@@ -115,6 +115,20 @@ export function registerHandlers(controller: AppController): void {
 
   handle('app:revealPath', (_event, which) => controller.revealPath(which))
 
+  // ── AI 解读（P2，docs/08 §后续）───────────────────────────────────
+  // 只读的解释层：结果不回流到信号、闸门、状态点或影子运行。
+  // `ai:config` / `ai:setConfig` 的返回值里**没有明文 API key** —— 明文只能单向流入。
+
+  handle('ai:config', () => controller.aiConfig())
+
+  handle('ai:setConfig', (_event, patch) => controller.setAiConfig(patch))
+
+  handle('ai:test', () => controller.testAi())
+
+  handle('ai:explain', (_event, signalId, force) => controller.explainWithAi(signalId, force ?? false))
+
+  handle('ai:cancel', (_event, requestId) => controller.cancelAi(requestId))
+
   handle('pet:setHitRegion', (_event, rects) => controller.setHitRects(rects))
 
   handle('pet:setInteractive', (_event, interactive) => controller.setOverlayInteractive(interactive))

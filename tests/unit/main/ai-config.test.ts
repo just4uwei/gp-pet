@@ -1,0 +1,184 @@
+/**
+ * AI 配置存储（src/main/ai/config.ts）。
+ *
+ * 这个文件里有一把能直接花钱的钥匙，所以用例盯的是三件事，不是「存取能不能跑通」：
+ *
+ *   1. **明文 key 绝不出现在渲染层视图里**（`view()` 是最后一道关口）
+ *   2. **系统凭据加密不可用时拒绝保存**，而不是退化成明文落盘 ——
+ *      那是「看起来成功了」的那一类失败，用户以为存好了，实际 %APPDATA% 里躺着裸 key
+ *   3. **明文 key 绝不出现在磁盘文件里**（读回落盘内容逐字搜）
+ */
+
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it } from 'vitest'
+import { AI_CONFIG_FILE, AiConfigStore, sanitizeAiConfig } from '@main/ai/config'
+import type { SecretCrypto } from '@main/ai/types'
+
+const dirs: string[] = []
+
+function tempFile(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'gp-ai-'))
+  dirs.push(dir)
+  return join(dir, AI_CONFIG_FILE)
+}
+
+afterEach(() => {
+  while (dirs.length > 0) {
+    const dir = dirs.pop()
+    if (dir !== undefined) rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/** 可用的假加密：base64 反转，足够验证「落盘的不是明文」 */
+function fakeCrypto(available = true): SecretCrypto {
+  return {
+    available: () => available,
+    encrypt: (plain) => Buffer.from([...plain].reverse().join(''), 'utf8').toString('base64'),
+    decrypt: (b64) => [...Buffer.from(b64, 'base64').toString('utf8')].reverse().join(''),
+  }
+}
+
+const SECRET = 'sk-test-abcdefghijklmnop-4f2a'
+
+describe('AiConfigStore', () => {
+  it('明文 key 不出现在渲染层视图里 —— 只有 hasKey 与脱敏尾巴', () => {
+    const store = new AiConfigStore(tempFile(), fakeCrypto())
+    store.load()
+    const view = store.patch({ apiKey: SECRET })
+
+    expect(view.hasKey).toBe(true)
+    expect(view.keyHint).toBe('••••4f2a')
+    // 整份视图序列化后都不许出现明文
+    expect(JSON.stringify(view)).not.toContain(SECRET)
+    // 主进程内部仍拿得到（发请求要用）
+    expect(store.apiKey()).toBe(SECRET)
+  })
+
+  it('明文 key 不出现在磁盘文件里', () => {
+    const file = tempFile()
+    const store = new AiConfigStore(file, fakeCrypto())
+    store.load()
+    store.patch({ apiKey: SECRET })
+
+    const raw = readFileSync(file, 'utf8')
+    expect(raw).not.toContain(SECRET)
+    expect(raw).toContain('apiKeyEnc')
+  })
+
+  it('加密不可用时**拒绝保存**，不退化成明文落盘', () => {
+    const file = tempFile()
+    const store = new AiConfigStore(file, fakeCrypto(false))
+    store.load()
+    const view = store.patch({ apiKey: SECRET })
+
+    expect(view.hasKey).toBe(false)
+    expect(view.encryptionAvailable).toBe(false)
+    expect(view.repaired.join('')).toContain('拒绝保存')
+    expect(readFileSync(file, 'utf8')).not.toContain(SECRET)
+    expect(store.apiKey()).toBeNull()
+  })
+
+  it('落盘后重新读回来，key 解得开', () => {
+    const file = tempFile()
+    const first = new AiConfigStore(file, fakeCrypto())
+    first.load()
+    first.patch({ apiKey: SECRET, baseUrl: 'https://example.com/v1', model: 'm', enabled: true })
+
+    const second = new AiConfigStore(file, fakeCrypto())
+    const view = second.load()
+    expect(view.hasKey).toBe(true)
+    expect(second.apiKey()).toBe(SECRET)
+    expect(second.usable()).toBe(true)
+  })
+
+  it('密文解不开时留一条提示，但**不清掉密文** —— 可能只是这一次读不出来', () => {
+    const file = tempFile()
+    const first = new AiConfigStore(file, fakeCrypto())
+    first.load()
+    first.patch({ apiKey: SECRET })
+
+    const broken: SecretCrypto = {
+      available: () => true,
+      encrypt: () => 'x',
+      decrypt: () => {
+        throw new Error('DPAPI: 换过 Windows 账户')
+      },
+    }
+    const second = new AiConfigStore(file, broken)
+    const view = second.load()
+
+    expect(view.hasKey).toBe(false)
+    expect(view.repaired.join('')).toContain('解不开')
+    expect(readFileSync(file, 'utf8')).toContain('apiKeyEnc')
+  })
+
+  it('apiKey 三态：缺省不动、null 清除、字符串覆盖', () => {
+    const store = new AiConfigStore(tempFile(), fakeCrypto())
+    store.load()
+    store.patch({ apiKey: SECRET })
+
+    // 缺省：改别的字段不该把 key 带没了
+    expect(store.patch({ model: 'deepseek-chat' }).hasKey).toBe(true)
+    // null：清除
+    expect(store.patch({ apiKey: null }).hasKey).toBe(false)
+    expect(store.apiKey()).toBeNull()
+  })
+
+  it('usable() 要求开关 + 三样齐全 —— 少一样就不渲染 AI 按钮', () => {
+    const store = new AiConfigStore(tempFile(), fakeCrypto())
+    store.load()
+    expect(store.usable()).toBe(false)
+
+    store.patch({ enabled: true, baseUrl: 'https://example.com/v1' })
+    expect(store.usable()).toBe(false) // 缺 model 与 key
+
+    store.patch({ model: 'm' })
+    expect(store.usable()).toBe(false) // 缺 key
+
+    store.patch({ apiKey: SECRET })
+    expect(store.usable()).toBe(true)
+
+    store.patch({ enabled: false })
+    expect(store.usable()).toBe(false)
+  })
+
+  it('文件不存在是正常情况：回默认值、不报错、不落盘', () => {
+    const file = tempFile()
+    const view = new AiConfigStore(file, fakeCrypto()).load()
+    expect(view.enabled).toBe(false)
+    expect(view.repaired).toEqual([])
+    expect(() => readFileSync(file, 'utf8')).toThrow()
+  })
+
+  it('文件被改坏：坏字段回默认值，好字段保留，逐条留痕', () => {
+    const file = tempFile()
+    writeFileSync(
+      file,
+      JSON.stringify({ enabled: true, baseUrl: 'not a url', model: 'glm-4-plus', maxTokens: 9 }),
+      'utf8'
+    )
+    const view = new AiConfigStore(file, fakeCrypto()).load()
+
+    expect(view.enabled).toBe(true) // 好字段保留
+    expect(view.model).toBe('glm-4-plus')
+    expect(view.baseUrl).toBe('') // 坏字段回默认
+    expect(view.maxTokens).toBe(1200)
+    expect(view.repaired).toHaveLength(2)
+  })
+})
+
+describe('sanitizeAiConfig', () => {
+  it('整份不是对象时全部回默认值并留痕', () => {
+    const { config, repaired } = sanitizeAiConfig('[]')
+    expect(config.enabled).toBe(false)
+    expect(repaired[0]).toContain('不是一个对象')
+  })
+
+  it('允许 http 本机地址 —— 本地 Ollama 是 http://127.0.0.1:11434/v1', () => {
+    const { config, repaired } = sanitizeAiConfig({ baseUrl: 'http://127.0.0.1:11434/v1' })
+    expect(config.baseUrl).toBe('http://127.0.0.1:11434/v1')
+    expect(repaired).toEqual([])
+  })
+})

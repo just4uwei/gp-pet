@@ -134,6 +134,27 @@ describe('buildConfigBundle', () => {
     bundle.settings.quietHours.push({ start: '00:00', end: '01:00' })
     expect(settings.quietHours).toHaveLength(1)
   })
+
+  /**
+   * AI 的 API key 不在 `AppSettings` 里，它单独住 ai.json（见 src/main/ai/config.ts）。
+   * 这条用例是那个决定的**回归闸门**：谁哪天为了「配置导出更完整」把 AI 字段搬进
+   * AppSettings，导出文件里就会多出一把能直接花钱的钥匙 —— 而导出文件的用途
+   * 恰恰是「发给另一台机器」。
+   */
+  it('导出文件里不含任何 AI 字段（key 单独存 ai.json，绝不进配置导出）', () => {
+    const bundle = buildConfigBundle({
+      settings: DEFAULT_SETTINGS,
+      watchlist: [],
+      positions: [],
+      now: 0,
+      appVersion: '0.1.0',
+    })
+    const raw = serializeConfigBundle(bundle)
+    for (const forbidden of ['apiKey', 'apiKeyEnc', 'baseUrl', 'sk-']) {
+      expect(raw, `导出文件里出现了 ${forbidden}`).not.toContain(forbidden)
+    }
+    expect(Object.keys(bundle.settings)).not.toContain('ai')
+  })
 })
 
 describe('parseConfigBundle', () => {

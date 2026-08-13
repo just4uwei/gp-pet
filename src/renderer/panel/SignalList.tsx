@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { AlertLevel, GatedDirection, Regime, SecCode } from '@core/types'
 import type { SignalEvidence, SignalRecord } from '@shared/ipc-types'
+import { AiExplain } from './AiExplain'
 
 const DIRECTION_LABEL: Record<GatedDirection, string> = {
   BUY: '买入',
@@ -136,11 +137,14 @@ function SignalRow({
   record,
   expanded,
   evidence,
+  aiReady,
   onToggle,
 }: {
   record: SignalRecord
   expanded: boolean
   evidence: SignalEvidence | null
+  /** AI 已配置且已启用。false → 整块不渲染，而不是渲染一个点了报错的按钮 */
+  aiReady: boolean
   onToggle: (id: string) => void
 }): React.JSX.Element {
   const suppressed = record.suppressedReason !== undefined
@@ -179,7 +183,12 @@ function SignalRow({
 
       {expanded ? (
         evidence ? (
-          <Evidence evidence={evidence} />
+          <>
+            <Evidence evidence={evidence} />
+            {/* AI 解读是**只读的解释层**：它不参与闸门，也不点亮状态点。
+                未配置时整块不渲染 —— 一个点了就报错的按钮比没有按钮更烦人 */}
+            {aiReady ? <AiExplain signalId={record.id} /> : null}
+          </>
         ) : (
           <p className="mt-2 text-xs text-white/40">依据加载中…</p>
         )
@@ -206,6 +215,16 @@ export function SignalList({
   const [showSuppressed, setShowSuppressed] = useState(true)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [evidence, setEvidence] = useState<Record<string, SignalEvidence>>({})
+  const [aiReady, setAiReady] = useState(false)
+
+  // AI 配置只在挂载时读一次：它改动很少，而这个列表每轮引擎跑完都会重拉。
+  // 用户在设置页改完回来时面板会重挂，够用了
+  useEffect(() => {
+    void window.gp
+      .invoke('ai:config')
+      .then((config) => setAiReady(config.enabled && config.hasKey && config.model !== ''))
+      .catch(() => setAiReady(false))
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -272,6 +291,7 @@ export function SignalList({
               record={record}
               expanded={expandedId === record.id}
               evidence={evidence[record.id] ?? null}
+              aiReady={aiReady}
               onToggle={toggle}
             />
           ))}

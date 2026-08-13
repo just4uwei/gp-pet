@@ -149,7 +149,7 @@ pnpm package          # electron-builder 打包 Windows
 
 ```
 src/core     纯引擎：指标 → 市场状态 → 策略 → 组合 → 风控。零依赖、可回测
-src/main     Electron 主进程：窗口、调度、数据源、存储、提醒编排、影子运行
+src/main     Electron 主进程：窗口、调度、数据源、存储、提醒编排、影子运行、AI 解读
 src/preload  contextBridge 窄接口
 src/renderer pet / panel / bubble 三个独立入口
 src/shared   主/渲染共享的纯类型
@@ -174,6 +174,7 @@ src/backtest 回测 CLI，复用 src/core
 | 改提醒逻辑 | [docs/05](./docs/05-风控与提醒规则.md) |
 | 改影子运行 | [docs/07 §2.3](./docs/07-回测与验证方案.md)（四条前向纪律 + 记账口径） |
 | 改设置页 / 参数表 | [docs/01 §5.5](./docs/01-产品需求与范围.md) + [ADR-0003](./docs/adr/ADR-0003-来源文档数值不作为出厂默认.md) |
+| 改 AI 解读 | [src/main/ai/index.ts](./src/main/ai/index.ts) 头注释（四条纪律）+ [docs/08 §后续](./docs/08-开发路线图.md) |
 | 写测试或回测 | [docs/07](./docs/07-回测与验证方案.md)（回测陷阱清单必读） |
 
 ## 容易踩的坑
@@ -407,6 +408,26 @@ src/backtest 回测 CLI，复用 src/core
   缩放比不是 100% 时 Electron 在 DIP 与物理像素之间两个方向都按「包住」取整。
   这不影响 C2（命中区在渲染层按 `window.innerHeight` 实测重算），写死 38 只会让用例
   在任何非 100% 缩放的机器上红。
+- **AI 的 API key 不得放进 `AppSettings`。** `config:export` 把整份设置写进用户选的 JSON
+  文件，而那个文件的用途恰恰是「发给另一台机器」—— key 进设置就等于跟着导出走。
+  它单独住 `<用户数据目录>/ai.json`，用 `safeStorage` 加密；**加密不可用时拒绝保存**，
+  不退化成明文落盘（那是「看起来成功了」的那一类失败）。
+  `tests/unit/main/config-transfer.test.ts` 有一条用例钉着导出文件里搜不到 key。
+- **AI 客户端不得复用 `net/http.ts`。** 那一层只有 `get()`、默认 3s 超时、GBK 解码，
+  而且它的限流器**与行情取数共用**（全局并发 4）。一次 40 秒的 LLM 调用挂上去，
+  盘中每 30 秒一轮的 tick 就会饿死 —— 症状是「行情突然不动了」，
+  而没人会想到是刚才点了 AI 解读。`src/main/ai/client.ts` 另起一套：POST + SSE、
+  自己的超时、并发 1。**全市场扫描要做也得走这条路**（见 [P2 评估 §1.2](./docs/notes/P2-全市场扫描评估.md)）。
+- **AI 解读是只读的解释层，不许回流。** 它不参与信号、闸门、状态点与影子运行。
+  状态点只认 `PetStateMachine`，而它只接受**过了四道闸门**的提醒 ——
+  让一段模型输出去点亮状态点，等于绕过冷却与免打扰。
+- **发给模型的上下文必须带参数标定状态。** 缺了它，模型会**默认**引擎结论经过验证，
+  然后用非常有说服力的语气把一套未标定的转述阈值讲成定论（ADR-0003 要防的正是这件事），
+  而从输出上完全看不出是上下文漏了一块。`tests/unit/main/ai-context.test.ts` 钉着这一块。
+  同理**免责与来源标注不靠提示词**：模型可能不照做，那两行是渲染层固定的 DOM。
+- **Anthropic 没有 OpenAI 兼容端点。** 现在只实现了 OpenAI 兼容的
+  `/chat/completions`（DeepSeek、Kimi、智谱、通义、Ollama、OpenRouter 都在这一形状里）。
+  要支持 Claude 得另写一个走 `/v1/messages` 的 adapter，别指望改个 base URL 就能用。
 
 ## 措辞纪律
 

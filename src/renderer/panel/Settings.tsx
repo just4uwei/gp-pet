@@ -26,6 +26,7 @@ import type {
   ParamRow,
 } from '@shared/ipc-types'
 import { DISCLAIMER } from './disclaimer'
+import { AiSettings } from './AiSettings'
 
 type Provider = AppSettings['providerPriority'][number]
 
@@ -56,7 +57,7 @@ const STATUS_LABEL: Record<ParamRow['status'], { text: string; cls: string }> = 
   GUESS: { text: '未测', cls: 'bg-amber-500/15 text-amber-300' },
 }
 
-function Row({
+export function Row({
   label,
   hint,
   children,
@@ -78,7 +79,13 @@ function Row({
   )
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }): React.JSX.Element {
+export function Section({
+  title,
+  children,
+}: {
+  title: string
+  children: React.ReactNode
+}): React.JSX.Element {
   return (
     <section className="gp-card">
       <div className="gp-card-head">
@@ -426,6 +433,10 @@ export function Settings({ onError }: { onError: (message: string) => void }): R
           />
         </Row>
       </Section>
+
+      {/* AI 解读是**只读的解释层**：它不参与信号、闸门、状态点与影子运行。
+          配置整块住在 ai.json，不在 AppSettings 里 —— 见 AiSettings.tsx 头注释 */}
+      <AiSettings onError={onError} />
 
       <Section title="系统">
         <Row label="开机自启" hint="开发模式下不写注册表（会注册成一个裸 Electron），要验请先打包">
