@@ -63,6 +63,37 @@ export function bottomRightOf(work: Bounds, size: { width: number; height: numbe
   }
 }
 
+/** 气泡与悬浮窗口之间的间距 */
+export const BUBBLE_GAP_PX = 8
+
+/**
+ * 气泡的落点：贴在悬浮窗口**上方**、右边对齐，装不下就翻到下方（docs/06 §2.3）。
+ *
+ * 右对齐而不是居中：出厂位置在右下角，居中会让气泡越过屏幕右边界被裁掉一截，
+ * 而「贴着谁弹出来的」这个视觉关联比对称更重要。两个方向都装不下时贴工作区顶边 ——
+ * 宁可盖住一点悬浮条，也不能把气泡放到屏幕外（那等于漏发）。
+ */
+export function anchorAbove(
+  anchor: Bounds,
+  size: { width: number; height: number },
+  work: Bounds,
+  gap = BUBBLE_GAP_PX
+): { x: number; y: number } {
+  const right = anchor.x + anchor.width
+  const x = Math.min(
+    Math.max(work.x, right - size.width),
+    Math.max(work.x, work.x + work.width - size.width)
+  )
+
+  const above = anchor.y - gap - size.height
+  if (above >= work.y) return { x, y: above }
+
+  const below = anchor.y + anchor.height + gap
+  if (below + size.height <= work.y + work.height) return { x, y: below }
+
+  return { x, y: work.y }
+}
+
 /**
  * 校验存储的位置在当前显示器拓扑下是否仍可见；越界则回落到主屏右下角。
  *

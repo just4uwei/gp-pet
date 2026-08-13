@@ -14,8 +14,12 @@ import type { AppController } from '../controller'
 
 const FORM_LABEL: Record<AppearanceForm, string> = { BAR: '悬浮条', PET: '桌宠' }
 
+/**
+ * 标签用**手动**免打扰而不是聚合结论：静默时段或全屏应用也会让 `quiet` 为真，
+ * 但那两者不是这个菜单项管的，写成「免打扰（至 15:00）」会让用户以为是自己开的。
+ */
 function quietLabel(controller: AppController): string {
-  if (!controller.quiet) return '免打扰'
+  if (!controller.manualQuiet) return '免打扰'
   const until = controller.quietUntilTs
   if (until === null) return '免打扰'
   const at = new Date(until)
@@ -37,7 +41,7 @@ export function buildContextMenu(controller: AppController): Menu {
         { type: 'separator' },
         {
           label: '解除免打扰',
-          enabled: controller.quiet,
+          enabled: controller.manualQuiet,
           click: () => controller.setQuietUntil(null),
         },
       ],

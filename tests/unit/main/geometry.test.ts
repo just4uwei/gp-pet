@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  anchorAbove,
   bottomRightOf,
   ensureVisible,
   snapToEdge,
@@ -69,5 +70,39 @@ describe('ensureVisible', () => {
 describe('bottomRightOf', () => {
   it('留出默认边距，且贴的是工作区', () => {
     expect(bottomRightOf(PRIMARY, PET)).toEqual({ x: 1920 - 220 - 24, y: 1040 - 220 - 24 })
+  })
+})
+
+/**
+ * 气泡落点（docs/06 §2.3）。悬浮条出厂在右下角，所以「上方 + 右对齐」是主路径；
+ * 用户把条子拖到屏幕顶端或底端时的两条退路要能自己走通 —— 气泡跑到屏幕外等于漏发。
+ */
+describe('anchorAbove', () => {
+  const BUBBLE = { width: 300, height: 116 }
+  /** 悬浮条出厂位置：主屏右下角，240×38，留白 24 */
+  const BAR: Bounds = { x: 1656, y: 978, width: 240, height: 38 }
+
+  it('贴在上方、右边对齐', () => {
+    expect(anchorAbove(BAR, BUBBLE, PRIMARY, 8)).toEqual({ x: 1596, y: 854 })
+  })
+
+  it('上方装不下就翻到下方', () => {
+    const top: Bounds = { x: 800, y: 0, width: 240, height: 38 }
+    expect(anchorAbove(top, BUBBLE, PRIMARY, 8)).toEqual({ x: 740, y: 46 })
+  })
+
+  it('两个方向都装不下时贴工作区顶边，绝不放到屏幕外', () => {
+    const tall: Bounds = { x: 800, y: 40, width: 240, height: 960 }
+    expect(anchorAbove(tall, BUBBLE, PRIMARY, 8)).toEqual({ x: 740, y: 0 })
+  })
+
+  it('锚点靠左时不越出工作区左边界', () => {
+    const left: Bounds = { x: 0, y: 500, width: 240, height: 38 }
+    expect(anchorAbove(left, BUBBLE, PRIMARY, 8).x).toBe(0)
+  })
+
+  it('负坐标的外接屏也成立（Windows 最常见的多屏布局）', () => {
+    const onLeft: Bounds = { x: -400, y: 900, width: 240, height: 38 }
+    expect(anchorAbove(onLeft, BUBBLE, LEFT, 8)).toEqual({ x: -460, y: 776 })
   })
 })

@@ -13,7 +13,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { createSignalEngine, snapshotOfIndicators, type SignalEngineDeps } from '@main/engine/signals'
 import { computeIndicators } from '@core/indicators'
 import { DEFAULT_PARAMS, engineVersionOf, withParams } from '@core/params'
-import type { Candle, Position, SecCode, SecProfile, Snapshot } from '@core/types'
+import type { Candle, Position, SecCode, SecProfile, SignalStage, Snapshot } from '@core/types'
 import type { MarketContext } from '@main/engine/market-data'
 import type { WatchEntry } from '@main/storage/repositories/watchlist'
 import type { SignalRow } from '@main/storage/repositories/signal'
@@ -73,20 +73,23 @@ function harness(options: {
       list: () => (options.position ? [options.position] : []),
       bumpPeak: (code, price) => peaks.push({ code, price }),
     },
+    // 两个仓储都是 class（带私有字段），结构化赋值过不去，只能 as ——
+    // 代价是对象字面量拿不到上下文类型，所以参数必须显式标注（否则 noImplicitAny 报错）
     signals: {
-      insert: (row) => rows.push(row),
-      updateStage: (id, stage) => {
+      insert: (row: SignalRow) => rows.push(row),
+      updateStage: (id: string, stage: SignalStage) => {
         stageUpdates.push({ id, stage })
         return true
       },
-      get: (id) => rows.find((r) => r.id === id) ?? null,
+      get: (id: string) => rows.find((r) => r.id === id) ?? null,
       query: () => [...rows],
       latestOfDay: () => options.latestOfDay ?? null,
       countOfDay: () => rows.length,
     } as unknown as SignalEngineDeps['signals'],
     indicators: {
       get: () => null,
-      put: (code, date, _payload, version) => cached.push({ code, date, version }),
+      put: (code: SecCode, date: string, _payload: Record<string, number | null>, version: string) =>
+        cached.push({ code, date, version }),
       purgeOtherVersions: () => 3,
       count: () => cached.length,
       prune: () => 0,

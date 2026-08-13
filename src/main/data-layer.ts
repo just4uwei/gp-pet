@@ -8,7 +8,8 @@
  * 装配层的正确性靠真机启动一次来验（CLAUDE.md：改完主进程要真启一次）。
  *
  * M2 追加了信号编排（SignalEngine）：取数之后跑一轮引擎，指标与信号落库。
- * 提醒（气泡、通知、冷却、免打扰）仍属 M3 —— 这里只把评估结果交给 onSignals 回调。
+ * M3 起 `onSignals` 的接收方是 AlertService（四道闸门 → 气泡 / 通知 / 角标 / 表情），
+ * 但**装配层仍然不认识提醒**：它只把 (ctx, outcomes) 交出去，谁来接是 controller 的事。
  * engineStatus 里 offline / stale 如实上报，宁可显示「行情离线」也不要让界面
  * 看起来在工作而实际没有数据。
  */
@@ -70,7 +71,7 @@ export interface DataLayerOptions {
   now?: () => number
   /** 每轮取数结束后回调：controller 用它推 push:quoteTick 与刷新托盘 */
   onQuotes?: (ctx: TickContext, snapshots: SnapshotOutcome) => void
-  /** 每轮引擎跑完后回调：M2 用它刷新面板；M3 在这里接 AlertDispatcher */
+  /** 每轮引擎跑完后回调：controller 用它跑一轮提醒分发并刷新面板 */
   onSignals?: (ctx: TickContext, outcomes: SignalOutcome[]) => void
   onTickError?: (error: unknown, ctx: TickContext) => void
 }

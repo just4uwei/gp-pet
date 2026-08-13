@@ -1,0 +1,148 @@
+/*
+ * 气泡样式。
+ *
+ * 窗口是 transparent 的，所以 html/body 必须彻底透明 —— 任何背景色都会变成一块
+ * 始终置顶的实心矩形（与悬浮条同一个坑，见 bar/styles.css）。
+ *
+ * 淡入淡出走 opacity + transform 的合成层动画（docs/06 §6 性能预算：
+ * 不触发布局）。气泡完全不可点击，所以这里不需要任何 :hover / cursor 处理。
+ */
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+  font: 12px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
+  color: rgb(255 255 255 / 92%);
+}
+
+.bubble {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  height: 100%;
+  padding: 9px 11px;
+  background: rgb(16 18 22 / 94%);
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: 10px;
+
+  /* 初态即淡出态：窗口 showInactive 之后由 .bubble--in 推上来 */
+  opacity: 0;
+  transform: translateY(6px);
+  transition:
+    opacity 240ms ease,
+    transform 240ms ease;
+  will-change: opacity, transform;
+}
+
+.bubble--in {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row--head {
+  gap: 7px;
+}
+
+.badge {
+  flex: none;
+  padding: 1px 5px;
+  border: 1px solid;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* A 股红涨绿跌：买入用红 */
+.badge--buy {
+  border-color: rgb(251 113 133 / 45%);
+  background: rgb(251 113 133 / 12%);
+  color: #fda4af;
+}
+
+/* 卖出/减仓一律暖橙，不用红 —— 红色会与涨跌色打架（docs/05 §5） */
+.badge--sell {
+  border-color: rgb(251 191 36 / 45%);
+  background: rgb(251 191 36 / 12%);
+  color: #fcd34d;
+}
+
+.badge--watch {
+  border-color: rgb(255 255 255 / 22%);
+  background: rgb(255 255 255 / 6%);
+  color: rgb(255 255 255 / 70%);
+}
+
+.name {
+  flex: none;
+  font-size: 13px;
+}
+
+.code {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  color: rgb(255 255 255 / 40%);
+}
+
+.score {
+  flex: none;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  color: rgb(255 255 255 / 75%);
+}
+
+.headline {
+  font-size: 12px;
+  color: rgb(255 255 255 / 82%);
+}
+
+.reasons {
+  font-size: 11px;
+  color: rgb(255 255 255 / 52%);
+}
+
+.row--foot {
+  margin-top: auto;
+  gap: 8px;
+  font-size: 11px;
+  color: rgb(255 255 255 / 45%);
+}
+
+.row--foot .up {
+  color: #fb7185;
+}
+
+.row--foot .down {
+  color: #34d399;
+}
+
+.row--foot .flat {
+  color: rgb(255 255 255 / 45%);
+}
+
+/* 每条提醒底部固定小字（docs/05 §5，不可删） */
+.disclaimer {
+  margin-left: auto;
+  color: rgb(255 255 255 / 30%);
+}

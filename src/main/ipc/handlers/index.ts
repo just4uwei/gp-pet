@@ -1,9 +1,9 @@
 /**
  * 通道实现登记（docs/02 §5）。
  *
- * M1 补齐了自选股、设置与健康度；M2 补齐了 signal:history / signal:explain。
- * signal:markRead 要写 alert_log，而那张表在 M3 才有内容 —— 仍由
- * reportUnimplementedChannels() 在启动日志里列出，缺口要看得见，不静默（docs/02 §7）。
+ * M1 补齐了自选股、设置与健康度；M2 补齐了 signal:history / signal:explain；
+ * M3 补齐了 alert:history / alert:markRead / position:list。
+ * 仍由 reportUnimplementedChannels() 在启动日志里列出缺口，不静默（docs/02 §7）。
  */
 
 import { Menu } from 'electron'
@@ -32,6 +32,8 @@ export function registerHandlers(controller: AppController): void {
 
   handle('watchlist:remove', (_event, code) => controller.removeWatch(normalizeCode(code)))
 
+  handle('position:list', () => controller.positions())
+
   handle('watchlist:reorder', (_event, codes) =>
     controller.reorderWatch(codes.map((code) => normalizeCode(code)))
   )
@@ -56,6 +58,21 @@ export function registerHandlers(controller: AppController): void {
   )
 
   handle('signal:explain', (_event, id) => controller.explainSignal(id))
+
+  // ── 提醒日志（M3，docs/05 §6）─────────────────────────────────────
+  // 与「今日信号」是两张表两件事：signal 表回答「引擎判了什么」，
+  // alert_log 回答「它有没有真的提醒我，没提醒是被哪道闸门挡的」
+
+  handle('alert:history', (_event, query) =>
+    controller.alertHistory({
+      ...(query.code === undefined ? {} : { code: normalizeCode(query.code) }),
+      ...(query.from === undefined ? {} : { from: query.from }),
+      ...(query.to === undefined ? {} : { to: query.to }),
+      ...(query.limit === undefined ? {} : { limit: query.limit }),
+    })
+  )
+
+  handle('alert:markRead', (_event, ids) => controller.markAlertsRead(ids))
 
   // ── 设置 ─────────────────────────────────────────────────────────
 

@@ -5,6 +5,7 @@
  */
 
 import type { Database } from './db'
+import { AlertRepo } from './repositories/alert'
 import { CalendarRepo } from './repositories/calendar'
 import { ProviderHealthRepo } from './repositories/health'
 import { IndicatorRepo } from './repositories/indicator'
@@ -20,6 +21,7 @@ export interface Storage {
   readonly klines: KlineRepo
   readonly indicators: IndicatorRepo
   readonly signals: SignalRepo
+  readonly alerts: AlertRepo
   readonly calendar: CalendarRepo
   readonly health: ProviderHealthRepo
   readonly positions: PositionRepo
@@ -34,6 +36,7 @@ export function createStorage(db: Database): Storage {
     klines: new KlineRepo(db),
     indicators: new IndicatorRepo(db),
     signals: new SignalRepo(db),
+    alerts: new AlertRepo(db),
     calendar: new CalendarRepo(db),
     health: new ProviderHealthRepo(db),
     positions: new PositionRepo(db),

@@ -1,25 +1,30 @@
 /**
- * 应用编排：把窗口、托盘、皮肤、免打扰状态、数据层串起来（docs/02 §2）。
- *
- * M2：数据层与信号引擎（SignalEngine）已接入，AlertDispatcher 仍未实现。
+ * 应用编排：把窗口、托盘、皮肤、免打扰状态、数据层与**提醒分发**串起来（docs/02 §2）。
  *
  * 常驻悬浮窗口有两种形态（`AppSettings.appearance`，出厂 `BAR` 悬浮条）。
  * 下面的 `*Overlay*` 方法对两种形态一视同仁；IPC 通道名仍是 `pet:*`（见 OverlayWindow 头注释）。
  *
- * 因此桌宠状态**仍然**只由「免打扰 / 是否开市 / 数据源是否全挂」决定，不出现 EXCITED / ALERT：
- * 那两态属于提醒分级的表现层，而分级要经过防抖、冷却、频率上限与免打扰探测
- * （docs/05 §4）才算数 —— 那整套是 M3。信号在 M2 的唯一出口是**面板列表**。
- * 提前把表情点亮，等于绕过还没实现的四道闸门直接骚扰用户。
+ * ## M3 起，信号有了第二个出口
+ *
+ * M2 时信号的唯一出口是面板列表，桌宠状态只由「免打扰 / 是否开市 / 数据源是否全挂」决定。
+ * 现在 `onSignals()` 会把评估结果交给 `AlertService` —— 四道闸门（防抖 / 冷却 / 频率上限 /
+ * 免打扰）之后才轮到气泡、通知、角标与表情。**闸门仍然是唯一的点亮路径**：
+ * 这里不允许出现「顺手把表情点亮一下」的旁路，那等于绕过闸门直接骚扰用户。
+ *
+ * 免打扰在这一层聚合（`quietVerdict()`）：手动截止时间 + 静默时段 + 锁屏 + 系统态探测。
+ * 判定本身是纯函数（alerts/dnd.ts），这里只负责把四个输入凑齐。
  */
 
-import { app } from 'electron'
+import { app, powerMonitor } from 'electron'
 import { join } from 'node:path'
 import type {
+  AlertRecord,
   AppearanceForm,
   AppSettings,
   EngineStatus,
   PetSkinView,
   PetState,
+  PositionView,
   ProviderHealth,
   Rect,
   SignalEvidence,
@@ -27,9 +32,16 @@ import type {
   WatchItem,
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
+import { createAlertService, type AlertService, type AlertSink } from './alerts/service'
+import type { QuoteView } from './alerts/candidates'
+import { resolveQuiet, type QuietVerdict } from './alerts/dnd'
+import { createNotificationStateProbe, type NotificationStateProbe } from './alerts/notification-state'
+import { showAlertNotification } from './alerts/notify'
 import type { DataLayer } from './data-layer'
+import type { SignalOutcome } from './engine'
 import { log } from './logging'
 import { resourcesRoot, resUrl } from './resources'
+import type { TickContext } from './scheduler'
 import { DEFAULT_SETTINGS } from './settings/schema'
 import { loadSkin, type SkinSource } from './skin/loader'
 import { isQuiet, quietUntil, type QuietPreset } from './util/quiet'
@@ -52,8 +64,26 @@ export class AppController {
   private reportedHitRects: Rect[] = []
   private data: DataLayer | null = null
 
+  /** 提醒分发。数据层就绪前为 null —— 那时也没有信号可发 */
+  private alerts: AlertService | null = null
+  private readonly probe: NotificationStateProbe
+  /** 锁屏 / 会话断开（docs/05 §4.4）。powerMonitor 是事件式的，这里只存最后一次结论 */
+  private screenLocked = false
+  private unread = 0
+  /** 桌宠高优先级状态的回落定时器（最短驻留 3s，而 tick 每 30s 才来一次） */
+  private petFallbackTimer: NodeJS.Timeout | null = null
+
   constructor() {
     this.skin = this.loadSkin(DEFAULT_SKIN_ID)
+    this.probe = createNotificationStateProbe({ log })
+    powerMonitor.on('lock-screen', () => this.setScreenLocked(true))
+    powerMonitor.on('unlock-screen', () => this.setScreenLocked(false))
+  }
+
+  private setScreenLocked(locked: boolean): void {
+    if (this.screenLocked === locked) return
+    this.screenLocked = locked
+    this.onStateChanged()
   }
 
   /**
@@ -65,6 +95,70 @@ export class AppController {
     // 皮肤取值这时才有设置可依（此前用常量），换皮肤要重载一次
     const skinId = layer.settings.get().skin
     if (skinId && skinId !== this.skin.id) this.skin = this.loadSkin(skinId)
+
+    this.alerts = createAlertService({
+      repo: layer.storage.alerts,
+      sink: this.alertSink(),
+      settings: () => layer.settings.get(),
+      quiet: () => this.quietVerdict(),
+      quotes: () => this.quoteViews(),
+      nameOf: (code) => layer.storage.watchlist.get(code)?.profile.name ?? code,
+      log,
+    })
+    this.unread = layer.storage.alerts.unreadCount()
+  }
+
+  /** 渠道执行端（docs/05 §3 的三档表现）。AlertService 只认这个接口，不认识窗口与托盘 */
+  private alertSink(): AlertSink {
+    return {
+      bubble: (payload) => this.windows.showBubble(payload),
+      notify: (payload, sound) =>
+        void showAlertNotification(payload, {
+          sound,
+          // 点通知只打开面板 —— 本产品不下单，通知里不该有看起来可执行的动作
+          onClick: () => this.showPanel(),
+          log,
+        }),
+      flash: () => this.onFlash?.(),
+      unread: (count) => {
+        this.unread = count
+        this.onChange?.()
+      },
+      petState: (nextChangeAt) => {
+        this.pushPetState()
+        this.schedulePetFallback(nextChangeAt)
+      },
+    }
+  }
+
+  /**
+   * 高优先级表情的回落重推。
+   *
+   * 状态机是时间驱动的（3s 最短驻留），而 tick 每 30s 才来一次 —— 不补这一下，
+   * 一个 3s 的动画会挂满半分钟，看起来像卡住了。
+   */
+  private schedulePetFallback(at: number | null): void {
+    if (this.petFallbackTimer) {
+      clearTimeout(this.petFallbackTimer)
+      this.petFallbackTimer = null
+    }
+    if (at === null) return
+    const delay = Math.max(50, at - Date.now())
+    this.petFallbackTimer = setTimeout(() => {
+      this.petFallbackTimer = null
+      this.pushPetState()
+      // 回落到 WATCHING 之后还有一档要回落到 IDLE，链式安排下一次
+      this.schedulePetFallback(this.alerts?.pet.nextChangeAt(Date.now()) ?? null)
+    }, delay)
+  }
+
+  /** 气泡与通知里的现价/涨跌用最新快照，拿不到就由 candidates.ts 退回 K 线收盘价 */
+  private quoteViews(): ReadonlyMap<SecCode, QuoteView> {
+    const map = new Map<SecCode, QuoteView>()
+    for (const tick of this.data?.quoteTicks() ?? []) {
+      map.set(tick.code, { last: tick.last, changePct: tick.changePct })
+    }
+    return map
   }
 
   get dataLayer(): DataLayer | null {
@@ -97,12 +191,21 @@ export class AppController {
     this.requireData().watchlist.reorder(codes)
   }
 
+  positions(): PositionView[] {
+    return this.data?.storage.positions.list() ?? []
+  }
+
   setPosition(code: SecCode, shares: number, cost: number): void {
+    if (!Number.isFinite(shares) || shares <= 0) throw new Error('持股数必须是正数')
+    if (!Number.isFinite(cost) || cost <= 0) throw new Error('成本价必须是正数')
+    // 成本价是**不复权**真实成交价（docs/03 §2.3）：拿前复权价算止损会在除权后凭空触发一次卖出
     this.requireData().storage.positions.set(code, shares, cost, Date.now())
+    this.onStateChanged()
   }
 
   clearPosition(code: SecCode): void {
     this.requireData().storage.positions.clear(code)
+    this.onStateChanged()
   }
 
   getSettings(): AppSettings {
@@ -164,15 +267,48 @@ export class AppController {
   }
 
   /**
-   * 引擎每轮跑完后由 data-layer 回调。
+   * 引擎每轮跑完后由 data-layer 回调 —— **提醒分发的入口**（docs/05 §4）。
    *
-   * M2 只做一件事：让面板重新拉一次信号列表（借 push:engineStatus 触发）。
-   * 真正的提醒分发在 M3 —— 那时这里会接 AlertDispatcher，而不是在这里直接推气泡。
+   * 两件事：① 把评估结果交给 AlertService 过四道闸门；② 让面板重新拉一次信号列表
+   * （借 push:engineStatus 触发，与 M2 同一做法）。
+   *
+   * `debounce` 只在连续竞价时段开：防抖的语义是「连续 N 个 tick 成立」，
+   * 而收盘确认轮与盘后只跑一次，等第二个 tick 等不到（docs/05 §4.1）。
    */
-  onSignals(): void {
+  onSignals(ctx?: TickContext, outcomes?: readonly SignalOutcome[]): void {
     if (!this.data) return
+    if (this.alerts && ctx && outcomes) {
+      try {
+        const debounce = ctx.session === 'CONTINUOUS_AM' || ctx.session === 'CONTINUOUS_PM'
+        const summary = this.alerts.handle(outcomes, { at: ctx.at, debounce })
+        if (summary.decisions.length > 0) {
+          log.info(`[alert] ${ctx.date} ${ctx.session}：发出 ${summary.delivered} 条，静默 ${summary.suppressed} 条`)
+        }
+      } catch (error) {
+        // 提醒挂了不该连带把面板刷新也吃掉：行情与信号仍要能看（docs/02 §7）
+        log.warn('[alert] 分发失败：', error)
+      }
+    }
     this.windows.push('push:engineStatus', this.engineStatus())
   }
+
+  // ── 提醒（M3）─────────────────────────────────────────────────────
+
+  alertHistory(query: { code?: SecCode; from?: number; to?: number; limit?: number }): AlertRecord[] {
+    return this.alerts?.history(query) ?? []
+  }
+
+  /** 空数组 = 全部已读（用户打开提醒日志即视为看过） */
+  markAlertsRead(ids: string[]): number {
+    return this.alerts?.markRead(ids, Date.now()) ?? 0
+  }
+
+  get unreadAlerts(): number {
+    return this.unread
+  }
+
+  /** 托盘图标闪烁（L3 到达）。由 main/index.ts 接到 TrayController 上 */
+  onFlash: (() => void) | null = null
 
   private requireData(): DataLayer {
     if (!this.data) throw new Error('数据层尚未就绪，请稍后重试')
@@ -257,7 +393,33 @@ export class AppController {
 
   // ── 免打扰 ────────────────────────────────────────────────────────
 
+  /**
+   * 免打扰的聚合结论（docs/05 §4.4）：手动 / 静默时段 / 锁屏 / 全屏 · 演示 · 专注助手。
+   *
+   * 顺带**触发一次后台探测**：系统态探测要起一个 PowerShell 子进程，不能同步等，
+   * 所以这里读的是缓存值、并顺手让它去刷新下一次。一轮 tick 30s、缓存 15s，
+   * 于是每轮都会拿到一个不超过一轮陈旧的值 —— 见 alerts/notification-state.ts。
+   */
+  private quietVerdict(): QuietVerdict {
+    const settings = this.getSettings()
+    this.probe.refresh()
+    return resolveQuiet({
+      now: Date.now(),
+      manualUntil: this.quietUntilAt,
+      quietHours: settings.quietHours,
+      respectFullscreen: settings.respectFullscreen,
+      notificationState: this.probe.current(),
+      locked: this.screenLocked,
+    })
+  }
+
+  /** 任一来源成立即为真。托盘图标、桌宠低调态、面板横幅都看这个 */
   get quiet(): boolean {
+    return this.quietVerdict().quiet
+  }
+
+  /** 用户自己按下去的那个开关。托盘菜单的「解除免打扰」只管得着它 */
+  get manualQuiet(): boolean {
     return isQuiet(this.quietUntilAt, Date.now())
   }
 
@@ -274,36 +436,50 @@ export class AppController {
     this.setQuietUntil(quietUntil(Date.now(), preset))
   }
 
-  /** C8：双击桌宠一键静默/解除 */
+  /**
+   * C8：双击桌宠一键静默/解除。
+   *
+   * 判据是 `manualQuiet` 而不是聚合的 `quiet`：正处在静默时段或全屏应用里时，
+   * 聚合值为真，用聚合值判会让双击变成「解除一个我没开过的开关」—— 点了没反应。
+   */
   toggleQuiet(): number | null {
-    this.setQuietUntil(this.quiet ? null : quietUntil(Date.now(), 'untilClose'))
+    this.setQuietUntil(this.manualQuiet ? null : quietUntil(Date.now(), 'untilClose'))
     return this.quietUntilAt
   }
 
   // ── 状态推送 ──────────────────────────────────────────────────────
 
-  private get petState(): PetState {
-    // 优先级见 docs/06 §3：OFFLINE > … > IDLE > SLEEPY。
-    // WATCHING / EXCITED / ALERT 由真实信号驱动（M2 / M3），M1 一律不点亮。
+  /**
+   * 数据层给的「底」状态：OFFLINE / SLEEPY（休市或免打扰）/ IDLE（盘中无事）。
+   * WATCHING / EXCITED / ALERT 由**过了四道闸门的提醒**叠加上去（见 PetStateMachine）。
+   */
+  private baseState(quiet: boolean): PetState {
     const status = this.data?.status()
     if (status?.offline === true) return 'OFFLINE'
-    if (this.quiet) return 'SLEEPY'
+    if (quiet) return 'SLEEPY'
     if (!status) return 'IDLE'
     return status.session === 'CLOSED' || status.session === 'LUNCH_BREAK' ? 'SLEEPY' : 'IDLE'
   }
 
+  private get petState(): PetState {
+    // 优先级见 docs/06 §3：OFFLINE > ALERT > EXCITED > WATCHING > IDLE > SLEEPY
+    const base = this.baseState(this.quiet)
+    return this.alerts?.pet.resolve(base, Date.now()) ?? base
+  }
+
   engineStatus(): EngineStatus {
     const status = this.data?.status()
+    const verdict = this.quietVerdict()
     const base: EngineStatus = {
       session: status?.session ?? 'CLOSED',
       lastTickAt: status?.lastTickAt ?? 0,
       watchCount: status?.watchCount ?? 0,
-      // 提醒层属 M3，未读数暂时如实为 0，而不是编一个数字
-      unreadAlerts: 0,
-      doNotDisturb: this.quiet,
+      unreadAlerts: this.unread,
+      doNotDisturb: verdict.quiet,
       // 数据层还没起来时如实报离线，不假装在线
       offline: status?.offline ?? true,
     }
+    if (verdict.reason !== undefined) base.doNotDisturbReason = verdict.reason
     if (status?.calendarUncertain === true) base.calendarUncertain = true
     if (status?.stale === true) base.stale = true
     return base
@@ -332,9 +508,16 @@ export class AppController {
 
   /** 由 before-quit 调用。与 quit() 分开，是为了让 OS 关机等非菜单路径也能走到清理 */
   dispose(): void {
+    if (this.petFallbackTimer) {
+      clearTimeout(this.petFallbackTimer)
+      this.petFallbackTimer = null
+    }
+    powerMonitor.removeAllListeners('lock-screen')
+    powerMonitor.removeAllListeners('unlock-screen')
     // 先停调度再关库：反过来会让正在写库的那一轮 tick 撞上已关闭的连接
     this.data?.dispose()
     this.data = null
+    this.alerts = null
     this.windows.destroyAll()
   }
 }

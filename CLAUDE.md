@@ -7,9 +7,16 @@
 GP Pet：Windows 桌面桌宠，跟踪用户自选的 A 股，用量化策略判断买卖时机并以不打断工作的方式提醒。
 Electron + React + TypeScript · 本地 SQLite · 免登录 · 无服务端 · **不接券商、不下单**。
 
-当前处于 **M2（引擎层）代码就绪**：五层引擎（指标 → 状态 → 策略 → 组合 → 风控）、回测 CLI、
-标定工具、面板「今日信号」列表都已实现并有测试。**提醒分发（气泡/通知/冷却/免打扰）仍是 M3**
-—— 信号目前的唯一出口是面板列表，状态点/表情不由信号驱动。
+当前处于 **M3（提醒层）代码就绪**：五层引擎、回测 CLI、标定工具、面板列表（M2）之上，
+提醒分发已接线 —— `tick → SignalEngine → AlertService → 四道闸门（防抖/冷却/频率上限/免打扰）
+→ alert_log + 气泡 / 系统通知 / 托盘角标 / 状态点`。持仓录入、提醒日志视图、收盘失效提示、
+静默时段与全屏探测都在。**出口条件（自用一周）未验**，逐条见
+[checklists/M3-提醒层验收](./docs/checklists/M3-提醒层验收.md)。
+
+**闸门是唯一的点亮路径。** 状态点与桌宠表情只认 `PetStateMachine`，而它只接受
+**过了四道闸门**的提醒（被降级成 L1 的算过了，被丢弃的不算）。不要在渲染层直接读
+`signal:history` 去点亮状态 —— 那是一条绕过闸门的旁路。`tests/unit/main/alert-service.test.ts`
+有两条用例钉着这件事。
 
 **⚠ 出厂形态是「托盘 + 悬浮条」，不是桌宠**（2026-08-13 改）。常驻置顶窗口有两种形态
 （`AppSettings.appearance`，出厂 `BAR`），**共用同一个窗口类** `OverlayWindow` 与同一套
@@ -23,6 +30,8 @@ M2 的「回测报告产出并据此确定出厂参数」还差大半 —— 但
 「确定」有三种合法结局，写回新值 / 已测保持出厂值（裁决 `KEEP`）/ 已判惰性，三种都算确定；
 另有四个数（`provisionalDiscount`、`alert.bubbleScore`、`lateBuyCutoffMinutes`、
 `staleSnapshotMs`）是**日线回测原理上测不到**的，归影子运行与 M3，不属于这条出口条件。
+（M3 接线后，`alert.bubbleScore` 的依据来源已经有了：提醒日志里「今天发出的几条值不值得
+被打断」，见 [M3 验收清单 §4](./docs/checklists/M3-提醒层验收.md)。判据是日志，不是回测 Calmar。）
 目前：写回 1 项、已测保持出厂值 8 项（`combine` 四数 + `adx` 两数 + `regime` 两数；
 `adx.baseThreshold = 20` / `volScale = 8` **有正面证据** —— ±2 邻域里每个方向都更差，
 两个邻居还被训练集红线淘汰）、已判惰性或算术无效 3 项，
@@ -248,9 +257,28 @@ src/backtest 回测 CLI，复用 src/core
   **命中区的形状两者不同**：桌宠要描轮廓（窗口比本体大一圈），悬浮条是「整块减掉四个圆角」
   ——`barHitRects` 的圆角半径必须与 `styles.css` 的 `border-radius` 一致，否则会盖到圆角外，
   吞掉本该穿透的点击（C2 是底线）。
-- **状态点在 M3 之前不许由信号驱动。** 与桌宠表情同一条纪律：分级要先过 docs/05 §4 的
-  四道闸门。`push:petState` 现在只会推 OFFLINE / SLEEPY / IDLE，M3 接上闸门后
-  WATCHING / EXCITED / ALERT 会自动开始出现，渲染层不需要改（三个 CSS 类已经备好）。
+- **状态点只跟 `push:petState` 走，不许自己从信号里推断。** 闸门（docs/05 §4）是唯一的
+  点亮路径，主进程的 `PetStateMachine` 是唯一的判定者。渲染层若自己去读 `signal:history`
+  点亮 WATCHING/EXCITED/ALERT，就等于开了一条绕过冷却与免打扰的旁路。
+- **提醒相关的一切都不读时钟。** `AlertDispatcher` / `PetStateMachine` / `resolveQuiet`
+  的 `now` 全部由调用方传入，与 `src/core` 同一条纪律 —— 「15:00 那一轮会不会重发」
+  「跨午夜的静默时段算不算」必须能写成用例，而不是靠改系统时间试。
+- **`alert_log` 与 `signal` 是两张表两件事，别合并。** `signal` 答「引擎判了什么」，
+  `alert_log` 答「有没有真的提醒我、被哪道闸门挡的」。**风控硬抑制的信号不进 alert_log**
+  （它已经带着原因在 signal 表里）。另外 `alert_log.signal_id` 是外键且 `foreign_keys = ON`，
+  所以拿不到 signalId 的候选**不发** —— 发了却没有审计记录，等于在提醒日志里凭空消失一条。
+- **用户的「整体上调/下调一档」不作用于持仓强制类。** 把止损从 L3 调成 L2 的症状是
+  「跌停那天没响」，事后极难归因 —— 少发的错误用户发现不了。
+  `tests/unit/main/alert-candidates.test.ts` 有用例钉着。
+- **收盘失效提示的方向必须是 `NONE`。** 同键冷却的键是 `code:direction`，沿用原方向会让
+  上午那条买入提醒的 2 小时冷却把撤销提示一起吃掉 —— 而撤销恰恰是「上午那条别当真了」。
+- **全屏/专注助手探测是 PowerShell 子进程，不是原生绑定**（判据见 docs/05 §4.4 的注）。
+  分发路径**只读缓存**（`probe.current()`，TTL 15s），绝不 await 它；连续 3 次失败即永久停用，
+  停用后状态 `UNKNOWN` → **判为可以提醒**。不要「顺手」把它改成同步等待，
+  那会让每轮 tick 卡 100–300ms。
+- **托盘菜单的「解除免打扰」与双击手势只管得着手动那一项**（`manualQuiet`）。
+  用聚合的 `quiet` 去判，会让静默时段或全屏应用期间的双击变成「解除一个我没开过的开关」
+  —— 点了没反应。
 - **从 agent / CI 的 shell 里跑 `pnpm dev` 会「启动即崩」**：这类环境常设
   `ELECTRON_RUN_AS_NODE=1`，于是 Electron 以纯 Node 模式启动，`require('electron')`
   解析到 npm 上那个「返回 exe 路径」的启动器包，第一个用到 `protocol` / `app` 的地方就炸

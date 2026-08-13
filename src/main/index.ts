@@ -33,6 +33,9 @@ void app.whenReady().then(() => {
   controller = new AppController()
   tray = new TrayController(controller)
   controller.onChange = () => tray?.refresh()
+  // L3 到达时闪一下托盘图标（docs/08 M3）。走回调而不是让 controller 直接持有 Tray：
+  // 窗口与托盘的生命周期不同，controller 认识 Tray 会让退出顺序变得难以推理
+  controller.onFlash = () => tray?.flash()
 
   registerHandlers(controller)
   reportUnimplementedChannels()
@@ -47,14 +50,12 @@ void app.whenReady().then(() => {
     resourcesRoot: resourcesRoot(),
     log: { info: (...args) => log.info(...args), warn: (...args) => log.warn(...args) },
     onQuotes: () => controller?.onQuotes(),
-    onSignals: () => controller?.onSignals(),
+    onSignals: (ctx, outcomes) => controller?.onSignals(ctx, outcomes),
   })
     .then((layer) => {
       controller?.attachDataLayer(layer)
       layer.start()
-      log.info(
-        `[app] 数据层与引擎就绪（${layer.signals.engineVersion}）。M2：有信号与面板列表，尚无提醒分发。`
-      )
+      log.info(`[app] 数据层、引擎与提醒分发就绪（${layer.signals.engineVersion}）。`)
     })
     .catch((error: unknown) => {
       // 数据层起不来是「行情离线」，不是崩溃 —— engineStatus 会如实报 offline

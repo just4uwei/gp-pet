@@ -1,18 +1,29 @@
 /**
- * 面板窗口 —— M2：自选股列表 + 数据层状态 + 今日信号（含被静默条目）。
+ * 面板窗口 —— 自选股列表 + 数据层状态 + 今日信号 + 持仓录入 + 提醒日志。
  *
  * 三条克制：
  *
- * 1. **只显示已经有的东西。** 持仓盈亏与提醒日志属 M3，这里一律不留占位行
- *    —— 空着的占位比没有更容易让人误判完成度。
+ * 1. **只显示已经有的东西。** 不留占位行 —— 空着的占位比没有更容易让人误判完成度。
  * 2. **拿不到数据就明说。** 行情离线、日历可能过期、数据源降级都摆在顶部，
  *    绝不用上一轮的价格假装实时（stale 一律灰显并标注）。
  * 3. **不出现「胜率」「必涨」一类措辞**（CLAUDE.md 措辞纪律），底部固定免责声明。
+ *
+ * 「今日信号」与「提醒日志」是两件事，刻意分成两块：
+ * 前者回答「引擎判了什么」，后者回答「它有没有真的提醒我，没提醒是被哪道闸门挡的」。
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { EngineStatus, PetSkinView, ProviderHealth, QuoteTick, WatchItem } from '@shared/ipc-types'
+import type {
+  EngineStatus,
+  PetSkinView,
+  PositionView,
+  ProviderHealth,
+  QuoteTick,
+  WatchItem,
+} from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
+import { AlertLog } from './AlertLog'
+import { PositionEditor } from './PositionEditor'
 import { SignalList } from './SignalList'
 
 const SESSION_LABEL: Record<string, string> = {
@@ -84,7 +95,12 @@ function StatusBar({
       <span>
         自选 <span className="text-white/80">{status?.watchCount ?? 0}</span> 只
       </span>
-      {status?.doNotDisturb ? <span className="text-white/80">免打扰生效中</span> : null}
+      {status?.doNotDisturb ? (
+        // 免打扰的成因要摆出来：用户问的是「为什么刚才没弹」，不是「有没有静默」
+        <span className="text-white/80">
+          免打扰生效中{status.doNotDisturbReason ? `（${status.doNotDisturbReason}）` : ''}
+        </span>
+      ) : null}
       <span className="flex gap-2">
         {health.length === 0 ? (
           <span>数据源 …</span>
@@ -150,63 +166,92 @@ function AddForm({ onAdd }: { onAdd: (code: string) => Promise<void> }): React.J
 function WatchRow({
   item,
   quote,
+  position,
+  editing,
   first,
   last,
   onRemove,
   onMove,
+  onToggleEdit,
+  onSaved,
+  onError,
 }: {
   item: WatchItem
   quote: QuoteTick | undefined
+  position: PositionView | undefined
+  editing: boolean
   first: boolean
   last: boolean
   onRemove: (code: SecCode) => void
   onMove: (code: SecCode, delta: number) => void
+  onToggleEdit: (code: SecCode) => void
+  onSaved: () => void
+  onError: (message: string) => void
 }): React.JSX.Element {
   // 没有报价 ≠ 报价为 0。这一栏在拿到第一轮快照前显示 '—'，不显示数字
   const stale = quote?.stale === true
   return (
-    <li className="flex items-center gap-3 border-b border-white/10 py-2 text-sm">
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="truncate">{item.name}</span>
-          {item.hasPosition ? (
-            <span className="shrink-0 rounded bg-white/10 px-1 text-[10px] text-white/60">持仓</span>
-          ) : null}
+    <li className="border-b border-white/10 py-2 text-sm">
+      <div className="flex items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="truncate">{item.name}</span>
+            {item.hasPosition ? (
+              <span className="shrink-0 rounded bg-white/10 px-1 text-[10px] text-white/60">持仓</span>
+            ) : null}
+          </div>
+          <div className="font-mono text-xs text-white/40">
+            {item.code}
+            {item.industry ? ` · ${item.industry}` : ''}
+          </div>
         </div>
-        <div className="font-mono text-xs text-white/40">
-          {item.code}
-          {item.industry ? ` · ${item.industry}` : ''}
+
+        <div className={`w-20 text-right font-mono ${stale ? 'text-white/35' : ''}`}>
+          {quote ? quote.last.toFixed(2) : '—'}
+        </div>
+        <div className={`w-20 text-right font-mono ${stale ? 'text-white/35' : changeTone(quote?.changePct ?? 0)}`}>
+          {quote ? signed(quote.changePct) : '—'}
+        </div>
+
+        <div className="flex w-24 shrink-0 justify-end gap-1 text-xs text-white/40">
+          <button
+            className={`px-1 hover:text-white/80 ${editing ? 'text-white/80' : ''}`}
+            title="录入持仓（启用止损类强制提醒）"
+            onClick={() => onToggleEdit(item.code)}
+          >
+            仓
+          </button>
+          <button
+            className="px-1 hover:text-white/80 disabled:opacity-25"
+            disabled={first}
+            title="上移"
+            onClick={() => onMove(item.code, -1)}
+          >
+            ↑
+          </button>
+          <button
+            className="px-1 hover:text-white/80 disabled:opacity-25"
+            disabled={last}
+            title="下移"
+            onClick={() => onMove(item.code, 1)}
+          >
+            ↓
+          </button>
+          <button className="px-1 hover:text-rose-300" title="移除" onClick={() => onRemove(item.code)}>
+            ×
+          </button>
         </div>
       </div>
 
-      <div className={`w-20 text-right font-mono ${stale ? 'text-white/35' : ''}`}>
-        {quote ? quote.last.toFixed(2) : '—'}
-      </div>
-      <div className={`w-20 text-right font-mono ${stale ? 'text-white/35' : changeTone(quote?.changePct ?? 0)}`}>
-        {quote ? signed(quote.changePct) : '—'}
-      </div>
-
-      <div className="flex w-16 shrink-0 justify-end gap-1 text-xs text-white/40">
-        <button
-          className="px-1 hover:text-white/80 disabled:opacity-25"
-          disabled={first}
-          title="上移"
-          onClick={() => onMove(item.code, -1)}
-        >
-          ↑
-        </button>
-        <button
-          className="px-1 hover:text-white/80 disabled:opacity-25"
-          disabled={last}
-          title="下移"
-          onClick={() => onMove(item.code, 1)}
-        >
-          ↓
-        </button>
-        <button className="px-1 hover:text-rose-300" title="移除" onClick={() => onRemove(item.code)}>
-          ×
-        </button>
-      </div>
+      {editing ? (
+        <PositionEditor
+          code={item.code}
+          position={position}
+          quote={quote}
+          onSaved={onSaved}
+          onError={onError}
+        />
+      ) : null}
     </li>
   )
 }
@@ -217,18 +262,22 @@ export function App(): React.JSX.Element {
   const [status, setStatus] = useState<EngineStatus | null>(null)
   const [health, setHealth] = useState<ProviderHealth[]>([])
   const [skin, setSkin] = useState<PetSkinView | null>(null)
+  const [positions, setPositions] = useState<PositionView[]>([])
+  const [editing, setEditing] = useState<SecCode | null>(null)
   const [error, setError] = useState<string | null>(null)
-  // 引擎每轮跑完会推一次 engineStatus；用它当信号列表的重取信号（M2 没有专门的推送通道）
+  // 引擎每轮跑完会推一次 engineStatus；用它当信号与提醒日志的重取信号
   const [signalKey, setSignalKey] = useState(0)
 
   const reload = useCallback(async (): Promise<void> => {
     try {
-      const [list, providers] = await Promise.all([
+      const [list, providers, held] = await Promise.all([
         window.gp.invoke('watchlist:list'),
         window.gp.invoke('app:providerHealth'),
+        window.gp.invoke('position:list'),
       ])
       setItems(list)
       setHealth(providers)
+      setPositions(held)
       setError(null)
     } catch (err) {
       // 数据层装配失败时 watchlist:list 会抛「数据层尚未就绪」—— 如实显示，不吞
@@ -257,6 +306,11 @@ export function App(): React.JSX.Element {
   }, [reload])
 
   const quoteOf = useMemo(() => new Map(quotes.map((q) => [q.code, q])), [quotes])
+  const positionOf = useMemo(() => new Map(positions.map((p) => [p.code, p])), [positions])
+
+  const refreshStatus = useCallback((): void => {
+    void window.gp.invoke('app:engineStatus').then(setStatus)
+  }, [])
 
   const add = useCallback(
     async (code: string): Promise<void> => {
@@ -340,27 +394,38 @@ export function App(): React.JSX.Element {
                 key={item.code}
                 item={item}
                 quote={quoteOf.get(item.code)}
+                position={positionOf.get(item.code)}
+                editing={editing === item.code}
                 first={i === 0}
                 last={i === items.length - 1}
                 onRemove={remove}
                 onMove={move}
+                onToggleEdit={(code) => setEditing((current) => (current === code ? null : code))}
+                onSaved={() => void reload()}
+                onError={setError}
               />
             ))}
           </ul>
         )}
 
         {items.length > 0 ? <SignalList refreshKey={signalKey} onError={setError} /> : null}
+
+        <AlertLog
+          refreshKey={signalKey}
+          unread={status?.unreadAlerts ?? 0}
+          onRead={refreshStatus}
+          onError={setError}
+        />
       </section>
 
       {/*
-        页脚这一行以前写的是「M2：信号只进面板，尚无气泡与系统通知（提醒分发是 M3）」。
-        里程碑编号是我们的记账方式，对用户没有意义 —— 但**能力边界对用户有意义**，
-        所以这句话保留，只换成用户读得懂的说法。提醒分发接上之后（M3）这一行就该删掉，
-        否则它会变成一句过时的假话。
+        这里以前有一行「信号只在这个列表里显示，还不会弹气泡或发系统通知」——
+        提醒分发接上之后它就变成了一句过时的假话，所以删掉了。
+        能力边界仍然对用户有意义，但现在的边界写在提醒日志里（每条为什么发/没发），
+        比页脚上一句静态的话诚实得多。
       */}
       <footer className="mt-4 shrink-0 text-xs text-white/40">
-        <p>信号目前只在这个列表里显示，还不会弹气泡或发系统通知。</p>
-        <p className="mt-1">仅供参考，非投资建议</p>
+        <p>仅供参考，非投资建议</p>
       </footer>
     </main>
   )

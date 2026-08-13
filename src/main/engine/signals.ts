@@ -20,6 +20,7 @@ import { DEFAULT_PARAMS, engineVersionOf, type EngineParams } from '@core/params
 import { continuousMinutesElapsed } from '@core/session'
 import type {
   Candle,
+  GatedDirection,
   IndicatorSet,
   Position,
   SecCode,
@@ -61,6 +62,14 @@ export interface TickInfo {
   producesSignals: boolean
 }
 
+/** 收盘确认轮把当日一条盘中信号判为失效（docs/04 §6）。提醒层据此发一条 L1 撤销提示 */
+export interface InvalidationNotice {
+  /** 被判失效的那一行 —— alert_log.signal_id 指向它 */
+  signalId: string
+  /** 它当初给出的方向，用于文案「上午的买入信号收盘未获确认」 */
+  direction: GatedDirection
+}
+
 export interface SignalOutcome {
   evaluation: Evaluation
   name: string
@@ -68,6 +77,8 @@ export interface SignalOutcome {
   persisted: boolean
   /** 落库行的 id；未落库时是上一次的 id */
   signalId: string | null
+  /** 非空表示本轮把上一条盘中信号判失效了（docs/05 §3：信号失效通知属 L1） */
+  invalidated?: InvalidationNotice
 }
 
 export interface SignalEngine {
@@ -230,19 +241,22 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
   /**
    * 收盘确认轮（docs/04 §6）：把当日的 PROVISIONAL 行推进为 CONFIRMED / INVALIDATED。
    *
-   * 只改 `stage`，**不发提醒** —— 失效时那条「主动撤销提示」属提醒层（M3）。
-   * 这里做的是让库里的状态与收盘事实一致，否则 M3 上线后拿到的是一堆永远停在
-   * PROVISIONAL 的历史行，分不清哪些当初被确认过。
+   * 这里只改 `stage` 并**把失效这件事报上去**，提醒怎么发是提醒层的事（docs/05 §3：
+   * 「信号失效通知」属 L1）。分开的理由与整个引擎层一致：这一层不认识气泡与通知。
+   *
+   * 返回非空 = 上一条盘中信号被判失效，需要一条撤销提示。
    */
-  function reconcile(evaluation: Evaluation): void {
-    if (evaluation.signal.stage !== 'CONFIRMED') return
+  function reconcile(evaluation: Evaluation): InvalidationNotice | null {
+    if (evaluation.signal.stage !== 'CONFIRMED') return null
     const previous = signals.latestOfDay(evaluation.code, evaluation.date)
-    if (!previous || previous.stage !== 'PROVISIONAL') return
+    if (!previous || previous.stage !== 'PROVISIONAL') return null
     const stillValid = previous.direction === evaluation.gated.direction && evaluation.gated.direction !== 'NONE'
     signals.updateStage(previous.id, stillValid ? 'CONFIRMED' : 'INVALIDATED')
-    if (!stillValid) {
-      log.info(`[signal] ${evaluation.code} 盘中信号收盘未获确认（${previous.direction}），已标记失效`)
-    }
+    if (stillValid) return null
+    log.info(`[signal] ${evaluation.code} 盘中信号收盘未获确认（${previous.direction}），已标记失效`)
+    // 只有当初真的指向某个方向的才值得撤销 —— NONE 的那条用户根本没被提醒过
+    if (previous.direction === 'NONE') return null
+    return { signalId: previous.id, direction: previous.direction }
   }
 
   return {
@@ -273,14 +287,20 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
 
           const stage = evaluation.signal.stage
           cacheIndicators(entry.profile.code, evaluation, stage)
-          reconcile(evaluation)
+          const invalidated = reconcile(evaluation)
           // 持仓峰值每交易日收盘更新（docs/05 §2.3）
           if (stage === 'CONFIRMED' && positions.get(entry.profile.code)) {
             positions.bumpPeak(entry.profile.code, evaluation.candle.high)
           }
 
           const { persisted, id } = persist(evaluation, tick)
-          outcomes.push({ evaluation, name: entry.profile.name, persisted, signalId: id })
+          outcomes.push({
+            evaluation,
+            name: entry.profile.name,
+            persisted,
+            signalId: id,
+            ...(invalidated ? { invalidated } : {}),
+          })
         } catch (error) {
           // 一只算不出来不该拖垮整轮：退市股的畸形序列、突然缺列的数据都可能走到这里
           log.warn(`[signal] ${entry.profile.code} 评估失败：${String(error)}`)

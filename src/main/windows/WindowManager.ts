@@ -1,19 +1,21 @@
 /**
  * 窗口生命周期与推送目标的唯一持有者（docs/02 §2）。
  *
- * Bubble 窗口属 M3（提醒层），此处暂不创建 —— 骨架阶段没有可提醒的内容，
- * 提前把空气泡窗口挂上去只会多一个常驻置顶窗口，与 C7「休市零开销」相悖。
+ * Bubble 窗口**懒加载**：第一条 L2 提醒到来时才创建（见 BubbleWindow）。
+ * 休市时一个提醒都没有，提前挂一个空的常驻置顶窗口只会白占 C7 的开销预算。
  */
 
 import { screen, type BrowserWindow } from 'electron'
-import type { AppearanceForm, IpcPushMap } from '@shared/ipc-types'
+import type { AlertPayload, AppearanceForm, IpcPushMap } from '@shared/ipc-types'
 import { broadcast } from '../ipc/router'
+import { BubbleWindow } from './BubbleWindow'
 import { PanelWindow } from './PanelWindow'
 import { OverlayWindow } from './OverlayWindow'
 
 export class WindowManager {
   private overlay: OverlayWindow | null = null
   private readonly panel = new PanelWindow()
+  private readonly bubble = new BubbleWindow()
   private onDisplayChange: (() => void) | null = null
 
   createOverlay(form: AppearanceForm): OverlayWindow {
@@ -57,6 +59,19 @@ export class WindowManager {
     return this.panel
   }
 
+  /**
+   * 弹一个气泡（L2+）。锚点取悬浮窗口当前位置 ——
+   * 用户把条子拖到哪，气泡就跟到哪；条子被隐藏（C9）时退到主屏右下角，仍然要弹。
+   */
+  showBubble(payload: AlertPayload): void {
+    const anchor = this.overlay?.isVisible() === true ? this.overlay.browserWindow.getBounds() : null
+    this.bubble.show(payload, anchor)
+  }
+
+  hideBubble(): void {
+    this.bubble.hide()
+  }
+
   private get targets(): (BrowserWindow | null)[] {
     return [this.overlay?.browserWindow ?? null, this.panel.browserWindow]
   }
@@ -75,6 +90,7 @@ export class WindowManager {
     }
     this.overlay?.destroy()
     this.overlay = null
+    this.bubble.destroy()
     this.panel.destroy()
   }
 }

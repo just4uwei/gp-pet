@@ -52,9 +52,11 @@ export interface SignalEvidence {
 
 export type PetState = 'SLEEPY' | 'IDLE' | 'WATCHING' | 'EXCITED' | 'ALERT' | 'OFFLINE'
 
+/** 气泡与系统通知的展示载荷。四段结构见 docs/05 §5 */
 export interface AlertPayload {
   signalId: string
   level: AlertLevel
+  direction: GatedDirection
   headline: string
   reasons: string[]
   code: SecCode
@@ -62,6 +64,46 @@ export interface AlertPayload {
   price: number
   changePct: number
   score: number
+  /** 触发时刻（墙上时间），气泡第四行显示 */
+  at: number
+}
+
+/** 分发渠道。与 `src/main/alerts/dispatcher.ts` 的 `AlertChannel` 同一集合 */
+export type AlertChannelName = 'PET' | 'TRAY' | 'BUBBLE' | 'OS_NOTIFY'
+
+/**
+ * 提醒日志的一行（docs/05 §6）。
+ *
+ * **每一条候选都有一行**，包括被丢弃的 —— 用户要能回答「它是不是漏提醒了」。
+ * `channels` 为空表示这条根本没发出去，`reason` 写明是被哪道闸门挡的。
+ */
+export interface AlertRecord {
+  id: string
+  signalId: string
+  code: SecCode
+  name: string
+  createdAt: number
+  direction: GatedDirection
+  /** UI 文案一律称「置信度」，不得称「胜率」（见 docs/04 §4.3） */
+  score: number
+  regime: Regime
+  stage: SignalStage
+  headline: string
+  /** 最终生效的级别；`channels` 为空时是它**本来**要发的级别 */
+  level: AlertLevel
+  channels: AlertChannelName[]
+  /** 非空 = 被丢弃或被降级及原因 */
+  reason?: string
+  read: boolean
+}
+
+/** 用户手工录入的持仓（docs/03 §4.2）。成本价是**不复权**真实成交价 */
+export interface PositionView {
+  code: SecCode
+  shares: number
+  cost: number
+  peakPrice: number
+  openedAt: number
 }
 
 export interface ProviderHealth {
@@ -78,6 +120,8 @@ export interface EngineStatus {
   watchCount: number
   unreadAlerts: number
   doNotDisturb: boolean
+  /** 免打扰的成因（静默时段 / 全屏应用 / 手动…）。面板据此解释「为什么没弹」 */
+  doNotDisturbReason?: string
   offline: boolean
   /** 日历依据不硬（内置表未核对，或退化到「周一至周五」），UI 应提示日历可能过期（docs/03 §3） */
   calendarUncertain?: boolean
@@ -147,11 +191,15 @@ export interface IpcInvokeMap {
   'watchlist:add': (code: string, group?: string) => WatchItem
   'watchlist:remove': (code: SecCode) => void
   'watchlist:reorder': (codes: SecCode[]) => void
+  'position:list': () => PositionView[]
   'position:set': (code: SecCode, shares: number, cost: number) => void
   'position:clear': (code: SecCode) => void
   'signal:history': (query: { code?: SecCode; from?: number; to?: number; limit?: number }) => SignalRecord[]
   'signal:explain': (id: string) => SignalEvidence
-  'signal:markRead': (ids: string[]) => void
+  /** 提醒日志（docs/05 §6）：含被丢弃与被降级的条目 */
+  'alert:history': (query: { code?: SecCode; from?: number; to?: number; limit?: number }) => AlertRecord[]
+  /** 标记已读。空数组 = 全部已读（用户打开日志视图即视为看过） */
+  'alert:markRead': (ids: string[]) => number
   'settings:get': () => AppSettings
   'settings:patch': (patch: Partial<AppSettings>) => AppSettings
   'app:providerHealth': () => ProviderHealth[]

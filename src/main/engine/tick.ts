@@ -49,7 +49,7 @@ export interface TickPipelineDeps {
   onQuotes?: (ctx: TickContext, snapshots: SnapshotOutcome) => void
   /** M2 引擎。不传则整轮退化为 M1 行为（只取数、不算信号） */
   engine?: Pick<SignalEngine, 'run'>
-  /** 引擎跑完一轮后的去处：M2 用它刷新面板，M3 接 AlertDispatcher */
+  /** 引擎跑完一轮后的去处：controller 拿它跑提醒分发并刷新面板 */
   onSignals?: (ctx: TickContext, outcomes: SignalOutcome[]) => void
   maintenanceIntervalMs?: number
 }
