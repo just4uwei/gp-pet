@@ -308,6 +308,22 @@ src/backtest 回测 CLI，复用 src/core
   未读角标、tooltip 计数、L3 图标闪烁都已删除。**别把它们加回来** ——
   提醒的可见出口只有气泡是刻意的（docs/05 §3）。tooltip 也刻意是静态的：
   让一个常驻图标随行情变文字，本身就是一种低强度的持续打扰。
+- **单实例锁不是体验优化，删了会静默损坏数据。** `market.db` 只有一个写者的假设写进了
+  整个存储层（WAL + 5s busy_timeout 会让两个进程都不报错地互相覆盖），而 `AlertDispatcher`
+  的冷却与配额**全在内存里**，两个实例各有一份 —— 「每小时 ≤ 6 条」在用户那里变成 12 条，
+  而两边日志都显示自己守规矩。`app.requestSingleInstanceLock()` 必须在**做任何事之前**判，
+  拿不到锁的那个不开库、不建窗口、不注册协议。
+  `second-instance` 只开面板，**不顺手显示悬浮条** —— 条子若是被用户按 C9 隐藏的，
+  替他打开等于否决他的选择。
+- **`autoLaunch` 在 `pnpm dev` 里刻意不生效**（日志会打一行「未打包，跳过」）。
+  `process.execPath` 在 dev 里是 `node_modules/electron/dist/electron.exe`，注册进去等于
+  让用户开机启动一个裸 Electron，而且卸载应用也带不走它。**别为了「本地能验」把这条去掉**，
+  要验就打包后验。同理它只在与 `app.getLoginItemSettings().openAtLogin` 不一致时才写：
+  无条件写会覆盖用户在「任务管理器 → 启动」里的手动禁用。
+- **日志是按天分文件的**（`main-YYYY-MM-DD.log`，保留 7 天）。`resolvePathFn` 每写一条都会被
+  调用，所以跨午夜自然滚到新文件、不需要定时器（日期串按天缓存）。`maxSize` 保留为**单日**
+  硬上限。清理**认不出名字的文件一律不删** —— 包括改动前留下的 `main.log` 与用户自己丢进来的
+  东西；误删别人的文件比多占几 MB 贵得多（`tests/unit/main/logging.test.ts` 钉着这条）。
 - **从 agent / CI 的 shell 里跑 `pnpm dev` 会「启动即崩」**：这类环境常设
   `ELECTRON_RUN_AS_NODE=1`，于是 Electron 以纯 Node 模式启动，`require('electron')`
   解析到 npm 上那个「返回 exe 路径」的启动器包，第一个用到 `protocol` / `app` 的地方就炸

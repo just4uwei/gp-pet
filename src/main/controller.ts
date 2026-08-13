@@ -29,6 +29,7 @@ import type {
   WatchItem,
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
+import { electronAutoLaunchDeps, syncAutoLaunch } from './auto-launch'
 import { createAlertService, type AlertService, type AlertSink } from './alerts/service'
 import type { QuoteView } from './alerts/candidates'
 import { resolveQuiet, type QuietVerdict } from './alerts/dnd'
@@ -221,8 +222,14 @@ export class AppController {
 
   patchSettings(patch: Partial<AppSettings>): AppSettings {
     const layer = this.requireData()
+    const previous = layer.settings.get()
     const next = layer.settings.patch(patch)
     layer.applySettings(next)
+    // 开机自启要落到系统里，不能只存进 JSON —— 一个改了不生效的开关比没有更糟。
+    // 只在真的变了时才同步：无条件写会覆盖用户在「任务管理器 → 启动」里的手动禁用
+    if (next.autoLaunch !== previous.autoLaunch) {
+      syncAutoLaunch(next.autoLaunch, electronAutoLaunchDeps(log))
+    }
     this.onStateChanged()
     return next
   }
