@@ -228,6 +228,23 @@ export interface RiskVerdict {
   evidence: Evidence
 }
 
+/**
+ * 日内做T建议（2026-08-14）。判据与三条边界在 `core/risk/intraday-t.ts` 的头注释里。
+ *
+ * **它不是一个方向。** 挂在 `GatedSignal` 上单独一格而不是并进 `GatedDirection`，
+ * 是因为 `signal` 表、回测的 `toOrder()`、影子运行都只读 `direction` ——
+ * 混进去等于让那三处认识「日内位置」，而它们只有日线，看不见日内路径。
+ */
+export interface TTradeAdvice {
+  /** 高抛（先卖后买）/ 低吸（先买，卖的是老仓那部分） */
+  side: 'HIGH_SELL' | 'LOW_BUY'
+  /** 现价在当日振幅中的位置 0..1 */
+  position: number
+  /** 当日振幅，相对昨收 */
+  amplitude: number
+  reason: string
+}
+
 export interface GatedSignal {
   signal: CombinedSignal
   direction: GatedDirection
@@ -243,6 +260,11 @@ export interface GatedSignal {
   /** 面板与气泡展示用的文案片段，规范见 docs/05 §5 */
   headline: string
   reasons: string[]
+  /**
+   * 日内做T建议。**只对持仓、只在盘中、不发提醒、不落库**（intraday-t.ts）。
+   * 缺省 = 这一刻没有可说的，不是「不建议做T」。
+   */
+  tTrade?: TTradeAdvice
 }
 
 // ─────────────────────────── 调用上下文 ───────────────────────────

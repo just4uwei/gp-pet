@@ -45,6 +45,7 @@
 
 import type { AlertLevel, GatedDirection, Regime, SecCode } from '@core/types'
 import type { SignalEvidence, SignalRecord, WatchPointView } from '@shared/ipc-types'
+import { WATCH_MARK_LABEL, type WatchMark } from '@shared/watch-mark'
 import { pinnedSignal, type SignalGroup } from '@shared/signal-group'
 import { metricLabel } from '@shared/watch-metrics'
 
@@ -168,6 +169,7 @@ function Evidence({ evidence }: { evidence: SignalEvidence }): React.JSX.Element
 
 export function SignalRow({
   record,
+  mark = null,
   expanded,
   evidence,
   aiReady,
@@ -175,6 +177,12 @@ export function SignalRow({
   onToggle,
 }: {
   record: SignalRecord
+  /**
+   * 用户自己设的观察点对这条结论的改写（`watchMarkOf`）。
+   * **失效替换方向标签、确认并排一个小字** —— 与悬浮条同一套表达，
+   * 两处不许各写一套（watch-mark.ts 头注释）。
+   */
+  mark?: WatchMark | null
   expanded: boolean
   evidence: SignalEvidence | null
   /** AI 已配置且已启用。false → 整块不渲染，而不是渲染一个点了报错的按钮 */
@@ -189,11 +197,20 @@ export function SignalRow({
     // 是嵌在组里的，不该各自成为列表项
     <div>
       <button className="flex w-full items-center gap-3 text-left" onClick={() => onToggle(record.id)}>
-        <span
-          className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${DIRECTION_TONE[record.direction]}`}
-        >
-          {DIRECTION_LABEL[record.direction]}
-        </span>
+        {mark === 'INVALIDATED' ? (
+          <span
+            className="shrink-0 rounded border border-white/15 px-1.5 py-0.5 text-[11px] text-white/40 line-through"
+            title="你设的失效条件已命中，这条结论不再成立"
+          >
+            {DIRECTION_LABEL[record.direction]}
+          </span>
+        ) : (
+          <span
+            className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${DIRECTION_TONE[record.direction]}`}
+          >
+            {DIRECTION_LABEL[record.direction]}
+          </span>
+        )}
 
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-2">
@@ -206,6 +223,15 @@ export function SignalRow({
             <span>{STAGE_LABEL[record.stage]}</span>
             <span>·</span>
             <span>{LEVEL_LABEL[record.level]}</span>
+            {/*
+              光靠删除线表达「已失效」会被漏看，所以把那三个字也写出来。
+              措辞跟着 WATCH_MARK_LABEL 走，与悬浮条同一份文案。
+            */}
+            {mark === null ? null : (
+              <span className={mark === 'INVALIDATED' ? 'text-white/50' : 'text-sky-200/70'}>
+                · 观察点{WATCH_MARK_LABEL[mark]}
+              </span>
+            )}
             {suppressed ? <span className="text-amber-200/70">· 已静默：{record.suppressedReason}</span> : null}
           </span>
         </span>

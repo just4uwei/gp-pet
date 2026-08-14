@@ -100,6 +100,16 @@ const STATUS: Record<string, { status: Status; note?: string }> = {
   },
   'risk.lateBuyCutoffMinutes': { status: 'UNTESTABLE', note: '回测按次日开盘成交，没有「14:50 之后」这件事' },
   'data.staleSnapshotMs': { status: 'UNTESTABLE', note: '回测没有实时快照，这条分支走不到' },
+  /*
+    做T的三个门。**是 UNTESTABLE 不是 GUESS** —— 差别不是「还没测」而是「测不了」：
+    一根日线只有开高低收，不知道当天先到高点还是先到低点，「日内位置」在日线上
+    根本没有对应量。把它们放进 GUESS 会让人在补完计划里排一轮网格，
+    而那一轮扫出来的「最优值」是在一个不存在的量上取的极值。
+  */
+  tTrade: {
+    status: 'UNTESTABLE',
+    note: '日线回测看不见日内路径（不知先到高点还是低点），依据只能来自实盘使用',
+  },
 
   // ── 一个网格都没跑过（docs/08 M2 那一行点了名的四块）──────────────
   macd: { status: 'GUESS', note: '一个网格都没跑过。12/17/9 来自来源文档转述（docs/04 §1.2）' },

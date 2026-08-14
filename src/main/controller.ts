@@ -922,6 +922,24 @@ export class AppController {
         log.warn('[alert] 分发失败：', error)
       }
     }
+
+    /*
+      日内做T建议（core/risk/intraday-t.ts）。**每轮都推，没有就推空数组** ——
+      它的时效只有几十分钟，只在「有」的时候推会让早上那条建议一直挂到收盘，
+      而用户没有任何办法看出它已经过期。
+
+      它刻意**不经过 AlertService**：不进 alert_log、不点状态点、不发气泡。
+      状态点仍然只由四道闸门点亮（docs/05 §4），这一条不是提醒，是面板上的一个标注。
+    */
+    this.windows.push(
+      'push:intradayT',
+      (outcomes ?? []).flatMap((outcome) => {
+        const advice = outcome.evaluation.gated.tTrade
+        if (!advice) return []
+        return [{ code: outcome.evaluation.code, name: outcome.name, ...advice }]
+      })
+    )
+
     this.windows.push('push:engineStatus', this.engineStatus())
   }
 

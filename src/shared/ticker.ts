@@ -25,9 +25,19 @@
  * 动作标签取**当日最后一条**未静默信号的方向，不是得分最高的那条：
  * 收盘失效提示（`direction: 'NONE'`）的全部意义就是「上午那条别当真了」，
  * 让它被上午那条得分更高的买入盖住，等于把撤销吞掉（docs/05 §4）。
+ *
+ * 观察点命中会**改写**这个标签（`mark`，2026-08-14）：用户自己设的失效条件命中之后，
+ * 条子上还写着「买入」是在替一条已被否掉的结论继续背书。判据在 `watch-mark.ts`
+ * —— 只有命中的**来源信号就是当前这条**时才改写，理由见那个文件的头注释。
+ *
+ * 日内做T建议（`tHint`）**不参与排序**：它是给「主动看一眼」的标注，
+ * 而跑马灯本来就会把全部自选轮一遍，让它去抢前排等于把一个几十分钟时效的东西
+ * 放到与引擎结论同一个位置上。`orderFingerprint` 也因此不含它 ——
+ * 做T建议每轮都可能翻转，进指纹会让条目位置跟着来回跳（那正是指纹要防的事）。
  */
 
 import type { AlertLevel, GatedDirection, SecCode } from '@core/types'
+import { watchMarkOf, type MarkableHit, type WatchMark } from './watch-mark'
 
 /** 只要求「有代码和名称」，方便调用方直接传 WatchItem */
 export interface TickerItem {
@@ -45,6 +55,8 @@ export interface TickerQuote {
 
 /** 字段与 SignalRecord 的同名子集一致 */
 export interface TickerSignal {
+  /** 观察点命中要按它认领来源信号（watch-mark.ts） */
+  id: string
   code: SecCode
   name: string
   createdAt: number
@@ -52,6 +64,12 @@ export interface TickerSignal {
   score: number
   level: AlertLevel
   suppressedReason?: string
+}
+
+/** 字段与 IntradayTHint 的同名子集一致 */
+export interface TickerTHint {
+  code: SecCode
+  side: 'HIGH_SELL' | 'LOW_BUY'
 }
 
 export interface TickerEntry {
@@ -66,6 +84,17 @@ export interface TickerEntry {
   action: GatedDirection | null
   level: AlertLevel | null
   score: number | null
+  /**
+   * 用户自己设的观察点对这条结论的改写：已失效 / 已确认。
+   * null = 没有针对**这条**信号的命中（见 watch-mark.ts，不是「没有命中」）。
+   */
+  mark: WatchMark | null
+  /**
+   * 本轮的日内做T建议（`core/risk/intraday-t.ts`）。**与 `action` 并列，不是它的一种**
+   * —— 引擎判什么方向，与「现价这一刻在日内哪个位置」是两件事，
+   * 而且它只对持仓给。null = 这一刻没有可说的。
+   */
+  tHint: 'HIGH_SELL' | 'LOW_BUY' | null
 }
 
 /**
@@ -76,8 +105,10 @@ export interface TickerEntry {
  * 「加/删了标的」或「某只票今天的方向变了」时才动，其余时候原地更新数字。
  */
 export function orderFingerprint(entries: readonly TickerEntry[]): string {
+  // 命中改写也算「结论变了」：标签从「买入」变成「已失效」是用户最该看见的一次变化，
+  // 让它跟着重排一次，比留在原位更符合「有变化的排前面」这条规则
   return entries
-    .map((entry) => `${entry.code}:${entry.action ?? '-'}`)
+    .map((entry) => `${entry.code}:${entry.action ?? '-'}:${entry.mark ?? '-'}`)
     .sort()
     .join(',')
 }
@@ -108,11 +139,15 @@ function moveOf(entry: TickerEntry): number {
  * @param items   自选列表。首轮基础信息补齐前可能为空，此时名称退到信号里的名称、再退到代码
  * @param quotes  本轮快照
  * @param signals 今日信号；缺省表示还没取到，此时全部条目都是「无信号」
+ * @param hits    今日命中的观察点。只有指向当前那条信号的才会改写标签（watch-mark.ts）
+ * @param tHints  本轮的日内做T建议。**每轮全量替换**，上一轮的不许留着（见 push:intradayT）
  */
 export function buildTicker(
   items: readonly TickerItem[],
   quotes: readonly TickerQuote[],
-  signals: readonly TickerSignal[] = []
+  signals: readonly TickerSignal[] = [],
+  hits: readonly MarkableHit[] = [],
+  tHints: readonly TickerTHint[] = []
 ): TickerEntry[] {
   const quoteOf = new Map<SecCode, TickerQuote>()
   for (const quote of quotes) if (!quoteOf.has(quote.code)) quoteOf.set(quote.code, quote)
@@ -124,6 +159,9 @@ export function buildTicker(
     const prev = signalOf.get(signal.code)
     if (prev === undefined || signal.createdAt >= prev.createdAt) signalOf.set(signal.code, signal)
   }
+
+  const tHintOf = new Map<SecCode, TickerTHint['side']>()
+  for (const hint of tHints) tHintOf.set(hint.code, hint.side)
 
   const nameOf = new Map<SecCode, string>()
   // 自选列表是名称的权威来源；信号里的名称只在自选还没读到时兜底
@@ -149,6 +187,8 @@ export function buildTicker(
       action: signal?.direction ?? null,
       level: signal?.level ?? null,
       score: signal?.score ?? null,
+      mark: signal === undefined ? null : watchMarkOf(signal.id, hits),
+      tHint: tHintOf.get(code) ?? null,
     }
   })
 

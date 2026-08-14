@@ -36,6 +36,11 @@ export function shiftLevel(level: AlertLevel, offset: number): AlertLevel {
   return LEVELS[Math.min(LEVELS.length - 1, Math.max(0, index))] ?? level
 }
 
+/** 两者取高。**只用于加佐证的场合**，不得用来绕过用户的整体下调之外的任何降级 */
+export function maxLevel(a: AlertLevel, b: AlertLevel): AlertLevel {
+  return LEVELS.indexOf(a) >= LEVELS.indexOf(b) ? a : b
+}
+
 /** 报价投影，只取气泡与通知要显示的两项 */
 export interface QuoteView {
   last: number
@@ -221,7 +226,20 @@ export function buildAlerts(outcomes: readonly SignalOutcome[], options: BuildOp
     if (signalId === null || signalId === '') continue
 
     const forced = forcedVerdict(evaluation)
-    const level = forced ? gated.level : shiftLevel(gated.level, levelOffset)
+    const shifted = forced ? gated.level : shiftLevel(gated.level, levelOffset)
+    /*
+      昨日收盘那条「明日观察」今天兑现了（engine/signals.ts 的 CarryoverNotice）。
+
+      **不新发一条提醒，而是把今天这条抬到 L2 并写清来历。** 两个理由：
+        * 一天两条说同一件事，用户只会觉得吵；
+        * 而它确实比一条孤立的盘中买入更值得一看 —— 昨天收盘 CONFIRMED、今天盘中仍成立，
+          是两次独立成立。分级规则本来就把「CONFIRMED 且强」放在 L3，
+          这里只抬到 L2（今天这根还是临时的，够不着 L3）。
+
+      **只抬不降**：用户把整体级别下调过一档时，`shiftLevel` 已经把它压到 L1，
+      而复活的意义就是让这条看得见 —— 但也不越过用户的上调（取两者较高的那个）。
+    */
+    const level = outcome.carriedOver && !forced ? maxLevel(shifted, 'L2') : shifted
     const quote = quotes?.get(evaluation.code)
 
     const candidate: AlertCandidate = {
@@ -242,8 +260,13 @@ export function buildAlerts(outcomes: readonly SignalOutcome[], options: BuildOp
         level,
         direction: gated.direction,
         headline: gated.headline,
-        // 依据行最多 3 条，完整依据在面板展开（docs/05 §5）
-        reasons: gated.reasons.slice(0, 3),
+        // 依据行最多 3 条，完整依据在面板展开（docs/05 §5）。
+        // 复活那一句排在最前：它是「这条为什么值得看」的第一理由，
+        // 挤掉第三条子信号依据是划算的（那条在面板展开里仍在）
+        reasons: (outcome.carriedOver
+          ? [`昨日（${outcome.carriedOver.from}）收盘给出明日观察，今日开盘后仍成立`, ...gated.reasons]
+          : gated.reasons
+        ).slice(0, 3),
         code: evaluation.code,
         name: outcome.name,
         // 展示价一律**不复权**：用户在券商 App 看到的是这个数（docs/03 §2.3）

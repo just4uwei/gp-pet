@@ -470,6 +470,60 @@ describe('分级（docs/05 §3）', () => {
   })
 })
 
+/**
+ * 做T建议接进 `gateSignal` 的那两道额外闸门。
+ *
+ * 判定本身在 `intraday-t.test.ts`（16 条）。这里只钉**接线**：
+ * 什么时候不该把它挂上去，以及方向为 NONE 时它照样要在 ——
+ * 后者是最容易漏的那条，因为 `gateSignal` 有两个返回点，
+ * 而「引擎今天没信号但手里的票冲高了」恰恰是做T最常见的场景。
+ */
+describe('日内做T建议的接线（intraday-t.ts）', () => {
+  /** 昨收 10、今日 9.5–10.5、现价踩在最高点 —— 振幅 10%、位置 100% */
+  const atHigh = { last: 10.5, high: 10.5, low: 9.5, preClose: 10 }
+
+  it('持仓 + 盘中 + 日内高位 → 挂上高抛', () => {
+    const gated = gateSignal(
+      input({ position: position(), snapshot: snapshot(atHigh), signal: signalOf('BUY', 0.8) })
+    )
+    expect(gated.tTrade?.side).toBe('HIGH_SELL')
+  })
+
+  it('方向为 NONE 时照样给 —— 「引擎没说话但我的票冲高了」是最常见的场景', () => {
+    const gated = gateSignal(
+      input({ position: position(), snapshot: snapshot(atHigh), signal: signalOf('NONE', 0.1) })
+    )
+    expect(gated.direction).toBe('NONE')
+    expect(gated.tTrade?.side).toBe('HIGH_SELL')
+  })
+
+  it('持仓强制类命中时不给：止损那一刻该看的是风险，不是日内价差', () => {
+    // 成本 12、现价 10.5 → 亏 12.5%，触及 8% 止损线
+    const gated = gateSignal(
+      input({ position: position({ cost: 12 }), snapshot: snapshot(atHigh), signal: signalOf('BUY', 0.8) })
+    )
+    expect(gated.verdicts.some((v) => v.rule === 'STOP_LOSS')).toBe(true)
+    expect(gated.tTrade).toBeUndefined()
+  })
+
+  it('硬抑制命中时不给：「无法执行」与「可考虑高抛」并排出现是自相矛盾', () => {
+    const gated = gateSignal(
+      input({
+        position: position(),
+        snapshot: snapshot({ ...atHigh, suspended: true }),
+        signal: signalOf('BUY', 0.8),
+      })
+    )
+    expect(gated.suppressed).toBe(true)
+    expect(gated.tTrade).toBeUndefined()
+  })
+
+  it('没有持仓就没有做T —— 与方向、得分都无关', () => {
+    const gated = gateSignal(input({ snapshot: snapshot(atHigh), signal: signalOf('BUY', 0.8) }))
+    expect(gated.tTrade).toBeUndefined()
+  })
+})
+
 describe('文案（docs/05 §5）', () => {
   const subs = [sub('T3_BREAKOUT', 'BUY', 0.9, 0.25), sub('T1_MA_CROSS', 'BUY', 0.6, 0.2)]
 

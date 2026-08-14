@@ -161,6 +161,21 @@ export const DEFAULT_PARAMS = {
     lateBuyCutoffMinutes: 320, // 09:30 起算，14:50 = 320 分钟（含午休扣除后的口径见实现）
   },
 
+  /**
+   * 日内做T建议的三个门（2026-08-14，判据在 `core/risk/intraday-t.ts`）。
+   *
+   * ⚠ **这三个数在 `params-view.ts` 里属 `UNTESTABLE`，不是 `GUESS`** —— 差别是硬的：
+   * `GUESS` 意味着「还没跑网格」，而这三个是**日线回测原理上测不到**的
+   * （一根日线只有开高低收，不知道当天先到高点还是先到低点，日内位置无从复现）。
+   * 与 `alert.bubbleScore` / `data.staleSnapshotMs` 同一档，依据只能来自实盘使用。
+   * **别把它们塞进标定网格** —— 扫出来的「最优值」是在一个不存在的量上取的极值。
+   *
+   * `minAmplitudePct = 3%`：日内来回一趟的双边成本约 0.1–0.2%（佣金 + 卖出印花税，
+   * 见 backtest/costs.ts），3% 是「价差要显著大于成本才值得动手」的一个保守取值。
+   * 它挡掉的是那种「振幅 0.8%、位置 95%」的伪高位 —— 那种日子的高低点差在噪音里。
+   */
+  tTrade: { minAmplitudePct: 0.03, highPct: 0.8, lowPct: 0.2 },
+
   data: { minBars: 40, fullBars: 300, insufficientPenalty: 0.8, staleSnapshotMs: 5 * 60 * 1000 },
 } as const
 
@@ -262,8 +277,13 @@ export function withSensitivity(
  * 那是清单 4.9 的「标定完成」一档。
  *
  * 0.2.6 不含参数标定，是 `R2_REVERT_TO_MID` 的判定口径修正（docs/04 §3.2、M2 §5.11）。
+ *
+ * 0.2.7 同样不含标定：新增 `tTrade` 三个门（日内做T建议）。
+ * **它改的是参数集，所以指纹变了 → 指标缓存整体作废重算、影子运行按纪律停止累积**
+ * —— 这是加参数块的固定代价，不是这次的副作用（CLAUDE.md「引擎参数一变立刻停止累积」）。
+ * 做T判定本身不影响任何既有信号：它不改 `direction`、不落库、不进回测与影子。
  */
-export const ENGINE_VERSION = '0.2.6-unvalidated'
+export const ENGINE_VERSION = '0.2.7-unvalidated'
 
 /**
  * 参数集的稳定指纹。

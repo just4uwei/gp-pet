@@ -28,8 +28,19 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { hitTest } from '@shared/hit-test'
 import { applyOrder, buildTicker, orderFingerprint, type TickerEntry } from '@shared/ticker'
+import { WATCH_MARK_LABEL } from '@shared/watch-mark'
+import { T_HINT_LABEL, T_HINT_TITLE } from '@shared/intraday-t'
 import type { GatedDirection, SecCode } from '@core/types'
-import type { EngineStatus, PetState, QuoteTick, Rect, SignalRecord, WatchItem } from '@shared/ipc-types'
+import type {
+  EngineStatus,
+  IntradayTHint,
+  PetState,
+  QuoteTick,
+  Rect,
+  SignalRecord,
+  WatchItem,
+  WatchPointView,
+} from '@shared/ipc-types'
 
 /** 与 styles.css 的 `.bar { border-radius }` 必须一致，否则命中区会盖到圆角外 */
 const CORNER_RADIUS = 8
@@ -152,10 +163,31 @@ function Item({ entry }: { entry: TickerEntry }): React.JSX.Element {
       >
         {entry.changePct === null ? '—' : signed(entry.changePct)}
       </span>
+      {/*
+        失效**替换**方向标签而不是并排放：用户自己设的失效条件已经命中了，
+        旁边还留着「买入」两个字，等于在替一条已被否掉的结论继续背书。
+        确认则是并排的小字 —— 那条结论仍然成立，只是多了一层用户自己的佐证。
+      */}
       {entry.action === null ? (
         <span className="act act--none">无信号</span>
+      ) : entry.mark === 'INVALIDATED' ? (
+        <span className="act act--none">{WATCH_MARK_LABEL.INVALIDATED}</span>
       ) : (
-        <span className={`act ${ACTION_CLASS[entry.action]}`}>{ACTION_LABEL[entry.action]}</span>
+        <>
+          <span className={`act ${ACTION_CLASS[entry.action]}`}>{ACTION_LABEL[entry.action]}</span>
+          {entry.mark === 'CONFIRMED' ? <span className="act act--mark">{WATCH_MARK_LABEL.CONFIRMED}</span> : null}
+        </>
+      )}
+      {/*
+        日内做T建议。**与方向标签并排而不是替换它**：引擎判什么方向，与「现价这一刻
+        在日内哪个位置」是两件事，合成一个标签会让用户以为引擎改口了。
+        措辞是「日内高抛 / 日内低吸」而不是「卖 / 买」—— 它说的是一次日内往返，
+        不是对这只票的看法（措辞纪律）。
+      */}
+      {entry.tHint === null ? null : (
+        <span className="act act--t" title={T_HINT_TITLE[entry.tHint]}>
+          {T_HINT_LABEL[entry.tHint]}
+        </span>
       )}
     </span>
   )
@@ -186,6 +218,16 @@ export function App(): React.JSX.Element {
   const [status, setStatus] = useState<EngineStatus | null>(null)
   // QuoteTick 只有代码与价格，名称在自选列表里（首轮基础信息补齐后才有，所以要跟着重取）
   const [items, setItems] = useState<WatchItem[]>([])
+  /*
+    今天命中的观察点。**只用来改写方向标签**（watch-mark.ts），不参与排序也不计数 ——
+    它不是信号（003_watch.sql 的头注释），条子上「今日 N 条信号」那个徽标一个都不许加。
+  */
+  const [hits, setHits] = useState<WatchPointView[]>([])
+  /*
+    本轮的日内做T建议。**每轮全量替换**（主进程没有建议时推空数组）——
+    留着上一轮的会让早上那条「可考虑高抛」一直挂到收盘，而它的时效只有几十分钟。
+  */
+  const [tHints, setTHints] = useState<IntradayTHint[]>([])
 
   const dragRef = useRef<DragState | null>(null)
   /** 本地缓存的穿透状态，避免每次 mousemove 都发 IPC */
@@ -235,20 +277,32 @@ export function App(): React.JSX.Element {
         .then(setItems)
         .catch(() => undefined)
     }
+    // 只取**今天**命中的：上周那次命中改写今天这条结论是错的（面板那边同一条口径）
+    const loadHits = (): void => {
+      const from = startOfToday()
+      void window.gp
+        .invoke('watch:list', { status: 'HIT', limit: 200 })
+        .then((rows) => setHits(rows.filter((row) => (row.hitAt ?? 0) >= from)))
+        .catch(() => undefined)
+    }
     loadSignals()
     loadItems()
+    loadHits()
 
     const offState = window.gp.on('push:petState', setPetState)
     const offQuotes = window.gp.on('push:quoteTick', setQuotes)
+    const offTHints = window.gp.on('push:intradayT', setTHints)
     const offStatus = window.gp.on('push:engineStatus', (next) => {
       setStatus(next)
       // 引擎每轮跑完会推一次，借它当信号列表的重取信号（与面板同一做法）
       loadSignals()
       loadItems()
+      loadHits()
     })
     return () => {
       offState()
       offQuotes()
+      offTHints()
       offStatus()
     }
   }, [])
@@ -367,7 +421,10 @@ export function App(): React.JSX.Element {
 
   // ── 绘制 ─────────────────────────────────────────────────────────
   const actionable = useMemo(() => signals.filter((s) => s.suppressedReason === undefined), [signals])
-  const fresh = useMemo(() => buildTicker(items, quotes, signals), [items, quotes, signals])
+  const fresh = useMemo(
+    () => buildTicker(items, quotes, signals, hits, tHints),
+    [items, quotes, signals, hits, tHints]
+  )
 
   /**
    * 位置只在「集合或方向变了」时才重排 —— 排序规则里有 |涨跌幅|，而它每一轮取数都在变，

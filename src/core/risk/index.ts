@@ -39,6 +39,7 @@ import type {
   TradingSession,
 } from '../types'
 import { DIRECTION_LABELS, composeHeadline, topReasons } from './text'
+import { tTradeAdvice } from './intraday-t'
 
 const LEVELS: readonly AlertLevel[] = ['L1', 'L2', 'L3']
 
@@ -325,6 +326,28 @@ export function gateSignal(input: GateInput): GatedSignal {
   const suppressions = hardSuppressions(input, direction)
   verdicts.push(...suppressions)
 
+  /*
+    日内做T建议（intraday-t.ts）。**与方向无关**，所以两个返回点都要带上 ——
+    最常见的场景恰恰是「引擎今天没信号（NONE），但手上这只票日内冲高了」。
+
+    两道额外的闸门在这里，不在 intraday-t.ts 里：
+      * **持仓强制类命中时不给**。止损/减仓那一刻该关心的是风险，
+        旁边并排一句「可考虑高抛」会让用户分不清哪个是要紧的；
+      * **硬抑制命中时不给**。停牌、数据不足、涨跌停封死 —— 那些是「无法执行」，
+        与做T建议同时出现自相矛盾。
+  */
+  const tTrade =
+    forced || suppressions.length > 0
+      ? null
+      : tTradeAdvice({
+          snapshot: input.snapshot,
+          shares: input.position?.shares ?? 0,
+          session: input.now.session,
+          minuteOfDay: input.now.minuteOfDay,
+          limits: limitPrices(input),
+          params: input.params,
+        })
+
   // 方向为 NONE：没有可提醒的东西，但**抑制原因照样要记**。
   // 「这只股票为什么从来不出信号」是面板必须能回答的问题 —— 数据不足、停牌、次新股
   // 都会让方向恒为 NONE，此时若连原因都不落库，用户看到的就是一片空白。
@@ -338,6 +361,7 @@ export function gateSignal(input: GateInput): GatedSignal {
       suppressed: suppressions.length > 0,
       headline: suppressions[0]?.reason ?? '无一致信号',
       reasons: annotations(verdicts),
+      ...(tTrade ? { tTrade } : {}),
     }
   }
 
@@ -376,6 +400,7 @@ export function gateSignal(input: GateInput): GatedSignal {
     suppressed: suppressions.length > 0,
     headline,
     reasons: [...reasons, ...annotations(verdicts)],
+    ...(tTrade ? { tTrade } : {}),
   }
 }
 
@@ -428,3 +453,4 @@ function limitPrices(input: GateInput): { limitUp: number; limitDown: number } |
 }
 
 export * from './text'
+export { tTradeAdvice, type TTradeInput } from './intraday-t'

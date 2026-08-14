@@ -61,6 +61,8 @@ function harness(options: {
   position?: Position | null
   snapshot?: Snapshot | null
   latestOfDay?: SignalRow | null
+  /** 按交易日给的 latestOfDay。复活判定要区分「昨天」与「今天」，一个常量答不了 */
+  latestOfDayBy?: (date: string) => SignalRow | null
   benchmark?: Candle[]
   throwOn?: SecCode
 } = {}): Harness {
@@ -105,7 +107,8 @@ function harness(options: {
       },
       get: (id: string) => rows.find((r) => r.id === id) ?? null,
       query: () => [...rows],
-      latestOfDay: () => options.latestOfDay ?? null,
+      latestOfDay: (_code: SecCode, date: string) =>
+        options.latestOfDayBy?.(date) ?? options.latestOfDay ?? null,
       countOfDay: () => rows.length,
     } as unknown as SignalEngineDeps['signals'],
     indicators: {
@@ -368,6 +371,146 @@ describe('指标缓存与确认轮', () => {
     createSignalEngine(h.deps).run(TICK)
     expect(h.peaks[0]?.code).toBe('SH600000')
     expect(h.peaks[0]?.price).toBeGreaterThan(0)
+  })
+})
+
+/**
+ * 昨日收盘的「明日观察」在今天的兑现（2026-08-14）。
+ *
+ * 为什么必须钉住：收盘确认轮**永远**落在 T+1 尾盘窗口里，实测 46 只 2024 年起
+ * 28973 个判定根，组合层给的 182 次 BUY **一次不漏**全被改写成 `NEXT_DAY_WATCH`。
+ * 那条改写是对的（收盘后买不进），缺的是第二天的跟进 —— 而它一旦写错，
+ * 症状是「昨天的建议今天又提醒了一遍」或者「照样没有跟进」，两种都不显眼。
+ */
+describe('明日观察的次日复活', () => {
+  /** 末根给 BUY 的那一段（实测：完整 fixture 的末根是 SELL，砍掉最后 4 根才是 BUY） */
+  function buyingCandles(): Candle[] {
+    const full = goldenCrossBreakout().candles
+    const cut = full.slice(0, full.length - 4)
+    const last = cut[cut.length - 1]
+    if (!last) throw new Error('fixture 太短')
+    // 盘中：最后一根是临时线。复活只在盘中判（收盘轮那条自己就是 NEXT_DAY_WATCH）
+    return [...cut.slice(0, -1), { ...last, provisional: true }]
+  }
+
+  const CANDLES = buyingCandles()
+  const TODAY = CANDLES[CANDLES.length - 1]?.date ?? ''
+  const YESTERDAY = CANDLES[CANDLES.length - 2]?.date ?? ''
+  // 11:30：量比按已走完的连续竞价分钟数归一化，10:00 那种「刚开盘半小时」会把
+  // 量比放大 8 倍，进而改变 T3 的成立与否 —— 这里要验的是复活闸门，不该被它拌住
+  const INTRADAY = { ...TICK, date: TODAY, session: 'CONTINUOUS_AM' as const, minuteOfDay: 11 * 60 + 30 }
+
+  /** 昨日收盘那一行。方向与 stage 由调用方给 —— 这两项正是判据 */
+  function yesterdayRow(direction: string, stage: SignalStage = 'CONFIRMED'): SignalRow {
+    return {
+      id: 'yesterday',
+      code: 'SH600000',
+      createdAt: 1,
+      tradeDate: YESTERDAY,
+      direction,
+      score: 0.7,
+      votes: 3,
+      regime: 'TREND_UP',
+      stage,
+      priceAt: 10,
+      engineVersion: 'v1',
+      evidence: {
+        level: 'L2',
+        headline: '',
+        reasons: [],
+        suppressed: false,
+        subSignals: [],
+        adjustments: [],
+        verdicts: [],
+        scoreByDirection: {},
+        indicatorsAt: {},
+        regimeEvidence: {},
+        sufficiency: { bars: 0, limited: false, penalty: 1, note: null },
+      },
+    } as unknown as SignalRow
+  }
+
+  /**
+   * 这一块**不能用文件顶上那个 SENSITIVE**，而且不是因为票数 —— 是因为它把**分数线**
+   * 压到了 0.3。
+   *
+   * 实测这段 fixture 的末根：BUY 0.691（T1+T3 两票）、SELL 0.550（R1 超买一票）。
+   * 冲突裁决判「势均力敌」的前置条件是 `contested = 两侧 final 都 ≥ scoreThreshold`，
+   * 0.3 的线让 SELL 那 0.55 也算进来，而两者差 0.141 < `conflictBand` 0.15
+   * → **压掉双方** → 方向恒为 NONE，于是复活的每一条用例都退化成
+   * 「本来就没有买入」的假通过。
+   *
+   * 所以这里保留**出厂分数线 0.6**（SELL 的 0.55 够不着，不构成矛盾），
+   * 只把趋势票数线从 3 放到 2 —— fixture 末根就是 T1+T3 两票，
+   * 而这一块验的是编排不是信号质量。
+   */
+  const NEAR_FACTORY = withParams({
+    combine: { ...DEFAULT_PARAMS.combine, voteThreshold: { trend: 2, meanReversion: 2 } },
+  })
+
+  function run(options: {
+    yesterday?: SignalRow | null
+    candles?: Candle[]
+    tick?: typeof INTRADAY
+  } = {}) {
+    const h = harness({
+      candles: options.candles ?? CANDLES,
+      latestOfDayBy: (date) => (date === YESTERDAY ? (options.yesterday ?? null) : null),
+    })
+    const engine = createSignalEngine({ ...h.deps, params: NEAR_FACTORY })
+    return { engine, outcomes: engine.run(options.tick ?? INTRADAY) }
+  }
+
+  it('前提成立：这段 fixture 的盘中结论确实是买入', () => {
+    expect(run().outcomes[0]?.evaluation.gated.direction).toBe('BUY')
+  })
+
+  it('昨日收盘是「明日观察」且今日盘中仍判买入 → 报一次复活', () => {
+    const { outcomes } = run({ yesterday: yesterdayRow('NEXT_DAY_WATCH') })
+    expect(outcomes[0]?.carriedOver).toEqual({ signalId: 'yesterday', from: YESTERDAY })
+  })
+
+  it('昨日不是「明日观察」→ 不复活（普通买入信号已经提醒过了）', () => {
+    expect(run({ yesterday: yesterdayRow('BUY') }).outcomes[0]?.carriedOver).toBeUndefined()
+  })
+
+  it('昨日那条还是 PROVISIONAL → 不复活：收盘轮没确认它，那不是昨天的最终结论', () => {
+    expect(
+      run({ yesterday: yesterdayRow('NEXT_DAY_WATCH', 'PROVISIONAL') }).outcomes[0]?.carriedOver
+    ).toBeUndefined()
+  })
+
+  it('昨天什么都没有 → 不复活', () => {
+    expect(run({ yesterday: null }).outcomes[0]?.carriedOver).toBeUndefined()
+  })
+
+  it('今日不判买入 → 不复活：昨天的结论不构成今天的理由', () => {
+    // 完整 fixture 的末根是 SELL（见 buyingCandles 的注释）
+    const full = goldenCrossBreakout().candles
+    const last = full[full.length - 1]
+    if (!last) throw new Error('fixture 太短')
+    const candles = [...full.slice(0, -1), { ...last, provisional: true }]
+    const { outcomes } = run({
+      yesterday: yesterdayRow('NEXT_DAY_WATCH'),
+      candles,
+      tick: { ...INTRADAY, date: last.date },
+    })
+    expect(outcomes[0]?.evaluation.gated.direction).not.toBe('BUY')
+    expect(outcomes[0]?.carriedOver).toBeUndefined()
+  })
+
+  it('一天只报一次 —— 盘中每 30s 一轮，重复报会在 alert_log 里攒一串被冷却挡掉的噪音', () => {
+    const { engine } = run({ yesterday: yesterdayRow('NEXT_DAY_WATCH') })
+    // 第一轮已经在 run() 里跑过了，这是第二轮
+    expect(engine.run({ ...INTRADAY, at: INTRADAY.at + 30_000 })[0]?.carriedOver).toBeUndefined()
+  })
+
+  it('判的不是今天这根（快照还没到手，引擎在判昨天的收盘线）→ 不复活', () => {
+    // 末根不是临时线时，被判定的那根就是「昨天」，而它的前一根是前天 ——
+    // 少了这道闸门会把前天那条明日观察当成昨天的
+    const settled = CANDLES.map((candle) => ({ ...candle, provisional: false }))
+    const { outcomes } = run({ yesterday: yesterdayRow('NEXT_DAY_WATCH'), candles: settled })
+    expect(outcomes[0]?.carriedOver).toBeUndefined()
   })
 })
 

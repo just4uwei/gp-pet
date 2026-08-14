@@ -674,6 +674,24 @@ export interface EngineStatus {
   stale?: boolean
 }
 
+/**
+ * 一条日内做T建议（2026-08-14）。
+ *
+ * **它不是信号，也不是提醒**：不落 `signal` 表、不进 `alert_log`、不进回测与影子运行。
+ * 判据、三条边界与「为什么阈值标不了」都在 `src/core/risk/intraday-t.ts` 的头注释里。
+ */
+export interface IntradayTHint {
+  code: SecCode
+  name: string
+  /** 高抛（先卖后买）/ 低吸（先买，卖的是老仓那部分） */
+  side: 'HIGH_SELL' | 'LOW_BUY'
+  /** 现价在当日振幅中的位置 0..1 */
+  position: number
+  /** 当日振幅，相对昨收 */
+  amplitude: number
+  reason: string
+}
+
 export interface Rect {
   x: number
   y: number
@@ -834,6 +852,17 @@ export interface IpcPushMap {
    * 主进程按真实光标位置（`screen.getCursorScreenPoint()`）轮询裁决，false 即离开。
    */
   'push:overlayPointer': { over: boolean }
+  /**
+   * 本轮的日内做T建议（2026-08-14，判据在 `core/risk/intraday-t.ts`）。
+   *
+   * **每轮都推，没有建议时推空数组** —— 这一条不是随手写的：做T建议的时效只有
+   * 几十分钟，价格一走开条件就不成立了。只在「有」的时候推，早上那条「可考虑高抛」
+   * 会一直挂到收盘，而用户没有任何办法看出它已经过期。
+   *
+   * 它**不走提醒层**：不进 alert_log、不点亮状态点、不发气泡（那需要闸门，
+   * 而闸门的冷却会让一条几十分钟时效的建议永远来不及）。出口只有面板与悬浮条。
+   */
+  'push:intradayT': IntradayTHint[]
 }
 
 /**

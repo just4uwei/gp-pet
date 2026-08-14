@@ -70,6 +70,35 @@ export interface InvalidationNotice {
   direction: GatedDirection
 }
 
+/**
+ * 昨日收盘那条「明日观察」在今天得到了兑现（2026-08-14）。
+ *
+ * ## 为什么需要这个东西
+ *
+ * 收盘确认轮**永远**落在 T+1 尾盘窗口里：`minuteOfDayFrom()` 把
+ * `minutesSinceOpen` 钳在 240，于是收盘后任何一轮算出来的 minuteOfDay 恒等于 900（15:00），
+ * 而 `T1_LATE_BUY` 的窗口是 14:50–15:10。实测 46 只 2024 年起 28973 个判定根：
+ * 组合层产出 182 次 BUY，`T1_LATE_BUY` **也是 182 次** —— 一次不漏，
+ * 收盘轮的买入结论 100% 被改写成 `NEXT_DAY_WATCH`。
+ *
+ * 那条改写本身是对的（收盘之后确实买不进了）。缺的是**后半句**：
+ * 「明日观察」到了第二天没有任何跟进，那条建议就此消失，
+ * 而用户的观感是「这软件从来不给买入建议」。
+ *
+ * ## 判据是两次独立成立，不是把昨天那条搬过来
+ *
+ * 只有**今天自己也判出 BUY** 时才复活。昨天的结论不构成今天的理由 ——
+ * 隔夜跳空、消息面变化都可能让它不再成立，而照搬等于用一根过期的 K 线下结论。
+ * 所以这条通知只是给今天那条 BUY 提醒**加一层佐证**（提到 L2、文案标明来历），
+ * 它**不新发一条提醒**：一天两条说同一件事，用户只会觉得吵。
+ */
+export interface CarryoverNotice {
+  /** 昨日那条「明日观察」的 id。文案与追溯用，**不作 alert_log 外键**（那条用今天的） */
+  signalId: string
+  /** 昨日那根的交易日 */
+  from: TradeDate
+}
+
 export interface SignalOutcome {
   evaluation: Evaluation
   name: string
@@ -79,6 +108,8 @@ export interface SignalOutcome {
   signalId: string | null
   /** 非空表示本轮把上一条盘中信号判失效了（docs/05 §3：信号失效通知属 L1） */
   invalidated?: InvalidationNotice
+  /** 非空表示今天这条 BUY 兑现了昨日收盘的「明日观察」（见 CarryoverNotice） */
+  carriedOver?: CarryoverNotice
 }
 
 export interface SignalEngine {
@@ -110,6 +141,8 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
   const engineVersion = engineVersionOf(params)
   /** 落库去重：code → 上一次已落库的签名与 id */
   const persistedSignature = new Map<SecCode, { signature: string; id: string }>()
+  /** 复活去重：code → 已经报过复活的交易日（见 carryover 第 4 道闸门） */
+  const carriedOverOn = new Map<SecCode, TradeDate>()
   let lastOutcomes: SignalOutcome[] = []
 
   /** 周线聚合按 (code, 末根日期) 缓存：一轮 tick 内 100 只股票各聚合一次已经够省 */
@@ -163,7 +196,16 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
     indicators.put(code, evaluation.date, snapshotOfIndicators(evaluation.indicators, evaluation.index), engineVersion)
   }
 
-  function evaluateOne(entry: WatchEntry, tick: TickInfo, sentiment: number, shares: Map<string, number>): Evaluation | null {
+  /**
+   * 跑一只。同时把**上一根的交易日**带出来 —— 复活判定要用它去查昨日收盘那条结论，
+   * 而「昨天」这件事只有 K 线序列答得准（停牌、节假日都在里面），日历算不出来。
+   */
+  function evaluateOne(
+    entry: WatchEntry,
+    tick: TickInfo,
+    sentiment: number,
+    shares: Map<string, number>
+  ): { evaluation: Evaluation; prevDate: TradeDate | null } | null {
     const profile: SecProfile = entry.profile
     const context = market.getContext(profile.code, tick.date, lookback)
     if (context.candles.length === 0) return null
@@ -172,7 +214,7 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
     const industry = profile.industry ?? '未分类'
     const share = position ? shares.get(industry) : undefined
 
-    return evaluate(
+    const evaluation = evaluate(
       {
         profile,
         candles: context.candles,
@@ -190,6 +232,12 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
       },
       params
     )
+    if (!evaluation) return null
+    // 被判定那根的**前一根**。盘中被判定的是今天的临时线，于是这就是昨天；
+    // 快照还没到手时被判定的是昨天的收盘线，此时它是前天 —— 所以复活判定
+    // 另有一道 `evaluation.date === tick.date` 的闸门，见 carryover()
+    const prev = context.candles[evaluation.index - 1]
+    return { evaluation, prevDate: prev?.date ?? null }
   }
 
   function persist(evaluation: Evaluation, tick: TickInfo): { persisted: boolean; id: string | null } {
@@ -246,6 +294,35 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
     return { signalId: previous.id, direction: previous.direction }
   }
 
+  /**
+   * 昨日收盘的「明日观察」今天兑现了吗（见 CarryoverNotice）。
+   *
+   * 四道闸门，少一道都会让它变成一个吵人的东西：
+   *
+   * 1. **今天自己也判 BUY** —— 昨天的结论不构成今天的理由（见 CarryoverNotice 头注释）；
+   * 2. **判的必须是今天这根临时线**（`evaluation.date === tick.date` 且 PROVISIONAL）。
+   *    快照还没到手时引擎判的是昨天的收盘线，那时的「前一根」是前天，
+   *    照着查会把前天那条明日观察当成昨天的；
+   * 3. **昨日那条必须是当日最后一条且已确认** —— 收盘轮那条才是昨天的最终结论。
+   *    用 `latestOfDay` 而不是「昨天有没有出现过 NEXT_DAY_WATCH」：
+   *    上午出、收盘被判失效的那种不算数；
+   * 4. **一天只报一次**。盘中每 30s 一轮，不去重的话它会跟着每一轮 BUY 重复报，
+   *    虽然冷却挡得住，但 alert_log 里会攒一串「被冷却挡掉」的噪音。
+   */
+  function carryover(evaluation: Evaluation, prevDate: TradeDate | null, tick: TickInfo): CarryoverNotice | null {
+    if (evaluation.gated.direction !== 'BUY') return null
+    if (evaluation.date !== tick.date || evaluation.signal.stage !== 'PROVISIONAL') return null
+    if (prevDate === null) return null
+    if (carriedOverOn.get(evaluation.code) === tick.date) return null
+
+    const previous = signals.latestOfDay(evaluation.code, prevDate)
+    if (!previous || previous.direction !== 'NEXT_DAY_WATCH' || previous.stage !== 'CONFIRMED') return null
+
+    carriedOverOn.set(evaluation.code, tick.date)
+    log.info(`[signal] ${evaluation.code} 昨日（${prevDate}）收盘的明日观察今日仍成立`)
+    return { signalId: previous.id, from: prevDate }
+  }
+
   return {
     engineVersion,
 
@@ -269,12 +346,14 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
         // 指数不产出交易信号：它是情绪输入，不是可交易品种（docs/04 §1.6）
         if (entry.profile.board === 'INDEX') continue
         try {
-          const evaluation = evaluateOne(entry, tick, sentiment, shares)
-          if (!evaluation) continue
+          const evaluated = evaluateOne(entry, tick, sentiment, shares)
+          if (!evaluated) continue
+          const { evaluation, prevDate } = evaluated
 
           const stage = evaluation.signal.stage
           cacheIndicators(entry.profile.code, evaluation, stage)
           const invalidated = reconcile(evaluation)
+          const carriedOver = carryover(evaluation, prevDate, tick)
           // 持仓峰值每交易日收盘更新（docs/05 §2.3）
           if (stage === 'CONFIRMED' && positions.get(entry.profile.code)) {
             positions.bumpPeak(entry.profile.code, evaluation.candle.high)
@@ -287,6 +366,7 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
             persisted,
             signalId: id,
             ...(invalidated ? { invalidated } : {}),
+            ...(carriedOver ? { carriedOver } : {}),
           })
         } catch (error) {
           // 一只算不出来不该拖垮整轮：退市股的畸形序列、突然缺列的数据都可能走到这里

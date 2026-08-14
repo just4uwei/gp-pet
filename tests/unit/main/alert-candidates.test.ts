@@ -207,6 +207,65 @@ describe('收盘失效提示（docs/04 §6、docs/05 §3）', () => {
 })
 
 /**
+ * 昨日「明日观察」的次日兑现（engine/signals.ts 的 CarryoverNotice）。
+ *
+ * 这里钉的是**表达方式**而不是判定：判定在引擎那一侧（signals.test.ts 有 8 条）。
+ * 提醒层只做两件事 —— 抬到 L2、把来历写进第一条依据，而且**不新发一条**。
+ * 多发一条的症状是「同一件事一天提醒两次」，用户只会觉得吵。
+ */
+describe('明日观察的次日兑现', () => {
+  const carried = outcome({
+    evaluation: evaluation({ direction: 'BUY', level: 'L1', score: 0.66 }),
+    carriedOver: { signalId: 'sig-yesterday', from: '2024-03-14' },
+  })
+
+  it('只出一条提醒，不为复活单独再发一条', () => {
+    expect(buildAlerts([carried], { at: AT })).toHaveLength(1)
+  })
+
+  it('抬到 L2：昨日收盘确认 + 今日盘中仍成立是两次独立成立，值得从状态点升到气泡', () => {
+    const [item] = buildAlerts([carried], { at: AT })
+    expect(item?.candidate.level).toBe('L2')
+    // 外键仍指向**今天**那条：它才是当前依据，昨天那条只在文案里出现
+    expect(item?.candidate.signalId).toBe('sig-1')
+  })
+
+  it('来历排在依据第一条，且依据总数仍不超过 3 条', () => {
+    const [item] = buildAlerts([carried], { at: AT })
+    expect(item?.payload.reasons[0]).toContain('2024-03-14')
+    expect(item?.payload.reasons[0]).toContain('明日观察')
+    expect(item?.payload.reasons).toHaveLength(3)
+  })
+
+  it('用户把整体级别上调过一档时不往下压 —— 取两者较高的那个', () => {
+    const [item] = buildAlerts([carried], { at: AT, levelOffset: 1 })
+    expect(item?.candidate.level).toBe('L2')
+    const [strong] = buildAlerts(
+      [
+        outcome({
+          evaluation: evaluation({ direction: 'BUY', level: 'L2' }),
+          carriedOver: { signalId: 'sig-yesterday', from: '2024-03-14' },
+        }),
+      ],
+      { at: AT, levelOffset: 1 }
+    )
+    expect(strong?.candidate.level).toBe('L3')
+  })
+
+  it('持仓强制类不受它影响：那一档由风控定，任何佐证都不该动它', () => {
+    const forced = outcome({
+      evaluation: evaluation({
+        direction: 'SELL',
+        level: 'L3',
+        verdicts: [{ rule: 'STOP_LOSS', action: 'FORCE_SELL', reason: '触及止损线', evidence: {} }],
+      }),
+      carriedOver: { signalId: 'sig-yesterday', from: '2024-03-14' },
+    })
+    expect(buildAlerts([forced], { at: AT })[0]?.candidate.level).toBe('L3')
+  })
+})
+
+/**
  * 观察点命中 —— 提醒层的**第三类来源**（信号 / 收盘失效 / 观察点命中）。
  *
  * 四个字段各有理由，逐条钉住：挂来源信号（外键）、方向 NONE（避开冷却串味）、

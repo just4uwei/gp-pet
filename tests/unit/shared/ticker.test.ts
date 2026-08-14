@@ -7,6 +7,7 @@ import {
   type TickerQuote,
   type TickerSignal,
 } from '@shared/ticker'
+import type { MarkableHit } from '@shared/watch-mark'
 import type { GatedDirection, SecCode } from '@core/types'
 
 /**
@@ -28,8 +29,9 @@ describe('buildTicker', () => {
   const signal = (
     code: string,
     score: number,
-    extra: { at?: number; direction?: GatedDirection; suppressedReason?: string } = {}
+    extra: { at?: number; id?: string; direction?: GatedDirection; suppressedReason?: string } = {}
   ): TickerSignal => ({
+    id: extra.id ?? `sig-${code}-${extra.at ?? 1_000}`,
     code: code as SecCode,
     name: `信号-${code}`,
     createdAt: extra.at ?? 1_000,
@@ -77,6 +79,83 @@ describe('buildTicker', () => {
       ]
     )
     expect(entries[0]?.action).toBe('NONE')
+  })
+
+  /*
+    观察点命中改写标签（2026-08-14）。判据只有一条：命中的**来源信号就是当前这条**。
+    钉在这里的是那条边界 —— 拿一条针对别的信号的命中去改写当前结论，
+    症状是「条子说已失效，而那条失效说的根本不是这件事」，从界面上完全看不出来。
+  */
+  const hit = (signalId: string, meaning: 'INVALIDATE' | 'CONFIRM', at = 3_000): MarkableHit => ({
+    signalId,
+    meaning,
+    hitAt: at,
+  })
+
+  it('失效条件命中 → 当前那条结论标记为已失效', () => {
+    const entries = buildTicker(
+      [item('SH600000', 'A')],
+      [quote('SH600000', 10, 0.1)],
+      [signal('SH600000', 0.8, { id: 'sig-1', direction: 'BUY' })],
+      [hit('sig-1', 'INVALIDATE')]
+    )
+    // 方向本身不改（signal 表里那条仍然是买入），改的是它现在还算不算数
+    expect(entries[0]?.action).toBe('BUY')
+    expect(entries[0]?.mark).toBe('INVALIDATED')
+  })
+
+  it('确认条件命中 → 标记为已确认', () => {
+    const entries = buildTicker(
+      [item('SH600000', 'A')],
+      [quote('SH600000', 10, 0.1)],
+      [signal('SH600000', 0.8, { id: 'sig-1' })],
+      [hit('sig-1', 'CONFIRM')]
+    )
+    expect(entries[0]?.mark).toBe('CONFIRMED')
+  })
+
+  it('命中指向别的信号时不改写 —— 包括同一只票今天更早的那条', () => {
+    const entries = buildTicker(
+      [item('SH600000', 'A')],
+      [quote('SH600000', 10, 0.1)],
+      [
+        signal('SH600000', 0.9, { id: 'sig-morning', at: 1_000 }),
+        signal('SH600000', 0.5, { id: 'sig-noon', at: 2_000, direction: 'SELL' }),
+      ],
+      [hit('sig-morning', 'INVALIDATE')]
+    )
+    // 标签取的是 sig-noon，而命中否掉的是上午那条 —— 两件事，不许串
+    expect(entries[0]?.action).toBe('SELL')
+    expect(entries[0]?.mark).toBeNull()
+  })
+
+  it('同一条信号挂多个观察点时取最近一次；同一时刻失效压过确认', () => {
+    const build = (hits: MarkableHit[]): ReturnType<typeof buildTicker> =>
+      buildTicker(
+        [item('SH600000', 'A')],
+        [quote('SH600000', 10, 0.1)],
+        [signal('SH600000', 0.8, { id: 'sig-1' })],
+        hits
+      )
+    expect(build([hit('sig-1', 'CONFIRM', 3_000), hit('sig-1', 'INVALIDATE', 4_000)])[0]?.mark).toBe(
+      'INVALIDATED'
+    )
+    expect(build([hit('sig-1', 'INVALIDATE', 4_000), hit('sig-1', 'CONFIRM', 5_000)])[0]?.mark).toBe(
+      'CONFIRMED'
+    )
+    expect(build([hit('sig-1', 'CONFIRM', 3_000), hit('sig-1', 'INVALIDATE', 3_000)])[0]?.mark).toBe(
+      'INVALIDATED'
+    )
+  })
+
+  it('还没命中的观察点（没有 hitAt）一律忽略', () => {
+    const entries = buildTicker(
+      [item('SH600000', 'A')],
+      [quote('SH600000', 10, 0.1)],
+      [signal('SH600000', 0.8, { id: 'sig-1' })],
+      [{ signalId: 'sig-1', meaning: 'INVALIDATE' }]
+    )
+    expect(entries[0]?.mark).toBeNull()
   })
 
   it('无信号是 null，不是某个中性方向', () => {

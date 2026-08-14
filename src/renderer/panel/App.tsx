@@ -26,6 +26,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import type {
   AppSettings,
   EngineStatus,
+  IntradayTHint,
   PositionView,
   ProviderHealth,
   QuoteTick,
@@ -35,6 +36,8 @@ import type {
   WatchPointView,
 } from '@shared/ipc-types'
 import { groupSignals } from '@shared/signal-group'
+import { watchMarkOf } from '@shared/watch-mark'
+import { T_HINT_LABEL, T_HINT_TITLE } from '@shared/intraday-t'
 import type { SecCode } from '@core/types'
 import { AlertLog } from './AlertLog'
 import { BrandMark } from './BrandMark'
@@ -201,6 +204,7 @@ function WatchRow({
   item,
   quote,
   position,
+  tHint,
   first,
   last,
   onRemove,
@@ -210,6 +214,12 @@ function WatchRow({
   item: WatchItem
   quote: QuoteTick | undefined
   position: PositionView | undefined
+  /**
+   * 本轮的日内做T建议（`core/risk/intraday-t.ts`）。挂在自选行而不是信号列表里：
+   * 它**只对持仓给**，而且与「引擎今天判了什么」是并列的两件事 ——
+   * 放进信号流水会让人以为引擎又出了一条结论。
+   */
+  tHint: IntradayTHint | undefined
   first: boolean
   last: boolean
   onRemove: (code: SecCode) => void
@@ -235,6 +245,19 @@ function WatchRow({
               <span className="truncate">{item.name}</span>
               {item.hasPosition ? (
                 <span className="shrink-0 rounded bg-white/10 px-1 text-[10px] text-white/60">持仓</span>
+              ) : null}
+              {/*
+                日内做T建议。**不是提醒**：它不进 alert_log、不点状态点、不发气泡，
+                只在这里和悬浮条上出现（core/risk/intraday-t.ts 的第 2 条边界）。
+                紫色与买卖两色都拉开 —— 它是并排的另一件事，不是引擎改口。
+              */}
+              {tHint ? (
+                <span
+                  className="shrink-0 rounded bg-violet-400/15 px-1 text-[10px] text-violet-200/85"
+                  title={`${T_HINT_TITLE[tHint.side]}（${tHint.reason}）`}
+                >
+                  {T_HINT_LABEL[tHint.side]}
+                </span>
               ) : null}
             </span>
             <span className="block font-mono text-xs text-white/40">
@@ -311,6 +334,11 @@ export function App(): React.JSX.Element {
   const [status, setStatus] = useState<EngineStatus | null>(null)
   const [health, setHealth] = useState<ProviderHealth[]>([])
   const [positions, setPositions] = useState<PositionView[]>([])
+  /*
+    本轮的日内做T建议。**每轮全量替换**：它的时效只有几十分钟，
+    留着上一轮的会让早上那条建议一直挂到收盘（push:intradayT 的头注释记着同一条）。
+  */
+  const [tHints, setTHints] = useState<IntradayTHint[]>([])
   const [error, setError] = useState<string | null>(null)
   const [transfer, setTransfer] = useState<TransferOutcome | null>(null)
   // 引擎每轮跑完会推一次 engineStatus；用它当信号与提醒日志的重取信号
@@ -459,6 +487,8 @@ export function App(): React.JSX.Element {
     (record: SignalRecord): React.JSX.Element => (
       <SignalRow
         record={record}
+        // 用户自己设的条件把这条结论否掉了 / 确认了。与悬浮条共用同一份判据
+        mark={watchMarkOf(record.id, watchHits)}
         expanded={signalEvidence.expandedId === record.id}
         evidence={signalEvidence.evidence[record.id] ?? null}
         aiReady={aiReady}
@@ -466,7 +496,7 @@ export function App(): React.JSX.Element {
         onToggle={signalEvidence.toggle}
       />
     ),
-    [signalEvidence, aiReady, openDrawer]
+    [signalEvidence, aiReady, openDrawer, watchHits]
   )
 
   /**
@@ -543,9 +573,12 @@ export function App(): React.JSX.Element {
       // 每轮取数后基础信息可能补上了名称/行业，健康度也变了，顺带重取一次
       void reload()
     })
+    // 全量替换：主进程每轮都推，没有建议时推空数组（见 push:intradayT 的说明）
+    const offTHints = window.gp.on('push:intradayT', setTHints)
     return () => {
       offStatus()
       offQuotes()
+      offTHints()
     }
   }, [reload])
 
@@ -559,6 +592,7 @@ export function App(): React.JSX.Element {
 
   const quoteOf = useMemo(() => new Map(quotes.map((q) => [q.code, q])), [quotes])
   const positionOf = useMemo(() => new Map(positions.map((p) => [p.code, p])), [positions])
+  const tHintOf = useMemo(() => new Map(tHints.map((h) => [h.code, h])), [tHints])
 
   const refreshStatus = useCallback((): void => {
     void window.gp.invoke('app:engineStatus').then(setStatus)
@@ -769,6 +803,7 @@ export function App(): React.JSX.Element {
                   item={item}
                   quote={quoteOf.get(item.code)}
                   position={positionOf.get(item.code)}
+                  tHint={tHintOf.get(item.code)}
                   first={i === 0}
                   last={i === items.length - 1}
                   onRemove={remove}
