@@ -950,6 +950,14 @@ export interface IpcInvokeMap {
   'watch:remove': (id: string) => boolean
   /** 从一段解读正文里抽建议，用于预填表单。抽不到返回空数组 */
   'watch:suggest': (text: string) => WatchSuggestion[]
+  /**
+   * 最近一个交易日的收盘日报。数据层没起来时返回 null（而不是一份空报告 ——
+   * 「还没准备好」与「今天什么都没发生」是两件事）。
+   *
+   * **只有最近一个交易日**：`position` 是当前状态，拿它算历史那天的浮盈亏是错的，
+   * 而错的方式用户看不出来（见 controller.dailyReport 的头注释）。
+   */
+  'report:daily': () => DailyReport | null
   'pet:setHitRegion': (rects: Rect[]) => void
   /**
    * 渲染层完成命中判定后上报：鼠标是否落在悬浮条本体上。

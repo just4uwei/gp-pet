@@ -42,6 +42,7 @@ import type { SecCode } from '@core/types'
 import { AlertLog } from './AlertLog'
 import { BrandMark } from './BrandMark'
 import { ConfigTransferButtons, ConfigTransferNotice, type TransferOutcome } from './ConfigTransfer'
+import { DailyReportPanel } from './DailyReport'
 import { FOOTER_NOTE } from './disclaimer'
 import { Onboarding } from './Onboarding'
 import { Settings } from './Settings'
@@ -52,18 +53,20 @@ import { useSignalEvidence } from './useSignalEvidence'
 import { WatchPoints } from './WatchPoints'
 
 /**
- * 四个标签页。**不做路由** —— 面板只有四屏，`useState` 比引一个 router 便宜得多。
+ * 五个标签页。**不做路由** —— 面板只有五屏，`useState` 比引一个 router 便宜得多。
  *
- * 「概览」是默认页且是唯一有推送的一屏（行情每轮都在变）；其余三个标签页都是
+ * 「概览」是默认页且是唯一有推送的一屏（行情每轮都在变）；其余四个标签页都是
  * 「打开看一眼」的性质，所以它们**不订阅推送**，只在切进来时拉一次。
  *
  * 「观察点」的标题带 ACTIVE 计数 —— 那是「软件现在在盯什么」最直接的回答，
  * 而这个功能的全部意义就在于让用户看得见它在盯。
  */
-type Tab = 'OVERVIEW' | 'WATCH' | 'SHADOW' | 'SETTINGS'
+type Tab = 'OVERVIEW' | 'REPORT' | 'WATCH' | 'SHADOW' | 'SETTINGS'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'OVERVIEW', label: '概览' },
+  // 日报排在概览之后：它是「一天结束后看一眼」的东西，比观察点更常用
+  { id: 'REPORT', label: '日报' },
   { id: 'WATCH', label: '观察点' },
   { id: 'SHADOW', label: '影子运行' },
   { id: 'SETTINGS', label: '设置' },
@@ -758,6 +761,16 @@ export function App(): React.JSX.Element {
       ) : null}
 
       {/* 影子运行与设置是单栏长内容，交给这一层滚动 */}
+      {/*
+        日报与观察点、影子运行同一形态：**不订阅推送**，切进来时拉一次。
+        `signalKey` 每轮引擎跑完递增，切回来时自然是最新的 ——
+        让一份「收盘总结」每 30 秒跳一次数字既没必要也让人分心。
+      */}
+      {tab === 'REPORT' ? (
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-5">
+          <DailyReportPanel refreshKey={signalKey} />
+        </div>
+      ) : null}
       {tab === 'WATCH' ? (
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
           <WatchPoints refreshKey={watchKey} onChanged={refreshWatch} onError={setError} />

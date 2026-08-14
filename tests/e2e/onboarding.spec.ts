@@ -103,7 +103,7 @@ test.describe('首次启动引导', () => {
   })
 })
 
-test.describe('面板四屏', () => {
+test.describe('面板五屏', () => {
   let userData = ''
   let app: ElectronApplication | null = null
 
@@ -194,5 +194,25 @@ test.describe('面板四屏', () => {
     await expect(panel.getByText(/不是策略参数/)).toBeVisible()
     await expect(panel.getByText(/还没有观察点/)).toBeVisible()
     await expect(panel.getByText(/让 AI 解读一次/)).toBeVisible()
+  })
+
+  /**
+   * 收盘日报的空态。
+   *
+   * 验的是三件在别处验不了的事：页真的打得开（IPC 通道登记了、controller 没抛）、
+   * 空库时如实说「还没有自选股」而不是画一屏 0、
+   * 以及**「这里不产生新的判断」那句话摆在页面上** ——
+   * 「日报只复述不推导」是这个功能的核心纪律，它必须对用户可见，
+   * 不能只写在 report/build.ts 的头注释里。
+   */
+  test('日报：页面能打开，空态如实说没有自选，并声明不产生新判断', async () => {
+    const panel = await openPanel(app as ElectronApplication)
+    await panel.getByRole('button', { name: '日报' }).click()
+
+    // 精确匹配：概览页是**常驻挂载**的（只切 display），它那句
+    // 「还没有自选股，先在上面添加一只。」同时在 DOM 里，模糊匹配会撞上两个
+    await expect(panel.getByText('还没有自选股。', { exact: true })).toBeVisible()
+    await expect(panel.getByText(/这里不产生新的判断/)).toBeVisible()
+    await expect(panel.getByText(/没有需要明天跟进的事项/)).toBeVisible()
   })
 })

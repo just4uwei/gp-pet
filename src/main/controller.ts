@@ -29,6 +29,7 @@ import type {
   AppSettings,
   ConfigTransferResult,
   DailyBar,
+  DailyReport,
   EngineStatus,
   IntradaySeries,
   MaintenanceResult,
@@ -49,8 +50,8 @@ import type {
   WatchPointDraft,
   WatchPointView,
 } from '@shared/ipc-types'
-import type { Position, SecCode } from '@core/types'
-import { engineVersionOf, withSensitivity } from '@core/params'
+import type { Candle, Position, SecCode, Snapshot, TradeDate } from '@core/types'
+import { DEFAULT_PARAMS, engineVersionOf, withSensitivity } from '@core/params'
 import { sma } from '@core/indicators/series'
 import {
   AI_CONFIG_FILE,
@@ -72,7 +73,7 @@ import { createNotificationStateProbe, type NotificationStateProbe } from './ale
 import type { DataLayer } from './data-layer'
 import type { SignalOutcome } from './engine'
 import { log } from './logging'
-import type { TickContext } from './scheduler'
+import { shanghaiTime, type TickContext } from './scheduler'
 import type { WatchEntry } from './storage/repositories/watchlist'
 import { DEFAULT_SETTINGS } from './settings/schema'
 import {
@@ -93,6 +94,7 @@ import {
   writeTextFile,
 } from './settings/transfer-io'
 import { paramRows } from './settings/params-view'
+import { buildDailyReport } from './report/build'
 import {
   DEFAULT_SHADOW_CAPITAL,
   emptyShadowSummary,
@@ -1088,6 +1090,65 @@ export class AppController {
   /** 空数组 = 全部已读（用户打开提醒日志即视为看过） */
   markAlertsRead(ids: string[]): number {
     return this.alerts?.markRead(ids, Date.now()) ?? 0
+  }
+
+  // ── 收盘日报 ──────────────────────────────────────────────────
+  //
+  // **这一层只凑数据，不做判断** —— 判据全在 `report/build.ts`（纯函数，有用例）。
+  // 日报不是提醒：不进 alert_log、不点状态点、不弹气泡，出口只有面板那个页签。
+
+  /**
+   * 最近一个交易日的日报。
+   *
+   * **刻意只做「最近一个交易日」，不支持翻历史。** `position` 表是**当前**状态，
+   * 拿它去算三天前那天的浮盈亏会得到一个错的数，而错的方式用户看不出来。
+   * 要做历史得先用 `trades/ledger.ts` 的 `replayTrades` 重建那一天的持仓，单独排期。
+   */
+  dailyReport(): DailyReport | null {
+    const layer = this.data
+    if (!layer) return null
+
+    // 「最近一个交易日」取**库里最新的那根日线**，不取本机日期：
+    // 周末与节假日打开时，本机的「今天」根本没有行情
+    const items = layer.watchlist.list()
+    const dates = items
+      .map((item) => layer.storage.klines.lastDate(item.code))
+      .filter((d): d is TradeDate => d !== null)
+    // 一根日线都没有时退到本机日期 —— 那时报告里全是「—」，而那正是实情
+    const date = dates.sort().at(-1) ?? shanghaiTime(Date.now()).date
+
+    const bars = new Map<SecCode, { day: Candle; prev?: Candle }>()
+    for (const item of items) {
+      // 要两根：涨跌幅与振幅的分母是**昨收**，而 Candle 里没有这一列
+      const pair = layer.storage.klines.recentThrough(item.code, date, 2)
+      const day = pair.at(-1)
+      // 末根不是那一天 → 这只当天没有收盘线（停牌 / 数据没到），交给快照那条退路
+      if (!day || day.date !== date) continue
+      const prev = pair.length >= 2 ? pair[pair.length - 2] : undefined
+      bars.set(item.code, prev ? { day, prev } : { day })
+    }
+
+    const snapshots = new Map<SecCode, Snapshot>()
+    for (const item of items) {
+      const snapshot = layer.market.snapshotOf(item.code)
+      if (snapshot) snapshots.set(item.code, snapshot)
+    }
+
+    const dayStart = new Date(new Date().setHours(0, 0, 0, 0)).getTime()
+    return buildDailyReport({
+      date,
+      at: Date.now(),
+      items,
+      bars,
+      snapshots,
+      // 含被硬抑制的：面板要能回答「它为什么没提醒我」（docs/05 §4）
+      signals: layer.signalHistory({ from: dayStart, limit: 500, perCode: 50 }),
+      positions: this.positions(),
+      watchPoints: this.watchPoints({ limit: 500 }),
+      alerts: this.alertHistory({ from: dayStart, limit: 500 }),
+      stopLossPct: DEFAULT_PARAMS.risk.stopLossPct,
+      dayStart,
+    })
   }
 
   get unreadAlerts(): number {

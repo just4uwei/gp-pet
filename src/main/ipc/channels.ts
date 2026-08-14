@@ -53,6 +53,7 @@ export const INVOKE_CHANNELS = [
   'watch:create',
   'watch:remove',
   'watch:suggest',
+  'report:daily',
   'app:backupDatabase',
   'app:clearCache',
   'app:chooseDataDir',
