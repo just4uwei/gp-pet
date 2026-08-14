@@ -82,8 +82,9 @@ export function registerHandlers(controller: AppController): void {
 
   handle('trade:remove', (_event, id) => controller.removeTrade(id))
 
-  // 当日分时留痕（004_quote_tick.sql）。**只在面板展开某个信号分组时才被调**，
-  // 所以这里不做任何缓存 —— 一次查询就是一条 SQLite 索引扫描
+  // 当日分时。**只在用户打开抽屉「行情」页时才被调**，且是全应用唯一一处
+  // 由用户交互直接触发取数的通道 —— 缓存与降级都在数据层（data-layer 的 minuteCache
+  // 与 engine/intraday.ts），这里只透传。
   handle('quote:intraday', (_event, query) =>
     controller.intradaySeries({
       code: normalizeCode(query.code),

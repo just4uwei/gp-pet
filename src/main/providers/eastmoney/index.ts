@@ -12,7 +12,7 @@
 import type { AdjustMode, SecCode, SecProfile, Snapshot, TradeDate } from '@core/types'
 import { isSTName, splitCode } from '@core/code'
 import type { HttpClient } from '../../net/http'
-import type { ProviderCapabilities, QuoteProvider } from '../types'
+import type { MinutePoint, MinuteSeries, ProviderCapabilities, QuoteProvider } from '../types'
 import {
   ProviderDataError,
   type RawBar,
@@ -27,6 +27,7 @@ import {
   inferSuspended,
   mergeAdjusted,
   num,
+  parseDateTime,
   positive,
   resolveLimits,
   withoutAdjustment,
@@ -37,6 +38,7 @@ const ID = 'eastmoney'
 const KLINE_URL = 'https://push2his.eastmoney.com/api/qt/stock/kline/get'
 const SNAPSHOT_URL = 'https://push2.eastmoney.com/api/qt/ulist.np/get'
 const PROFILE_URL = 'https://push2.eastmoney.com/api/qt/stock/get'
+const TRENDS_URL = 'https://push2his.eastmoney.com/api/qt/stock/trends2/get'
 
 /**
  * 接口必需的查询参数，不是伪造身份 —— 缺了它多数端点直接 400。
@@ -88,10 +90,21 @@ const P = { digits: 'f57', name: 'f58', industry: 'f127', listedAt: 'f189' } as 
 /** 由基准指数日线反推交易日历时用它。上证指数历史最长，任何年份都有数据。 */
 const CALENDAR_BENCHMARK: SecCode = 'SH000001'
 
+/** trends2 里 CSV 的列序，由 fields2 决定 —— 两者必须一起改 */
+const TRENDS_FIELDS = 'f51,f53,f56,f58'
+const T = {
+  /** 'YYYY-MM-DD HH:mm' */
+  time: 0,
+  last: 1,
+  /** 手 —— 分时图不画量，留着是为了列序对得上 */
+  volumeHands: 2,
+  avg: 3,
+} as const
+
 const CAPABILITIES: ProviderCapabilities = {
   daily: true,
   snapshot: true,
-  minute: false,
+  minute: true,
   profile: true,
   calendar: true,
 }
@@ -161,6 +174,56 @@ export function parseKline(body: string, from: TradeDate, to: TradeDate): RawBar
   }
   bars.sort((a, b) => a.date.localeCompare(b.date))
   return bars
+}
+
+// ─────────────────────────── 分时 ───────────────────────────
+
+interface TrendsResponse {
+  rc?: number
+  data?: { trends?: unknown; preClose?: unknown } | null
+}
+
+/**
+ * `data.trends` 的每行是 `'2026-08-14 09:31,10.11,1234,10.10'`。
+ *
+ * **`tradeDate` 取自数据本身的第一行，不取本机日期** —— 休市日请求这个端点，
+ * 返回的是上一个交易日那条曲线，用本机日期去标就等于把周五的走势说成今天的。
+ */
+export function parseTrends(body: string): MinuteSeries {
+  let parsed: TrendsResponse
+  try {
+    parsed = JSON.parse(body) as TrendsResponse
+  } catch {
+    throw new ProviderDataError(ID, `分时返回不是 JSON：${body.slice(0, 80)}`)
+  }
+  if (parsed.rc !== undefined && parsed.rc !== 0) {
+    throw new ProviderDataError(ID, `分时返回 rc=${parsed.rc}`)
+  }
+
+  const rows = parsed.data?.trends
+  if (rows !== undefined && rows !== null && !Array.isArray(rows)) {
+    throw new ProviderDataError(ID, 'trends 不是数组，疑似接口变更')
+  }
+
+  const points: MinutePoint[] = []
+  let tradeDate = ''
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (typeof row !== 'string') continue
+    const cells = row.split(',')
+    const stamp = (cells[T.time] ?? '').trim()
+    const [date = '', time = ''] = stamp.split(' ')
+    const ts = parseDateTime(date, time)
+    const last = positive(cells[T.last])
+    if (ts === null || last === null) continue
+    if (tradeDate === '') tradeDate = date
+    // 跨日的返回（ndays > 1，或接口自己拼了两天）只保留第一天那段：
+    // 这张图画的是「一个交易日」，两天连起来会在午夜处画出一条不存在的长线
+    if (date !== tradeDate) continue
+    points.push({ ts, last, avg: positive(cells[T.avg]) })
+  }
+  points.sort((a, b) => a.ts - b.ts)
+
+  return { tradeDate, preClose: positive(parsed.data?.preClose), points }
 }
 
 // ─────────────────────────── 快照 ───────────────────────────
@@ -291,6 +354,27 @@ export function createEastmoneyProvider(options: EastmoneyOptions): QuoteProvide
         })
       )
       return batches.flat()
+    },
+
+    /**
+     * 当日分时。`ndays=1` 只要最近一个交易日 —— 休市时它给的是**上一个交易日**，
+     * 这不是错误，由 `tradeDate` 如实带出去，上层照它画 x 轴。
+     */
+    async fetchMinutes(code: SecCode): Promise<MinuteSeries> {
+      const secid = toSecId(code)
+      if (!secid) throw new ProviderDataError(ID, `无法识别的代码：${code}`)
+
+      const query = new URLSearchParams({
+        secid,
+        ut: UT,
+        fields1: 'f1,f2,f3,f4,f5,f6,f7,f8',
+        fields2: TRENDS_FIELDS,
+        // iscr=0 不含盘前集合竞价那一段（09:15–09:25 是虚价，docs/03 §3 的 AUCTION 一行）
+        iscr: '0',
+        ndays: '1',
+      })
+      const { body } = await http.get(`${TRENDS_URL}?${query.toString()}`)
+      return parseTrends(body)
     },
 
     async fetchProfile(code: SecCode): Promise<SecProfile> {

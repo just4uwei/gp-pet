@@ -10,6 +10,8 @@ export {
   createMarketDataService,
   expectedLastBar,
 } from './market-data'
+export { MINUTE_CACHE_TTL_MS, createMinuteCache, mergeIntraday, shanghaiTradeDate } from './intraday'
+export type { IntradayWindow, LocalIntraday, MinuteCache } from './intraday'
 export { BENCHMARK_CODE, createSignalEngine, evidencePayload, snapshotOfIndicators, toSignalRecord } from './signals'
 export type { SignalEngine, SignalEngineDeps, SignalOutcome, TickInfo } from './signals'
 export { MAINTENANCE_INTERVAL_MS, createTickPipeline } from './tick'

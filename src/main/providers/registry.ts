@@ -18,6 +18,7 @@
 import type { AdjustMode, Candle, SecCode, SecProfile, Snapshot, TradeDate } from '@core/types'
 import type {
   HealthRecord,
+  MinuteSeries,
   ProviderCapabilities,
   ProviderId,
   ProviderRegistryOptions,
@@ -142,6 +143,10 @@ export interface ProviderRegistry {
   fetchSnapshots(codes: SecCode[]): Promise<RegistryResult<Snapshot[]>>
   fetchProfile(code: SecCode): Promise<RegistryResult<SecProfile>>
   fetchCalendar(year: number): Promise<RegistryResult<CalendarDay[]>>
+  /** 当日分时（用户打开抽屉时才调，见 types.ts fetchMinutes） */
+  fetchMinutes(code: SecCode): Promise<RegistryResult<MinuteSeries>>
+  /** 当前有没有源能给分时 —— 没有时上层直接走本机留痕，不必白发一轮 */
+  supports(capability: Capability): boolean
 
   /** 两个快照源交叉抽检最新价，偏差过大记告警。返回越界的那些 */
   crossCheck(codes: SecCode[]): Promise<CrossCheckAlarm[]>
@@ -315,6 +320,26 @@ export function createProviderRegistry(config: RegistryOptions): ProviderRegistr
 
     fetchProfile(code) {
       return run('profile', (provider) => provider.fetchProfile(code), { label: `profile ${code}` })
+    },
+
+    /**
+     * 分时。**刻意不传 `emptyIsFailure`** —— 停牌股、开盘前请求都会合法地返回 0 个点，
+     * 把它记成失败会一路降级三个源、跳熔断，进而拖累 tick 路径依赖的那几个源，
+     * 还会污染 docs/08 M1 的「成功率 > 99%」出口指标。而它换来的只是一张图没画出来。
+     */
+    fetchMinutes(code) {
+      return run(
+        'minute',
+        async (provider) => {
+          if (!provider.fetchMinutes) throw new Error(`${provider.id} 声明了 minute 但未实现`)
+          return provider.fetchMinutes(code)
+        },
+        { label: `minute ${code}` }
+      )
+    },
+
+    supports(capability) {
+      return candidates(capability).length > 0
     },
 
     fetchCalendar(year) {

@@ -31,11 +31,19 @@
  * 全部提到 `App`：抽屉与列表共用同一份 `expandedId` / `evidence`
  * —— 各存一套的话，在列表里展开的那条进抽屉会「忘记」自己是展开的，
  * AI 解读还会因重新挂载被取消（`AiExplain` 是卸载即取消的）。
+ *
+ * ## ⚠ 这个列表能把正在跑的 AI 解读摘掉（2026-08-14 修过一次）
+ *
+ * 上面那句「卸载即取消」不只在抽屉那条路上成立，**组头换人也会触发它**：
+ * 每组常显的只有 `latest`，同一只票再来一条信号（盘中每轮 tick 都可能）就把
+ * 用户正展开着的那条挤出列表 —— 分析界面自己消失，而那次调用已经计过费。
+ * 修法见 `SignalGroupItem` 的 `pinnedSignal`。
+ * **改分组、排序、`key`、条件渲染之前先问一句：会不会把某个正在跑的 `AiExplain` 摘掉。**
  */
 
 import type { AlertLevel, GatedDirection, Regime, SecCode } from '@core/types'
 import type { SignalEvidence, SignalRecord } from '@shared/ipc-types'
-import type { SignalGroup } from '@shared/signal-group'
+import { pinnedSignal, type SignalGroup } from '@shared/signal-group'
 import { AiExplain } from './AiExplain'
 
 const DIRECTION_LABEL: Record<GatedDirection, string> = {
@@ -261,24 +269,49 @@ export function CountChips({ group }: { group: SignalGroup<SignalRecord> }): Rea
 }
 
 /**
- * 一只标的的一组信号：常显最新那条，其余在**抽屉**里看。
+ * 一只标的的一组信号：常显最新那条 + **正展开着的那条**，其余在抽屉里看。
  *
  * 徽标行是**主行之外**的另一个按钮（见文件头）。它同时管两件事：
  * 看同股的旧信号，以及看当日走势图 —— 两者回答的是同一个问题
  *（「今天这只票到底怎么了」），分开放反而要点两次。
+ *
+ * ## 为什么要多钉一条（2026-08-14 修）
+ *
+ * 只渲染 `latest` 时，同一只票再来一条信号会把用户**正展开着、AI 解读正在生成**
+ * 的那条挤出列表 —— 组件卸载、请求被取消（`AiExplain` 是卸载即取消的），
+ * 用户看到的是「等了四十秒的分析界面自己没了」，而那次调用已经计过费。
+ * 判据是纯函数 `pinnedSignal`（在 shared，有用例），这里只负责画。
  */
 function SignalGroupItem({
   group,
+  expandedId,
   renderRow,
   onOpen,
 }: {
   group: SignalGroup<SignalRecord>
+  /** 当前展开的信号 id。组头之外的那条要靠它决定钉不钉住 */
+  expandedId: string | null
   renderRow: (record: SignalRecord) => React.JSX.Element
   onOpen: (code: SecCode) => void
 }): React.JSX.Element {
+  const pinned = pinnedSignal(group, expandedId)
   return (
     <li className="border-b border-white/[0.06] py-2 last:border-b-0">
       {renderRow(group.latest)}
+
+      {/*
+        钉住的那条画在新信号**下面**：新来的必须在最上面（这是这个列表的本职），
+        用户正在看的那条跟在后面。加一行说明是因为「同一只票凭空多出一行」
+        本身会让人困惑 —— 不说的话，看起来像列表出了重复。
+      */}
+      {pinned ? (
+        <div className="mt-2 border-l-2 border-violet-400/25 pl-2">
+          <p className="mb-1 text-[10px] leading-snug text-white/30">
+            上面是刚到的新信号；这条是你正在看的那条，留在这里没有打断它。
+          </p>
+          {renderRow(pinned)}
+        </div>
+      ) : null}
 
       <button
         className="mt-1 flex w-full items-center gap-1 text-left"
@@ -299,6 +332,7 @@ function SignalGroupItem({
 
 export function SignalList({
   groups,
+  expandedId,
   suppressedCount,
   showSuppressed,
   onShowSuppressed,
@@ -307,6 +341,8 @@ export function SignalList({
 }: {
   /** 已按「含被静默的」筛过、并分好组的数据。拉取与分组都在 App（见文件头） */
   groups: readonly SignalGroup<SignalRecord>[]
+  /** 当前展开的信号 id。用来把它钉在组里，别被新信号挤掉（见 SignalGroupItem） */
+  expandedId: string | null
   suppressedCount: number
   showSuppressed: boolean
   onShowSuppressed: (next: boolean) => void
@@ -337,7 +373,13 @@ export function SignalList({
       ) : (
         <ul className="min-h-0 flex-1 overflow-y-auto px-3">
           {groups.map((group) => (
-            <SignalGroupItem key={group.code} group={group} renderRow={renderRow} onOpen={onOpen} />
+            <SignalGroupItem
+              key={group.code}
+              group={group}
+              expandedId={expandedId}
+              renderRow={renderRow}
+              onOpen={onOpen}
+            />
           ))}
         </ul>
       )}

@@ -35,20 +35,33 @@ export interface QuoteTick {
 }
 
 /**
- * 当日分时留痕（004_quote_tick.sql）。面板「今日信号」展开分组时画那张走势图用。
+ * 当日分时（抽屉「行情」页那张走势图）。**两种来源，图上必须可分辨**：
  *
- * **它不是完整的分时。** 覆盖范围 = 应用开着的时段，而且取数失败那几轮不入库
- * （stale 快照是缓存重放，写进去会画出一条其实没有成交的平线）。
- * 所以 `points` **会有洞**：午休那段、以及用户当时没开机的那段。
- * 渲染层必须把洞画成断线并标注覆盖起点，**不许用直线连过去** ——
- * 那条斜线看着像分时线，但那段时间里什么都没被观测到。
+ * - `REMOTE` —— 数据源的逐分钟分时，09:30 起覆盖全天。用户打开抽屉时拉一次
+ *   （带 30s 缓存，不进 tick 轮询，见 providers/types.ts fetchMinutes）。
+ * - `LOCAL` —— 拉不到时退到本机留痕 `quote_tick`（004_quote_tick.sql）。
+ *   它**不是完整的分时**：覆盖范围 = 应用开着的时段，取数失败那几轮还不入库
+ *   （stale 快照是缓存重放，写进去会画出一条其实没有成交的平线）。
+ *
+ * 所以 `points` **两种来源都可能有洞**（REMOTE 是午休，LOCAL 还多了「当时没开机」）。
+ * 渲染层一律把洞画成断线，**不许用直线连过去** —— 那条斜线看着像分时线，
+ * 但那段时间里什么都没被观测到。而 `LOCAL` 还必须额外标注覆盖起点：
+ * 一条半截曲线不许看起来像全天。
  */
 export interface IntradaySeries {
   code: SecCode
+  /**
+   * 这串点属于哪个交易日（`YYYY-MM-DD`）。**可能不是今天** —— 休市日打开抽屉时
+   * 数据源给的是上一个交易日那条曲线。渲染层按它推 x 轴并在文案里点名，
+   * 默认当成今天画会得到一条日期错位、图上却完全看不出来的假曲线。
+   * 一个点都没有时为 null。
+   */
+  tradeDate: TradeDate | null
+  source: 'REMOTE' | 'LOCAL'
   /** 昨收，画基准线用。数据源没给时为 null —— 不要用 0 顶替（约束 4） */
   preClose: number | null
-  /** 按 ts 升序，**可能有洞**（见上） */
-  points: { ts: number; last: number }[]
+  /** 按 ts 升序，**可能有洞**（见上）。`avg` 是当日均价，`LOCAL` 一律 null，不插值补 */
+  points: { ts: number; last: number; avg: number | null }[]
 }
 
 /**
@@ -632,10 +645,14 @@ export interface IpcInvokeMap {
   'position:set': (code: SecCode, shares: number, cost: number) => void
   'position:clear': (code: SecCode) => void
   /**
-   * 当日分时留痕。**只在面板展开某个信号分组时才发** —— 列表平时零额外 IPC。
+   * 当日分时。**只在用户打开抽屉「行情」页时才发** —— 列表平时零额外 IPC。
    * `to` 省略时取「现在」。
+   *
+   * 这条**会发一次网络请求**（主进程侧带 30s 缓存），是全应用唯一一处
+   * 由用户交互直接触发取数的地方；轮询那份请求预算（docs/03 §2.4）不包含它，
+   * 也不许反过来让 tick 去调它。
    */
-  'quote:intraday': (query: { code: SecCode; from: number; to?: number }) => IntradaySeries
+  'quote:intraday': (query: { code: SecCode; from: number; to?: number }) => Promise<IntradaySeries>
   /** 日 K（不复权 + 展示用 MA）。`limit` 缺省 60 —— 抽屉里那张图就画这么多 */
   'kline:daily': (query: { code: SecCode; limit?: number }) => DailyBar[]
   /** 某只票的成交流水与盈亏汇总 */

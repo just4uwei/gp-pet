@@ -189,6 +189,7 @@ src/backtest 回测 CLI，复用 src/core
 | 写指标或策略 | [docs/04](./docs/04-指标与信号引擎.md)（公式与口径都在这，含与来源文档的差异说明） |
 | 接数据源 | [docs/03](./docs/03-数据源与存储设计.md) + [src/main/providers/README.md](./src/main/providers/README.md) |
 | 改窗口或交互 | [docs/06](./docs/06-桌宠交互与非干扰设计.md)（§2.1 悬浮条，§5 皮肤系统已删的说明） |
+| 改分时图 | [docs/03 §2.5](./docs/03-数据源与存储设计.md)（用户触发取数的三条边界）+ [`src/main/engine/intraday.ts`](./src/main/engine/intraday.ts) 头注释（远端/本机的取舍） |
 | 换托盘 / 应用图标 | [resources/icons/README.md](./resources/icons/README.md)（png 是手绘资产；只有 `icon.ico` 是生成件，跑 `node tools/logo/make-ico.mjs` 重出，它**不在** package.json 的 scripts 里） |
 | 改提醒逻辑 | [docs/05](./docs/05-风控与提醒规则.md) |
 | 改影子运行 | [docs/07 §2.3](./docs/07-回测与验证方案.md)（四条前向纪律 + 记账口径） |
@@ -418,6 +419,38 @@ src/backtest 回测 CLI，复用 src/core
   data-layer 因此把 `signals` 存成 `let` 并给 pipeline 传 `{ run: (t) => signals.run(t) }` 转发 ——
   **直接把 `signals` 传进去的话，流水线会一直握着旧那个**，换完档以后信号还按旧参数出，
   几乎无从发现。
+- **`quote:intraday` 是唯一一条会发网络请求的 invoke，别把它当成一次 SQLite 查询。**
+  分时图 2026-08-14 起画的是数据源的逐分钟分时（`QuoteProvider.fetchMinutes`），
+  `quote_tick` 降级成拉不到时的兜底。它是全应用**唯一**由用户交互直接触发的取数，
+  docs/03 §2.4 那份「每日 < 1000 次」的轮询预算管不到它 —— 前提恰恰是**量由人决定**。
+  于是三条边界：**不许从 tick 里调 `fetchMinutes`**（那会变成「每 30 秒一整个自选列表」）；
+  闸门是 `engine/intraday.ts` 那道 30s 缓存（缓存 Promise 不缓存结果，失败立即剔除）；
+  registry 的 `fetchMinutes` **刻意不传 `emptyIsFailure`** —— 停牌股与开盘前会合法地
+  返回 0 个点，记成失败会降级三个源、跳熔断，把 tick 路径一起拖下水。
+- **分时图的 x 轴那一天由 `tradeDate` 推，不是由「今天」推。** 休市日请求这类接口，
+  数据源返回的是**上一个交易日**那条曲线（trends2 的 `ndays=1`、腾讯 minute 都如此）。
+  按今天画的症状是一张日期错位、图上却毫无破绽的假曲线。`MinuteSeries.tradeDate`
+  因此取自数据本身而不是本机日期，落在请求窗口外时整段作废并降级成 LOCAL。
+  同理**分时的时刻一律按北京时间读写**（`shared.ts shanghaiToEpochMs`、渲染层的
+  `CST_OFFSET_MS`）：用 `getHours()` 会让非 +08 的机器上 09:30 那根竖线跑到曲线中间。
+- **两家的分时后两列含义完全相反，别照着一边写另一边。** 东财 trends2 是
+  「这一分钟的量 + 接口直接给的均价」，腾讯 minute 是「**当日累计**量 + **当日累计额**」，
+  均价得自己除（`额 / (量 × 100)`）。把腾讯第 4 列直接当均价会得到一个七位数，
+  它会被算进纵轴范围 —— **症状是整条分时线被压成贴着框底的直线**，
+  图上完全看不出是哪一列读错了。两边实测同一分钟均价都是 9.132，可以拿来交叉验证。
+  另外腾讯那个端点**没有 `prec`**（网上示例里有），昨收实际来自 `qt[4]`。
+- **远端分时与本机留痕不合并，`IntradaySeries.source` 必须跟着实际用了哪份数据走。**
+  分钟收盘价与 30s 快照是两种采样口径，拼在一条线上会出现肉眼可见的锯齿，
+  而用户没有任何办法看出那是两个来源。`source` 也不是「试了远端就算 REMOTE」——
+  渲染层靠它决定要不要说「覆盖全天」，说错了就是在替一条半截曲线担保。
+  `tests/unit/main/intraday.test.ts` 钉着这几条。
+- **`AiExplain` 是「卸载即取消」的，所以任何会让它意外卸载的渲染改动都是在烧用户的钱。**
+  已经踩过一次（2026-08-14）：信号列表每组只渲染 `group.latest`，同一只票再来一条信号
+  组头就换人，用户**正展开着、AI 解读正在流式生成**的那条直接从列表里消失 ——
+  组件卸载 → `ai:cancel` → 等了四十秒的界面自己没了，而那次调用已经计过费。
+  修法是把正展开的那条钉在组里（`pinnedSignal`，在 `@shared/signal-group`，有用例），
+  **不是**去掉卸载即取消 —— 那条纪律防的是「用户已经不看了钱还在烧」，仍然要留着。
+  改分组、排序、`key`、条件渲染之前先问一句：**它会不会把某个正在跑的 `AiExplain` 摘掉**。
 - **面板的概览页保持挂载、只切 `display`，而且不能用 `hidden` 属性。** Tailwind 的 `grid` 类
   会盖掉 `hidden` 带来的 `display: none`（v4 下常见的坑），所以是显式切 `grid` / `hidden` 两个类。
   保持挂载是因为它订阅了 `push:quoteTick`，卸载再装回来会丢掉滚动位置与正在编辑的持仓行。

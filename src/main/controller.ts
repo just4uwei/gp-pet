@@ -793,14 +793,24 @@ export class AppController {
   }
 
   /**
-   * 当日分时留痕（面板信号分组里那张走势图）。
+   * 当日分时（抽屉「行情」页那张图）。**会发一次网络请求**，带 30s 缓存，
+   * 拉不到时由数据层退回本机留痕 —— 取舍规则在 engine/intraday.ts。
    *
    * 数据层没起来时返回空序列而不是抛错 —— 与 `signalHistory` 同一条：
    * 一张图画不出来不该让整个面板报错。空序列在渲染层有自己的说法
-   * （「今天还没记到分时数据」），而那句话恰好是真的。
+   * （「今天还没有分时数据」），而那句话恰好是真的。
    */
-  intradaySeries(query: { code: SecCode; from: number; to?: number }): IntradaySeries {
-    return this.data?.intradaySeries(query) ?? { code: query.code, preClose: null, points: [] }
+  intradaySeries(query: { code: SecCode; from: number; to?: number }): Promise<IntradaySeries> {
+    return (
+      this.data?.intradaySeries(query) ??
+      Promise.resolve({
+        code: query.code,
+        tradeDate: null,
+        source: 'LOCAL' as const,
+        preClose: null,
+        points: [],
+      })
+    )
   }
 
   /** 用户点「刷新」或新加自选后：跑一轮 tick。失败只记日志，不弹窗 */

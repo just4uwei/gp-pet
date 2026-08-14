@@ -31,8 +31,10 @@ import {
   BENCHMARK_CODE,
   createMarketDataService,
   createSignalEngine,
+  createMinuteCache,
   createTickPipeline,
   createWatchlistService,
+  mergeIntraday,
   type MarketDataService,
   type SignalEngine,
   type SignalOutcome,
@@ -47,6 +49,7 @@ import {
   createProviderRegistry,
   DEFAULT_REGISTRY_OPTIONS,
   perProviderLimited,
+  type MinuteSeries,
   type ProviderId,
   type ProviderRegistry,
   type QuoteProvider,
@@ -106,8 +109,11 @@ export interface DataLayer {
   }
   health(): ProviderHealth[]
   quoteTicks(): QuoteTick[]
-  /** 当日分时留痕，只服务面板上那张走势图（见 004_quote_tick.sql） */
-  intradaySeries(query: { code: SecCode; from: number; to?: number }): IntradaySeries
+  /**
+   * 当日分时，只服务抽屉「行情」页那张图。**会发一次网络请求**（带 30s 缓存），
+   * 拉不到时退回本机留痕 `quote_tick` —— 取舍规则在 engine/intraday.ts。
+   */
+  intradaySeries(query: { code: SecCode; from: number; to?: number }): Promise<IntradaySeries>
   signalHistory(query: { code?: SecCode; from?: number; to?: number; limit?: number }): SignalRecord[]
   explainSignal(id: string): SignalEvidence | null
   /** 最近一轮的评估结果，供桌宠状态与面板使用 */
@@ -120,6 +126,7 @@ export function changePct(last: number, preClose: number): number {
   if (!Number.isFinite(last) || !Number.isFinite(preClose) || preClose <= 0) return 0
   return ((last - preClose) / preClose) * 100
 }
+
 
 export async function createDataLayer(options: DataLayerOptions): Promise<DataLayer> {
   const {
@@ -163,6 +170,9 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     options: { priority: [...settings.providerPriority] },
     now,
   })
+
+  // ── 分时缓存（engine/intraday.ts，它是这条取数路径自己的请求闸门）───────
+  const minuteCache = createMinuteCache((code) => registry.fetchMinutes(code).then((r) => r.value), now)
 
   // ── 交易日历 ───────────────────────────────────────────────────
   const holidays = loadHolidayTable(resourcesRoot)
@@ -378,13 +388,25 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
       })
     },
 
-    intradaySeries(query) {
+    async intradaySeries(query) {
       const to = query.to ?? now()
-      return {
-        code: query.code,
+      const local = {
         preClose: storage.quoteTicks.preCloseOf(query.code, query.from, to),
         points: storage.quoteTicks.series(query.code, query.from, to),
       }
+
+      let remote: MinuteSeries | null = null
+      if (registry.supports('minute')) {
+        try {
+          remote = await minuteCache.get(query.code)
+        } catch (error) {
+          // 一张图拉不到不该让面板报错，也不该顶掉本机留痕 ——
+          // 降级路径本来就在，而它的文案（「自 xx:xx 起在本机记录」）恰好是真的
+          log.warn(`[intraday] ${query.code} 取分时失败，退回本机留痕：`, error)
+        }
+      }
+
+      return mergeIntraday(query.code, local, remote, { from: query.from, to })
     },
 
     signalHistory(query) {

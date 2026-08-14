@@ -31,6 +31,12 @@ const TITLE_BAR_HEIGHT = 40
 
 export type StockTab = 'QUOTE' | 'SIGNAL' | 'POSITION'
 
+/** 北京时间那一天的 00:00（epoch ms）。交易时段是交易所的，不看本机时区 */
+function beijingDayStart(at: number): number {
+  const offset = 8 * 60 * 60_000
+  return Math.floor((at + offset) / 86_400_000) * 86_400_000 - offset
+}
+
 const TABS: { key: StockTab; label: string }[] = [
   { key: 'QUOTE', label: '行情' },
   { key: 'SIGNAL', label: '信号' },
@@ -95,8 +101,10 @@ export function StockDrawer({
     direction: record.direction,
   }))
 
-  /** 当天 00:00，分时图的 x 轴由它推出 09:30–15:00 */
-  const dayStart = new Date(new Date().setHours(0, 0, 0, 0)).getTime()
+  // 当天 00:00 —— 按**北京时间**，不是本机时区。它同时是分时的查询窗口下界，
+  // 而 quote_tick.ts 与数据源的分时时刻都是交易所时间：机器设成别的时区时，
+  // 用本机零点会把窗口整体挪走，图上会缺掉一头
+  const dayStart = beijingDayStart(Date.now())
 
   return createPortal(
     <>

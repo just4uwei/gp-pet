@@ -90,3 +90,28 @@ export function groupSignals<T extends GroupableSignal>(records: readonly T[]): 
 
   return groups.sort((a, b) => b.latest.createdAt - a.latest.createdAt)
 }
+
+/**
+ * 组里除组头之外、**必须继续渲染**的那一条：用户正展开着的那条。
+ *
+ * ## 这不是「顺便多显示一条」，是在挡一个会烧钱的 bug
+ *
+ * 列表常显的只有 `latest`。同一只票再来一条信号（盘中每轮 tick 都可能），
+ * `latest` 就换人了 —— 于是用户**正展开着、AI 解读正在流式生成**的那条
+ * 直接从列表里消失，`AiExplain` 跟着卸载，而它是「卸载即取消」的。
+ * 用户看到的是：等了四十秒的分析界面自己没了，什么提示都没有，
+ * 而那次调用已经按对方规则计过费了。
+ *
+ * 组头照旧是 `latest`（新信号必须立刻可见，这是这个列表的本职），
+ * 正在看的那条**钉在它下面**，两条都在。
+ *
+ * 返回 null 的三种情况：没有展开任何一条、展开的那条就是组头（已经在渲染了）、
+ * 展开的那条不属于这个组。
+ */
+export function pinnedSignal<T extends GroupableSignal & { id: string }>(
+  group: SignalGroup<T>,
+  expandedId: string | null
+): T | null {
+  if (expandedId === null || group.latest.id === expandedId) return null
+  return group.rest.find((record) => record.id === expandedId) ?? null
+}

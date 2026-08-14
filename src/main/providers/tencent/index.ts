@@ -9,7 +9,7 @@
 import type { AdjustMode, SecCode, SecProfile, Snapshot, TradeDate } from '@core/types'
 import { splitCode } from '@core/code'
 import type { HttpClient } from '../../net/http'
-import type { ProviderCapabilities, QuoteProvider } from '../types'
+import type { MinutePoint, MinuteSeries, ProviderCapabilities, QuoteProvider } from '../types'
 import {
   ProviderDataError,
   type RawBar,
@@ -17,6 +17,7 @@ import {
   calendarFromIndexBars,
   chunk,
   classify,
+  dashDate,
   estimateBarCount,
   fromLowerPrefixed,
   handsToShares,
@@ -25,6 +26,7 @@ import {
   mergeAdjusted,
   num,
   parseCompactStamp,
+  parseDateTime,
   positive,
   resolveLimits,
   toLowerPrefixed,
@@ -36,6 +38,7 @@ const ID = 'tencent'
 
 const SNAPSHOT_URL = 'https://qt.gtimg.cn/q='
 const KLINE_URL = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get'
+const MINUTE_URL = 'https://web.ifzq.gtimg.cn/appstock/app/minute/query'
 
 /** `v_sh600000="…"` 里 `~` 分隔的字段下标。完整清单见 NOTES.md。 */
 const F = {
@@ -62,7 +65,7 @@ const MIN_SNAPSHOT_FIELDS = 58
 const CAPABILITIES: ProviderCapabilities = {
   daily: true,
   snapshot: true,
-  minute: false,
+  minute: true,
   // 只有名称与板块，没有行业与上市日 —— 见 NOTES.md
   profile: true,
   // 由基准指数日线反推，见 shared.ts calendarFromIndexBars
@@ -75,6 +78,90 @@ const CALENDAR_BENCHMARK: SecCode = 'SH000001'
 export interface TencentOptions {
   http: HttpClient
   now?: () => number
+}
+
+// ─────────────────────────── 分时 ───────────────────────────
+
+/**
+ * 分时一行：`'0931 9.11 18364 16769279.00'`，空格分隔。
+ *
+ * ⚠ **后两列是「当日累计」量与额，不是这一分钟的，更不是均价**（2026-08-14 实测核对）。
+ * 把第 4 列直接当均价用会得到一个七位数，而它会被算进纵轴范围 ——
+ * 症状是整条分时线被压成贴着框底的一条直线，图上看不出是哪一列读错了。
+ * 均价只能自己除：`额 / (量 × 100)`。已与主源同一分钟的 f58 对过（两边都是 9.132）。
+ */
+const M = { time: 0, last: 1, cumVolumeHands: 2, cumAmountYuan: 3 } as const
+
+interface MinuteResponse {
+  code?: number
+  data?: Record<string, unknown> | null
+}
+
+function pick(node: unknown, key: string): unknown {
+  return typeof node === 'object' && node !== null ? (node as Record<string, unknown>)[key] : undefined
+}
+
+/**
+ * `data.sh600000.data` = `{ date: '20260814', data: ['0931 9.11 18364 16769279.00', …] }`。
+ *
+ * **昨收实测来自 `qt` 那条快照的下标 4**（2026-08-14 核对：响应里的键只有
+ * `data` / `qt` / `mx_price`，**没有 `prec`**）。仍然先看 `prec` 是因为网上的示例里有它，
+ * 留一条兼容路径不花什么代价；但真正在跑的是 `qt` 那条 —— 别把 `qt` 当可有可无的东西删掉，
+ * 删了就没有昨收，基准线与右轴涨跌幅一起消失。
+ *
+ * ⚠ 这个端点是 **UTF-8 JSON**，不像 `qt.gtimg.cn` 的快照那样按 GBK 读。
+ * 而且这里必须是 UTF-8：把 UTF-8 字节按 GBK 解会让某个汉字吞掉紧随其后的 ASCII 字节
+ * （GBK 的尾字节范围含 `}` `\`），JSON 结构直接被啃坏 —— 反过来则只会出几个替换字符。
+ */
+export function parseMinutes(body: string, external: string): MinuteSeries {
+  let parsed: MinuteResponse
+  try {
+    parsed = JSON.parse(body) as MinuteResponse
+  } catch {
+    throw new ProviderDataError(ID, `分时返回不是 JSON：${body.slice(0, 80)}`)
+  }
+  if (parsed.code !== undefined && parsed.code !== 0) {
+    throw new ProviderDataError(ID, `分时返回 code=${parsed.code}`)
+  }
+
+  const node = pick(parsed.data, external)
+  const inner = pick(node, 'data')
+  const rows = pick(inner, 'data')
+  if (rows !== undefined && rows !== null && !Array.isArray(rows)) {
+    throw new ProviderDataError(ID, '分时 data.data 不是数组，疑似接口变更')
+  }
+
+  const compact = typeof pick(inner, 'date') === 'string' ? (pick(inner, 'date') as string).trim() : ''
+  // 日期只有 8 位紧凑串这一种来源。拿不到就整段作废 —— 用本机日期顶替会把
+  // 休市日返回的「上一个交易日」标成今天（见 types.ts MinuteSeries 的告警）
+  if (!/^\d{8}$/.test(compact)) {
+    throw new ProviderDataError(ID, `分时没有给交易日：${body.slice(0, 80)}`)
+  }
+  const tradeDate = dashDate(compact)
+
+  const points: MinutePoint[] = []
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (typeof row !== 'string') continue
+    const cells = row.trim().split(/\s+/)
+    const hhmm = (cells[M.time] ?? '').trim()
+    if (!/^\d{4}$/.test(hhmm)) continue
+    const ts = parseDateTime(tradeDate, `${hhmm.slice(0, 2)}:${hhmm.slice(2)}`)
+    const last = positive(cells[M.last])
+    if (ts === null || last === null) continue
+    // 均价自己除（见 M 的注释）。任一项为 0 / 缺失时是 null，**不要退化成 last** ——
+    // 那会画出一条与价格线完全重合的假均价线，而重合本身看起来很正常
+    const cumVolume = handsToShares(positive(cells[M.cumVolumeHands]))
+    const cumAmount = positive(cells[M.cumAmountYuan])
+    const avg = cumVolume !== null && cumVolume > 0 && cumAmount !== null ? cumAmount / cumVolume : null
+    points.push({ ts, last, avg })
+  }
+  points.sort((a, b) => a.ts - b.ts)
+
+  const prec = positive(pick(node, 'prec'))
+  const qtFields = pick(pick(node, 'qt'), external)
+  const fromQt = Array.isArray(qtFields) ? positive(qtFields[F.preClose]) : null
+
+  return { tradeDate, preClose: prec ?? fromQt, points }
 }
 
 // ─────────────────────────── 快照 ───────────────────────────
@@ -260,6 +347,18 @@ export function createTencentProvider(options: TencentOptions): QuoteProvider {
         })
       )
       return batches.flat()
+    },
+
+    /**
+     * 当日分时。这个端点只给「最近一个交易日」，休市时给的是上一个 ——
+     * 由 `tradeDate` 如实带出去，上层照它画 x 轴（见 types.ts MinuteSeries）。
+     */
+    async fetchMinutes(code: SecCode): Promise<MinuteSeries> {
+      const external = toLowerPrefixed(code)
+      if (!external) throw new ProviderDataError(ID, `无法识别的代码：${code}`)
+      // 刻意不传 encoding：这是 UTF-8 JSON，按 GBK 读会啃坏结构（见 parseMinutes）
+      const { body } = await http.get(`${MINUTE_URL}?code=${external}`)
+      return parseMinutes(body, external)
     },
 
     async fetchProfile(code: SecCode): Promise<SecProfile> {

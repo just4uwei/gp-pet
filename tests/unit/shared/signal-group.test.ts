@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { groupSignals, type GroupableSignal } from '@shared/signal-group'
+import { groupSignals, pinnedSignal, type GroupableSignal } from '@shared/signal-group'
 import type { GatedDirection, SecCode } from '@core/types'
 
 /**
@@ -92,5 +92,61 @@ describe('groupSignals', () => {
     const shuffled = groupSignals([s('SH600000', 100, 'SELL'), s('SH600000', 300, 'BUY')])
     expect(shuffled[0]?.latest.createdAt).toBe(ordered[0]?.latest.createdAt)
     expect(shuffled[0]?.rest.map((r) => r.createdAt)).toEqual(ordered[0]?.rest.map((r) => r.createdAt))
+  })
+})
+
+/**
+ * 「正展开着的那条要留在组里」（2026-08-14 修的 bug）。
+ *
+ * 症状是**只有在正好来了新信号的那一刻**才出现，而且现场什么都不剩：
+ * 用户展开一条信号、点了 AI 解读，四十秒的流式生成跑到一半，同一只票再来一条
+ * 信号 → 组头换人 → 那条被挤出列表 → `AiExplain` 卸载 → 请求被取消，
+ * 界面自己没了。日志上看不出异常，而那次调用已经按对方规则计过费。
+ */
+describe('pinnedSignal', () => {
+  const r = (id: string, code: string, createdAt: number): GroupableSignal & { id: string } => ({
+    id,
+    code: code as SecCode,
+    name: code,
+    createdAt,
+    direction: 'BUY',
+  })
+
+  const group = (...records: (GroupableSignal & { id: string })[]) => {
+    const groups = groupSignals(records)
+    const first = groups[0]
+    if (!first) throw new Error('fixture 至少要给一条')
+    return first
+  }
+
+  it('展开的那条已经是组头 → 不用钉（它本来就在渲染）', () => {
+    const g = group(r('new', 'SH600000', 200), r('old', 'SH600000', 100))
+    expect(pinnedSignal(g, 'new')).toBeNull()
+  })
+
+  it('新信号把它挤下组头 → 必须钉住，否则 AI 解读会被卸载取消', () => {
+    const g = group(r('new', 'SH600000', 200), r('old', 'SH600000', 100))
+    expect(pinnedSignal(g, 'old')?.id).toBe('old')
+    // 组头仍是新来的那条 —— 新信号必须立刻可见，这是这个列表的本职
+    expect(g.latest.id).toBe('new')
+  })
+
+  it('什么都没展开 → null', () => {
+    expect(pinnedSignal(group(r('a', 'SH600000', 100)), null)).toBeNull()
+  })
+
+  it('展开的是别的票 → 不钉到这个组里来', () => {
+    const g = group(r('a', 'SH600000', 100))
+    expect(pinnedSignal(g, '别的票的信号 id')).toBeNull()
+  })
+
+  it('连来两条新信号，钉住的仍是最初展开的那条', () => {
+    const g = group(
+      r('newer', 'SH600000', 300),
+      r('new', 'SH600000', 200),
+      r('watching', 'SH600000', 100)
+    )
+    expect(g.latest.id).toBe('newer')
+    expect(pinnedSignal(g, 'watching')?.id).toBe('watching')
   })
 })

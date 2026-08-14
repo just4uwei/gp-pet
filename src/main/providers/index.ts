@@ -44,6 +44,8 @@ export function perProviderLimited(globalLimiter: Parameters<typeof chainLimiter
 }
 
 export type {
+  MinutePoint,
+  MinuteSeries,
   ProviderCapabilities,
   ProviderId,
   ProviderRegistryOptions,

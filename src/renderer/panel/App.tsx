@@ -748,6 +748,7 @@ export function App(): React.JSX.Element {
           {/* 信号是流水，占掉右栏剩下的全部高度；提醒日志是按需展开的，按内容给高 */}
           <SignalList
             groups={groups}
+            expandedId={signalEvidence.expandedId}
             suppressedCount={suppressedCount}
             showSuppressed={showSuppressed}
             onShowSuppressed={setShowSuppressed}

@@ -5,6 +5,11 @@
  * tests/fixtures/providers/eastmoney/README.md）。因此本文件验证的是
  * 「解析器对这个形状的输入是否正确」，**不构成**对真实响应形状的验证。
  * 首次能联网的机器上必须先 `pnpm fixtures:record -- --provider eastmoney` 并人工比对差异。
+ *
+ * **例外：`trends2-*.json` 已按真实响应核对过（2026-08-14）** —— 字段名、列序、
+ * 数值全部来自当天真实拉到的 trends2 返回，是这批 fixture 里唯一有真机依据的。
+ * push2his 那台主机在开发机上是**间歇**可用的（`other side closed`，重试能过），
+ * 与文件头这段「访问不到」的旧结论不符 —— 见 NOTES.md 的 2026-08-12 更正。
  */
 
 import { describe, expect, it } from 'vitest'
@@ -17,6 +22,8 @@ const KLINE_RAW = fixtureText('eastmoney', 'kline-day-raw-sh600000.json')
 const KLINE_QFQ = fixtureText('eastmoney', 'kline-day-qfq-sh600000.json')
 const KLINE_EMPTY = fixtureText('eastmoney', 'kline-empty.json')
 const PROFILE = fixtureText('eastmoney', 'profile-sh600000.json')
+const TRENDS = fixtureText('eastmoney', 'trends2-sh600000.json')
+const TRENDS_EMPTY = fixtureText('eastmoney', 'trends2-empty.json')
 
 const CODES = ['SH600000', 'SZ000001', 'SZ300750', 'BJ430047', 'SH510300']
 
@@ -194,5 +201,70 @@ describe('eastmoney · 基础信息与日历', () => {
     expect(calls[0]?.url).toContain('secid=1.000001')
     expect(days?.filter((d) => d.isOpen)).toHaveLength(25)
     expect(days?.find((d) => d.date === '2024-01-01')?.isOpen).toBe(false)
+  })
+})
+
+describe('eastmoney · 当日分时', () => {
+  it('请求带 ndays=1 与 iscr=0（不含集合竞价那段虚价）', async () => {
+    const { provider, calls } = eastmoney([['trends2/get', TRENDS]])
+    await provider.fetchMinutes?.('SH600000')
+    expect(calls[0]?.url).toContain('secid=1.600000')
+    expect(calls[0]?.url).toContain('ndays=1')
+    expect(calls[0]?.url).toContain('iscr=0')
+    // 列序由 fields2 决定，两者必须一起改
+    expect(calls[0]?.url).toContain('f51%2Cf53%2Cf56%2Cf58')
+  })
+
+  it('时刻按北京时间换算，昨收与均价一起带出来', async () => {
+    const { provider } = eastmoney([['trends2/get', TRENDS]])
+    const series = await provider.fetchMinutes?.('SH600000')
+    expect(series?.tradeDate).toBe('2026-08-14')
+    expect(series?.preClose).toBe(9.18)
+    expect(series?.points).toHaveLength(9)
+
+    const open = series?.points[0]
+    // 北京时间 09:30 = UTC 01:30。用 new Date('2026-08-14 09:30') 解析会按本机时区走，
+    // 机器不在 +08 时整体偏掉，而这不会报任何错（本仓库的开发机就是 +07）
+    expect(open?.ts).toBe(Date.UTC(2026, 7, 14, 1, 30))
+    expect(open).toMatchObject({ last: 9.14, avg: 9.14 })
+    // f58 是接口直接给的均价，不用自己除（腾讯那边要除，见它的 NOTES）
+    expect(series?.points[1]).toMatchObject({ last: 9.11, avg: 9.132 })
+    expect(series?.points.at(-1)).toMatchObject({ last: 9.16, avg: 9.124 })
+  })
+
+  it('午休那段本来就没有点 —— 解析器不补，由渲染层断线', async () => {
+    const { provider } = eastmoney([['trends2/get', TRENDS]])
+    const series = await provider.fetchMinutes?.('SH600000')
+    const times = series?.points.map((p) => p.ts) ?? []
+    const amClose = Date.UTC(2026, 7, 14, 3, 30)
+    const pmOpen = Date.UTC(2026, 7, 14, 5, 0)
+    expect(times).toContain(amClose)
+    expect(times).toContain(pmOpen)
+    expect(times.filter((t) => t > amClose && t < pmOpen)).toEqual([])
+  })
+
+  it('data 为 null（代码不存在）返回空序列，不抛错', async () => {
+    const { provider } = eastmoney([['trends2/get', TRENDS_EMPTY]])
+    const series = await provider.fetchMinutes?.('SH600000')
+    expect(series).toEqual({ tradeDate: '', preClose: null, points: [] })
+  })
+
+  it('trends 不是数组 = 疑似接口变更，宁可报错也不要静默返回空', async () => {
+    const { provider } = eastmoney([['trends2/get', '{"rc":0,"data":{"trends":"9.30"}}']])
+    await expect(provider.fetchMinutes?.('SH600000')).rejects.toThrow(/trends 不是数组/)
+  })
+
+  it('跨日的返回只保留第一天 —— 两天连起来会在午夜画出一条不存在的长线', async () => {
+    const body = JSON.stringify({
+      rc: 0,
+      data: {
+        preClose: 9.28,
+        trends: ['2026-08-13 14:59,9.20,10,9.20', '2026-08-14 09:30,9.14,10,9.14'],
+      },
+    })
+    const { provider } = eastmoney([['trends2/get', body]])
+    const series = await provider.fetchMinutes?.('SH600000')
+    expect(series?.tradeDate).toBe('2026-08-13')
+    expect(series?.points).toHaveLength(1)
   })
 })

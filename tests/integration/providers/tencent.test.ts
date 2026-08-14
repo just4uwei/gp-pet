@@ -12,6 +12,7 @@ import { FIXED_NOW, fixtureBytes, fixtureText, replay } from './fixtures'
 const SNAPSHOT = fixtureBytes('tencent', 'snapshot-mixed.gbk.txt')
 const KLINE_RAW = fixtureText('tencent', 'kline-day-raw-sh600000.json')
 const KLINE_QFQ = fixtureText('tencent', 'kline-day-qfq-sh600000.json')
+const MINUTE = fixtureText('tencent', 'minute-sh600000.json')
 
 const CODES = ['SH600000', 'SZ000001', 'SZ300750', 'BJ430047', 'SH510300']
 
@@ -222,5 +223,80 @@ describe('tencent · 基础信息与日历', () => {
     expect(days?.find((d) => d.date === '2024-01-01')?.isOpen).toBe(false)
     expect(days?.at(-1)?.date).toBe('2024-02-05')
     expect(days?.some((d) => d.date > '2024-02-05')).toBe(false)
+  })
+})
+
+describe('tencent · 当日分时', () => {
+  it('交易日取自返回里的 date，时刻按北京时间换算', async () => {
+    const { provider: p, calls } = provider([['minute/query', MINUTE]])
+    const series = await p.fetchMinutes?.('SH600000')
+    expect(calls[0]?.url).toContain('code=sh600000')
+
+    expect(series?.tradeDate).toBe('2026-08-14')
+    expect(series?.points).toHaveLength(8)
+    // 北京时间 09:30 = UTC 01:30。用本机时区解析会在非 +08 的机器上整体偏掉，且不报错
+    expect(series?.points[0]).toMatchObject({ ts: Date.UTC(2026, 7, 14, 1, 30), last: 9.14 })
+    expect(series?.points.at(-1)?.last).toBe(9.16)
+  })
+
+  it('均价要自己除 —— 第 4 列是当日累计成交额（元），不是均价', async () => {
+    const { provider: p } = provider([['minute/query', MINUTE]])
+    const series = await p.fetchMinutes?.('SH600000')
+    // 09:31 行是 '0931 9.11 18364 16769279.00'：16769279 / (18364 × 100) = 9.132，
+    // 与主源同一分钟给的 f58 完全一致（2026-08-14 实测交叉核对）。
+    // 直接把那一列当均价会得到 16769279 —— 它会被算进纵轴范围，
+    // 把整条分时线压成贴着框底的一条直线，而图上看不出是哪一列读错了
+    expect(series?.points[1]?.avg).toBeCloseTo(9.132, 3)
+    expect(series?.points[0]?.avg).toBeCloseTo(9.14, 3)
+  })
+
+  it('累计量为 0（开盘一笔未成交）时均价是 null，不退化成最新价', async () => {
+    const body = '{"code":0,"data":{"sh600000":{"data":{"date":"20260814","data":["0930 9.14 0 0.00"]}}}}'
+    const { provider: p } = provider([['minute/query', body]])
+    const series = await p.fetchMinutes?.('SH600000')
+    // 退化成 last 会画出一条与价格线完全重合的假均价线，而重合本身看起来很正常
+    expect(series?.points[0]).toMatchObject({ last: 9.14, avg: null })
+  })
+
+  it('昨收取 qt 的下标 4 —— 实测响应里没有 prec 这个键', async () => {
+    const { provider: p } = provider([['minute/query', MINUTE]])
+    expect((await p.fetchMinutes?.('SH600000'))?.preClose).toBe(9.18)
+  })
+
+  it('prec 存在时优先用它（兼容路径）', async () => {
+    const withPrec = JSON.parse(MINUTE) as Record<string, Record<string, Record<string, unknown>>>
+    const node = withPrec.data?.sh600000
+    if (node) node.prec = '9.20'
+    const { provider: p } = provider([['minute/query', JSON.stringify(withPrec)]])
+    expect((await p.fetchMinutes?.('SH600000'))?.preClose).toBe(9.2)
+  })
+
+  it('qt 整块缺失且没有 prec：昨收是 null，不许拿首个价顶替（约束 4）', async () => {
+    const withoutQt = JSON.parse(MINUTE) as Record<string, Record<string, Record<string, unknown>>>
+    delete withoutQt.data?.sh600000?.qt
+    const { provider: p } = provider([['minute/query', JSON.stringify(withoutQt)]])
+    expect((await p.fetchMinutes?.('SH600000'))?.preClose).toBeNull()
+  })
+
+  it('午休那段本来就没有点 —— 解析器不补，由渲染层断线', async () => {
+    const { provider: p } = provider([['minute/query', MINUTE]])
+    const times = (await p.fetchMinutes?.('SH600000'))?.points.map((x) => x.ts) ?? []
+    const amClose = Date.UTC(2026, 7, 14, 3, 30)
+    const pmOpen = Date.UTC(2026, 7, 14, 5, 0)
+    expect(times).toContain(amClose)
+    expect(times).toContain(pmOpen)
+    expect(times.filter((t) => t > amClose && t < pmOpen)).toEqual([])
+  })
+
+  it('没给交易日就整段作废 —— 用本机日期顶替会把上一个交易日标成今天', async () => {
+    const body = '{"code":0,"data":{"sh600000":{"data":{"data":["0930 9.30 10 9.30"]}}}}'
+    const { provider: p } = provider([['minute/query', body]])
+    await expect(p.fetchMinutes?.('SH600000')).rejects.toThrow(/没有给交易日/)
+  })
+
+  it('data.data 不是数组 = 疑似接口变更，宁可报错也不要静默返回空', async () => {
+    const body = '{"code":0,"data":{"sh600000":{"data":{"date":"20260814","data":"9.30"}}}}'
+    const { provider: p } = provider([['minute/query', body]])
+    await expect(p.fetchMinutes?.('SH600000')).rejects.toThrow(/不是数组/)
   })
 })
