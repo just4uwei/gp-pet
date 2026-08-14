@@ -333,6 +333,33 @@ src/backtest 回测 CLI，复用 src/core
   这条毫不相干的结论。代价是有些命中不改 tag —— 那是对的，面板时间线里那次命中照样在。
   **不许读 `watch_point.verdict` 去改方向**：那是模型当时的判断，不是引擎的结论，
   写进买卖 tag 等于让 AI 直接给交易建议，与「AI 只读、不回流」冲突。
+- **`signalSignature` 里一个连续量都不许进，`reasons[0]` 已经因此被移出（2026-08-14）。**
+  它是一句嵌着百分比的文案（止损写「已亏损 −32.7%，触及 8% 止损线」）。
+  实测一天：某只跌破止损线的票，子信号集合 / 裁决 / level / 方向**各只有 1 种**，
+  而 `reasons[0]` 有 22 种，**落了 243 行同一条止损**（去重比的是「上一次」，
+  −32.7 → −32.6 → −32.7 来回抖每次都算变）。两天 769 行按新签名回放**只剩 13 行**。
+  它能表达的离散信息已经全在 `subs` / `verdicts` 里，**别加回来**。
+- **「今日信号」这类列表要传 `perCode`，否则一只刷屏的票能把别的票整个挤出窗口。**
+  `signal:history` 是 `ORDER BY created_at DESC LIMIT n`，答的是「最近 n 行」而不是
+  「哪些票出了信号」。上面那 664 行让 200 的窗口只覆盖了 12:38–14:00 这 82 分钟，
+  上午的 377 行在面板与悬浮条上**根本不存在** —— 而界面不报错，只是少了东西。
+  根因修掉后每只每天约 2 行，但 100 只自选仍会压到边缘，所以那道闸门留着。
+  实现用 `ROW_NUMBER() OVER`（SQLite ≥ 3.25，两个驱动都够），
+  **写错不抛异常只少给行**，改它要跑 `tests/integration/storage/signal-repo.test.ts`。
+- **收盘确认轮靠「次日盘前补跑」才成立，不是靠 SETTLE 那 10 分钟。**
+  数据源发布**个股**日线在 15:05–15:30，晚于 SETTLE 窗口（15:00–15:10），
+  而 15:10 之后 `needsQuotes` 变 false 引擎不再跑 —— 于是实测两天下来
+  `CONFIRMED` **0 行**、`indicator_daily` **0 行**、影子三张表全空
+  （`reconcile` / `cacheIndicators` / `carryover` 都以 CONFIRMED 为前提）。
+  `engine/settle.ts` 在次日盘前那一跳补跑，用的是
+  `market.getContextThrough(code, D)`（截至 D 的收盘线、不拼临时线、不带快照）。
+  三条边界：**不发提醒**、**不接影子运行**（前向纪律，见那个文件的边界 2）、
+  **只补上一个交易日**（往前追等于给应用没开机的那些天凭空造出信号历史）。
+  `closedAt` 必须走 `closeMsOf()` 按北京时间算，用本机时区会让补跑的行落进错误的自然日。
+- **拷 `market.db` 一律用 `VACUUM INTO`，`cp` 出来的副本是坏的。**
+  这条本来只写在备份那一节，实际调试时同样会踩：WAL 下主文件不自足，
+  `cp` 出来的库**少了最近的写却照样能打开** —— 症状是拿它跑出来的结论莫名其妙
+  （实测副本里当天的信号与 K 线整块缺失，而查询一条错都不报）。
 - **穿越只在相邻两根间判定一次**，不做「N 日内曾金叉」的模糊匹配；去重是提醒层的职责，不是指标层的。
 - **better-sqlite3 是原生模块**，需在 Electron ABI 下重建（`electron-rebuild`）。`pnpm-workspace.yaml` 里已显式跳过它的默认构建。
 - **主进程/preload 的外置依赖清单在 `electron.vite.config.ts`**，从 `package.json` 的 `dependencies` 派生。别用 `rollupOptions.external` 去覆盖它 —— 漏外置 `electron` 会让 `import { app } from 'electron'` 解析到 npm 上那个「返回 exe 路径」的启动器包，**构建照样成功，启动才炸**。

@@ -38,4 +38,14 @@ export const META_KEYS = {
   calendarRefreshedAt: 'calendar_refreshed_at',
   profileRefreshedAt: 'profile_refreshed_at',
   lastPruneAt: 'last_prune_at',
+  /**
+   * 最近一次补跑过收盘确认轮的交易日（`engine/settle.ts`）。**存日期串不是时刻。**
+   *
+   * 它是幂等闸门：补跑本身是幂等的（签名去重 + 只动 PROVISIONAL 行 + upsert），
+   * 但它要为每只标的算一遍 320 根的全套指标，没必要每轮 tick 都来。
+   *
+   * **不能改用「当日有没有 CONFIRMED 行」来判**：一个交易日合法地可以零信号，
+   * 那样会变成每轮都重跑。
+   */
+  lastSettledDate: 'last_settled_date',
 } as const

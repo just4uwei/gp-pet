@@ -118,7 +118,7 @@ export interface SignalEngine {
   run(tick: TickInfo): SignalOutcome[]
   /** 最近一轮的评估结果，供面板与桌宠状态使用 */
   latest(): SignalOutcome[]
-  history(query: { code?: SecCode; from?: number; to?: number; limit?: number }): SignalRecord[]
+  history(query: { code?: SecCode; from?: number; to?: number; limit?: number; perCode?: number }): SignalRecord[]
   explain(id: string): SignalEvidence | null
   /** 启动时调用：清掉旧引擎版本的指标缓存（参数一改，旧值不再可比） */
   purgeStaleCache(): number
@@ -454,6 +454,23 @@ export function snapshotOfIndicators(ind: IndicatorSet, index: number): Record<s
  * 结论没变、首要理由没变，就**不落新行** —— 而 `signal.evidence` 里存的还是
  * 三小时前那份旧依据。面板上「触发时的指标值」会与实际不符，
  * 而这件事从界面上完全看不出来（2026-08-14 补）。
+ *
+ * ## `reasons[0]` 已经**移出**签名（2026-08-14 晚，实测数据逼出来的）
+ *
+ * 它是上面那个旧签名的遗留物，而它是一句**文案** —— 里面嵌着连续量：
+ * 止损那条写的是「已亏损 −32.7%，触及 8% 止损线」，每 0.1pp 就是一个新字符串。
+ *
+ * 实测一天的真实数据（SZ002716，跌破止损线后被强制通道接管）：
+ * 子信号集合 1 种、裁决集合 1 种、level 1 种、方向 1 种，
+ * **而 `reasons[0]` 有 22 种，落了 243 行**。
+ * （243 > 22 是因为去重比的是「上一次」不是「见过的集合」：
+ * −32.7% → −32.6% → −32.7% 来回抖，每一次都算「变了」。）
+ *
+ * 移除它不会漏掉任何该落的新行 —— 它能表达的离散信息**已经全在**下面三项里：
+ *   * 强制类的首要理由由 `verdicts` 的 `rule:action` 决定；
+ *   * 策略类的首要理由由 `topReasons()` 从子信号里挑，而子信号集合就是 `subs`。
+ * 它**独有**的那部分恰恰全是连续量：百分比、以及「谁最强」这个由
+ * `score × weight` 决定的排序。两者都正是本函数开头那条纪律要挡的东西。
  */
 export function signalSignature(evaluation: Evaluation): string {
   const gated = evaluation.gated
@@ -468,7 +485,8 @@ export function signalSignature(evaluation: Evaluation): string {
     signal.stage,
     gated.level,
     gated.suppressed ? 'S' : '-',
-    gated.reasons[0] ?? '',
+    // ⚠ 这里曾经有一项 `gated.reasons[0]`。**别加回来** —— 它是一句嵌着百分比的文案，
+    //   一天能制造 243 行同一条止损（见上面那段）。它的离散部分已经被 subs/verdicts 覆盖。
     subs,
     adjustments,
     verdicts,

@@ -116,6 +116,25 @@ export interface SignalQuery {
   from?: number
   to?: number
   limit?: number
+  /**
+   * 每只标的最多取几条（2026-08-14）。缺省 = 不限，行为与从前逐位相同。
+   *
+   * ## 为什么需要它：全局 `LIMIT` 会被单只票吃光
+   *
+   * 「今日信号」问的是**哪些票出了信号**，而 `ORDER BY created_at DESC LIMIT 200`
+   * 答的是「最近 200 行」—— 这两件事在信号密度不均时会分叉，而分叉的方式很难看出来：
+   * 界面不会报错，只是**早上那批信号凭空不见了**。
+   *
+   * 2026-08-14 实测到过一次真的：三只跌破止损线的票一天落了 664 行
+   * （成因是签名里混了连续量，已修，见 `signalSignature`），
+   * 于是那天的 200 行窗口只覆盖 12:38–14:00 这 82 分钟，
+   * 上午的 377 行在面板与悬浮条上**根本不存在**。
+   *
+   * 根因修掉之后行数降到每只每天约 2 行，但**结构性风险仍在**：
+   * 100 只自选就是 200 行/天，正好压在窗口边缘。所以这道闸门不是为那个 bug 打的补丁，
+   * 而是把「一只票刷屏能不能挤掉别的票」这件事从**能**改成**不能**。
+   */
+  perCode?: number
 }
 
 export class SignalRepo {
@@ -173,6 +192,31 @@ export class SignalRepo {
     }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : ''
     const limit = Math.max(1, Math.min(1000, Math.floor(query.limit ?? 200)))
+
+    /*
+      `perCode` 走窗口函数先按票各取最近 N 条，再整体倒序截断（见 SignalQuery.perCode）。
+
+      **两层截断都要留着**：`perCode` 保证没有哪只票能把别的票挤出去，
+      `limit` 仍然是这次查询的总量上限（自选 100 只 × perCode 20 = 2000 行，
+      一次性丢给渲染层没有意义）。少了后者，「限制返回量」这件事就没人管了。
+
+      `ROW_NUMBER() OVER` 要 SQLite ≥ 3.25。两个驱动都够：better-sqlite3 13 捆的是
+      3.53.4，node:sqlite 跟 Node 自带的走。**写错了不会抛异常，只会少给行** ——
+      所以它在真库上有六条用例（tests/integration/storage/signal-repo.test.ts）。
+    */
+    if (query.perCode !== undefined) {
+      const perCode = Math.max(1, Math.min(1000, Math.floor(query.perCode)))
+      return this.db
+        .prepare(
+          `SELECT ${COLUMNS} FROM (
+             SELECT *, ROW_NUMBER() OVER (PARTITION BY code ORDER BY created_at DESC) AS rn
+             FROM signal ${where}
+           ) WHERE rn <= ? ORDER BY created_at DESC LIMIT ?`
+        )
+        .all<RawRow>(...params, perCode, limit)
+        .map(toRow)
+    }
+
     return this.db
       .prepare(`SELECT ${COLUMNS} FROM signal ${where} ORDER BY created_at DESC LIMIT ?`)
       .all<RawRow>(...params, limit)

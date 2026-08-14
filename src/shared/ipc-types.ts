@@ -692,6 +692,129 @@ export interface IntradayTHint {
   reason: string
 }
 
+// ─────────────────────────── 收盘日报 ───────────────────────────
+
+/**
+ * 一份收盘日报（2026-08-14）。判据在 `src/main/report/build.ts`（纯函数，有用例）。
+ *
+ * ## 它**只复述，不推导**
+ *
+ * 日报里必然有「明天该关注什么」，而那正是 `NEXT_DAY_WATCH` 信号在回答的问题。
+ * 若日报自己去推导一份「明日关注」，就会出现两个来源、可能互相矛盾的结论，
+ * **而用户没有办法判断该信哪个**。所以 `tomorrow` 一节的每一项都必须能指回
+ * 一条已经存在的信号 / 观察点 / 风控裁决 —— 一个新结论都不产生。
+ * 这与「观察点命中不写进 signal 表」「状态点只认闸门」是同一条纪律。
+ *
+ * ## 它不是提醒
+ *
+ * 不进 `alert_log`、不点亮状态点、不弹气泡。出口只有面板的「日报」页签。
+ */
+export interface DailyReport {
+  date: TradeDate
+  /**
+   * `FINAL` = 每只有数据的标的都用上了当日**收盘线**；
+   * `PROVISIONAL` = 至少有一只还在用盘中最后一个快照（当日日线尚未入库）。
+   *
+   * 这个区分不是洁癖：集合竞价会改收盘价，快照版与定稿版的数字对不上，
+   * 而**用户看不出是哪个对**。界面必须把它显示出来。
+   */
+  stage: 'PROVISIONAL' | 'FINAL'
+  /** 生成时刻（墙上时间），由调用方给 —— 判据本身不读时钟 */
+  at: number
+  overview: {
+    watchCount: number
+    /** 今日出现过**未静默**信号的只数 */
+    withSignal: number
+    /** 未静默信号的方向分布 */
+    byDirection: { direction: GatedDirection; count: number }[]
+    /** 有持仓的只数 */
+    positions: number
+    /** 跌破止损线的持仓数（含用户重画过线的） */
+    belowStop: number
+  }
+  stocks: DailyReportStock[]
+  alerts: {
+    /** 真的发出去的条数 */
+    delivered: number
+    /** 被闸门挡下或降级的条数 */
+    gated: number
+    /** 被挡下的原因分布，多到少 */
+    reasons: { reason: string; count: number }[]
+  }
+  tomorrow: DailyReportTomorrow[]
+  data: {
+    /** 当日收盘线已入库的只数 */
+    withClose: number
+    /** 当日既没有收盘线也没有快照的标的 —— 它们在报告里是「—」而不是 0 */
+    missing: SecCode[]
+  }
+  /**
+   * 几句**陈述**。刻意不叫「评价」：规则拼出来的句子只能陈述事实，
+   * 真正的评价是 AI 那个按钮的事（措辞纪律：不得出现胜率/概率/必涨/抄底）。
+   */
+  highlights: string[]
+}
+
+export interface DailyReportStock {
+  code: SecCode
+  name: string
+  industry?: string
+  /** 拿不到行情时为 null —— 绝不用 0 占位（约束 4） */
+  quote: {
+    close: number
+    changePct: number
+    /** 当日振幅，相对昨收；拿不到昨收时为 null */
+    amplitudePct: number | null
+    open: number | null
+    high: number | null
+    low: number | null
+    /** `CLOSE` = 当日收盘线；`SNAPSHOT` = 盘中最后一个快照（当日日线还没入库） */
+    source: 'CLOSE' | 'SNAPSHOT'
+  } | null
+  signals: {
+    total: number
+    /** 未被风控硬抑制的条数 */
+    actionable: number
+    /** 当日**最后一条未静默**信号 —— 与悬浮条 tag 同一口径 */
+    last: {
+      direction: GatedDirection
+      level: AlertLevel
+      stage: SignalStage
+      score: number
+    } | null
+    /** 当日被硬抑制的原因（去重），回答「它为什么没提醒我」 */
+    suppressedReasons: string[]
+  }
+  position?: {
+    shares: number
+    cost: number
+    /** 浮动盈亏百分比；拿不到现价时为 null */
+    pnlPct: number | null
+    /**
+     * 距固定止损线还有多少（百分比，负数 = 已经跌破）。拿不到现价时为 null。
+     * 用户重画过线（`stopAck`）时按他画的那条算 —— 那才是当前生效的判据。
+     */
+    toStopPct: number | null
+    /** 用户确认接受过的那一段亏损，界面要显示（见 PositionView.stopAck） */
+    stopFloor?: number
+  }
+  watch: { hit: number; expired: number; active: number }
+}
+
+/** 「明日关注」的一项。**每一项都指回一个已经存在的东西**（见 DailyReport 头注释） */
+export interface DailyReportTomorrow {
+  code: SecCode
+  name: string
+  /**
+   * `NEXT_DAY_WATCH` 今日收盘给出的明日观察信号
+   * `WATCH_POINT` 仍在盯的观察点（含明天到期的）
+   * `POSITION_RISK` 未了结的持仓风控裁决（止损 / 减仓）
+   */
+  kind: 'NEXT_DAY_WATCH' | 'WATCH_POINT' | 'POSITION_RISK'
+  /** 复述那条东西自己的说法，不另起一句结论 */
+  note: string
+}
+
 export interface Rect {
   x: number
   y: number
@@ -741,7 +864,18 @@ export interface IpcInvokeMap {
   'trade:add': (draft: TradeDraft) => TradeLedger
   /** 删一笔（录错了）。**按剩余流水重放重建持仓**，不做反向增量 */
   'trade:remove': (id: string) => TradeLedger
-  'signal:history': (query: { code?: SecCode; from?: number; to?: number; limit?: number }) => SignalRecord[]
+  /**
+   * `perCode` = 每只标的最多取几条。**「今日信号」这类列表应当传它** ——
+   * 全局 `limit` 会被单只刷屏的票吃光，而症状是「早上那批信号凭空不见了」，
+   * 界面上完全看不出来（判据与实测见 `storage/repositories/signal.ts` 的 `SignalQuery.perCode`）。
+   */
+  'signal:history': (query: {
+    code?: SecCode
+    from?: number
+    to?: number
+    limit?: number
+    perCode?: number
+  }) => SignalRecord[]
   'signal:explain': (id: string) => SignalEvidence
   /** 提醒日志（docs/05 §6）：含被丢弃与被降级的条目 */
   'alert:history': (query: { code?: SecCode; from?: number; to?: number; limit?: number }) => AlertRecord[]

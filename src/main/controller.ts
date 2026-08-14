@@ -697,7 +697,7 @@ export class AppController {
 
   // ── 信号（M2）─────────────────────────────────────────────────────
 
-  signalHistory(query: { code?: SecCode; from?: number; to?: number; limit?: number }): SignalRecord[] {
+  signalHistory(query: { code?: SecCode; from?: number; to?: number; limit?: number; perCode?: number }): SignalRecord[] {
     // 数据层没起来时返回空列表而不是抛错：面板要能把「数据层未就绪」那条横幅画出来
     return this.data?.signalHistory(query) ?? []
   }

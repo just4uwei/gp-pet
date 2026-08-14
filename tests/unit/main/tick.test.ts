@@ -59,14 +59,15 @@ function outcome(over: Partial<SnapshotOutcome> = {}): SnapshotOutcome {
 /** 记录每个依赖被调用了几次 —— 「没发请求」这件事只能靠计数来断言 */
 function harness(over: Partial<TickPipelineDeps> = {}): {
   deps: TickPipelineDeps
-  meta: Map<string, number>
+  meta: Map<string, number | string>
   backfill: ReturnType<typeof vi.fn>
   refreshSnapshots: ReturnType<typeof vi.fn>
   refreshProfiles: ReturnType<typeof vi.fn>
   calendarRefresh: ReturnType<typeof vi.fn>
   markObserved: ReturnType<typeof vi.fn>
 } {
-  const meta = new Map<string, number>()
+  // 数字（维护间隔）与字符串（补跑闸门的日期）共用一张表，与 MetaRepo 一致
+  const meta = new Map<string, number | string>()
   const backfill = vi.fn(async (codes: SecCode[]) =>
     codes.map((code) => ({ code, status: 'UP_TO_DATE' as const, written: 0 }))
   )
@@ -91,8 +92,17 @@ function harness(over: Partial<TickPipelineDeps> = {}): {
       markObserved,
     },
     meta: {
-      getNumber: (key) => meta.get(key) ?? null,
+      getNumber: (key) => {
+        const raw = meta.get(key)
+        return typeof raw === 'number' ? raw : null
+      },
       setNumber: (key, value) => void meta.set(key, value),
+      // 补跑闸门存的是日期串（META_KEYS.lastSettledDate）
+      get: (key) => {
+        const raw = meta.get(key)
+        return typeof raw === 'string' ? raw : null
+      },
+      set: (key, value) => void meta.set(key, value),
     },
     ...over,
   }
@@ -336,6 +346,75 @@ describe('createTickPipeline', () => {
     const h = harness({ shadow: { advance } })
     await createTickPipeline(h.deps).run(ctxOf())
     expect(advance).not.toHaveBeenCalled()
+  })
+
+  /*
+    补跑收盘确认轮的触发闸门（engine/settle.ts）。
+
+    为什么要钉：这段的每一种错法都是**静默**的 ——
+    不触发 → 确认轮永远跑不成（现状就是这样，实测 CONFIRMED 0 行、指标缓存 0 行），
+    而日志与界面上都看不出少了什么；每轮都触发 → 每一跳都做一次全量指标重算。
+  */
+  describe('补跑收盘确认轮', () => {
+    it('盘中那一跳补跑上一个交易日', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0 }))
+      const h = harness({ settle })
+
+      await createTickPipeline(h.deps).run(ctxOf())
+
+      // 10:00 时「应该已存在的最后一根」是上一个交易日，正是要补跑的那天
+      expect(settle).toHaveBeenCalledWith('2026-03-09')
+      expect(h.meta.get(META_KEYS.lastSettledDate)).toBe('2026-03-09')
+    })
+
+    it('同一天不重复补跑 —— 它要为每只标的算一遍 320 根的全套指标', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0 }))
+      const h = harness({ settle })
+      h.meta.set(META_KEYS.lastSettledDate, '2026-03-09')
+
+      await createTickPipeline(h.deps).run(ctxOf())
+
+      expect(settle).not.toHaveBeenCalled()
+    })
+
+    it('收盘后那一跳不补跑当天 —— 那是正常的收盘确认轮自己的活', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0 }))
+      const h = harness({ settle })
+
+      await createTickPipeline(h.deps).run(ctxOf({ session: 'SETTLE', minuteOfDay: 15 * 60 + 5 }))
+
+      expect(settle).not.toHaveBeenCalled()
+    })
+
+    it('补跑排在回补之后 —— 它用的正是刚补进来的那根收盘线', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0 }))
+      const h = harness({ settle })
+
+      await createTickPipeline(h.deps).run(ctxOf())
+
+      expect(h.backfill.mock.invocationCallOrder[0]).toBeLessThan(
+        settle.mock.invocationCallOrder[0] ?? 0
+      )
+    })
+
+    it('补跑抛错只 warn，不中断这一轮取数；且照样记账不重试', async () => {
+      const settle = vi.fn(() => {
+        throw new Error('补跑炸了')
+      })
+      const warn = vi.fn()
+      const h = harness({ settle })
+
+      await createTickPipeline({ ...h.deps, log: { info: () => {}, warn } }).run(ctxOf())
+
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('补跑失败'))
+      expect(h.refreshSnapshots).toHaveBeenCalledOnce()
+    })
+
+    it('不传 settle 时整块跳过（行为与从前逐位相同）', async () => {
+      const h = harness()
+      await expect(createTickPipeline(h.deps).run(ctxOf())).resolves.toBeUndefined()
+      expect(h.meta.has(META_KEYS.lastSettledDate)).toBe(false)
+    })
   })
 
   it('备份挂在休市维护里，盘中不跑 —— VACUUM INTO 要读全库，会和取数抢连接', async () => {

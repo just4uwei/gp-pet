@@ -14,6 +14,8 @@ export { MINUTE_CACHE_TTL_MS, createMinuteCache, mergeIntraday, shanghaiTradeDat
 export type { IntradayWindow, LocalIntraday, MinuteCache } from './intraday'
 export { BENCHMARK_CODE, createSignalEngine, evidencePayload, snapshotOfIndicators, toSignalRecord } from './signals'
 export type { SignalEngine, SignalEngineDeps, SignalOutcome, TickInfo } from './signals'
+export { closeMsOf, settleDay } from './settle'
+export type { SettleDeps, SettleResult } from './settle'
 export { MAINTENANCE_INTERVAL_MS, createTickPipeline } from './tick'
 export type { TickMetaStore, TickPipeline, TickPipelineDeps, TickState } from './tick'
 export { DEFAULT_GROUP, MAX_WATCH_ITEMS, createWatchlistService, toWatchItem } from './watchlist'

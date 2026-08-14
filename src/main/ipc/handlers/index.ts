@@ -63,6 +63,7 @@ export function registerHandlers(controller: AppController): void {
       ...(query.from === undefined ? {} : { from: query.from }),
       ...(query.to === undefined ? {} : { to: query.to }),
       ...(query.limit === undefined ? {} : { limit: query.limit }),
+      ...(query.perCode === undefined ? {} : { perCode: query.perCode }),
     })
   )
 

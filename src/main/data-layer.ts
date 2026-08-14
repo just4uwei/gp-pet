@@ -33,6 +33,8 @@ import {
   createSignalEngine,
   createMinuteCache,
   createTickPipeline,
+  closeMsOf,
+  settleDay,
   createWatchlistService,
   mergeIntraday,
   type MarketDataService,
@@ -114,7 +116,7 @@ export interface DataLayer {
    * 拉不到时退回本机留痕 `quote_tick` —— 取舍规则在 engine/intraday.ts。
    */
   intradaySeries(query: { code: SecCode; from: number; to?: number }): Promise<IntradaySeries>
-  signalHistory(query: { code?: SecCode; from?: number; to?: number; limit?: number }): SignalRecord[]
+  signalHistory(query: { code?: SecCode; from?: number; to?: number; limit?: number; perCode?: number }): SignalRecord[]
   explainSignal(id: string): SignalEvidence | null
   /** 最近一轮的评估结果，供桌宠状态与面板使用 */
   latestSignals(): SignalOutcome[]
@@ -268,6 +270,26 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     // 转发而不是直接给 `signals`：换灵敏度会重建引擎，直接给的话
     // 流水线会一直握着**旧那个**（换完档以后信号还按旧参数出，几乎无从发现）
     engine: { run: (tick) => signals.run(tick) },
+    /*
+      补跑收盘确认轮（engine/settle.ts）。与 `engine` 同样用转发闭包而不是直接给对象 ——
+      换灵敏度会重建引擎参数，而补跑必须用**当前**那套（它落库的行带引擎版本）。
+
+      `closedAt` 由这里算：settle.ts 与 src/core 同一条纪律，不读时钟。
+      15:00 是收盘时刻，按北京时间换算（`shanghaiToEpochMs` 与分时那边共用一个口径 ——
+      用 `new Date(...)` 会让非 +08 的机器上算出偏 8 小时的 created_at）。
+    */
+    settle: (date) =>
+      settleDay(date, {
+        market,
+        watchlist: storage.watchlist,
+        positions: storage.positions,
+        signals: storage.signals,
+        indicators: storage.indicators,
+        lookback: market.options.initialBars,
+        params: withSensitivity(settings.sensitivity),
+        closedAt: closeMsOf(date),
+        log,
+      }),
     shadow,
     /*
       分时留痕 + 转发。**始终**挂这个回调（不再是 `...(onQuotes ? …)`）——

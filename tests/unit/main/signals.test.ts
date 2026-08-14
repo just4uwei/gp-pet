@@ -199,6 +199,36 @@ describe('落库签名（signalSignature）', () => {
     expect(signalSignature(evalOf({ score: 0.61 }))).toBe(signalSignature(evalOf({ score: 0.88 })))
   })
 
+  /*
+    首要理由（`reasons[0]`）**不进签名**，这是 2026-08-14 晚被真实数据逼出来的一条。
+
+    它是一句嵌着连续量的文案：止损写的是「已亏损 −32.7%，触及 8% 止损线」。
+    实测一天：SZ002716 的子信号集合 / 裁决 / level / 方向各只有 1 种，
+    而 `reasons[0]` 有 22 种，**落了 243 行同一条止损**
+    （243 > 22 是因为去重比的是「上一次」：−32.7 → −32.6 → −32.7 来回抖）。
+
+    这三条用例分别钉住：文案变了不落新行、而它背后真正的离散依据变了照样落新行。
+  */
+  it('首要理由的文案变了签名不变 —— 那是一句嵌着百分比的话，不是新的结论', () => {
+    const a = signalSignature(evalOf({ reasons: ['已亏损 -32.7%，触及 8% 止损线'] }))
+    const b = signalSignature(evalOf({ reasons: ['已亏损 -31.2%，触及 8% 止损线'] }))
+    expect(a).toBe(b)
+  })
+
+  it('但同一条止损的裁决变了照样落新行（止损 → 回撤减仓）', () => {
+    const stop = signalSignature(evalOf({ verdicts: [['STOP_LOSS', 'FORCE_SELL']] }))
+    const reduce = signalSignature(evalOf({ verdicts: [['DRAWDOWN_REDUCE', 'FORCE_REDUCE']] }))
+    expect(stop).not.toBe(reduce)
+  })
+
+  it('策略信号的首要理由换人时，签名只跟着子信号集合走', () => {
+    // 同一个集合、不同的「谁最强」（由 score × weight 排出来，是连续量）→ 同一条
+    const subs: [string, string][] = [['T1_MA_CROSS', 'BUY'], ['T3_BREAKOUT', 'BUY']]
+    const a = signalSignature(evalOf({ subs, reasons: ['均线金叉'] }))
+    const b = signalSignature(evalOf({ subs, reasons: ['放量突破上轨'] }))
+    expect(a).toBe(b)
+  })
+
   it('结论没变但子信号集合变了 → 新签名（这是 2026-08-14 补的那条）', () => {
     // 旧签名只看 reasons[0]，于是这两种情况被判成同一条，
     // 而落库的 evidence 还停在三小时前那一份

@@ -76,6 +76,8 @@ function klineStore(seed: Record<string, Candle[]> = {}) {
     },
     lastDate: (code) => rows.get(code)?.at(-1)?.date ?? null,
     recent: (code, limit) => (rows.get(code) ?? []).slice(-limit),
+    recentThrough: (code, through, limit) =>
+      (rows.get(code) ?? []).filter((c) => c.date <= through).slice(-limit),
     range: (code, from, to) => (rows.get(code) ?? []).filter((c) => c.date >= from && c.date <= to),
     deleteAll(code) {
       calls.push(`deleteAll:${code}`)

@@ -31,6 +31,9 @@ export const MAINTENANCE_INTERVAL_MS = 7 * 24 * 60 * 60_000
 export interface TickMetaStore {
   getNumber(key: string): number | null
   setNumber(key: string, value: number): void
+  /** 补跑闸门存的是**日期串**不是时刻，所以要这两个（见 META_KEYS.lastSettledDate） */
+  get(key: string): string | null
+  set(key: string, value: string): void
 }
 
 export interface TickPipelineDeps {
@@ -58,6 +61,13 @@ export interface TickPipelineDeps {
   engine?: Pick<SignalEngine, 'run'>
   /** 引擎跑完一轮后的去处：controller 拿它跑提醒分发并刷新面板 */
   onSignals?: (ctx: TickContext, outcomes: SignalOutcome[]) => void
+  /**
+   * 补跑某个交易日的收盘确认轮（`engine/settle.ts`）。不传则整块跳过。
+   *
+   * **不返回 outcomes 是刻意的**：那天已经过去了，补出来的结论一条都不该进提醒层
+   * （settle.ts 的边界 1）。这里只拿一个计数打日志。
+   */
+  settle?: (date: string) => { evaluated: number; persisted: number; invalidated: number }
   /**
    * 影子运行推进（M4，docs/07 §2.3）。排在提醒**之后**且**单独 try**：
    * 模拟账本记错了不该连带把提醒吃掉，两者的重要性差一个量级。
@@ -94,6 +104,7 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
     onQuotes,
     engine,
     onSignals,
+    settle,
     shadow,
     maintenanceIntervalMs = MAINTENANCE_INTERVAL_MS,
   } = deps
@@ -155,6 +166,35 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
           if (outcome.status === 'REFETCHED') {
             log.info(`[daily] ${outcome.code} 复权口径变化（${outcome.drift?.date}），已整只重拉`)
           }
+        }
+      }
+
+      /*
+        补跑上一个交易日的收盘确认轮（engine/settle.ts）。
+
+        **位置是必须的**：排在 backfill 之后 —— 它要用的正是刚刚补进来的那根收盘线。
+        排在 refreshSnapshots 之前则是因为补跑与快照无关，早跑早写完，
+        不必让它跟当轮取数抢同一个 SQLite 连接。
+
+        触发判据直接用 `through`：`expectedLastBar()` 给的是「此刻应该已存在的最后一根」，
+        15:00 前它就是上一个交易日。`through === ctx.date` 时不补跑 ——
+        那是当天，正常的收盘确认轮（engine.run 的 SETTLE 那一轮）自己会做。
+
+        实践上这一段几乎总是在**次日盘前**那一跳执行：数据源发布个股日线在 15:05–15:30，
+        晚于当天的 SETTLE 窗口，所以当天那一轮拿不到收盘线（这正是要补跑的原因）。
+      */
+      if (settle && through && through < ctx.date && meta.get(META_KEYS.lastSettledDate) !== through) {
+        try {
+          const result = settle(through)
+          // 先记账再说：即使一只都没跑成（全部停牌 / 数据仍未到），也不该每轮重试 ——
+          // 那会把每一跳都变成一次全量指标重算
+          meta.set(META_KEYS.lastSettledDate, through)
+          log.info(
+            `[settle] ${through} 收盘确认补跑：评估 ${result.evaluated} 只，新落 ${result.persisted} 行，判失效 ${result.invalidated} 条`
+          )
+        } catch (error) {
+          // 补跑挂了不该拖垮当轮取数（与引擎失败同一条：行情能看，只是少了这一步）
+          log.warn(`[settle] ${through} 补跑失败：${String(error)}`)
         }
       }
 

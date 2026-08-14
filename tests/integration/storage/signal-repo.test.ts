@@ -164,6 +164,74 @@ describe('信号表（signal）', () => {
     storage.close()
   })
 
+  /**
+   * `perCode`：一只刷屏的票不许把别的票挤出窗口（2026-08-14）。
+   *
+   * 这不是假想的：那天三只跌破止损线的票一天落了 664 行（成因是签名里混了连续量，
+   * 已在 `signalSignature` 修掉），于是 200 行的窗口只覆盖了 82 分钟，
+   * 上午的信号在面板与悬浮条上**根本不存在** —— 而界面不会报错，只是少了东西。
+   *
+   * 窗口函数写错不会抛异常，只会**少给行**，所以这几条必须在真库上跑。
+   */
+  describe('perCode：单只票不许吃光全局 limit', () => {
+    /** 一只刷屏的票 + 一只只出了一条的票。刷屏那只的时间**全部更晚** —— 这才构成挤出 */
+    async function noisyAndQuiet(): Promise<Storage> {
+      const storage = await openMemory()
+      storage.signals.insert(row({ id: 'quiet-1', code: 'SZ000001', createdAt: 1_000 }))
+      for (let i = 0; i < 50; i++) {
+        storage.signals.insert(row({ id: `noisy-${i}`, code: 'SH600000', createdAt: 10_000 + i }))
+      }
+      return storage
+    }
+
+    it('不传 perCode 时行为不变 —— 安静那只确实会被挤出去', async () => {
+      const storage = await noisyAndQuiet()
+      const rows = storage.signals.query({ limit: 10 })
+      expect(rows).toHaveLength(10)
+      expect(rows.every((r) => r.code === 'SH600000')).toBe(true)
+      storage.close()
+    })
+
+    it('传了之后每只票各取最近 N 条，安静那只回来了', async () => {
+      const storage = await noisyAndQuiet()
+      const rows = storage.signals.query({ limit: 10, perCode: 3 })
+      expect(rows.filter((r) => r.code === 'SH600000')).toHaveLength(3)
+      expect(rows.filter((r) => r.code === 'SZ000001')).toHaveLength(1)
+      storage.close()
+    })
+
+    it('每只票取的是**最近**的那几条，不是最早的', async () => {
+      const storage = await noisyAndQuiet()
+      const ids = storage.signals
+        .query({ perCode: 2 })
+        .filter((r) => r.code === 'SH600000')
+        .map((r) => r.id)
+      expect(ids).toEqual(['noisy-49', 'noisy-48'])
+      storage.close()
+    })
+
+    it('总量上限仍然生效 —— perCode 不是「把闸门拆了」', async () => {
+      const storage = await noisyAndQuiet()
+      expect(storage.signals.query({ limit: 2, perCode: 20 })).toHaveLength(2)
+      storage.close()
+    })
+
+    it('整体仍按时间倒序返回（分组是取数口径，不是展示顺序）', async () => {
+      const storage = await noisyAndQuiet()
+      const rows = storage.signals.query({ perCode: 3 })
+      const times = rows.map((r) => r.createdAt)
+      expect(times).toEqual([...times].sort((a, b) => b - a))
+      storage.close()
+    })
+
+    it('与 from / code 过滤同时生效', async () => {
+      const storage = await noisyAndQuiet()
+      const rows = storage.signals.query({ from: 10_040, perCode: 2 })
+      expect(rows.map((r) => r.id)).toEqual(['noisy-49', 'noisy-48'])
+      storage.close()
+    })
+  })
+
   it('evidence 损坏时该行仍能列出（只是依据是空壳），不让整个列表崩掉', async () => {
     const storage = await openMemory()
     storage.db

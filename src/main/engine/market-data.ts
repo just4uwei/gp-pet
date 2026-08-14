@@ -74,6 +74,8 @@ export interface KlineStore {
   upsertMany(code: SecCode, candles: readonly Candle[], provider: string): number
   lastDate(code: SecCode): TradeDate | null
   recent(code: SecCode, limit: number): Candle[]
+  /** 截至 `through`（含）的最后 limit 根。补跑收盘确认轮要它 —— 见 `getContextThrough` */
+  recentThrough(code: SecCode, through: TradeDate, limit: number): Candle[]
   range(code: SecCode, from: TradeDate, to: TradeDate): Candle[]
   deleteAll(code: SecCode): number
 }
@@ -146,6 +148,17 @@ export interface MarketDataService {
   refreshSnapshots(codes: readonly SecCode[]): Promise<SnapshotOutcome>
   /** 同步读：历史日线 + 当日临时线。不发请求 */
   getContext(code: SecCode, date: TradeDate, bars?: number): MarketContext
+  /**
+   * 同步读：**截至 `through` 的收盘线，不拼临时线、不带快照**。补跑收盘确认轮用（settle.ts）。
+   *
+   * 与 `getContext` 的差别是全部意义所在：那个是「此刻这只票长什么样」（尾部可能是临时线），
+   * 这个是「D 那天收盘时它长什么样」。少了后者，D 当天的结论永远停在 `PROVISIONAL`——
+   * 而 `reconcile()` / `cacheIndicators()` / `carryover()` 三处都以 `CONFIRMED` 为前提。
+   *
+   * **末根日期不等于 `through` 时返回空序列**（停牌、数据还没到），
+   * 让调用方看到「这只没得跑」而不是拿前一天的收盘线冒充 D 的。
+   */
+  getContextThrough(code: SecCode, through: TradeDate, bars?: number): MarketContext
   /** 缓存里的快照，供面板展示涨跌幅 */
   snapshotOf(code: SecCode): Snapshot | null
   lastSnapshotAt(): number | null
@@ -366,6 +379,19 @@ export function createMarketDataService(deps: MarketDataDeps): MarketDataService
         stale: snapshot !== null && snapshotsStale,
         storedThrough: history[history.length - 1]?.date ?? null,
       }
+    },
+
+    getContextThrough(code, through, bars) {
+      const limit = Math.max(1, bars ?? options.initialBars)
+      const candles = kline.recentThrough(code, through, limit)
+      const last = candles[candles.length - 1]
+      // 末根不是 through 那天 → 这只在那天没有收盘线（停牌，或数据还没到）。
+      // **不拿前一天的冒充**：那会让 D 的「收盘确认」建立在 D−1 的收盘价上
+      if (!last || last.date !== through) {
+        return { code, candles: [], provisional: false, snapshot: null, stale: false, storedThrough: last?.date ?? null }
+      }
+      // 快照一律不带：它是「此刻」的价，而这里问的是 D 收盘那一刻
+      return { code, candles, provisional: false, snapshot: null, stale: false, storedThrough: last.date }
     },
 
     snapshotOf(code) {

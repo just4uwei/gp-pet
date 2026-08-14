@@ -423,7 +423,13 @@ export function App(): React.JSX.Element {
   useEffect(() => {
     let cancelled = false
     void window.gp
-      .invoke('signal:history', { from: dayStart, limit: 200 })
+      /*
+        `perCode` 是防饥饿的闸门：全局 limit 会被单只刷屏的票吃光，
+        而症状是「早上那批信号凭空不见了」，界面上完全看不出来
+        （2026-08-14 实测过一次真的，判据见 SignalQuery.perCode）。
+        20 条足够画一只票的当日时间线 —— 它本来就是折叠成一组显示的。
+      */
+      .invoke('signal:history', { from: dayStart, limit: 200, perCode: 20 })
       .then((rows) => {
         if (!cancelled) setSignalRecords(rows)
       })

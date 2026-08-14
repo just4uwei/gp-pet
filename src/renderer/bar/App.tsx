@@ -267,7 +267,12 @@ export function App(): React.JSX.Element {
     // 悬浮条上没有地方显示错误，且它不该因为一次取数失败就空白 —— 静默保留上一次
     const loadSignals = (): void => {
       void window.gp
-        .invoke('signal:history', { from: startOfToday(), limit: 200 })
+        /*
+          条子只用到「每只票当日最后一条」（buildTicker 的口径），所以 perCode 给 3 就够 ——
+          多要的那些在这里一行都用不上，而少了 perCode 会让一只刷屏的票
+          把其余自选整个挤出窗口，表现为「那几只永远显示无信号」。
+        */
+        .invoke('signal:history', { from: startOfToday(), limit: 200, perCode: 3 })
         .then(setSignals)
         .catch(() => undefined)
     }
