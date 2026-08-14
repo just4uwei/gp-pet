@@ -218,6 +218,10 @@ export class OverlayWindow {
     if (visible) {
       this.win.showInactive()
     } else {
+      // 隐藏时必须把交互态一起收掉：光标可能正压在条子上，而藏起来之后既不会再有
+      // mousemove、轮询也在替一个看不见的矩形做判定 —— 重新显示时跑马灯会停在暂停态。
+      // （`setInteractive(false)` 顺带停轮询并推一次 `over:false`，两边缓存都归位。）
+      this.setInteractive(false)
       this.win.hide()
     }
   }

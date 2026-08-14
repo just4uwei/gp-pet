@@ -274,15 +274,35 @@ export function App(): React.JSX.Element {
     所以「离开」由主进程按**真实光标位置**裁决（`OverlayWindow.watchPointer`，
     只在压着条子时轮询），结论经 `push:overlayPointer` 回来。
     **别把这条订阅删掉去依赖 DOM 事件** —— 那正是这个 bug 修了两次的原因。
+
+    第三次（2026-08-14）修的是这条推送的**副作用没做全**：主进程裁定离开时，
+    它那边的 `interactive` 已经变成 false，而这里的 `interactiveRef` 还留着 true。
+    于是下次进入时 `setInteractive(true)` 撞上「值没变」的短路、一条 IPC 都不发 ——
+    主进程停在穿透态、轮询不再启动，再离开就没有任何人能把 `hovering` 解开，
+    跑马灯从此不动。连带的第二个症状是那期间条子是穿透的（**双击打不开面板**），
+    但用户不会把这两件事联系到一起。
+    **主进程是唯一的裁决者，所以这里必须跟着它把本地缓存一起改掉。**
   */
   const [hovering, setHovering] = useState(false)
-  useEffect(() => window.gp.on('push:overlayPointer', ({ over }) => setHovering(over)), [])
+  useEffect(
+    () =>
+      window.gp.on('push:overlayPointer', ({ over }) => {
+        setHovering(over)
+        if (!over) interactiveRef.current = false
+      }),
+    []
+  )
 
   // ── 命中判定 + 拖拽（与桌宠形态同一套逻辑）────────────────────────
   useEffect(() => {
+    const endDrag = (drag: DragState): void => {
+      dragRef.current = null
+      if (drag.travelled > DRAG_SLOP_PX) void window.gp.invoke('pet:dragEnd')
+    }
+
     const onMouseMove = (event: MouseEvent): void => {
       const drag = dragRef.current
-      if (drag) {
+      if (drag !== null && event.buttons !== 0) {
         const dx = event.screenX - drag.lastScreenX
         const dy = event.screenY - drag.lastScreenY
         if (dx !== 0 || dy !== 0) {
@@ -293,6 +313,13 @@ export function App(): React.JSX.Element {
         }
         return // 拖拽期间不做命中判定，否则拖出本体范围会立刻穿透并丢掉拖拽
       }
+      if (drag !== null) {
+        // 按键已经松了却还留着拖拽态 —— 松手那一下丢了（甩得快时窗口追不上光标，
+        // mouseup 落到了别的窗口上）。不补这一手，`dragRef` 会永久留着，
+        // 往后每一次 mousemove 都当拖拽：条子粘着鼠标走，而命中判定与 `hovering`
+        // 再也不更新，跑马灯停死。`event.buttons` 是这里唯一可信的判据。
+        endDrag(drag)
+      }
       const hit = hitTest(rects, event.clientX, event.clientY)
       setInteractive(hit)
       setHovering(hit)
@@ -300,9 +327,8 @@ export function App(): React.JSX.Element {
 
     const onMouseUp = (): void => {
       const drag = dragRef.current
-      if (!drag) return
-      dragRef.current = null
-      if (drag.travelled > DRAG_SLOP_PX) void window.gp.invoke('pet:dragEnd')
+      if (drag === null) return
+      endDrag(drag)
     }
 
     // 鼠标快速掠出窗口时可能收不到最后一个 mousemove，
