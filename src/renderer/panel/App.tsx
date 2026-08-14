@@ -33,6 +33,7 @@ import type {
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
 import { AlertLog } from './AlertLog'
+import { BrandMark } from './BrandMark'
 import { ConfigTransferButtons, ConfigTransferNotice, type TransferOutcome } from './ConfigTransfer'
 import { FOOTER_NOTE } from './disclaimer'
 import { Onboarding } from './Onboarding'
@@ -486,8 +487,8 @@ export function App(): React.JSX.Element {
         <div className="flex items-center gap-2.5 pr-[144px]">
           {/* 纯装饰的品牌标记。这里**不放状态点** —— 状态点的唯一判定者是主进程的
               PetStateMachine（CLAUDE.md），面板上再放一个语义相近的点只会让两处对不上 */}
-          <span className="h-5 w-5 shrink-0 rounded bg-gradient-to-br from-sky-400/70 to-indigo-500/70" />
-          <h1 className="text-sm font-semibold tracking-wide">GP Pet</h1>
+          <BrandMark />
+          <h1 className="text-sm font-semibold tracking-wide">蹲点</h1>
           <span className="hidden text-xs text-white/30 sm:inline">自选 · 信号 · 提醒</span>
 
           <div

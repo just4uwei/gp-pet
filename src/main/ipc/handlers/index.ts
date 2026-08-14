@@ -60,6 +60,16 @@ export function registerHandlers(controller: AppController): void {
 
   handle('signal:explain', (_event, id) => controller.explainSignal(id))
 
+  // 当日分时留痕（004_quote_tick.sql）。**只在面板展开某个信号分组时才被调**，
+  // 所以这里不做任何缓存 —— 一次查询就是一条 SQLite 索引扫描
+  handle('quote:intraday', (_event, query) =>
+    controller.intradaySeries({
+      code: normalizeCode(query.code),
+      from: query.from,
+      ...(query.to === undefined ? {} : { to: query.to }),
+    })
+  )
+
   // ── 提醒日志（M3，docs/05 §6）─────────────────────────────────────
   // 与「今日信号」是两张表两件事：signal 表回答「引擎判了什么」，
   // alert_log 回答「它有没有真的提醒我，没提醒是被哪道闸门挡的」

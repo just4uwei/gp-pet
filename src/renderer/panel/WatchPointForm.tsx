@@ -12,7 +12,7 @@
 
 import { useState } from 'react'
 import type { SecCode } from '@core/types'
-import type { WatchPointDraft, WatchSuggestion } from '@shared/ipc-types'
+import type { WatchPointDraft, WatchSuggestion, WatchVerdict } from '@shared/ipc-types'
 
 /** 与 src/main/watch/metrics.ts 的白名单一致。那边是判定用的，这边是给人选的 */
 const METRICS: { value: string; label: string }[] = [
@@ -40,6 +40,19 @@ const METRICS: { value: string; label: string }[] = [
 const FIELD =
   'rounded border border-white/15 bg-black/25 px-2 py-1 text-[11px] outline-none focus:border-white/35'
 
+/**
+ * 方向结论的可选值。空串 = 不填。
+ *
+ * **「不填」必须是一个正当选项**：模型说不清方向时（或它压根没给）不该被逼着选一个 ——
+ * 一个猜出来的方向会以「用户确认过」的身份留在观察点列表上（005_watch_verdict.sql）。
+ */
+const VERDICTS: { value: '' | WatchVerdict; label: string }[] = [
+  { value: '', label: '判断：不填' },
+  { value: 'UP', label: '判断：上涨' },
+  { value: 'DOWN', label: '判断：下跌' },
+  { value: 'RANGE', label: '判断：震荡' },
+]
+
 export function WatchPointForm({
   signalId,
   code,
@@ -64,6 +77,8 @@ export function WatchPointForm({
   const [threshold, setThreshold] = useState(first === undefined ? '' : String(first.threshold))
   const [meaning, setMeaning] = useState<'INVALIDATE' | 'CONFIRM'>(first?.meaning ?? 'INVALIDATE')
   const [note, setNote] = useState(first?.note ?? '')
+  const [verdict, setVerdict] = useState<'' | WatchVerdict>(first?.verdict ?? '')
+  const [verdictText, setVerdictText] = useState(first?.verdictText ?? '')
   const [days, setDays] = useState('28')
   const [busy, setBusy] = useState(false)
 
@@ -72,12 +87,16 @@ export function WatchPointForm({
     metric: first?.metric ?? 'PRICE',
     op: first?.op ?? 'LTE',
     threshold: first === undefined ? '' : String(first.threshold),
+    verdict: (first?.verdict ?? '') as '' | WatchVerdict,
   }))
 
   const value = Number(threshold)
   const valid = threshold.trim() !== '' && Number.isFinite(value)
   const edited =
-    metric !== prefill.metric || op !== prefill.op || threshold.trim() !== prefill.threshold
+    metric !== prefill.metric ||
+    op !== prefill.op ||
+    threshold.trim() !== prefill.threshold ||
+    verdict !== prefill.verdict
 
   const submit = (): void => {
     if (!valid) return
@@ -93,6 +112,8 @@ export function WatchPointForm({
       edited: first === undefined || edited,
     }
     if (note.trim() !== '') draft.note = note.trim()
+    if (verdict !== '') draft.verdict = verdict
+    if (verdictText.trim() !== '') draft.verdictText = verdictText.trim().slice(0, 40)
 
     void window.gp
       .invoke('watch:create', draft)
@@ -159,6 +180,32 @@ export function WatchPointForm({
           onChange={(e) => setDays(e.target.value)}
         />
         <span className="text-[10px] text-white/35">天内有效</span>
+      </div>
+
+      {/*
+        方向结论。这一行记的是**当时那条解读判的是什么方向**，不是引擎的判断，
+        也不参与任何判定 —— 它的用处是让一条到期未命中的观察点变成一个能读的结论：
+        「当时判上涨、失效条件没出现」与「当时判下跌、失效条件没出现」是两件事。
+      */}
+      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+        <select
+          className={FIELD}
+          value={verdict}
+          onChange={(e) => setVerdict(e.target.value as '' | WatchVerdict)}
+        >
+          {VERDICTS.map((item) => (
+            <option key={item.value} value={item.value}>
+              {item.label}
+            </option>
+          ))}
+        </select>
+        <input
+          className={`${FIELD} min-w-0 flex-1`}
+          value={verdictText}
+          placeholder="判断原文（模型原话，最多 40 字）"
+          maxLength={40}
+          onChange={(e) => setVerdictText(e.target.value)}
+        />
       </div>
 
       <input

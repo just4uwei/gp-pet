@@ -13,16 +13,22 @@ import { app, dialog, type BrowserWindow } from 'electron'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-/** gp-pet-config-20260813.json —— 带日期，同一天多次导出会被系统的「(1)」后缀区分开 */
+/**
+ * dundian-config-20260814.json —— 带日期，同一天多次导出会被系统的「(1)」后缀区分开。
+ *
+ * 只有**文件名**跟着改名走。文件**内部**的 `format` 标记仍是 `gp-pet-config`
+ * （`transfer.ts` 的 `CONFIG_BUNDLE_FORMAT`）—— 那是兼容标记，改了会让改名前导出的
+ * 文件一律被判成「这不是蹲点的配置文件」。
+ */
 export function defaultExportName(now: number): string {
   const at = new Date(now)
   const y = at.getFullYear()
   const m = String(at.getMonth() + 1).padStart(2, '0')
   const d = String(at.getDate()).padStart(2, '0')
-  return `gp-pet-config-${y}${m}${d}.json`
+  return `dundian-config-${y}${m}${d}.json`
 }
 
-const FILTERS = [{ name: 'GP Pet 配置', extensions: ['json'] }]
+const FILTERS = [{ name: '蹲点配置', extensions: ['json'] }]
 
 /** 用户取消返回 null */
 export async function askSavePath(win: BrowserWindow | null, now: number): Promise<string | null> {

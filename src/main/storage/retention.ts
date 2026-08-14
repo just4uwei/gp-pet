@@ -9,6 +9,7 @@ import type { Database } from './db'
 import { KlineRepo } from './repositories/kline'
 import { META_KEYS, MetaRepo } from './repositories/meta'
 import { ProviderHealthRepo } from './repositories/health'
+import { QuoteTickRepo } from './repositories/quote-tick'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -22,6 +23,8 @@ export interface RetentionPolicy {
   healthDays: number
   /** 已结束的观察点（命中/过期/取消）保留多久。ACTIVE 的永不裁剪 */
   watchDays: number
+  /** 当日分时留痕保留多久。只服务面板上那张「今日」走势图，留久了没有用处 */
+  quoteTickDays: number
 }
 
 export const DEFAULT_RETENTION: RetentionPolicy = {
@@ -33,6 +36,9 @@ export const DEFAULT_RETENTION: RetentionPolicy = {
   // 与 alert_log 同一档：观察点的历史是「我当时押了什么、押中没有」，
   // 比信号日志更值得留一年 —— 它是用户自己的判断记录
   watchDays: 365,
+  // 面板只画「今日」那张图，7 天纯粹是给「周五收盘后周一才开机」这类情况留的余量。
+  // 12 只自选约 3000 行/天，7 天不到 3 MB
+  quoteTickDays: 7,
 }
 
 export interface RetentionReport {
@@ -42,6 +48,7 @@ export interface RetentionReport {
   alertDeleted: number
   watchDeleted: number
   healthDeleted: number
+  quoteTickDeleted: number
 }
 
 /**
@@ -115,11 +122,22 @@ export function pruneAll(
     )
     .run(signalCutoff).changes
 
+  // 分时留痕没有外键，删除顺序上不需要与谁配合
+  const quoteTickDeleted = new QuoteTickRepo(db).prune(now - policy.quoteTickDays * DAY_MS)
+
   const healthDeleted = health.prune(now - policy.healthDays * DAY_MS)
 
   meta.setNumber(META_KEYS.lastPruneAt, now)
 
-  return { klineDeleted, indicatorDeleted, signalDeleted, alertDeleted, watchDeleted, healthDeleted }
+  return {
+    klineDeleted,
+    indicatorDeleted,
+    signalDeleted,
+    alertDeleted,
+    watchDeleted,
+    healthDeleted,
+    quoteTickDeleted,
+  }
 }
 
 /**

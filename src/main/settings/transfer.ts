@@ -25,7 +25,13 @@ import type { AppSettings } from '@shared/ipc-types'
 import { sanitizeSettings } from './schema'
 import type { AppSettingsSchema } from './schema'
 
-/** 文件头。改了不兼容的结构就升 version，读的时候按 version 分支 */
+/**
+ * 文件头。改了不兼容的结构就升 version，读的时候按 version 分支。
+ *
+ * **`gp-pet-config` 这个字符串不跟着产品改名走**（2026-08-14 改名「蹲点」时刻意留下）：
+ * 它是导出文件里的兼容标记，改掉等于让改名前导出的每一份配置都被判成
+ * 「这不是蹲点的配置文件」，而那条报错的本意是拦住「压根不是本应用的文件」。
+ */
 export const CONFIG_BUNDLE_FORMAT = 'gp-pet-config'
 export const CONFIG_BUNDLE_VERSION = 1
 
@@ -134,11 +140,11 @@ export function serializeConfigBundle(bundle: ConfigBundle): string {
 export function parseConfigBundle(raw: unknown): ParsedConfigBundle {
   const envelope = EnvelopeSchema.safeParse(raw)
   if (!envelope.success) {
-    throw new Error('这不是 GP Pet 的配置文件（缺少 format 标记或结构不符）')
+    throw new Error('这不是蹲点的配置文件（缺少 format 标记或结构不符）')
   }
   if (envelope.data.version > CONFIG_BUNDLE_VERSION) {
     throw new Error(
-      `配置文件版本 ${envelope.data.version} 比当前应用（${CONFIG_BUNDLE_VERSION}）新，请先升级 GP Pet`
+      `配置文件版本 ${envelope.data.version} 比当前应用（${CONFIG_BUNDLE_VERSION}）新，请先升级蹲点`
     )
   }
 

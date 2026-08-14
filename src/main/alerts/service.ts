@@ -93,6 +93,39 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
     log = { info: () => {}, warn: () => {} },
   } = deps
 
+  /**
+   * 上一条已落库的裁决，按标的记（006_alert_repeat.sql）。
+   *
+   * 盘中每 30s 一轮都会对同一个持续中的信号造一次候选、被同键冷却挡一次，
+   * 而**被丢弃的裁决照样要留痕**（docs/05 §4「不制造信息黑洞」）。两条加起来的后果是
+   * 一条持续一上午的买入信号在日志里刷 200+ 行一模一样的东西，
+   * 用户翻不动，真正发出去的那几条被淹掉。
+   *
+   * 所以：签名相同 → 把首行的 `repeat_count + 1`（信息一条不少，噪音没了）；
+   * 签名不同 → 照常插一行。
+   *
+   * **这是内存态，重启后清空** → 重启后同一个持续状态会多留一行。可以接受，
+   * 而且**不要**改成启动时去库里回捞上一条来对齐：那要在每轮 tick 的热路径上
+   * 加一次查询，换来的只是省下一行日志。
+   */
+  const lastDecision = new Map<SecCode, { signature: string; rowId: string }>()
+
+  /**
+   * 判重签名。
+   *
+   * **`signalId` 必须在里面**：新信号就是新事件，哪怕文案一字不差也要新行 ——
+   * 否则「早上那条买入」与「下午重新触发的那条买入」会被记成同一件事。
+   * 得分不在里面（它每轮都抖，含它等于没有去重，与 signals.ts 的落库签名同一条纪律）。
+   */
+  function decisionSignature(decision: AlertDecision): string {
+    return [
+      decision.candidate.signalId,
+      decision.level ?? '-',
+      decision.channels.join(','),
+      decision.reason ?? '-',
+    ].join('|')
+  }
+
   function rowOf(decision: AlertDecision, at: number): AlertRow {
     return {
       id: newId(),
@@ -139,7 +172,19 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
 
       // 先落库再执行渠道：渠道抛错时审计记录已经在了（顺序反过来会丢掉那一条）
       try {
-        repo.insertMany(decisions.map((decision) => rowOf(decision, ctx.at)))
+        const fresh: AlertRow[] = []
+        for (const decision of decisions) {
+          const code = decision.candidate.code
+          const signature = decisionSignature(decision)
+          const previous = lastDecision.get(code)
+          // bumpRepeat 返回 false = 那一行已经不在了（被裁剪掉），退回插新行 ——
+          // 不能静默丢掉这一轮的裁决，那才是真的信息黑洞
+          if (previous?.signature === signature && repo.bumpRepeat(previous.rowId, ctx.at)) continue
+          const row = rowOf(decision, ctx.at)
+          fresh.push(row)
+          lastDecision.set(code, { signature, rowId: row.id })
+        }
+        repo.insertMany(fresh)
       } catch (error) {
         // 落库失败不该把提醒也一起吃掉 —— 但必须留痕（docs/02 §7）
         log.warn('[alert] alert_log 写入失败：', error)
@@ -191,8 +236,10 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
           level: row.level,
           channels: [...row.channels],
           read: row.readAt !== null,
+          repeatCount: row.repeatCount ?? 1,
         }
         if (row.suppressedReason !== null) record.reason = row.suppressedReason
+        if (row.lastAt !== null && row.lastAt !== undefined) record.lastAt = row.lastAt
         return record
       })
     },

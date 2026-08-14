@@ -23,6 +23,7 @@ export const INVOKE_CHANNELS = [
   'position:clear',
   'signal:history',
   'signal:explain',
+  'quote:intraday',
   'alert:history',
   'alert:markRead',
   'settings:get',

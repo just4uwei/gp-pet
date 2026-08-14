@@ -4,7 +4,11 @@
 
 ## 这是什么
 
-GP Pet：Windows 桌面悬浮条 + 托盘，跟踪用户自选的 A 股，用量化策略判断买卖时机并以不打断工作的方式提醒。
+蹲点（2026-08-14 由 GP Pet 改名）：Windows 桌面悬浮条 + 托盘，跟踪用户自选的 A 股，用量化策略判断买卖时机并以不打断工作的方式提醒。
+**改名只改了显示名与应用身份**（`productName` / 窗口标题 / 托盘 / `APP_ID` / 安装包文件名）——
+`package.json` 的 `name` 仍是 `gp-pet`，所以**数据目录仍是 `%APPDATA%/gp-pet`**，
+`CONFIG_BUNDLE_FORMAT` 也仍是 `gp-pet-config`（改了会让改名前导出的配置一律导不进来）。
+理由与代价见 [`src/main/identity.ts`](./src/main/identity.ts) 头注释：换 APP_ID 丢的是任务栏归组，换 name 丢的是数据。
 Electron + React + TypeScript · 本地 SQLite · 免登录 · 无服务端 · **不接券商、不下单**。
 
 当前处于 **M4（打磨）代码就绪**：五层引擎、回测 CLI、标定工具、面板列表（M2）、
@@ -174,7 +178,7 @@ src/backtest 回测 CLI，复用 src/core
 | 写指标或策略 | [docs/04](./docs/04-指标与信号引擎.md)（公式与口径都在这，含与来源文档的差异说明） |
 | 接数据源 | [docs/03](./docs/03-数据源与存储设计.md) + [src/main/providers/README.md](./src/main/providers/README.md) |
 | 改窗口或交互 | [docs/06](./docs/06-桌宠交互与非干扰设计.md)（§2.1 悬浮条，§5 皮肤系统已删的说明） |
-| 换托盘 / 应用图标 | [resources/icons/README.md](./resources/icons/README.md)（静态文件，不是生成件） |
+| 换托盘 / 应用图标 | [resources/icons/README.md](./resources/icons/README.md)（png 是手绘资产；只有 `icon.ico` 是生成件，跑 `node tools/logo/make-ico.mjs` 重出，它**不在** package.json 的 scripts 里） |
 | 改提醒逻辑 | [docs/05](./docs/05-风控与提醒规则.md) |
 | 改影子运行 | [docs/07 §2.3](./docs/07-回测与验证方案.md)（四条前向纪律 + 记账口径） |
 | 改设置页 / 参数表 | [docs/01 §5.5](./docs/01-产品需求与范围.md) + [ADR-0003](./docs/adr/ADR-0003-来源文档数值不作为出厂默认.md) |

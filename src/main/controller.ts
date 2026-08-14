@@ -28,6 +28,7 @@ import type {
   AppSettings,
   ConfigTransferResult,
   EngineStatus,
+  IntradaySeries,
   MaintenanceResult,
   ParamRow,
   PetState,
@@ -132,6 +133,8 @@ function toWatchPointView(
     status: row.status,
   }
   if (row.note !== undefined) view.note = row.note
+  if (row.verdict !== undefined) view.verdict = row.verdict
+  if (row.verdictText !== undefined) view.verdictText = row.verdictText
   if (row.hitAt !== undefined) view.hitAt = row.hitAt
   if (row.hitValue !== undefined) view.hitValue = row.hitValue
   if (row.metric !== 'PRICE' && row.engineVersion !== currentEngineVersion) {
@@ -594,6 +597,17 @@ export class AppController {
     return evidence
   }
 
+  /**
+   * 当日分时留痕（面板信号分组里那张走势图）。
+   *
+   * 数据层没起来时返回空序列而不是抛错 —— 与 `signalHistory` 同一条：
+   * 一张图画不出来不该让整个面板报错。空序列在渲染层有自己的说法
+   * （「今天还没记到分时数据」），而那句话恰好是真的。
+   */
+  intradaySeries(query: { code: SecCode; from: number; to?: number }): IntradaySeries {
+    return this.data?.intradaySeries(query) ?? { code: query.code, preClose: null, points: [] }
+  }
+
   /** 用户点「刷新」或新加自选后：跑一轮 tick。失败只记日志，不弹窗 */
   async refreshData(): Promise<void> {
     if (!this.data) return
@@ -720,6 +734,12 @@ export class AppController {
       threshold: draft.threshold,
       meaning: draft.meaning,
       ...(draft.note === undefined || draft.note === '' ? {} : { note: draft.note.slice(0, 500) }),
+      // 方向结论：表单里可选可改。**归不了类就没有**，这里不做任何猜测式补全 ——
+      // 猜出来的方向会以「用户确认过」的身份留在观察点列表上（005_watch_verdict.sql）
+      ...(draft.verdict === undefined ? {} : { verdict: draft.verdict }),
+      ...(draft.verdictText === undefined || draft.verdictText === ''
+        ? {}
+        : { verdictText: draft.verdictText.slice(0, 40) }),
       engineVersion: layer.signals.engineVersion,
       createdAt: now,
       expiresAt: now + days * 24 * 60 * 60 * 1000,

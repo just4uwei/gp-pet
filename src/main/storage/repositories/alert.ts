@@ -42,6 +42,13 @@ export interface AlertRow {
   suppressedReason: string | null
   readAt: number | null
   createdAt: number
+  /**
+   * 同一条裁决重复了几轮（006_alert_repeat.sql）。插入时恒为 1，之后靠 `bumpRepeat` 递增。
+   * 读出来是给日志显示的，写入路径不接受它 —— 计数只能一次 +1，不能被调用方设成任意值
+   */
+  repeatCount?: number
+  /** 最后一次重复的时刻。null = 只发生过一次 */
+  lastAt?: number | null
 }
 
 /** alert_log 与 signal 的联表结果 —— 提醒日志视图要的「时间/标的/方向/得分/结果」都在这 */
@@ -62,6 +69,8 @@ interface RawRow {
   suppressed_reason: string | null
   read_at: number | null
   created_at: number
+  repeat_count: number
+  last_at: number | null
 }
 
 interface RawJoinedRow extends RawRow {
@@ -73,7 +82,10 @@ interface RawJoinedRow extends RawRow {
   evidence: string
 }
 
-const COLUMNS = `id, signal_id, level, channel, suppressed_reason, read_at, created_at`
+const COLUMNS = `id, signal_id, level, channel, suppressed_reason, read_at, created_at,
+                 repeat_count, last_at`
+/** 插入时用的列（不含 repeat_count / last_at —— 那两列由 bumpRepeat 维护） */
+const INSERT_COLUMNS = `id, signal_id, level, channel, suppressed_reason, read_at, created_at`
 
 function parseChannels(raw: string): AlertChannelName[] {
   if (raw === NO_CHANNEL || raw === '') return []
@@ -88,6 +100,8 @@ function toRow(raw: RawRow): AlertRow {
     channels: parseChannels(raw.channel),
     suppressedReason: raw.suppressed_reason,
     readAt: raw.read_at,
+    repeatCount: raw.repeat_count,
+    lastAt: raw.last_at,
     createdAt: raw.created_at,
   }
 }
@@ -126,7 +140,7 @@ export class AlertRepo {
 
   insert(row: AlertRow): void {
     this.db
-      .prepare(`INSERT INTO alert_log (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .prepare(`INSERT INTO alert_log (${INSERT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .run(
         row.id,
         row.signalId,
@@ -144,6 +158,23 @@ export class AlertRepo {
     this.db.transaction(() => {
       for (const row of rows) this.insert(row)
     })
+  }
+
+  /**
+   * 同一条裁决又发生了一次：计数 +1、记下最后时刻，**不新增行**（006_alert_repeat.sql）。
+   *
+   * **刻意不动 `read_at`。** 已读的行不该因为这个状态还在持续就变回未读 ——
+   * 未读数答的是「有几件新事」，不是「有几件事还在」。
+   *
+   * 返回 false = 那一行已经不在了（被裁剪掉，或库被换过）。调用方据此退回「插新行」，
+   * 而不是把这一轮的裁决静默丢掉。
+   */
+  bumpRepeat(id: string, at: number): boolean {
+    return (
+      this.db
+        .prepare(`UPDATE alert_log SET repeat_count = repeat_count + 1, last_at = ? WHERE id = ?`)
+        .run(at, id).changes > 0
+    )
   }
 
   /** 提醒日志视图（docs/05 §6）：联表取信号的方向与得分 */
@@ -167,6 +198,7 @@ export class AlertRepo {
     return this.db
       .prepare(
         `SELECT a.id, a.signal_id, a.level, a.channel, a.suppressed_reason, a.read_at, a.created_at,
+                a.repeat_count, a.last_at,
                 s.code, s.direction, s.score, s.regime, s.stage, s.evidence
          FROM alert_log a JOIN signal s ON s.id = a.signal_id
          ${where} ORDER BY a.created_at DESC LIMIT ?`

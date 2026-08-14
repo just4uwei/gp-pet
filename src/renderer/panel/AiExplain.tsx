@@ -9,6 +9,19 @@
  * 2. **流式渲染。** 一次解读跑几十秒是常态，一个转四十秒的圈在桌面应用里是不可接受的。
  * 3. **卸载即取消。** 面板关掉、行折叠、切换到别的信号，都要把在跑的请求断掉 ——
  *    否则用户已经不看了，钱还在烧。
+ *
+ * ## 等待期间必须一直有反馈（2026-08-14 补）
+ *
+ * 推理模型先思考几十秒、一个字都不吐是常态，而**思考过程本地刻意不显示**
+ * （`ai/protocols.ts` 只取 `text_delta`，`thinking_delta` 直接丢）。
+ * 于是在这之前，等待期的界面是一个空框加一个闪烁光标 —— 用户分不出
+ * 「模型在想」和「连接死了」。现在等待期一直显示**已等待多少秒**，
+ * 并在「有字了但停了很久」时单独说出来。
+ *
+ * 与之配套的一条：**停止之后绝不退回 idle。** 早先「停止」时若一个字都没收到，
+ * 就 `setPhase('idle')` 把整块收回去 —— 用户看到的是「点了一下，界面自己没了」，
+ * 既不知道发生过什么，也不知道要不要重试。现在退到 `stopped`，
+ * 把「停在了哪一步」写出来，重新生成的按钮留在原地。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -17,7 +30,10 @@ import type { WatchSuggestion } from '@shared/ipc-types'
 import { FOOTER_NOTE } from './disclaimer'
 import { WatchPointForm } from './WatchPointForm'
 
-type Phase = 'idle' | 'running' | 'done' | 'error'
+type Phase = 'idle' | 'running' | 'done' | 'error' | 'stopped'
+
+/** 有字之后停顿多久算「卡住了」。比一次正常的分片间隔大一个量级 */
+const STALL_MS = 10_000
 
 /**
  * 建议块是给程序读的，不显示给用户。
@@ -55,6 +71,18 @@ export function AiExplain({
   const [formOpen, setFormOpen] = useState(false)
   /** 累积正文。用 ref 而不是从 state 里读：done 那一刻要拿到**全量**去抽建议 */
   const textRef = useRef('')
+  /** 本轮开始的时刻与最后一次收到增量的时刻。等待期的全部反馈都从这两个数推出来 */
+  const [startedAt, setStartedAt] = useState(0)
+  const [lastDeltaAt, setLastDeltaAt] = useState(0)
+  /** 每秒一跳的时钟。**只在 running 时跑** —— 否则一个看完的解读会一直重渲染 */
+  const [now, setNow] = useState(0)
+
+  useEffect(() => {
+    if (phase !== 'running') return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [phase])
 
   /** 显示给用户的正文：把机器读的建议块摘掉 */
   const visibleText = useMemo(() => text.replace(SUGGESTION_BLOCK, '').trimEnd(), [text])
@@ -81,6 +109,8 @@ export function AiExplain({
       offRef.current = null
 
       setPhase('running')
+      setStartedAt(Date.now())
+      setLastDeltaAt(0)
       textRef.current = ''
       setText('')
       setError(null)
@@ -104,6 +134,7 @@ export function AiExplain({
         if (chunk.delta !== undefined) {
           textRef.current += chunk.delta
           setText(textRef.current)
+          setLastDeltaAt(Date.now())
         }
         if (chunk.done === true) {
           setPhase('done')
@@ -141,6 +172,9 @@ export function AiExplain({
     [signalId]
   )
 
+  const elapsed = Math.max(0, Math.round((now - startedAt) / 1000))
+  const sinceDelta = lastDeltaAt === 0 ? 0 : Math.max(0, Math.round((now - lastDeltaAt) / 1000))
+
   if (phase === 'idle') {
     return (
       <button className="gp-btn mt-2 w-full justify-center text-[11px]" onClick={() => start(false)}>
@@ -165,6 +199,43 @@ export function AiExplain({
       ) : (
         <p className="leading-relaxed text-rose-200/80">{error}</p>
       )}
+
+      {/*
+        等待反馈。这一块的**唯一目的**是让用户分得出「模型在想」与「连接死了」——
+        思考过程本地不显示（见文件头），所以只能靠时间说话。三种措辞对应三种状态，
+        都不许说成「即将完成」一类无依据的安抚。
+      */}
+      {phase === 'running' ? (
+        <p className="mt-1.5 text-[10px] leading-snug text-white/35">
+          {textRef.current === '' ? (
+            <span>
+              已等待 {elapsed}s · 模型还没吐出第一个字。
+              推理模型会先思考几十秒（思考过程本地不显示），再等不到会自动报超时。
+            </span>
+          ) : sinceDelta >= STALL_MS / 1000 ? (
+            <span className="text-amber-200/60">
+              已 {sinceDelta}s 没有新内容（共 {elapsed}s，{textRef.current.length} 字）——
+              可能还在思考，也可能连接断了。
+            </span>
+          ) : (
+            <span>
+              生成中 · {elapsed}s · {textRef.current.length} 字
+            </span>
+          )}
+        </p>
+      ) : null}
+
+      {/*
+        停止之后**不收回界面**。收回去（退到 idle）的话，用户看到的是
+        「点了一下，界面自己没了」—— 既不知道发生过什么，也不知道要不要重试。
+      */}
+      {phase === 'stopped' ? (
+        <p className="mt-1.5 text-[10px] leading-snug text-amber-200/60">
+          {text === ''
+            ? `已停止，等了 ${elapsed}s 一个字都没收到。可能是模型还在思考，也可能接口不通 —— 可以重新生成，或去设置页点「测试连接」。`
+            : `已停止，上面是收到的部分内容（${elapsed}s）。`}
+        </p>
+      ) : null}
 
       {/*
         把第 4 段（失效条件）变成可跟踪的东西。**只在生成完之后出现**：
@@ -204,7 +275,10 @@ export function AiExplain({
             className="gp-btn ml-auto px-1.5 py-0.5 text-[10px]"
             onClick={() => {
               stop()
-              setPhase(text === '' ? 'idle' : 'done')
+              // 一个字都没有时**也不退回 idle**：那会把整块界面收掉（见上面那段注释）。
+              // 有内容时算 'done'，观察点表单照常可用 —— 收到一半的正文里
+              // 建议块可能不全，但表单本来就允许留空自己填
+              setPhase(text === '' ? 'stopped' : 'done')
             }}
           >
             停止

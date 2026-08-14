@@ -6,7 +6,7 @@
  */
 
 import type { SecCode } from '@core/types'
-import type { WatchPointView } from '@shared/ipc-types'
+import type { WatchPointView, WatchVerdict } from '@shared/ipc-types'
 import type { Database } from '../db'
 
 /** 落库行（主进程内部用）。与 `WatchPointView` 的差别是没有 `name` 与派生字段 */
@@ -20,6 +20,9 @@ export interface WatchPointRow {
   threshold: number
   meaning: WatchPointView['meaning']
   note?: string
+  /** 建点时那条解读的方向结论（005_watch_verdict.sql）。归不了类时缺省，那不是错误 */
+  verdict?: WatchVerdict
+  verdictText?: string
   engineVersion: string
   createdAt: number
   expiresAt: number
@@ -38,6 +41,8 @@ interface Row {
   threshold: number
   meaning: string
   note: string | null
+  verdict: string | null
+  verdict_text: string | null
   engine_version: string
   created_at: number
   expires_at: number
@@ -63,12 +68,15 @@ function toRow(row: Row): WatchPointRow {
   }
   // exactOptionalPropertyTypes：没有就不要这个键，而不是塞 undefined
   if (row.note !== null) out.note = row.note
+  if (row.verdict !== null) out.verdict = row.verdict as WatchVerdict
+  if (row.verdict_text !== null) out.verdictText = row.verdict_text
   if (row.hit_at !== null) out.hitAt = row.hit_at
   if (row.hit_value !== null) out.hitValue = row.hit_value
   return out
 }
 
 const COLUMNS = `id, code, signal_id, source, metric, op, threshold, meaning, note,
+                 verdict, verdict_text,
                  engine_version, created_at, expires_at, status, hit_at, hit_value`
 
 export class WatchPointRepo {
@@ -79,8 +87,9 @@ export class WatchPointRepo {
       .prepare(
         `INSERT INTO watch_point
            (id, code, signal_id, source, metric, op, threshold, meaning, note,
+            verdict, verdict_text,
             engine_version, created_at, expires_at, status, hit_at, hit_value)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         row.id,
@@ -92,6 +101,8 @@ export class WatchPointRepo {
         row.threshold,
         row.meaning,
         row.note ?? null,
+        row.verdict ?? null,
+        row.verdictText ?? null,
         row.engineVersion,
         row.createdAt,
         row.expiresAt,

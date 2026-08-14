@@ -12,7 +12,12 @@
  * （`%APPDATA%/gp-pet`），改名等于把整个数据目录搬走 —— 已有用户的 market.db、
  * settings.json、日志会全部「消失」，而回测 CLI 的默认库路径也写着 gp-pet
  * （`src/backtest/cli.ts` 的 `defaultDbPath`）。name 由 package.json 的 `name` 决定，就这样。
+ *
+ * **2026-08-14 产品改名「蹲点」时，改的是 APP_ID 而不是 name。** 两者的代价不对称：
+ * 换 APP_ID 丢的是任务栏归组与已固定的磁贴（用户重新固定一次即可），
+ * 换 name 丢的是**数据**。所以 `%APPDATA%/gp-pet` 这个路径**留着不动** ——
+ * 它现在是个历史名字，别为了「统一」去改它。
  */
 
 /** 反写域名式的唯一标识。改它等于换一个应用身份，会丢掉已注册的固定磁贴与任务栏归组 */
-export const APP_ID = 'com.gppet.desktop'
+export const APP_ID = 'com.dundian.desktop'

@@ -37,7 +37,7 @@ export class TrayController {
 
   private applyTooltip(): void {
     if (!this.tray || this.tray.isDestroyed()) return
-    this.tray.setToolTip(this.controller.quiet ? 'GP Pet · 免打扰中' : 'GP Pet')
+    this.tray.setToolTip(this.controller.quiet ? '蹲点 · 免打扰中' : '蹲点')
   }
 
   private iconFor(quiet: boolean): Electron.NativeImage {

@@ -220,7 +220,7 @@ export function detectProtocol(baseUrl: string): AiProtocol {
  *
  * 火山方舟的 Coding Plan / Agent Plan 套餐额度**只允许在 AI 编程工具里用**，
  * 拿这套 base URL + key 去做别的 API 调用可能被判定为滥用，
- * 后果是订阅停用甚至封号。GP Pet 是行情信号解释器，不是编程工具 ——
+ * 后果是订阅停用甚至封号。蹲点是行情信号解释器，不是编程工具 ——
  * 用户很可能只是「手边有这把 key」就填进来了，而代价他事先不知道。
  *
  * 这一条**必须摆在界面上**：一个能让人被封号的默认路径，不该只写在文档里。

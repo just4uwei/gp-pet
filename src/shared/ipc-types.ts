@@ -34,6 +34,23 @@ export interface QuoteTick {
   stale: boolean
 }
 
+/**
+ * 当日分时留痕（004_quote_tick.sql）。面板「今日信号」展开分组时画那张走势图用。
+ *
+ * **它不是完整的分时。** 覆盖范围 = 应用开着的时段，而且取数失败那几轮不入库
+ * （stale 快照是缓存重放，写进去会画出一条其实没有成交的平线）。
+ * 所以 `points` **会有洞**：午休那段、以及用户当时没开机的那段。
+ * 渲染层必须把洞画成断线并标注覆盖起点，**不许用直线连过去** ——
+ * 那条斜线看着像分时线，但那段时间里什么都没被观测到。
+ */
+export interface IntradaySeries {
+  code: SecCode
+  /** 昨收，画基准线用。数据源没给时为 null —— 不要用 0 顶替（约束 4） */
+  preClose: number | null
+  /** 按 ts 升序，**可能有洞**（见上） */
+  points: { ts: number; last: number }[]
+}
+
 export interface SignalRecord {
   id: string
   code: SecCode
@@ -117,6 +134,15 @@ export interface AlertRecord {
   /** 非空 = 被丢弃或被降级及原因 */
   reason?: string
   read: boolean
+  /**
+   * 同一条裁决重复了几轮（006_alert_repeat.sql）。1 = 只发生过一次。
+   *
+   * 盘中每 30s 一轮都会对同一个持续中的信号造一次候选、被冷却挡一次，
+   * 那不是 47 件事而是 1 件事持续了 47 轮 —— 记在同一行上，别在日志里刷 47 行。
+   */
+  repeatCount: number
+  /** 最后一次重复的时刻。`repeatCount === 1` 时缺省 */
+  lastAt?: number
 }
 
 /** 用户手工录入的持仓（docs/03 §4.2）。成本价是**不复权**真实成交价 */
@@ -403,6 +429,16 @@ export interface AiChunk {
  * 回测标定（ADR-0003）；观察点是用户的、单标的、一次性、会过期，依据是「用户确认」。
  * 两者混在一起会污染设置页那张标定状态表。
  */
+/**
+ * 观察点上记的**方向结论**（005_watch_verdict.sql）。
+ *
+ * 它是「当时那条 AI 解读判的是什么方向」，由用户在表单里确认过 ——
+ * **不是引擎的判断**，也不参与任何判定。它的用处是让一条到期未命中的观察点
+ * 变成一个能读的结论：「当时判上涨，失效条件没出现」与
+ * 「当时判下跌，失效条件没出现」是两件完全不同的事。
+ */
+export type WatchVerdict = 'UP' | 'DOWN' | 'RANGE'
+
 export interface WatchPointView {
   id: string
   code: SecCode
@@ -417,6 +453,14 @@ export interface WatchPointView {
   /** 命中意味着什么：原判断失效，还是得到确认 */
   meaning: 'INVALIDATE' | 'CONFIRM'
   note?: string
+  /**
+   * 建这个观察点时那条解读的**方向结论**，归一化后的值。
+   * 认不出时**缺省**（`suggestion.ts` 的白名单归不了类就留空，绝不猜）——
+   * 缺省不是错误，`verdictText` 里仍有原文。
+   */
+  verdict?: WatchVerdict
+  /** 判断原文，最多 40 字。回答「当时到底是怎么说的」 */
+  verdictText?: string
   createdAt: number
   expiresAt: number
   status: 'ACTIVE' | 'HIT' | 'EXPIRED' | 'CANCELED'
@@ -438,6 +482,8 @@ export interface WatchPointDraft {
   threshold: number
   meaning: 'INVALIDATE' | 'CONFIRM'
   note?: string
+  verdict?: WatchVerdict
+  verdictText?: string
   /** 有效期天数。缺省按 20 个交易日折算 */
   days?: number
   /** true = 用户改过模型给的数值 */
@@ -454,6 +500,9 @@ export interface WatchSuggestion {
   threshold: number
   meaning: 'INVALIDATE' | 'CONFIRM'
   note?: string
+  /** 归一化后的方向结论。整条解读只有一个，同一块里的每条建议都带上它 */
+  verdict?: WatchVerdict
+  verdictText?: string
 }
 
 /** 数据维护动作（清缓存 / 备份 / 选数据目录）的结果 */
@@ -503,6 +552,11 @@ export interface IpcInvokeMap {
   'position:list': () => PositionView[]
   'position:set': (code: SecCode, shares: number, cost: number) => void
   'position:clear': (code: SecCode) => void
+  /**
+   * 当日分时留痕。**只在面板展开某个信号分组时才发** —— 列表平时零额外 IPC。
+   * `to` 省略时取「现在」。
+   */
+  'quote:intraday': (query: { code: SecCode; from: number; to?: number }) => IntradaySeries
   'signal:history': (query: { code?: SecCode; from?: number; to?: number; limit?: number }) => SignalRecord[]
   'signal:explain': (id: string) => SignalEvidence
   /** 提醒日志（docs/05 §6）：含被丢弃与被降级的条目 */

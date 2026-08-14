@@ -61,11 +61,17 @@ export const AI_SYSTEM_PROMPT = `你是一个 A 股技术分析助手，嵌在�
 软件会解析它，预填成一个「观察点」表单让用户确认；确认之后条件真的成立时会提醒他。
 
 <观察点建议>
+判断=上涨
 metric=PRICE op=LTE threshold=8.20 meaning=INVALIDATE 说明=跌破 20 日均线支撑
 </观察点建议>
 
 规则：
 
+- \`判断\` 单独一行，写你第 1 段给出的**方向结论**，两到六个字，如
+  \`上涨\` / \`下跌\` / \`震荡\`。软件会把它和观察点一起存下来，这样三个月后
+  用户还能回答「当时判的是涨还是跌、后来兑现没有」——
+  **只有失效条件、没有判断方向的记录是答不了这个问题的。**
+  判断不明确就整行省略，不要写「暂不确定」这类占位。
 - \`metric\` 只能是 \`PRICE\`（价格）或这些指标键之一：
   ma5 ma10 ma20 ma60 ma120 dif dea hist bollUpper bollMid bollLower bbwPct
   adx plusDI minusDI atr rsi volRatio。**不在这个清单里的一律不要写** ——

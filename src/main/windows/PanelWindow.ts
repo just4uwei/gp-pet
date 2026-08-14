@@ -58,7 +58,7 @@ export class PanelWindow {
       minWidth: 720,
       minHeight: 480,
       show: false,
-      title: 'GP Pet',
+      title: '蹲点',
       ...(icon ? { icon } : {}),
       backgroundColor: '#101216',
       // 顶栏交给页面画，只保留系统的窗口控件（见 TITLE_BAR_COLOR 上面那段）

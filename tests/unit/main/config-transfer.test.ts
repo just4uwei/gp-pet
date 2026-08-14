@@ -181,9 +181,9 @@ describe('parseConfigBundle', () => {
   })
 
   it('不是本应用的文件就抛错，而不是当成一份空配置往下走', () => {
-    expect(() => parseConfigBundle({ hello: 'world' })).toThrow(/不是 GP Pet/)
-    expect(() => parseConfigBundle(null)).toThrow(/不是 GP Pet/)
-    expect(() => parseConfigBundle('{}')).toThrow(/不是 GP Pet/)
+    expect(() => parseConfigBundle({ hello: 'world' })).toThrow(/不是蹲点/)
+    expect(() => parseConfigBundle(null)).toThrow(/不是蹲点/)
+    expect(() => parseConfigBundle('{}')).toThrow(/不是蹲点/)
   })
 
   it('版本比当前新时拒绝导入（结构可能已经不兼容）', () => {

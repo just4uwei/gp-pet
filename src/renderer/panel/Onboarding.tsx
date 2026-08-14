@@ -18,6 +18,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { BrandMark } from './BrandMark'
 import { DISCLAIMER, ONBOARDING_POINTS } from './disclaimer'
 
 export function Onboarding({ onAccept }: { onAccept: () => Promise<void> }): React.JSX.Element {
@@ -62,8 +63,8 @@ export function Onboarding({ onAccept }: { onAccept: () => Promise<void> }): Rea
         style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
       >
         <div className="flex items-center gap-2.5 pr-[144px]">
-          <span className="h-5 w-5 shrink-0 rounded bg-gradient-to-br from-sky-400/70 to-indigo-500/70" />
-          <h1 className="text-sm font-semibold tracking-wide">GP Pet · 开始之前</h1>
+          <BrandMark />
+          <h1 className="text-sm font-semibold tracking-wide">蹲点 · 开始之前</h1>
         </div>
       </header>
 

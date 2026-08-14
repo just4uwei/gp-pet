@@ -56,6 +56,18 @@ function timeText(ms: number): string {
   return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
+/**
+ * 方向结论的显示。**红涨绿跌**（A 股口径，与列表其余地方一致）。
+ *
+ * 措辞上写「判断」不写「预测」：它是用户确认过的、当时那条解读的方向结论，
+ * 而这个软件里没有任何一个经过验证的绩效数字（docs/01 §9 的措辞纪律）。
+ */
+const VERDICT_STYLE: Record<'UP' | 'DOWN' | 'RANGE', { label: string; tone: string }> = {
+  UP: { label: '判断：上涨', tone: 'text-rose-200/85' },
+  DOWN: { label: '判断：下跌', tone: 'text-emerald-200/85' },
+  RANGE: { label: '判断：震荡', tone: 'text-white/45' },
+}
+
 function Row({
   point,
   now,
@@ -77,6 +89,14 @@ function Row({
       </div>
 
       <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[11px] text-white/40">
+        {point.verdict !== undefined ? (
+          <>
+            <span className={VERDICT_STYLE[point.verdict].tone}>
+              {VERDICT_STYLE[point.verdict].label}
+            </span>
+            <span>·</span>
+          </>
+        ) : null}
         <span>{meaning}</span>
         <span>·</span>
         <span>{point.source === 'AI_SUGGESTED' ? '模型建议，你确认过' : '你自己填的数'}</span>
@@ -117,6 +137,18 @@ function Row({
           </button>
         ) : null}
       </div>
+
+      {/*
+        判断原文单独一行、单独一种灰：它是**模型当时的原话**，不是软件的结论。
+        归一化枚举认不出时（`verdict` 缺省）这一行仍然在 —— 那正是它存在的理由，
+        「继续震荡上行」归不了类，但它本身是有价值的记录。
+      */}
+      {point.verdictText !== undefined && point.verdictText !== '' ? (
+        <p className="mt-0.5 text-[10px] leading-snug text-white/35">
+          <span className="text-white/25">原话 </span>
+          {point.verdictText}
+        </p>
+      ) : null}
 
       {point.note !== undefined && point.note !== '' ? (
         <p className="mt-0.5 text-[10px] leading-snug text-white/30">{point.note}</p>

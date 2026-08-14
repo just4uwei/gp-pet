@@ -19,6 +19,7 @@ import { join } from 'node:path'
 import type {
   AppSettings,
   EngineStatus,
+  IntradaySeries,
   ProviderHealth,
   QuoteTick,
   SignalEvidence,
@@ -105,6 +106,8 @@ export interface DataLayer {
   }
   health(): ProviderHealth[]
   quoteTicks(): QuoteTick[]
+  /** 当日分时留痕，只服务面板上那张走势图（见 004_quote_tick.sql） */
+  intradaySeries(query: { code: SecCode; from: number; to?: number }): IntradaySeries
   signalHistory(query: { code?: SecCode; from?: number; to?: number; limit?: number }): SignalRecord[]
   explainSignal(id: string): SignalEvidence | null
   /** 最近一轮的评估结果，供桌宠状态与面板使用 */
@@ -256,7 +259,35 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     // 流水线会一直握着**旧那个**（换完档以后信号还按旧参数出，几乎无从发现）
     engine: { run: (tick) => signals.run(tick) },
     shadow,
-    ...(onQuotes ? { onQuotes } : {}),
+    /*
+      分时留痕 + 转发。**始终**挂这个回调（不再是 `...(onQuotes ? …)`）——
+      落库是数据层自己的事，不该取决于外面有没有人订阅推送。
+
+      两条纪律写在 004_quote_tick.sql 头注释里，这里是它们的落点：
+        1. `stale` 为 true 时一行都不写。stale = 本轮取数失败、重放的是上一轮缓存，
+           写进去会在图上画出一条「其实没有成交」的平线。
+        2. ts 取 `snapshot.at`（交易所给的行情时刻，三家 provider 都在解析它）
+           而不是 `ctx.at`。这样重复的快照会被主键挡掉 —— 盘后还会跑好几轮 tick，
+           用本机时钟当键的话每轮都会多一个点。
+      落库失败不能连累推送：图是锦上添花，行情推送不是。
+    */
+    onQuotes: (ctx, snapshots) => {
+      if (!snapshots.stale) {
+        try {
+          storage.quoteTicks.record(
+            snapshots.snapshots.map((s) => ({
+              code: s.code,
+              ts: s.at,
+              last: s.last,
+              preClose: Number.isFinite(s.preClose) && s.preClose > 0 ? s.preClose : null,
+            }))
+          )
+        } catch (error) {
+          log.warn(`[quote-tick] 分时留痕写入失败：${String(error)}`)
+        }
+      }
+      onQuotes?.(ctx, snapshots)
+    },
     ...(onSignals ? { onSignals } : {}),
   })
 
@@ -345,6 +376,15 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
         if (lastError) item.lastError = lastError
         return item
       })
+    },
+
+    intradaySeries(query) {
+      const to = query.to ?? now()
+      return {
+        code: query.code,
+        preClose: storage.quoteTicks.preCloseOf(query.code, query.from, to),
+        points: storage.quoteTicks.series(query.code, query.from, to),
+      }
     },
 
     signalHistory(query) {

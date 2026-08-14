@@ -58,6 +58,24 @@ function startOfToday(): number {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
 }
 
+/**
+ * 「同一条裁决持续了多久」。
+ *
+ * 盘中每 30s 一轮都会对同一个持续中的信号造一次候选、被同键冷却挡一次 ——
+ * 那不是 47 件事，是 1 件事持续了 47 轮（006_alert_repeat.sql）。
+ * 落库时已经合成一行了，这里把次数与最后时刻显示出来，
+ * 否则用户会以为软件只在 10:05 判过一次。
+ */
+function Repeat({ record }: { record: AlertRecord }): React.JSX.Element | null {
+  if (record.repeatCount <= 1) return null
+  return (
+    <span className="shrink-0 text-white/30">
+      ×{record.repeatCount}
+      {record.lastAt !== undefined ? ` · 持续到 ${timeOf(record.lastAt)}` : null}
+    </span>
+  )
+}
+
 function Outcome({ record }: { record: AlertRecord }): React.JSX.Element {
   const delivered = record.channels.length > 0
   if (!delivered) {
@@ -166,6 +184,7 @@ export function AlertLog({
                       {record.name}
                       <span className="ml-1.5 font-mono text-xs text-white/35">{record.code}</span>
                     </span>
+                    <Repeat record={record} />
                     <span className="shrink-0 font-mono text-white/60">
                       置信 {Math.round(record.score * 100)}%
                     </span>

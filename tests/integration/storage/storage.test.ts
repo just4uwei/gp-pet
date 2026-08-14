@@ -73,6 +73,7 @@ describe('迁移', () => {
         'meta',
         'position',
         'provider_health',
+        'quote_tick',
         'signal',
         'trade_calendar',
         'watchlist',
@@ -376,6 +377,53 @@ describe('ProviderHealthRepo', () => {
   })
 })
 
+describe('QuoteTickRepo', () => {
+  let storage: Storage
+  beforeEach(async () => {
+    storage = await openMemory()
+  })
+  afterEach(() => storage.close())
+
+  const T = 1_700_000_000_000
+
+  it('主键 (code, ts) 就是幂等闸门 —— 同一时刻写两次只留一行', () => {
+    // 盘后还会跑好几轮 tick，快照时刻不变时不该攒出新点。
+    // 少了这道闸门，净值…不，折线图上「点多了」这件事完全看不出来
+    expect(storage.quoteTicks.record([{ code: 'SH600000', ts: T, last: 10, preClose: 9.9 }])).toBe(1)
+    expect(storage.quoteTicks.record([{ code: 'SH600000', ts: T, last: 10.5, preClose: 9.9 }])).toBe(0)
+    expect(storage.quoteTicks.series('SH600000', T - 1000, T + 1000)).toEqual([{ ts: T, last: 10 }])
+  })
+
+  it('series 按 ts 升序，且只取区间内的点', () => {
+    storage.quoteTicks.record([
+      { code: 'SH600000', ts: T + 2000, last: 11, preClose: 9.9 },
+      { code: 'SH600000', ts: T, last: 10, preClose: 9.9 },
+      { code: 'SH600000', ts: T + 9999, last: 12, preClose: 9.9 },
+      { code: 'SZ000001', ts: T, last: 5, preClose: 4.9 },
+    ])
+    expect(storage.quoteTicks.series('SH600000', T, T + 5000)).toEqual([
+      { ts: T, last: 10 },
+      { ts: T + 2000, last: 11 },
+    ])
+  })
+
+  it('last 非有限值的行被跳过，preClose 缺失存 null 而不是 0（约束 4）', () => {
+    // preClose 填 0 会让图上的基准线跑到坐标轴底下，把整张图的纵轴压扁
+    expect(storage.quoteTicks.record([{ code: 'SH600000', ts: T, last: Number.NaN, preClose: 1 }])).toBe(0)
+    storage.quoteTicks.record([{ code: 'SH600000', ts: T + 1, last: 10, preClose: null }])
+    expect(storage.quoteTicks.preCloseOf('SH600000', T, T + 100)).toBeNull()
+  })
+
+  it('preCloseOf 取区间里最后一个非空值 —— 跨日时晚的那个才是当天的昨收', () => {
+    storage.quoteTicks.record([
+      { code: 'SH600000', ts: T, last: 10, preClose: 9.9 },
+      { code: 'SH600000', ts: T + 1000, last: 10, preClose: null },
+      { code: 'SH600000', ts: T + 2000, last: 10, preClose: 10.4 },
+    ])
+    expect(storage.quoteTicks.preCloseOf('SH600000', T, T + 5000)).toBe(10.4)
+  })
+})
+
 describe('裁剪', () => {
   let storage: Storage
   beforeEach(async () => {
@@ -403,12 +451,20 @@ describe('裁剪', () => {
       .prepare(`INSERT INTO alert_log (id, signal_id, level, channel, created_at) VALUES (?, ?, 'L2', 'BUBBLE', ?)`)
       .run('old-alert', 'old-signal', now - 800 * 24 * 3600_000)
 
+    // 分时留痕按 7 天滚动：一个 8 天前的点该被删，今天的留下
+    storage.quoteTicks.record([
+      { code: 'SH600000', ts: now - 8 * 24 * 3600_000, last: 10, preClose: 9.9 },
+      { code: 'SH600000', ts: now, last: 10, preClose: 9.9 },
+    ])
+
     const report = pruneAll(storage.db, now, { ...DEFAULT_RETENTION, klineBars: 5 })
     expect(report.klineDeleted).toBe(15)
     expect(storage.klines.count('SH600000')).toBe(5)
     expect(report.signalDeleted).toBe(1)
     expect(report.alertDeleted).toBe(1)
     expect(report.healthDeleted).toBe(1)
+    expect(report.quoteTickDeleted).toBe(1)
+    expect(storage.quoteTicks.series('SH600000', 0, now)).toHaveLength(1)
     expect(storage.meta.getNumber(META_KEYS.lastPruneAt)).toBe(now)
   })
 

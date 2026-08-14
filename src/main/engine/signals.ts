@@ -193,16 +193,42 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
   }
 
   /**
-   * 落库签名。方向、阶段、级别、首要子信号任一变化即视为「新的一条」。
+   * 落库签名 = **结论 + 依据的结构**。任一变化即视为「新的一条」。
    *
    * 为什么不是每轮都插：盘中每 30s 一轮，一天 800 轮 × 100 只 = 8 万行，
-   * 而其中绝大多数是同一条信号的重复。去重键刻意**不含得分** ——
-   * 得分会随最后一根临时 K 线连续抖动，含它等于没去重。
+   * 而其中绝大多数是同一条信号的重复。
+   *
+   * ## 只放离散量，一个连续量都不许进来
+   *
+   * 得分、指标值、票数都会随最后一根临时 K 线连续抖动 —— 放进签名等于没有去重
+   * （每一轮都会算出一个新签名）。所以「依据」取的是**结构**：
+   * 哪些子信号在响、多周期怎么调、风控判了什么，而不是它们的数值。
+   *
+   * ## 为什么依据必须进签名
+   *
+   * 早先的签名只有 `reasons[0]`。于是子信号集合从 {T1,T3} 变成 {T1,T3,T4} 时，
+   * 结论没变、首要理由没变，就**不落新行** —— 而 `signal.evidence` 里存的还是
+   * 三小时前那份旧依据。面板上「触发时的指标值」会与实际不符，
+   * 而这件事从界面上完全看不出来（2026-08-14 补）。
    */
   function signatureOf(evaluation: Evaluation): string {
     const gated = evaluation.gated
-    const top = gated.reasons[0] ?? ''
-    return [evaluation.date, gated.direction, evaluation.signal.stage, gated.level, gated.suppressed ? 'S' : '-', top].join('|')
+    const signal = evaluation.signal
+    // 排序后拼接：子信号的产出顺序不保证稳定，不排序会让顺序变化被误判成「依据变了」
+    const subs = signal.subSignals.map((sub) => `${sub.id}:${sub.direction}`).sort().join(',')
+    const adjustments = signal.adjustments.map((item) => item.id).sort().join(',')
+    const verdicts = gated.verdicts.map((item) => `${item.rule}:${item.action}`).sort().join(',')
+    return [
+      evaluation.date,
+      gated.direction,
+      signal.stage,
+      gated.level,
+      gated.suppressed ? 'S' : '-',
+      gated.reasons[0] ?? '',
+      subs,
+      adjustments,
+      verdicts,
+    ].join('|')
   }
 
   function persist(evaluation: Evaluation, tick: TickInfo): { persisted: boolean; id: string | null } {

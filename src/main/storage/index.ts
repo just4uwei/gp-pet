@@ -12,6 +12,7 @@ import { IndicatorRepo } from './repositories/indicator'
 import { KlineRepo } from './repositories/kline'
 import { MetaRepo } from './repositories/meta'
 import { PositionRepo } from './repositories/position'
+import { QuoteTickRepo } from './repositories/quote-tick'
 import { ShadowRepo } from './repositories/shadow'
 import { SignalRepo } from './repositories/signal'
 import { WatchPointRepo } from './repositories/watch'
@@ -31,6 +32,8 @@ export interface Storage {
   readonly shadow: ShadowRepo
   /** 观察点：用户确认的一次性盯盘条件（**不是策略参数**，见 003_watch.sql） */
   readonly watchPoints: WatchPointRepo
+  /** 当日分时留痕：只服务面板上那张走势图，引擎与回测都不读它（见 004_quote_tick.sql） */
+  readonly quoteTicks: QuoteTickRepo
   readonly meta: MetaRepo
   close(): void
 }
@@ -48,6 +51,7 @@ export function createStorage(db: Database): Storage {
     positions: new PositionRepo(db),
     shadow: new ShadowRepo(db),
     watchPoints: new WatchPointRepo(db),
+    quoteTicks: new QuoteTickRepo(db),
     meta: new MetaRepo(db),
     close: () => db.close(),
   }

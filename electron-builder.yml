@@ -11,10 +11,15 @@
 # 3. **`resources/` 要原样进 `process.resourcesPath/resources`**：
 #    `src/main/resources.ts` 的 `resourcesRoot()` 就是这么找托盘图标与节假日表的，
 #    路径对不上会走兜底托盘图标的降级路径 —— 能跑，但看起来像资源丢了。
+# 4. **`productName` 决定不了数据目录。** userData 走 `app.getName()`，而它读的是
+#    asar 里那份 `package.json` 的 `name`（本仓库是 `gp-pet`，2026-08-14 改名时刻意没动）。
+#    所以装出来的应用叫「蹲点」，数据仍在 `%APPDATA%/gp-pet` —— 见 `src/main/identity.ts`。
+#    哪天 electron-builder 改成把 productName 注入进 asar 的 package.json，
+#    数据目录会跟着搬，**升级它之后要打一次包验这一条**。
 
-appId: com.gppet.desktop
-productName: GP Pet
-copyright: GP Pet
+appId: com.dundian.desktop
+productName: 蹲点
+copyright: 蹲点
 
 directories:
   output: release
@@ -85,7 +90,7 @@ win:
       arch: [x64]
   icon: resources/icons/app/icon.ico
   # 没有代码签名证书：安装时 SmartScreen 会拦一次「未知发布者」，属预期
-  artifactName: gp-pet-${version}-${arch}.${ext}
+  artifactName: dundian-${version}-${arch}.${ext}
 
 nsis:
   # 走带界面的安装流程而不是 oneClick：自用工具也该让人看清装到哪、能不能改路径
@@ -94,13 +99,13 @@ nsis:
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
-  shortcutName: GP Pet
+  shortcutName: 蹲点
   installerIcon: resources/icons/app/icon.ico
   uninstallerIcon: resources/icons/app/icon.ico
-  # 卸载时**不**删数据目录：自选、持仓、信号历史都在 %APPDATA%/GP Pet 下，
+  # 卸载时**不**删数据目录：自选、持仓、信号历史都在 %APPDATA%/gp-pet 下，
   # 静默删掉用户自己录进去的持仓成本是不可逆的
   deleteAppDataOnUninstall: false
-  artifactName: gp-pet-${version}-setup-${arch}.${ext}
+  artifactName: dundian-${version}-setup-${arch}.${ext}
 
 portable:
-  artifactName: gp-pet-${version}-portable-${arch}.${ext}
+  artifactName: dundian-${version}-portable-${arch}.${ext}
