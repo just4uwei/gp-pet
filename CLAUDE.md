@@ -373,6 +373,23 @@ src/backtest 回测 CLI，复用 src/core
 - **日报只做「最近一个交易日」，别顺手加历史翻页。** `position` 表是**当前**状态，
   拿它算三天前那天的浮盈亏会得到一个错的数，而错的方式用户看不出来。
   要做得先用 `trades/ledger.ts` 的 `replayTrades` 重建那一天的持仓。
+- **`ai:explain` 的目标标识有两种取值，格式只在 `shared/ai-target.ts` 定义一处。**
+  日报的 AI 评价借道那条通道（`report:<date>`），为的是复用两层缓存防重复计费、
+  在途去重、取消、流式接续那一整套 —— 另起一条通道等于把踩出来的东西再抄一遍。
+  代价是渲染层与主进程必须用**同一个**函数拼/认前缀：各写一份的症状是
+  「点了没反应」，或者更糟 —— 走到解释单条信号那条路上，拿日期去信号表里查，
+  报一句「该信号已不在库中」。
+- **日报评价不复用 `ai_explain` 表。** 那张表的 `code`/`direction`/`stage`/`score`/`signal_at`
+  是 NOT NULL 且刻意冗余（原信号被裁剪后仍要可读），而一份日报没有这些 ——
+  塞空串和 0 进去正是这个项目一直在防的「用假值冒充」，还会污染抽屉里**按 code**
+  的历史列表。它住 `report_note`（010），`trade_date` 是主键 = 一天一条 = 幂等闸门。
+- **`reportFactDigest` 里不许放生成时刻或 `highlights`。** 它答的是「这段评价是对着
+  哪一版事实写的」（盘中版 vs 定稿版）。把时刻或派生量算进去，指纹每次都变，
+  「这段已过期」的提示就恒亮 —— 等于没有这个功能。`report-ai.test.ts` 两条钉着。
+- **流式 AI 的状态机在 `renderer/panel/useAiStream.ts`，但 `AiExplain` 还没迁过去。**
+  那不是遗漏：`AiExplain` 还带着建议块剥离与观察点表单，而项目**没有渲染层测试** ——
+  在同一次改动里重构它，等于让一条真花钱的路径失去唯一的验证手段。迁移是单独一次改动。
+  新增流式 AI 的地方一律用这个 hook，别再抄第三份。
 - **穿越只在相邻两根间判定一次**，不做「N 日内曾金叉」的模糊匹配；去重是提醒层的职责，不是指标层的。
 - **better-sqlite3 是原生模块**，需在 Electron ABI 下重建（`electron-rebuild`）。`pnpm-workspace.yaml` 里已显式跳过它的默认构建。
 - **主进程/preload 的外置依赖清单在 `electron.vite.config.ts`**，从 `package.json` 的 `dependencies` 派生。别用 `rollupOptions.external` 去覆盖它 —— 漏外置 `electron` 会让 `import { app } from 'electron'` 解析到 npm 上那个「返回 exe 路径」的启动器包，**构建照样成功，启动才炸**。

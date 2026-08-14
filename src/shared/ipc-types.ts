@@ -815,6 +815,23 @@ export interface DailyReportTomorrow {
   note: string
 }
 
+/**
+ * 已经存在的日报 AI 评价（`report:note`）。**读它不会发起任何请求、不花钱。**
+ *
+ * `stale` 是这个类型存在的理由：日报有盘中版与定稿版两个阶段，
+ * 一段基于盘中版写的评价在定稿后可能已经与屏幕上的数字对不上 ——
+ * 而它读起来完全正常。判据是事实层指纹（`report/digest.ts`）。
+ */
+export interface ReportNoteView {
+  tradeDate: TradeDate
+  text: string
+  /** 发起时刻 */
+  createdAt: number
+  model: string
+  /** true = 这段评价写于事实层的**上一个版本**，界面必须说出来 */
+  stale: boolean
+}
+
 export interface Rect {
   x: number
   y: number
@@ -958,6 +975,11 @@ export interface IpcInvokeMap {
    * 而错的方式用户看不出来（见 controller.dailyReport 的头注释）。
    */
   'report:daily': () => DailyReport | null
+  /**
+   * 已经存在的日报评价。**纯读，不发起任何模型请求** ——
+   * 打开页签就有东西看，而「要不要花这笔钱」始终是用户按按钮那一下才决定的。
+   */
+  'report:note': () => ReportNoteView | null
   'pet:setHitRegion': (rects: Rect[]) => void
   /**
    * 渲染层完成命中判定后上报：鼠标是否落在悬浮条本体上。

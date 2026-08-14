@@ -198,6 +198,9 @@ export function registerHandlers(controller: AppController): void {
   // 收盘日报（判据在 report/build.ts）。**它不是提醒**：不进 alert_log、不点状态点
   handle('report:daily', () => controller.dailyReport())
 
+  // 已有的评价。**纯读不发请求** —— 打开页签不等于花钱（与 ai:explain 同一条纪律）
+  handle('report:note', () => controller.reportNote())
+
   handle('pet:setHitRegion', (_event, rects) => controller.setHitRects(rects))
 
   handle('pet:setInteractive', (_event, interactive) => controller.setOverlayInteractive(interactive))

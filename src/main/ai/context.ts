@@ -16,7 +16,7 @@
  */
 
 import { ADJUSTMENT_LABELS, DIRECTION_LABELS, REGIME_LABELS, subSignalLabel } from '@core/risk/text'
-import type { ParamRow, PositionView, SignalEvidence, SignalRecord } from '@shared/ipc-types'
+import type { DailyReport, ParamRow, PositionView, SignalEvidence, SignalRecord } from '@shared/ipc-types'
 import type { AiSignalContext } from './types'
 
 const STAGE_LABELS: Record<SignalRecord['stage'], string> = {
@@ -210,6 +210,122 @@ export function renderContext(context: AiSignalContext): string {
   lines.push('- 布林带标准差除 n，不是 n−1（国内平台口径）')
   lines.push('- 指标一律用前复权价计算；展示价与持仓成本用不复权价')
   lines.push('- 盘中量比按时间归一化后再比')
+
+  return lines.join('\n')
+}
+
+/**
+ * 收盘日报 → 发给模型的正文（2026-08-14）。
+ *
+ * 与上面那份的区别不只是数据换了一套：**这一份的任务是横向看**
+ * （`AI_REPORT_PROMPT`），所以它给的是**一整天、全部自选**的截面，
+ * 而不是一条信号的推导链。
+ *
+ * 两条与那份共享的纪律：
+ *
+ * 1. **必须带参数标定状态。** 缺了它模型会默认引擎结论经过验证，然后用非常有说服力的
+ *    语气把一套未标定的转述阈值讲成定论（ADR-0003 要防的正是这件事），
+ *    而从输出上完全看不出上下文漏了一块。
+ * 2. **不发原始 K 线。** 事实层已经算完了，再发一遍只会烧 token，
+ *    并且给模型一个用别的口径自己重算、然后报出与界面不一致的数字的机会。
+ */
+export function renderReportContext(input: {
+  report: DailyReport
+  params: readonly ParamRow[]
+  engineVersion: string
+  /** 生成时刻的可读串，**由调用方格式化**（本模块不读时钟） */
+  at: string
+}): string {
+  const { report, params, engineVersion, at } = input
+  const counts = { CALIBRATED: 0, KEPT: 0, INERT: 0, UNTESTABLE: 0, GUESS: 0 }
+  for (const row of params) counts[row.status]++
+  const calibratedKeys = params
+    .filter((row) => row.status === 'CALIBRATED')
+    .map((row) => `${row.group}.${row.key}`)
+
+  const lines: string[] = []
+
+  lines.push(`## 这一天`)
+  lines.push(`交易日 ${report.date}，生成于 ${at}`)
+  lines.push(
+    report.stage === 'FINAL'
+      ? '数据来源：当日收盘线（已定稿）'
+      : '数据来源：**盘中最后一次行情**（当日日线尚未入库，数字可能与最终收盘价有出入）'
+  )
+
+  lines.push('')
+  lines.push(`## 概览`)
+  lines.push(`自选 ${report.overview.watchCount} 只，其中 ${report.overview.withSignal} 只今日出现未静默信号`)
+  if (report.overview.byDirection.length > 0) {
+    lines.push(
+      `方向分布：${report.overview.byDirection.map((d) => `${d.direction} ${d.count} 条`).join('、')}`
+    )
+  }
+  lines.push(`有持仓 ${report.overview.positions} 只，其中 ${report.overview.belowStop} 只已跌破止损线`)
+
+  lines.push('')
+  lines.push(`## 逐只（这一段是给你找共同点用的，**不要复述它**）`)
+  for (const stock of report.stocks) {
+    const parts: string[] = [`${stock.name}（${stock.code}${stock.industry ? `，${stock.industry}` : ''}）`]
+    parts.push(
+      stock.quote === null
+        ? '无行情数据'
+        : `收 ${num(stock.quote.close)}，涨跌 ${num(stock.quote.changePct)}%，振幅 ${
+            stock.quote.amplitudePct === null ? '—' : `${num(stock.quote.amplitudePct)}%`
+          }${stock.quote.source === 'SNAPSHOT' ? '（盘中）' : ''}`
+    )
+    parts.push(
+      stock.signals.last === null
+        ? '今日无信号'
+        : `今日 ${stock.signals.actionable} 条信号，最后一条 ${stock.signals.last.direction}（置信 ${(
+            stock.signals.last.score * 100
+          ).toFixed(0)}%，${stock.signals.last.stage}）`
+    )
+    if (stock.position) {
+      parts.push(
+        `持仓 ${stock.position.shares} 股，浮动 ${
+          stock.position.pnlPct === null ? '—' : `${num(stock.position.pnlPct)}%`
+        }，距止损线 ${stock.position.toStopPct === null ? '—' : `${num(stock.position.toStopPct)}%`}`
+      )
+    }
+    if (stock.watch.hit > 0) parts.push(`观察点命中 ${stock.watch.hit} 次`)
+    if (stock.signals.suppressedReasons.length > 0) {
+      parts.push(`被静默：${stock.signals.suppressedReasons.join('；')}`)
+    }
+    lines.push(`- ${parts.join('｜')}`)
+  }
+
+  lines.push('')
+  lines.push(`## 今日提醒`)
+  lines.push(`真的发出 ${report.alerts.delivered} 条，被闸门挡下或降级 ${report.alerts.gated} 条`)
+  for (const row of report.alerts.reasons) lines.push(`- ${row.reason}：${row.count} 次`)
+
+  lines.push('')
+  lines.push(`## 引擎已经给出的「明日关注」（**这是它的结论，不是让你重新列一份**）`)
+  if (report.tomorrow.length === 0) {
+    lines.push('无')
+  } else {
+    for (const row of report.tomorrow) lines.push(`- ${row.name}（${row.code}）${row.kind}：${row.note}`)
+  }
+
+  lines.push('')
+  lines.push(`## 参数标定状态（重要，回答时必须据此把握口径）`)
+  lines.push(`引擎版本 ${engineVersion}`)
+  lines.push(
+    `参数共 ${counts.CALIBRATED + counts.KEPT + counts.INERT + counts.UNTESTABLE + counts.GUESS} 项：` +
+      `已标定并写回 ${counts.CALIBRATED} 项、已上网格但保持出厂值 ${counts.KEPT} 项、` +
+      `已判惰性 ${counts.INERT} 项、日线回测原理上测不到 ${counts.UNTESTABLE} 项、` +
+      `**一个网格都没跑过 ${counts.GUESS} 项**。`
+  )
+  lines.push(
+    calibratedKeys.length === 0
+      ? '没有任何一项经过本地回测标定。'
+      : `真正标定过的只有：${calibratedKeys.join('、')}。`
+  )
+  lines.push(
+    '也就是说：上面这些结论绝大多数建立在公开资料转述的阈值上，没有本地证据支持。' +
+      '**不得**把这套规则说成「经过验证」「有效」或「准确」。'
+  )
 
   return lines.join('\n')
 }

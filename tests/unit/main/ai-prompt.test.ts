@@ -10,7 +10,13 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { AI_SYSTEM_PROMPT, AI_USER_SUFFIX, FORBIDDEN_WORDS } from '@main/ai/prompt'
+import {
+  AI_REPORT_PROMPT,
+  AI_REPORT_USER_SUFFIX,
+  AI_SYSTEM_PROMPT,
+  AI_USER_SUFFIX,
+  FORBIDDEN_WORDS,
+} from '@main/ai/prompt'
 
 describe('AI_SYSTEM_PROMPT', () => {
   it('逐个点名 CLAUDE.md 的禁用词', () => {
@@ -61,5 +67,52 @@ describe('AI_USER_SUFFIX', () => {
     expect(AI_USER_SUFFIX).toContain('不是胜率')
     expect(AI_USER_SUFFIX).toContain('绩效数字')
     expect(AI_USER_SUFFIX).toContain('经过验证')
+  })
+})
+
+/**
+ * 日报的「让 AI 评一下」（2026-08-14）。
+ *
+ * 与上面那份是**两个任务**，所以禁令也不同。最要紧的一条是「不要另列明日关注」：
+ * 日报的事实层严格遵守「只复述不推导」（report/build.ts），
+ * 若模型在这里给出一份自己的名单，那条纪律就从后门被破了 ——
+ * 用户会看到两份可能相反的名单，而没有办法判断该信哪个。
+ */
+describe('AI_REPORT_PROMPT', () => {
+  it('禁令覆盖全部禁用词', () => {
+    for (const word of FORBIDDEN_WORDS) {
+      if (word === '胜率' || word === '概率') {
+        expect(AI_REPORT_PROMPT).toContain(word)
+        continue
+      }
+      expect(AI_REPORT_PROMPT).toContain(word)
+    }
+  })
+
+  it('**不许另列一份「明日关注」，也不许给单只票买卖建议** —— 这条是这份提示词的核心', () => {
+    expect(AI_REPORT_PROMPT).toContain('不要给出你自己的「明日关注」名单')
+    expect(AI_REPORT_PROMPT).toContain('不要对任何单只票给出买卖建议')
+  })
+
+  it('任务是横向看，且明令不要逐只复述（那是烧 token 且给它说错数字的机会）', () => {
+    expect(AI_REPORT_PROMPT).toContain('横向')
+    expect(AI_REPORT_PROMPT).toContain('不要逐只复述')
+  })
+
+  it('照旧禁止绩效数字、禁止把未标定的规则说成经过验证', () => {
+    expect(AI_REPORT_PROMPT).toContain('绩效数字')
+    expect(AI_REPORT_PROMPT).toContain('经过验证')
+    expect(AI_REPORT_PROMPT).toContain('标定')
+  })
+
+  it('盘中数据要留有余地 —— 日报有两个阶段', () => {
+    expect(AI_REPORT_PROMPT).toContain('盘中')
+  })
+})
+
+describe('AI_REPORT_USER_SUFFIX', () => {
+  it('末尾重申那两条最容易被忘的', () => {
+    expect(AI_REPORT_USER_SUFFIX).toContain('明日关注')
+    expect(AI_REPORT_USER_SUFFIX).toContain('绩效数字')
   })
 })

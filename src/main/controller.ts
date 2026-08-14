@@ -38,6 +38,7 @@ import type {
   PositionView,
   ProviderHealth,
   Rect,
+  ReportNoteView,
   ShadowSummary,
   ShadowTradeView,
   SignalEvidence,
@@ -55,6 +56,10 @@ import { DEFAULT_PARAMS, engineVersionOf, withSensitivity } from '@core/params'
 import { sma } from '@core/indicators/series'
 import {
   AI_CONFIG_FILE,
+  AI_REPORT_PROMPT,
+  AI_REPORT_USER_SUFFIX,
+  AI_SYSTEM_PROMPT,
+  AI_USER_SUFFIX,
   AiConfigStore,
   buildSignalContext,
   createAiClient,
@@ -62,6 +67,7 @@ import {
   createUndiciAiTransport,
   electronSecretCrypto,
   renderContext,
+  renderReportContext,
   type AiHistorySink,
   type AiService,
 } from './ai'
@@ -94,7 +100,9 @@ import {
   writeTextFile,
 } from './settings/transfer-io'
 import { paramRows } from './settings/params-view'
+import { isReportTarget, reportDateOf } from '@shared/ai-target'
 import { buildDailyReport } from './report/build'
+import { reportFactDigest } from './report/digest'
 import {
   DEFAULT_SHADOW_CAPITAL,
   emptyShadowSummary,
@@ -1092,6 +1100,29 @@ export class AppController {
     return this.alerts?.markRead(ids, Date.now()) ?? 0
   }
 
+  /**
+   * 已经存在的日报评价。**纯读，不发起任何模型请求。**
+   *
+   * `stale` 由事实层指纹比出来（`report/digest.ts`）：一段基于盘中版写的评价，
+   * 在日线补齐、日报定稿之后可能已经与屏幕上的数字对不上 —— 而它读起来完全正常。
+   * 这与「stale 快照必须灰显」是同一条纪律：不假装，也不让用户自己去发现。
+   */
+  reportNote(): ReportNoteView | null {
+    const layer = this.data
+    if (!layer) return null
+    const report = this.dailyReport()
+    if (!report) return null
+    const row = layer.storage.reportNotes.latestOf(report.date)
+    if (!row) return null
+    return {
+      tradeDate: row.tradeDate,
+      text: row.text,
+      createdAt: row.createdAt,
+      model: row.model,
+      stale: row.factDigest !== reportFactDigest(report),
+    }
+  }
+
   // ── 收盘日报 ──────────────────────────────────────────────────
   //
   // **这一层只凑数据，不做判断** —— 判据全在 `report/build.ts`（纯函数，有用例）。
@@ -1201,7 +1232,12 @@ export class AppController {
       store,
       client: createAiClient(createUndiciAiTransport(store.config().timeoutMs)),
       emit: (chunk) => this.windows.push('push:aiChunk', chunk),
-      buildUserMessage: (signalId) => this.aiUserMessage(signalId),
+      buildUserMessage: (id) => this.aiUserMessage(id),
+      // 两个任务两套提示词：解释一条信号 vs 做一整天的横向观察（见 ai/prompt.ts）
+      promptFor: (id) =>
+        isReportTarget(id)
+          ? { system: AI_REPORT_PROMPT, userSuffix: AI_REPORT_USER_SUFFIX }
+          : { system: AI_SYSTEM_PROMPT, userSuffix: AI_USER_SUFFIX },
       history: this.aiHistorySink(),
       log: { info: (m) => log.info(m), warn: (m, e) => log.warn(m, e) },
     })
@@ -1218,11 +1254,35 @@ export class AppController {
    */
   private aiHistorySink(): AiHistorySink {
     return {
-      latest: (signalId) => this.data?.storage.aiExplains.latestOf(signalId)?.text,
+      latest: (id) => {
+        const date = reportDateOf(id)
+        // 日报走 report_note（一天一条）；信号走 ai_explain。两张表的形状差得远，
+        // 硬塞进一张会往 NOT NULL 的信号列里填假值（010 的头注释记着这一条）
+        if (date !== null) return this.data?.storage.reportNotes.latestOf(date)?.text
+        return this.data?.storage.aiExplains.latestOf(id)?.text
+      },
 
       save: ({ signalId, text, startedAt, finishedAt }) => {
         const layer = this.data
         if (!layer) return
+
+        const reportDate = reportDateOf(signalId)
+        if (reportDate !== null) {
+          const report = this.dailyReport()
+          if (!report) return
+          const config = this.aiStore?.config()
+          layer.storage.reportNotes.upsert({
+            tradeDate: reportDate,
+            createdAt: startedAt,
+            elapsedMs: Math.max(0, finishedAt - startedAt),
+            text,
+            model: config?.model ?? '未知',
+            protocol: config?.protocol ?? 'openai',
+            // 这段评价是对着**哪一版事实**写的。定稿之后据它提示「基于盘中数据」
+            factDigest: reportFactDigest(report),
+          })
+          return
+        }
         // 与 aiUserMessage 同一条查法：一条信号的 id 唯一，倒查最近 500 条即可
         const record = layer.signalHistory({ limit: 500 }).find((row) => row.id === signalId)
         if (!record) {
@@ -1251,8 +1311,39 @@ export class AppController {
     }
   }
 
+  /**
+   * 把一次请求摊成发给模型的正文。拿不到东西就抛错 —— 让 service 报成一次失败。
+   *
+   * 两种目标（`shared/ai-target.ts`）：`report:<date>` 是一整天的日报，其余是一条信号。
+   */
+  private aiUserMessage(id: string): string {
+    if (isReportTarget(id)) return this.aiReportMessage(id)
+    return this.aiSignalMessage(id)
+  }
+
+  /**
+   * 日报的上下文。**发的是已经算好的事实层**（`DailyReport`），不是原始 K 线 ——
+   * 再发一遍只会烧 token，并给模型一个用别的口径重算、报出与界面不一致的数字的机会。
+   */
+  private aiReportMessage(id: string): string {
+    const layer = this.requireData()
+    const report = this.dailyReport()
+    if (!report) throw new Error('日报尚未就绪')
+    const date = reportDateOf(id)
+    if (date !== null && date !== report.date) {
+      // 请求的是别的一天，而这里只算得出最近一个交易日（见 dailyReport 的头注释）
+      throw new Error(`只能评价最近一个交易日（${report.date}）`)
+    }
+    return renderReportContext({
+      report,
+      params: this.paramRows(),
+      engineVersion: layer.signals.engineVersion,
+      at: new Date(report.at).toLocaleString('zh-CN'),
+    })
+  }
+
   /** 把一条信号摊成发给模型的正文。拿不到信号就抛错 —— 让 service 报成一次失败 */
-  private aiUserMessage(signalId: string): string {
+  private aiSignalMessage(signalId: string): string {
     const layer = this.requireData()
     const evidence = layer.explainSignal(signalId)
     if (!evidence) throw new Error('该信号已不在库中（可能已被保留策略裁剪）')

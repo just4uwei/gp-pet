@@ -767,7 +767,12 @@ export function App(): React.JSX.Element {
         让一份「收盘总结」每 30 秒跳一次数字既没必要也让人分心。
       */}
       {tab === 'REPORT' ? (
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-5">
+        // 滚动交给**这一层**（与观察点 / 影子运行 / 设置逐字相同）。
+        // 别把它改成 `flex flex-col overflow-hidden` 再让子组件 `flex-1 overflow-y-auto`：
+        // 那样内层列容器被限死在视口高度，而 `.gp-card` 是 `display:flex; min-height:0`
+        // 的 flex 子项、默认会**收缩** —— 内容压不下就溢出到下一张卡上面，
+        // 表现是「一打开就重叠错乱」（2026-08-14 真机撞到）
+        <div className="min-h-0 flex-1 overflow-y-auto p-5">
           <DailyReportPanel refreshKey={signalKey} />
         </div>
       ) : null}

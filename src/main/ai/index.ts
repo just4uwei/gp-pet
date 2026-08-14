@@ -18,8 +18,14 @@
 export { AiError, createAiClient, createUndiciAiTransport } from './client'
 export type { AiClient } from './client'
 export { AI_CONFIG_FILE, AiConfigStore, DEFAULT_AI_CONFIG, sanitizeAiConfig } from './config'
-export { buildSignalContext, renderContext } from './context'
-export { AI_SYSTEM_PROMPT, FORBIDDEN_WORDS } from './prompt'
+export { buildSignalContext, renderContext, renderReportContext } from './context'
+export {
+  AI_REPORT_PROMPT,
+  AI_REPORT_USER_SUFFIX,
+  AI_SYSTEM_PROMPT,
+  AI_USER_SUFFIX,
+  FORBIDDEN_WORDS,
+} from './prompt'
 export { ANTHROPIC_ADAPTER, OPENAI_ADAPTER, adapterOf, detectProtocol, protocolHint } from './protocols'
 export type { AiDelta, ProtocolAdapter } from './protocols'
 export { electronSecretCrypto } from './secret-crypto'

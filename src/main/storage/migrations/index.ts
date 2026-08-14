@@ -16,6 +16,7 @@ import alertRepeat006 from './006_alert_repeat.sql?raw'
 import tradeLog007 from './007_trade_log.sql?raw'
 import aiExplain008 from './008_ai_explain.sql?raw'
 import positionStop009 from './009_position_stop.sql?raw'
+import reportNote010 from './010_report_note.sql?raw'
 
 export interface Migration {
   version: number
@@ -33,6 +34,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 7, name: '007_trade_log', sql: tradeLog007 },
   { version: 8, name: '008_ai_explain', sql: aiExplain008 },
   { version: 9, name: '009_position_stop', sql: positionStop009 },
+  { version: 10, name: '010_report_note', sql: reportNote010 },
 ]
 
 export const LATEST_SCHEMA_VERSION = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)

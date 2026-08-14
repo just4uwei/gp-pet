@@ -56,6 +56,15 @@ export interface AiServiceDeps {
   /** 由调用方组装的上下文文本（见 context.ts）。拿不到信号时抛错 */
   buildUserMessage: (signalId: string) => string
   /**
+   * 这次请求该用哪套提示词。缺省 = 解释单条信号那一套。
+   *
+   * **加这个口子而不是新起一个 AiService 实例**：去重、两层缓存、取消、在途接续
+   * 那一整套机器只该有一份。而任务确实不同 —— 解释一条信号与做一整天的横向观察
+   * 是两回事，共用一份提示词会让日报那条也按「四段结构」作答。
+   * 分发在 controller（它本来就按 id 前缀分发 `buildUserMessage` 与 `history`）。
+   */
+  promptFor?: (id: string) => { system: string; userSuffix: string }
+  /**
    * 历史落库。**缺省是个空实现** —— 数据层还没起来时 AI 仍然要能用，
    * 只是那几条不进历史（而不是整块报错）。
    */
@@ -88,6 +97,8 @@ interface InFlight {
 
 export function createAiService(deps: AiServiceDeps): AiService {
   const { store, client, emit, buildUserMessage } = deps
+  const promptFor =
+    deps.promptFor ?? (() => ({ system: AI_SYSTEM_PROMPT, userSuffix: AI_USER_SUFFIX }))
   const history: AiHistorySink = deps.history ?? { latest: () => undefined, save: () => {} }
   const log = deps.log ?? { info: () => {}, warn: () => {} }
   const now = deps.now ?? (() => Date.now())
@@ -111,11 +122,12 @@ export function createAiService(deps: AiServiceDeps): AiService {
   async function run(requestId: string, entry: InFlight): Promise<void> {
     const startedAt = now()
     try {
-      const user = `${buildUserMessage(entry.signalId)}${AI_USER_SUFFIX}`
+      const prompt = promptFor(entry.signalId)
+      const user = `${buildUserMessage(entry.signalId)}${prompt.userSuffix}`
       const stream = client.stream({
         config: store.config(),
         apiKey: store.apiKey(),
-        system: AI_SYSTEM_PROMPT,
+        system: prompt.system,
         user,
         signal: entry.controller.signal,
       })
