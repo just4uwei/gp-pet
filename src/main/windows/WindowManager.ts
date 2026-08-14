@@ -21,6 +21,8 @@ export class WindowManager {
   createOverlay(): OverlayWindow {
     if (!this.overlay) {
       this.overlay = new OverlayWindow()
+      // 主进程裁定「光标已离开」时告诉渲染层：它自己判不了这件事（见 OverlayWindow.watchPointer）
+      this.overlay.onPointerOut = () => this.push('push:overlayPointer', { over: false })
       if (!this.onDisplayChange) {
         this.onDisplayChange = () => this.overlay?.revalidatePosition()
         // 拔插外接屏 / 改分辨率后，存下来的坐标可能落在不存在的区域（docs/06 §4）

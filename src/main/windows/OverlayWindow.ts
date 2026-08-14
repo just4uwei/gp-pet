@@ -29,10 +29,28 @@ import { bottomRightOf, ensureVisible, snapToEdge, type Bounds } from '../util/g
  */
 export const OVERLAY_SIZE = { width: 300, height: 38 }
 
+/**
+ * 光标离开轮询的间隔。**只在鼠标压着条子时才跑**，所以它不违反 C7（休市零开销）。
+ * 250ms 是「跑马灯恢复得够快」与「别白转」之间的取舍 —— 人眼分辨不出这点延迟。
+ */
+const POINTER_POLL_MS = 250
+
+/**
+ * 收到最后一次 `dragBy` 之后多久才恢复光标轮询。
+ * 比 `POINTER_POLL_MS` 大一档，保证一次拖拽里至少跳过一个轮询周期。
+ */
+const DRAG_GRACE_MS = 400
+
 export class OverlayWindow {
   private readonly win: BrowserWindow
   /** 当前是否关闭了点击穿透。缓存一份避免每次 mousemove 都跨进程重复设置 */
   private interactive = false
+  /** 光标离开的轮询句柄。非 null 即正在盯（见 watchPointer） */
+  private pointerTimer: ReturnType<typeof setInterval> | null = null
+  /** 这个时刻之前不做光标裁决 —— 拖拽期间窗口会短暂追不上光标（见 dragBy） */
+  private draggingUntil = 0
+  /** 主进程裁定「光标已离开」时回调，由装配层接到 `push:overlayPointer` 上 */
+  onPointerOut?: () => void
   /** 标称尺寸（DIP）。每次移动都按它把宽高重申一遍，见 `moveTo` */
   private readonly size = OVERLAY_SIZE
 
@@ -91,17 +109,62 @@ export class OverlayWindow {
 
   /**
    * 渲染层完成命中判定后调用。
-   * 判定在渲染层做是因为主进程拿不到「鼠标是否压在本体上」这个信息 ——
-   * Electron 只有窗口级的 setIgnoreMouseEvents，没有像素级命中测试（docs/06 §2.2）。
+   * **像素级**判定必须在渲染层做：主进程只知道窗口矩形，不知道四个圆角
+   * （Electron 只有窗口级的 setIgnoreMouseEvents，没有像素级命中测试，docs/06 §2.2）。
+   *
+   * 但「离开」这件事渲染层判不准 —— 见 `watchPointer()`。
    */
   setInteractive(interactive: boolean): void {
     if (!this.alive || interactive === this.interactive) return
     this.interactive = interactive
     if (interactive) {
       this.win.setIgnoreMouseEvents(false)
+      this.watchPointer()
     } else {
       this.win.setIgnoreMouseEvents(true, { forward: true })
+      this.stopWatchingPointer()
+      this.onPointerOut?.()
     }
+  }
+
+  /**
+   * 光标离开的裁决者（2026-08-14 加）。
+   *
+   * ## 为什么渲染层判不了「离开」
+   *
+   * 命中判定跑在 `mousemove` 上，而**鼠标移出窗口之后就没有 mousemove 了** ——
+   * 最后收到的那一次坐标仍然落在本体内。于是渲染层认为鼠标还在条子上。
+   * `document` 上的 `mouseleave` 本来是兜底，但在这个
+   * `focusable: false` + `setIgnoreMouseEvents` 的窗口上并不可靠。
+   *
+   * 后果有两个，一个显眼一个不显眼：
+   *   * 显眼：「悬停暂停跑马灯」永久卡在暂停态，而条子是常驻的，用户没办法解掉；
+   *   * 不显眼：窗口停在**可交互**状态，把下层应用那一小块的点击吃掉 —— **C2 被破**，
+   *     而用户只会觉得「那个位置有时候点不动」。
+   *
+   * 所以改由主进程按**真实光标位置**裁决：只在 interactive 期间轮询（离开即停），
+   * 一次比较两个数，代价可以忽略（C7 说的是休市零开销，而这只在鼠标压着条子时跑）。
+   */
+  private watchPointer(): void {
+    if (this.pointerTimer !== null) return
+    this.pointerTimer = setInterval(() => {
+      if (!this.alive) return this.stopWatchingPointer()
+      if (Date.now() < this.draggingUntil) return
+      const cursor = screen.getCursorScreenPoint()
+      const b = this.win.getBounds()
+      const outside =
+        cursor.x < b.x || cursor.x >= b.x + b.width || cursor.y < b.y || cursor.y >= b.y + b.height
+      // 只管「离开」：进入与圆角那几个像素仍然归渲染层的命中判定
+      if (outside) this.setInteractive(false)
+    }, POINTER_POLL_MS)
+    // 别让这个计时器拖住退出
+    this.pointerTimer.unref?.()
+  }
+
+  private stopWatchingPointer(): void {
+    if (this.pointerTimer === null) return
+    clearInterval(this.pointerTimer)
+    this.pointerTimer = null
   }
 
   /**
@@ -121,6 +184,9 @@ export class OverlayWindow {
   /** 拖拽增量（屏幕像素）。渲染层用 screenX/screenY 求差，窗口跟着走也不会累积误差 */
   dragBy(dx: number, dy: number): void {
     if (!this.alive) return
+    // 拖拽期间让光标轮询闭嘴：甩得快时窗口会短暂追不上光标，那一瞬间轮询会判成
+    // 「离开」→ 关掉可交互 → 渲染层再也收不到 mouseup → 拖拽卡死在按下状态
+    this.draggingUntil = Date.now() + DRAG_GRACE_MS
     const [x, y] = this.win.getPosition()
     this.moveTo((x ?? 0) + dx, (y ?? 0) + dy)
   }
@@ -161,6 +227,8 @@ export class OverlayWindow {
   }
 
   destroy(): void {
+    // 先停轮询：窗口销毁后再触发一次会去读已销毁窗口的 bounds
+    this.stopWatchingPointer()
     if (this.alive) this.win.destroy()
   }
 }

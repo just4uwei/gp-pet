@@ -259,6 +259,25 @@ export function App(): React.JSX.Element {
     void window.gp.invoke('pet:setInteractive', next)
   }, [])
 
+  /*
+    鼠标在不在条子上。**进入靠渲染层，离开靠主进程**，两边都不是 CSS `:hover`。
+
+    `:hover` 在这个窗口上会卡住：鼠标一离开本体，主进程就
+    `setIgnoreMouseEvents(true, { forward: true })`，窗口从此不参与 OS 命中测试，
+    离开时那一下 mouseout 送不到渲染层。
+
+    但**光把 `:hover` 换成命中判定还不够**（2026-08-14 第一次修没修好）：
+    命中判定跑在 `mousemove` 上，而鼠标移出窗口之后就再也没有 `mousemove` 了 ——
+    最后收到的那一次坐标仍然落在本体内，于是这里照样卡在 true。
+    `document` 上的 `mouseleave` 本来是兜底，实测在这个窗口上不可靠。
+
+    所以「离开」由主进程按**真实光标位置**裁决（`OverlayWindow.watchPointer`，
+    只在压着条子时轮询），结论经 `push:overlayPointer` 回来。
+    **别把这条订阅删掉去依赖 DOM 事件** —— 那正是这个 bug 修了两次的原因。
+  */
+  const [hovering, setHovering] = useState(false)
+  useEffect(() => window.gp.on('push:overlayPointer', ({ over }) => setHovering(over)), [])
+
   // ── 命中判定 + 拖拽（与桌宠形态同一套逻辑）────────────────────────
   useEffect(() => {
     const onMouseMove = (event: MouseEvent): void => {
@@ -274,7 +293,9 @@ export function App(): React.JSX.Element {
         }
         return // 拖拽期间不做命中判定，否则拖出本体范围会立刻穿透并丢掉拖拽
       }
-      setInteractive(hitTest(rects, event.clientX, event.clientY))
+      const hit = hitTest(rects, event.clientX, event.clientY)
+      setInteractive(hit)
+      setHovering(hit)
     }
 
     const onMouseUp = (): void => {
@@ -287,7 +308,10 @@ export function App(): React.JSX.Element {
     // 鼠标快速掠出窗口时可能收不到最后一个 mousemove，
     // 不补这一手会让窗口停在「可交互」状态，把下层应用的点击吃掉 —— C2 的典型破法
     const onMouseLeave = (): void => {
-      if (!dragRef.current) setInteractive(false)
+      if (dragRef.current) return
+      setInteractive(false)
+      // 跟着一起解，否则鼠标快速掠出时跑马灯会停在暂停态再也不动
+      setHovering(false)
     }
 
     window.addEventListener('mousemove', onMouseMove)
@@ -354,6 +378,15 @@ export function App(): React.JSX.Element {
 
   // 休市 / 离线 / 免打扰时停下（C7 休市零开销）
   const paused = petState === 'SLEEPY' || petState === 'OFFLINE' || status?.doNotDisturb === true
+  /*
+    实际停不停 = C7 那三种情况 **或** 鼠标停在条子上
+    （想看清某一只时它正好在往外走，是最直接的一种烦人）。
+
+    悬停这一半以前是 CSS `.bar:hover` 干的，但那个 hover 状态在这个窗口上会卡住 ——
+    见上面 `hovering` 那段。两者合成一个值，滚动与「一次一只」的定时器共用它，
+    否则减少动态效果的那条路上悬停不会停。
+  */
+  const frozen = paused || hovering
 
   /**
    * 减少动态效果时的轮播：一次一只，到点换下一只。
@@ -362,10 +395,10 @@ export function App(): React.JSX.Element {
   const cardCount = entries.length + (hasAdvice ? 1 : 0)
   const [step, setStep] = useState(0)
   useEffect(() => {
-    if (!reducedMotion || paused || cardCount <= 1) return
+    if (!reducedMotion || frozen || cardCount <= 1) return
     const timer = window.setInterval(() => setStep((prev) => prev + 1), STEP_MS)
     return () => window.clearInterval(timer)
-  }, [reducedMotion, paused, cardCount])
+  }, [reducedMotion, frozen, cardCount])
   const stepIndex = cardCount > 0 ? step % cardCount : 0
   const stepEntry = entries[stepIndex]
 
@@ -398,7 +431,7 @@ export function App(): React.JSX.Element {
             </div>
           ) : (
             <div
-              className={`track${scrollSec > 0 ? ' track--scroll' : ''}${paused ? ' track--paused' : ''}`}
+              className={`track${scrollSec > 0 ? ' track--scroll' : ''}${frozen ? ' track--paused' : ''}`}
               style={scrollSec > 0 ? { animationDuration: `${scrollSec.toFixed(1)}s` } : undefined}
             >
               <div className="lap" ref={lapRef}>

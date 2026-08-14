@@ -71,6 +71,7 @@ export const PUSH_CHANNELS = [
   'push:quoteTick',
   'push:engineStatus',
   'push:aiChunk',
+  'push:overlayPointer',
 ] as const satisfies readonly (keyof IpcPushMap)[]
 
 export type InvokeChannel = (typeof INVOKE_CHANNELS)[number]

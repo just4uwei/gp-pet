@@ -263,4 +263,164 @@ describe('createAiService', () => {
     expect(service.explain('sig-54').cached).toBe('x')
     expect(service.explain('sig-0').cached).toBeUndefined()
   })
+
+  // ── 落库（008_ai_explain.sql）────────────────────────────────────
+  //
+  // 这一组钉的是「花过一次钱就别再花第二次」：内存缓存重启就空，
+  // 而重启是家常便饭 —— 没有第二层的话，同一条信号会被反复计费而没人发现。
+
+  /** AiHistorySink 的最小替身：一个按 signalId 存全文的 Map */
+  function fakeHistory() {
+    const saved: { signalId: string; text: string; startedAt: number; finishedAt: number }[] = []
+    return {
+      saved,
+      sink: {
+        latest: (signalId: string) => saved.filter((r) => r.signalId === signalId).at(-1)?.text,
+        save: (entry: { signalId: string; text: string; startedAt: number; finishedAt: number }) => {
+          saved.push(entry)
+        },
+      },
+    }
+  }
+
+  it('done 才落库，正文是全量', async () => {
+    const history = fakeHistory()
+    const { client } = instantClient(['甲', '乙'])
+    const service = createAiService({
+      store: fakeStore(),
+      client,
+      emit: () => {},
+      buildUserMessage: () => 'ctx',
+      history: history.sink,
+      now: () => 1000,
+    })
+
+    service.explain('sig-1')
+    await flush()
+    expect(history.saved).toHaveLength(1)
+    expect(history.saved[0]).toMatchObject({ signalId: 'sig-1', text: '甲乙' })
+  })
+
+  it('用户点了停止 → **不落库**：半截的解读进历史，日后翻到时读不懂', async () => {
+    const history = fakeHistory()
+    const { client, release } = controlledClient(['甲', '乙'])
+    const service = createAiService({
+      store: fakeStore(),
+      client,
+      emit: () => {},
+      buildUserMessage: () => 'ctx',
+      history: history.sink,
+    })
+
+    const { requestId } = service.explain('sig-1')
+    service.cancel(requestId)
+    release()
+    await flush()
+    expect(history.saved).toEqual([])
+  })
+
+  it('失败也不落库', async () => {
+    const history = fakeHistory()
+    const client: AiClient = {
+      // eslint-disable-next-line require-yield
+      async *stream() {
+        throw new Error('HTTP 401')
+      },
+    }
+    const service = createAiService({
+      store: fakeStore(),
+      client,
+      emit: () => {},
+      buildUserMessage: () => 'ctx',
+      history: history.sink,
+    })
+
+    service.explain('sig-1')
+    await flush()
+    expect(history.saved).toEqual([])
+  })
+
+  it('重启后（内存缓存为空）命中库里那条，**一个请求都不发**', async () => {
+    const history = fakeHistory()
+    const first = instantClient(['结果'])
+    const service = createAiService({
+      store: fakeStore(),
+      client: first.client,
+      emit: () => {},
+      buildUserMessage: () => 'ctx',
+      history: history.sink,
+    })
+    service.explain('sig-1')
+    await flush()
+    expect(first.calls()).toBe(1)
+
+    // 重启 = 新建一个 service（内存缓存空的），但历史那一层还在
+    const second = instantClient(['不该被用到'])
+    const restarted = createAiService({
+      store: fakeStore(),
+      client: second.client,
+      emit: () => {},
+      buildUserMessage: () => 'ctx',
+      history: history.sink,
+    })
+    expect(restarted.explain('sig-1').cached).toBe('结果')
+    await flush()
+    expect(second.calls()).toBe(0)
+  })
+
+  it('force 绕过两层缓存，并在历史里**多留一条**（旧的不删）', async () => {
+    const history = fakeHistory()
+    const { client, calls } = instantClient(['结果'])
+    const service = createAiService({
+      store: fakeStore(),
+      client,
+      emit: () => {},
+      buildUserMessage: () => 'ctx',
+      history: history.sink,
+    })
+
+    service.explain('sig-1')
+    await flush()
+    // 那正是「同一条信号解读了两次」，两条都要留着才对得起「历史」二字
+    service.explain('sig-1', true)
+    await flush()
+
+    expect(calls()).toBe(2)
+    expect(history.saved).toHaveLength(2)
+  })
+
+  it('落库失败不影响用户看到全文 —— 界面上照常给，只是进不了历史', async () => {
+    const { client } = instantClient(['结果'])
+    const chunks: AiChunk[] = []
+    const service = createAiService({
+      store: fakeStore(),
+      client,
+      emit: (chunk) => chunks.push(chunk),
+      buildUserMessage: () => 'ctx',
+      history: {
+        latest: () => undefined,
+        save: () => {
+          throw new Error('database is locked')
+        },
+      },
+    })
+
+    service.explain('sig-1')
+    await flush()
+    expect(chunks.map((c) => c.delta).filter(Boolean)).toEqual(['结果'])
+    expect(chunks.at(-1)?.done).toBe(true)
+  })
+
+  it('不给 history 时照常工作 —— 数据层没起来不该让 AI 整块报错', async () => {
+    const { client } = instantClient(['结果'])
+    const service = createAiService({
+      store: fakeStore(),
+      client,
+      emit: () => {},
+      buildUserMessage: () => 'ctx',
+    })
+    service.explain('sig-1')
+    await flush()
+    expect(service.explain('sig-1').cached).toBe('结果')
+  })
 })

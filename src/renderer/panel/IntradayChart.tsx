@@ -19,6 +19,8 @@
  *    午休（11:30–13:00，两种来源都没有点）和「应用当时没开着」（只有 LOCAL 会有）。
  *    直连出来的那条斜线看着像分时线，但那段时间里什么都没被观测到 ——
  *    而用户没有任何办法看出那是假的。
+ *    **x 轴折叠午休之后这一条更要紧了**：轴上不再有那 90 分钟的宽度，
+ *    于是「午休没有交易」这件事**只剩断线与那条虚线在说**。
  * 2. **覆盖起点如实标注**（仅 LOCAL）。首个点明显晚于 09:30 时，图下方写一行
  *    「分时自 13:02 起在本机记录」。不写就等于宣称覆盖了全天。
  * 3. **一个点都没有时不画空坐标系**，直接说「今天还没有分时数据」。
@@ -43,11 +45,35 @@ import type { IntradaySeries } from '@shared/ipc-types'
 /** 相邻两点超过这个间隔就认为中间没有观测，断开折线 */
 const GAP_MS = 5 * 60_000
 
-/** 连续竞价的四个时刻，单位是「当天第几毫秒」。x 轴按墙上时间线性铺开，午休不压缩 */
+/** 连续竞价的四个时刻，单位是「当天第几毫秒」 */
 const OPEN_MS = (9 * 60 + 30) * 60_000
 const AM_CLOSE_MS = (11 * 60 + 30) * 60_000
 const PM_OPEN_MS = 13 * 60 * 60_000
 const CLOSE_MS = 15 * 60 * 60_000
+
+/**
+ * x 轴**跳过午休**（2026-08-14 改）：11:30 与 13:00 画在同一个位置。
+ *
+ * 原先按墙上时间线性铺开，于是中间空出 90/330 ≈ **27% 的宽度**，
+ * 而那一段永远不会有任何东西 —— 一张只有 430px 宽的图白白让掉四分之一，
+ * 剩下的曲线被压扁，看细节更难。国内所有行情软件也都是这么画的，
+ * 用户对「11:30 和 13:00 挨着」这件事没有任何理解成本。
+ *
+ * **代价是必须把那条竖线画出来**（下面 xTicks 里 11:30/13:00 合成一条虚线）：
+ * 不画的话，午休前后的价格会被一条实线直接连起来，看着像那段时间在连续成交。
+ * 这与「相邻点超过 GAP_MS 就断线」是同一条纪律的两半 —— 一半管数据，一半管坐标。
+ */
+const SESSION_MS = AM_CLOSE_MS - OPEN_MS + (CLOSE_MS - PM_OPEN_MS)
+
+/** 「当天第几毫秒」→「开盘以来的第几个交易毫秒」。午休那 90 分钟整段折叠掉 */
+function tradingOffset(msOfDay: number): number {
+  if (msOfDay <= OPEN_MS) return 0
+  if (msOfDay <= AM_CLOSE_MS) return msOfDay - OPEN_MS
+  // 午休期间（理论上没有点，但停牌复牌一类的脏数据会落在这儿）一律夹到上午收盘处，
+  // **不要让它插到下午段里去** —— 那会画出一条时间倒流的线
+  if (msOfDay <= PM_OPEN_MS) return AM_CLOSE_MS - OPEN_MS
+  return AM_CLOSE_MS - OPEN_MS + Math.min(msOfDay - PM_OPEN_MS, CLOSE_MS - PM_OPEN_MS)
+}
 
 /** viewBox。抽屉宽约 460px，这个比例下 1 单位 ≈ 1px */
 const W = 430
@@ -207,8 +233,9 @@ export function IntradayChart({
   }
   const digits = priceDigits(hi - lo)
 
+  // 午休折叠：见 tradingOffset。轴上没有那 90 分钟，所以 11:30 与 13:00 落在同一点
   const xOf = (ts: number): number => {
-    const ratio = (ts - (dayStart + OPEN_MS)) / (CLOSE_MS - OPEN_MS)
+    const ratio = tradingOffset(ts - dayStart) / SESSION_MS
     return PAD.left + Math.min(1, Math.max(0, ratio)) * PLOT.w
   }
   const yOf = (value: number): number => PAD.top + (1 - (value - lo) / (hi - lo)) * PLOT.h
@@ -223,11 +250,15 @@ export function IntradayChart({
   const coverageFrom = first && first.ts > dayStart + OPEN_MS + 60_000 ? first.ts : null
 
   const yTicks = Array.from({ length: Y_TICKS }, (_, i) => lo + ((hi - lo) * i) / (Y_TICKS - 1))
+  /*
+    午休折叠之后 11:30 与 13:00 是同一个 x，所以合成**一条**刻度，标签写成
+    「11:30/13:00」而不是叠两个字上去。那条虚线是这次改动的必需品，不是装饰：
+    没有它，午休前后两个价会被一条实线连起来，看着像那 90 分钟里在连续成交。
+  */
   const xTicks = [
-    { at: OPEN_MS, label: '09:30' },
-    { at: AM_CLOSE_MS, label: '11:30' },
-    { at: PM_OPEN_MS, label: '13:00' },
-    { at: CLOSE_MS, label: '15:00' },
+    { at: OPEN_MS, label: '09:30', anchor: 'start' as const, dashed: false },
+    { at: AM_CLOSE_MS, label: '11:30/13:00', anchor: 'middle' as const, dashed: true },
+    { at: CLOSE_MS, label: '15:00', anchor: 'end' as const, dashed: false },
   ]
 
   return (
@@ -270,7 +301,7 @@ export function IntradayChart({
           )
         })}
 
-        {/* 时间刻度。午休两端各一条竖线，中间那段与「断线」一起说明那里没有交易 */}
+        {/* 时间刻度。中间那条虚线就是午休 —— 轴上没有宽度，但它必须看得见（见 xTicks） */}
         {xTicks.map((tick) => (
           <g key={tick.label}>
             <line
@@ -278,14 +309,14 @@ export function IntradayChart({
               x2={xOf(dayStart + tick.at)}
               y1={PAD.top}
               y2={PAD.top + PLOT.h}
-              stroke="rgba(255,255,255,0.07)"
+              stroke={tick.dashed ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.07)'}
               strokeWidth={1}
-              {...(tick.at === AM_CLOSE_MS || tick.at === PM_OPEN_MS ? { strokeDasharray: '2 3' } : {})}
+              {...(tick.dashed ? { strokeDasharray: '2 3' } : {})}
             />
             <text
               x={xOf(dayStart + tick.at)}
               y={H - 6}
-              textAnchor={tick.at === OPEN_MS ? 'start' : tick.at === CLOSE_MS ? 'end' : 'middle'}
+              textAnchor={tick.anchor}
               fontSize={8}
               fill="rgba(255,255,255,0.35)"
             >
@@ -359,6 +390,7 @@ export function IntradayChart({
           <>
             <span>逐分钟分时，覆盖全天</span>
             {avgSegments.length > 0 ? <span style={{ color: AVG_COLOR }}>— 均价</span> : null}
+            <span className="text-white/20">虚线处是午休（轴上不占宽度）</span>
           </>
         ) : coverageFrom !== null ? (
           <span className="text-amber-200/60">

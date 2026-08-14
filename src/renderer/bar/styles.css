@@ -77,9 +77,16 @@ body,
  * 两条不能省：
  * 1. **装得下就不滚** —— 轨道只在渲染层量出「一圈比可视区宽」时才加 .track--scroll，
  *    一条常驻置顶的条子没必要为了有动效而一直动（C7 的精神）。
- * 2. **休市 / 离线 / 免打扰要停** —— .track--paused 由 petState 给出，
+ * 2. **休市 / 离线 / 免打扰要停** —— .track--paused 由渲染层给出，
  *    对应 C7「休市时 CPU ≈ 0，动画降至 6fps 或暂停」。
- * 鼠标停在条子上时也暂停：想看清某一只时它正好在往外走，是最直接的一种烦人。
+ *
+ * 鼠标停在条子上时也暂停（想看清某一只时它正好在往外走，是最直接的一种烦人），
+ * **但那一半绝不能写成 `.bar:hover`**（2026-08-14 踩过）：这个窗口的命中判定在渲染层，
+ * 鼠标一离开本体主进程就 `setIgnoreMouseEvents(true, { forward: true })`，
+ * 窗口从此不参与 OS 命中测试 —— 离开时那一下 mouseout 送不到渲染层，
+ * `:hover` 永久停在 true。症状是「移上去停住，移开再也不动了」，而条子是常驻的，
+ * 用户没有任何办法把那个状态解掉。悬停现在与休市走同一个 .track--paused，
+ * 由 App.tsx 的命中判定给出（它每次 mousemove 都重算，还有两条兜底）。
  */
 .viewport {
   display: flex;
@@ -101,8 +108,8 @@ body,
   animation: marquee linear infinite;
 }
 
-.track--paused,
-.bar:hover .track--scroll {
+/* 悬停也走这一个类。**别把 `.bar:hover .track--scroll` 加回来**，见上面那段 */
+.track--paused {
   animation-play-state: paused;
 }
 

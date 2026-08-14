@@ -790,6 +790,18 @@ export interface IpcPushMap {
   'push:engineStatus': EngineStatus
   /** AI 解读的流式分片（P2）。与提醒无关，不经过四道闸门 */
   'push:aiChunk': AiChunk
+  /**
+   * 鼠标是不是真的还压在悬浮条上（2026-08-14）。
+   *
+   * **只有主进程答得准。** 渲染层能可靠地判断「进入」（每次 mousemove 都在算命中区），
+   * 但判断不了「离开」：鼠标移出窗口之后就再也没有 mousemove 了，而最后收到的那一次
+   * 坐标仍然落在本体内。`document` 上的 mouseleave 在这个
+   * `focusable: false` + `setIgnoreMouseEvents` 的窗口上并不可靠 ——
+   * 于是「悬停暂停跑马灯」会永久卡在暂停态，而条子是常驻的，用户解不掉。
+   *
+   * 主进程按真实光标位置（`screen.getCursorScreenPoint()`）轮询裁决，false 即离开。
+   */
+  'push:overlayPointer': { over: boolean }
 }
 
 /**

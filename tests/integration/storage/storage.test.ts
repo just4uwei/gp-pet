@@ -542,7 +542,95 @@ describe('QuoteTickRepo', () => {
   })
 })
 
+describe('AiExplainRepo（008）', () => {
+  let storage: Storage
+  beforeEach(async () => {
+    storage = await openMemory()
+  })
+  afterEach(() => storage.close())
+
+  const T = 1_700_000_000_000
+  const row = (id: string, code: string, createdAt: number, signalId = `sig-${id}`) => ({
+    id,
+    signalId,
+    code,
+    createdAt,
+    elapsedMs: 12_000,
+    text: `正文 ${id}`,
+    model: 'qwen-max',
+    protocol: 'openai' as const,
+    direction: 'BUY' as const,
+    stage: 'CONFIRMED' as const,
+    score: 0.78,
+    priceAt: 10.5,
+    signalAt: createdAt - 60_000,
+  })
+
+  it('按 code 倒序（新的在上），与提醒日志、信号列表同向', () => {
+    storage.aiExplains.insert(row('a', 'SH600000', T))
+    storage.aiExplains.insert(row('c', 'SH600000', T + 2000))
+    storage.aiExplains.insert(row('b', 'SH600000', T + 1000))
+    storage.aiExplains.insert(row('x', 'SZ000001', T + 3000))
+
+    expect(storage.aiExplains.listByCode('SH600000').map((r) => r.id)).toEqual(['c', 'b', 'a'])
+    expect(storage.aiExplains.countByCode('SH600000')).toBe(3)
+  })
+
+  it('latestOf 取该信号最近一次 —— **防重复计费走它**', () => {
+    storage.aiExplains.insert(row('old', 'SH600000', T, 'sig-1'))
+    storage.aiExplains.insert(row('new', 'SH600000', T + 5000, 'sig-1'))
+    // 「重新生成」会在同一条信号下多留一行，旧的不删；读的时候取最新那条
+    expect(storage.aiExplains.latestOf('sig-1')?.id).toBe('new')
+    expect(storage.aiExplains.latestOf('没解读过的信号')).toBeNull()
+  })
+
+  it('拿不到当时价时是 undefined，**不是 0**（约束 4）', () => {
+    const withPrice = row('a', 'SH600000', T)
+    delete (withPrice as { priceAt?: number }).priceAt
+    storage.aiExplains.insert(withPrice)
+    expect(storage.aiExplains.get('a')?.priceAt).toBeUndefined()
+  })
+
+  it('信号被裁掉之后这一行照样活着 —— 它没有指向 signal 的外键', () => {
+    storage.db
+      .prepare(
+        `INSERT INTO signal (id, code, created_at, trade_date, direction, score, votes, regime, stage, price_at, evidence, engine_version)
+         VALUES ('sig-1', 'SH600000', ?, '2020-01-02', 'BUY', 0.7, 3, 'RANGE', 'CONFIRMED', 10, '{}', 'v')`
+      )
+      .run(T - 800 * 24 * 3600_000)
+    storage.aiExplains.insert(row('a', 'SH600000', T, 'sig-1'))
+
+    pruneAll(storage.db, T, DEFAULT_RETENTION)
+
+    // 原信号没了，解读还在 —— 而且方向/置信/当时价都读得出来（那组字段是冗余存的）
+    expect(storage.db.prepare(`SELECT COUNT(*) AS n FROM signal`).get<{ n: number }>()?.n).toBe(0)
+    expect(storage.aiExplains.get('a')).toMatchObject({ direction: 'BUY', score: 0.78, priceAt: 10.5 })
+  })
+
+  it('**裁剪一行都不碰它** —— 它是花过钱的记录，不是可再生的派生物', () => {
+    // 两年前的一条：任何按天算的保留策略都会想删它
+    storage.aiExplains.insert(row('ancient', 'SH600000', T - 900 * 24 * 3600_000))
+    pruneAll(storage.db, T, DEFAULT_RETENTION)
+    expect(storage.aiExplains.get('ancient')).not.toBeNull()
+  })
+
+  it('把票移出自选也不影响它（没有指向 watchlist 的外键）', () => {
+    storage.watchlist.add(profile('SH600000', '浦发银行'), '自选', T)
+    storage.aiExplains.insert(row('a', 'SH600000', T))
+    storage.watchlist.remove('SH600000')
+    expect(storage.aiExplains.countByCode('SH600000')).toBe(1)
+  })
+
+  it('remove 是删除的唯一入口', () => {
+    storage.aiExplains.insert(row('a', 'SH600000', T))
+    expect(storage.aiExplains.remove('a')).toBe(true)
+    expect(storage.aiExplains.remove('a')).toBe(false)
+    expect(storage.aiExplains.get('a')).toBeNull()
+  })
+})
+
 describe('裁剪', () => {
+
   let storage: Storage
   beforeEach(async () => {
     storage = await openMemory()
