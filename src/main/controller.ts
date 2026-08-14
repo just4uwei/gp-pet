@@ -27,6 +27,7 @@ import type {
   AlertRecord,
   AppSettings,
   ConfigTransferResult,
+  DailyBar,
   EngineStatus,
   IntradaySeries,
   MaintenanceResult,
@@ -39,12 +40,17 @@ import type {
   ShadowTradeView,
   SignalEvidence,
   SignalRecord,
+  TradeDraft,
+  TradeLedger,
+  TradePreview,
+  TradeView,
   WatchItem,
   WatchPointDraft,
   WatchPointView,
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
 import { engineVersionOf, withSensitivity } from '@core/params'
+import { sma } from '@core/indicators/series'
 import {
   AI_CONFIG_FILE,
   AiConfigStore,
@@ -97,6 +103,8 @@ import { pruneAll, vacuum } from './storage/retention'
 import { isQuiet, quietUntil, type QuietPreset } from './util/quiet'
 import { evaluateWatchPoints, type WatchHit } from './watch/evaluate'
 import { isWatchMetric } from './watch/metrics'
+import { applyTrade, isTradeError, replayTrades } from './trades/ledger'
+import type { TradeRow } from './storage/repositories/trade'
 import type { WatchPointRow } from './storage/repositories/watch'
 import { WindowManager } from './windows/WindowManager'
 
@@ -140,6 +148,26 @@ function toWatchPointView(
   if (row.metric !== 'PRICE' && row.engineVersion !== currentEngineVersion) {
     view.staleEngineVersion = row.engineVersion
   }
+  return view
+}
+
+/**
+ * 成交流水的落库行 → 渲染层视图。
+ * 名字里带 Log 是为了与 `shadow` 那边的 `toTradeView`（影子成交）区分 ——
+ * 两者都叫「成交」，但一个是用户真金白银的账本，一个是模拟盘的绩效记录。
+ */
+function toTradeLogView(row: TradeRow): TradeView {
+  const view: TradeView = {
+    id: row.id,
+    code: row.code,
+    side: row.side,
+    tradedAt: row.tradedAt,
+    price: row.price,
+    shares: row.shares,
+    fee: row.fee,
+  }
+  if (row.realized !== undefined) view.realized = row.realized
+  if (row.note !== undefined) view.note = row.note
   return view
 }
 
@@ -392,6 +420,24 @@ export class AppController {
         applyConfigBundle(bundle, {
           watchlist: layer.storage.watchlist,
           positions: layer.storage.positions,
+          // 导入的持仓补一笔期初建仓，让账本与持仓从导入那一刻起就对得上
+          // （与 007 迁移做的是同一件事）
+          trades: {
+            removeByCode: (code) => layer.storage.trades.removeByCode(code as SecCode),
+            seedOpening: (input) =>
+              layer.storage.trades.insert({
+                id: randomUUID(),
+                code: input.code as SecCode,
+                side: 'OPENING',
+                tradedAt: input.at,
+                price: input.cost,
+                shares: input.shares,
+                // 0 不是「没有手续费」，是「不知道」—— 导出文件里从来没有过费用
+                fee: 0,
+                note: '导入配置时按持仓补的期初建仓，手续费未知',
+                createdAt: Date.now(),
+              }),
+          },
         })
       )
       // 设置走 patchSettings 而不是直接写 store：轮询间隔、灵敏度等要立刻作用到数据层
@@ -595,6 +641,155 @@ export class AppController {
     const evidence = this.requireData().explainSignal(id)
     if (!evidence) throw new Error('该信号已不在库中（可能已被保留策略裁剪）')
     return evidence
+  }
+
+  // ── 日 K 与成交流水（007_trade_log.sql）───────────────────────────
+
+  /**
+   * 日 K（抽屉「行情」页）。**不复权**价格 + 两条**展示用** MA。
+   *
+   * 为什么不复权：价格轴要与用户的成交价、持仓成本、券商 App 上的数字对得上。
+   * 代价是除权日会跳空，两条 MA 也跟着跳 —— **如实呈现，不做接续**（渲染层标一行小字）。
+   * 引擎用的那两条 MA 是前复权算的，与这里不是同一条线，不要拿去互相校对。
+   */
+  dailyBars(query: { code: SecCode; limit?: number }): DailyBar[] {
+    const layer = this.data
+    if (!layer) return []
+    const limit = Math.min(Math.max(Math.trunc(query.limit ?? 60), 1), 500)
+    // 多取 60 根只为把 MA60 预热出来，最后再切回 limit 根 ——
+    // 不预热的话前 59 根的 MA 全是 null，图上那两条线会从中间才开始
+    const candles = layer.storage.klines.recent(query.code, limit + 60)
+    if (candles.length === 0) return []
+
+    const closes = candles.map((c) => c.close)
+    const ma20 = sma(closes, 20)
+    const ma60 = sma(closes, 60)
+    return candles.slice(-limit).map((candle, i) => {
+      const index = candles.length - Math.min(limit, candles.length) + i
+      return {
+        date: candle.date,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: candle.volume,
+        ma20: ma20[index] ?? null,
+        ma60: ma60[index] ?? null,
+      }
+    })
+  }
+
+  /** 某只票的账本视图。汇总在这一层算，渲染层不再实现一遍口径 */
+  tradeLedger(code: SecCode): TradeLedger {
+    const layer = this.data
+    if (!layer) return { code, trades: [], realizedTotal: 0, feeTotal: 0, position: null }
+    const rows = layer.storage.trades.listByCode(code)
+    return {
+      code,
+      // 仓储只出升序（重放要的顺序），展示要新的在上 —— 在这里翻一次，别让两边各记一半
+      trades: [...rows].reverse().map(toTradeLogView),
+      realizedTotal: layer.storage.trades.sumRealized(code),
+      feeTotal: layer.storage.trades.sumFees(code),
+      position: layer.storage.positions.get(code) ?? null,
+    }
+  }
+
+  /**
+   * 录入前试算。**与 `addTrade` 走同一个 `applyTrade`** —— 表单里显示的
+   * 「录入后会变成什么样」必须与真的存进去的结果逐位相同，否则用户两个数都不会信。
+   */
+  previewTrade(draft: TradeDraft): TradePreview {
+    const empty = { fee: 0, amount: 0, position: null, realized: null }
+    const layer = this.data
+    if (!layer) return { ...empty, error: '数据层还没就绪' }
+
+    const current = layer.storage.positions.get(draft.code)
+    const outcome = applyTrade(
+      current ? { shares: current.shares, cost: current.cost } : null,
+      { side: draft.side, price: draft.price, shares: draft.shares }
+    )
+    if (isTradeError(outcome)) return { ...empty, error: outcome.error }
+    return {
+      fee: outcome.fee,
+      amount: draft.price * Math.trunc(draft.shares),
+      position: outcome.position,
+      realized: outcome.realized,
+    }
+  }
+
+  /**
+   * 录一笔成交：追加流水 + 按加权平均更新持仓。
+   *
+   * 记账规则在 `trades/ledger.ts`，**与表单里的试算是同一个函数** ——
+   * 两处各算一遍必然分叉，而症状是「表单说成本会变成 12.34，存完变成 12.31」。
+   *
+   * 落库包在一个事务里：流水写进去了但持仓没更新，账就永远对不上了。
+   */
+  addTrade(draft: TradeDraft): TradeLedger {
+    const layer = this.requireData()
+    const code = draft.code
+    if (!layer.storage.watchlist.get(code)) throw new Error('这只股票不在自选里，先添加再录成交')
+
+    const current = layer.storage.positions.get(code)
+    const outcome = applyTrade(
+      current ? { shares: current.shares, cost: current.cost } : null,
+      { side: draft.side, price: draft.price, shares: draft.shares }
+    )
+    if (isTradeError(outcome)) throw new Error(outcome.error)
+
+    const now = Date.now()
+    const tradedAt = draft.tradedAt ?? now
+    layer.storage.db.transaction(() => {
+      layer.storage.trades.insert({
+        id: randomUUID(),
+        code,
+        side: draft.side,
+        tradedAt,
+        price: draft.price,
+        shares: Math.trunc(draft.shares),
+        fee: outcome.fee,
+        ...(outcome.realized === null ? {} : { realized: outcome.realized }),
+        ...(draft.note === undefined || draft.note === '' ? {} : { note: draft.note.slice(0, 200) }),
+        createdAt: now,
+      })
+      if (outcome.position === null) {
+        layer.storage.positions.clear(code)
+      } else {
+        layer.storage.positions.set(code, outcome.position.shares, outcome.position.cost, current?.openedAt ?? tradedAt)
+        // 买入之后持有期最高价至少是成本价：不补这一下，移动止损会拿一个比成本还低的
+        // peak 去算回撤（docs/05 §2.3）
+        layer.storage.positions.bumpPeak(code, Math.max(outcome.position.cost, draft.price))
+      }
+    })
+
+    log.info(`[trade] ${code} ${draft.side} ${draft.shares}股 @${draft.price}（费 ${outcome.fee}）`)
+    this.onStateChanged()
+    return this.tradeLedger(code)
+  }
+
+  /**
+   * 删一笔（录错了）：删掉之后**按剩余流水重放重建持仓**。
+   *
+   * 不做反向增量回滚：卖出不改成本价，所以没有可逆信息 ——「买 → 卖 → 又买」这种序列上
+   * 反算是回不到正确成本的。重放的前提是期初那一笔已经补上了（007 迁移做的事）。
+   */
+  removeTrade(id: string): TradeLedger {
+    const layer = this.requireData()
+    const row = layer.storage.trades.get(id)
+    if (!row) throw new Error('这笔成交已经不在了')
+
+    const code = row.code
+    layer.storage.db.transaction(() => {
+      layer.storage.trades.remove(id)
+      const rebuilt = replayTrades(layer.storage.trades.listByCode(code))
+      const openedAt = layer.storage.positions.get(code)?.openedAt ?? row.tradedAt
+      if (rebuilt === null) layer.storage.positions.clear(code)
+      else layer.storage.positions.set(code, rebuilt.shares, rebuilt.cost, openedAt)
+    })
+
+    log.info(`[trade] ${code} 删掉一笔 ${row.side} ${row.shares}股 @${row.price}，已按剩余流水重建持仓`)
+    this.onStateChanged()
+    return this.tradeLedger(code)
   }
 
   /**

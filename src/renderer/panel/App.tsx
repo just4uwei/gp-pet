@@ -29,18 +29,22 @@ import type {
   PositionView,
   ProviderHealth,
   QuoteTick,
+  SignalRecord,
+  TradeLedger,
   WatchItem,
 } from '@shared/ipc-types'
+import { groupSignals } from '@shared/signal-group'
 import type { SecCode } from '@core/types'
 import { AlertLog } from './AlertLog'
 import { BrandMark } from './BrandMark'
 import { ConfigTransferButtons, ConfigTransferNotice, type TransferOutcome } from './ConfigTransfer'
 import { FOOTER_NOTE } from './disclaimer'
 import { Onboarding } from './Onboarding'
-import { PositionEditor } from './PositionEditor'
 import { Settings } from './Settings'
 import { ShadowPanel } from './ShadowPanel'
-import { SignalList } from './SignalList'
+import { CountChips, SignalList, SignalRow } from './SignalList'
+import { StockDrawer, type StockTab } from './StockDrawer'
+import { useSignalEvidence } from './useSignalEvidence'
 import { WatchPoints } from './WatchPoints'
 
 /**
@@ -196,57 +200,63 @@ function WatchRow({
   item,
   quote,
   position,
-  editing,
   first,
   last,
   onRemove,
   onMove,
-  onToggleEdit,
-  onSaved,
-  onError,
+  onOpen,
 }: {
   item: WatchItem
   quote: QuoteTick | undefined
   position: PositionView | undefined
-  editing: boolean
   first: boolean
   last: boolean
   onRemove: (code: SecCode) => void
   onMove: (code: SecCode, delta: number) => void
-  onToggleEdit: (code: SecCode) => void
-  onSaved: () => void
-  onError: (message: string) => void
+  /** 打开详情抽屉。`tab` 决定落在哪一页 */
+  onOpen: (code: SecCode, tab: StockTab) => void
 }): React.JSX.Element {
   // 没有报价 ≠ 报价为 0。这一栏在拿到第一轮快照前显示 '—'，不显示数字
   const stale = quote?.stale === true
-  return (
-    <li className="border-b border-white/[0.06] px-3 py-2 text-sm last:border-b-0 hover:bg-white/[0.02]">
-      <div className="flex items-center gap-3">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="truncate">{item.name}</span>
-            {item.hasPosition ? (
-              <span className="shrink-0 rounded bg-white/10 px-1 text-[10px] text-white/60">持仓</span>
-            ) : null}
-          </div>
-          <div className="font-mono text-xs text-white/40">
-            {item.code}
-            {item.industry ? ` · ${item.industry}` : ''}
-          </div>
-        </div>
+  const floatingPct =
+    position && quote && position.cost > 0 ? ((quote.last - position.cost) / position.cost) * 100 : null
 
-        <div className={`w-16 text-right font-mono ${stale ? 'text-white/35' : ''}`}>
-          {quote ? quote.last.toFixed(2) : '—'}
-        </div>
-        <div className={`w-18 text-right font-mono ${stale ? 'text-white/35' : changeTone(quote?.changePct ?? 0)}`}>
-          {quote ? signed(quote.changePct) : '—'}
-        </div>
+  return (
+    <li className="border-b border-white/[0.06] last:border-b-0 hover:bg-white/[0.02]">
+      <div className="flex items-center gap-3 px-3 py-2 text-sm">
+        {/*
+          整行是打开详情的按钮。上移/下移/移除三个小按钮在它外面 ——
+          嵌在按钮里的按钮点起来会连带触发外层，那是「点了移除结果弹出详情」的来源
+        */}
+        <button className="flex min-w-0 flex-1 items-center gap-3 text-left" onClick={() => onOpen(item.code, 'QUOTE')}>
+          <span className="min-w-0 flex-1">
+            <span className="flex items-center gap-2">
+              <span className="truncate">{item.name}</span>
+              {item.hasPosition ? (
+                <span className="shrink-0 rounded bg-white/10 px-1 text-[10px] text-white/60">持仓</span>
+              ) : null}
+            </span>
+            <span className="block font-mono text-xs text-white/40">
+              {item.code}
+              {item.industry ? ` · ${item.industry}` : ''}
+            </span>
+          </span>
+
+          <span className={`w-16 text-right font-mono ${stale ? 'text-white/35' : ''}`}>
+            {quote ? quote.last.toFixed(2) : '—'}
+          </span>
+          <span
+            className={`w-18 text-right font-mono ${stale ? 'text-white/35' : changeTone(quote?.changePct ?? 0)}`}
+          >
+            {quote ? signed(quote.changePct) : '—'}
+          </span>
+        </button>
 
         <div className="flex shrink-0 justify-end gap-0.5 text-xs text-white/40">
           <button
-            className={`px-1 hover:text-white/80 ${editing ? 'text-white/80' : ''}`}
-            title="录入持仓（启用止损类强制提醒）"
-            onClick={() => onToggleEdit(item.code)}
+            className="px-1 hover:text-white/80"
+            title="持仓与成交录入"
+            onClick={() => onOpen(item.code, 'POSITION')}
           >
             仓
           </button>
@@ -272,14 +282,15 @@ function WatchRow({
         </div>
       </div>
 
-      {editing ? (
-        <PositionEditor
-          code={item.code}
-          position={position}
-          quote={quote}
-          onSaved={onSaved}
-          onError={onError}
-        />
+      {/* 有持仓时把浮盈亏摆在行里：那是用户最常想看的一个数，不该要点进抽屉才知道 */}
+      {position ? (
+        <div className="flex items-baseline gap-2 px-3 pb-1.5 text-[10px] text-white/35">
+          <span>{position.shares} 股</span>
+          <span>成本 {position.cost.toFixed(3)}</span>
+          {floatingPct === null ? null : (
+            <span className={changeTone(floatingPct)}>{signed(floatingPct)}</span>
+          )}
+        </div>
       ) : null}
     </li>
   )
@@ -299,7 +310,6 @@ export function App(): React.JSX.Element {
   const [status, setStatus] = useState<EngineStatus | null>(null)
   const [health, setHealth] = useState<ProviderHealth[]>([])
   const [positions, setPositions] = useState<PositionView[]>([])
-  const [editing, setEditing] = useState<SecCode | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [transfer, setTransfer] = useState<TransferOutcome | null>(null)
   // 引擎每轮跑完会推一次 engineStatus；用它当信号与提醒日志的重取信号
@@ -314,6 +324,25 @@ export function App(): React.JSX.Element {
    * 现在切回概览时重读，设置页改完也会主动回调重读。
    */
   const [aiReady, setAiReady] = useState(false)
+  /*
+    信号的拉取与分组提到这一层（原先在 SignalList 里）：抽屉现在有三个入口，
+    其中两个在自选列表那边，而抽屉的信号页要拿到同一份分组数据。
+    「展开了哪一条依据」也在这里（useSignalEvidence），列表与抽屉共用一份。
+  */
+  const [signalRecords, setSignalRecords] = useState<SignalRecord[]>([])
+  const [showSuppressed, setShowSuppressed] = useState(true)
+  const signalEvidence = useSignalEvidence(setError)
+  /** 抽屉：看哪只、落在哪个页签。null = 关着 */
+  const [drawer, setDrawer] = useState<{ code: SecCode; tab: StockTab } | null>(null)
+  const [ledger, setLedger] = useState<TradeLedger | null>(null)
+  const [tradeBusy, setTradeBusy] = useState(false)
+  /*
+    「今天」只在挂载时算一次并存住：每次渲染现算的话，跨午夜那一刻起点会变，
+    而面板是常驻挂载的（下面只切 display），真的会跨午夜。
+    refreshKey 每轮引擎跑完都递增，届时自然重新对齐。
+  */
+  const [dayStart] = useState(() => new Date(new Date().setHours(0, 0, 0, 0)).getTime())
+
   /** ACTIVE 观察点数，显示在标签上 —— 「软件在盯什么」要一眼看见 */
   const [watchActive, setWatchActive] = useState(0)
   const [watchKey, setWatchKey] = useState(0)
@@ -324,13 +353,6 @@ export function App(): React.JSX.Element {
       .invoke('watch:list', { status: 'ACTIVE', limit: 200 })
       .then((rows) => setWatchActive(rows.length))
       .catch(() => setWatchActive(0))
-  }, [])
-
-  const refreshAiReady = useCallback((): void => {
-    void window.gp
-      .invoke('ai:config')
-      .then((config) => setAiReady(config.enabled && config.hasKey && config.model !== ''))
-      .catch(() => setAiReady(false))
   }, [])
 
   const reload = useCallback(async (): Promise<void> => {
@@ -349,6 +371,112 @@ export function App(): React.JSX.Element {
       setError(errorText(err))
     }
   }, [])
+
+  // ── 信号：拉取 → 过滤 → 分组 ──────────────────────────────────
+  useEffect(() => {
+    let cancelled = false
+    void window.gp
+      .invoke('signal:history', { from: dayStart, limit: 200 })
+      .then((rows) => {
+        if (!cancelled) setSignalRecords(rows)
+      })
+      .catch((err: unknown) => setError(errorText(err)))
+    return () => {
+      cancelled = true
+    }
+  }, [signalKey, dayStart])
+
+  /*
+    先按「含被静默的」过滤，**再**分组 —— 顺序不能倒过来。
+    倒过来的话徽标会数上几条用户当前看不到的信号，而「写着 4 条、展开只有 1 条」
+    这种对不上比少显示更难排查（groupSignals 的头注释记着同一条）。
+  */
+  const { groups, suppressedCount } = useMemo(() => {
+    const suppressed = signalRecords.filter((r) => r.suppressedReason !== undefined)
+    const visible = showSuppressed
+      ? signalRecords
+      : signalRecords.filter((r) => r.suppressedReason === undefined)
+    return { groups: groupSignals(visible), suppressedCount: suppressed.length }
+  }, [signalRecords, showSuppressed])
+
+  /** 信号行由这一层渲染：列表与抽屉共用同一份展开状态（见 useSignalEvidence） */
+  const renderSignalRow = useCallback(
+    (record: SignalRecord): React.JSX.Element => (
+      <SignalRow
+        record={record}
+        expanded={signalEvidence.expandedId === record.id}
+        evidence={signalEvidence.evidence[record.id] ?? null}
+        aiReady={aiReady}
+        onWatchCreated={refreshWatch}
+        onError={setError}
+        onToggle={signalEvidence.toggle}
+      />
+    ),
+    [signalEvidence, aiReady, refreshWatch]
+  )
+
+  // ── 详情抽屉与成交流水 ───────────────────────────────────────
+  const loadLedger = useCallback((code: SecCode): void => {
+    void window.gp
+      .invoke('trade:list', { code })
+      .then(setLedger)
+      .catch((err: unknown) => setError(errorText(err)))
+  }, [])
+
+  const openDrawer = useCallback(
+    (code: SecCode, drawerTab: StockTab): void => {
+      setDrawer({ code, tab: drawerTab })
+      // 账本每次打开都重拉：它可能在别处被改过（导入配置、另一只票的重放）
+      setLedger(null)
+      loadLedger(code)
+    },
+    [loadLedger]
+  )
+
+  /**
+   * 录一笔成交。成功后同时刷三处：账本（抽屉里）、自选行的持仓角标、以及引擎状态
+   * —— 持仓变了会打开/关闭止损类强制提醒那条通道（docs/05 §2.3），
+   * 不刷的话用户看到的是「录完了但列表上还是没持仓」。
+   */
+  const submitTrade = useCallback(
+    (draft: { side: 'BUY' | 'SELL'; price: number; shares: number; tradedAt: number; note?: string }): void => {
+      const code = drawer?.code
+      if (code === undefined) return
+      setTradeBusy(true)
+      void window.gp
+        .invoke('trade:add', { code, ...draft })
+        .then((next) => {
+          setLedger(next)
+          void reload()
+        })
+        .catch((err: unknown) => setError(errorText(err)))
+        .finally(() => setTradeBusy(false))
+    },
+    [drawer, reload]
+  )
+
+  const removeTrade = useCallback(
+    (id: string): void => {
+      setTradeBusy(true)
+      void window.gp
+        .invoke('trade:remove', id)
+        .then((next) => {
+          setLedger(next)
+          void reload()
+        })
+        .catch((err: unknown) => setError(errorText(err)))
+        .finally(() => setTradeBusy(false))
+    },
+    [reload]
+  )
+
+  const refreshAiReady = useCallback((): void => {
+    void window.gp
+      .invoke('ai:config')
+      .then((config) => setAiReady(config.enabled && config.hasKey && config.model !== ''))
+      .catch(() => setAiReady(false))
+  }, [])
+
 
   useEffect(() => {
     // 设置读失败也要能进主界面：把用户锁在引导页外面（或里面）比少弹一次声明糟得多。
@@ -447,7 +575,8 @@ export function App(): React.JSX.Element {
       setTransfer(silent ? null : outcome)
       // 导入成功后整份自选与持仓都换了，界面必须立刻跟上，不能等下一轮 tick
       if (outcome.kind === 'import' && outcome.result.status === 'DONE') {
-        setEditing(null)
+        // 抽屉里那只票的持仓与账本已经被整份换掉了，关掉比留一屏旧数字诚实
+        setDrawer(null)
         void reload()
         refreshStatus()
         setSignalKey((key) => key + 1)
@@ -604,14 +733,11 @@ export function App(): React.JSX.Element {
                   item={item}
                   quote={quoteOf.get(item.code)}
                   position={positionOf.get(item.code)}
-                  editing={editing === item.code}
                   first={i === 0}
                   last={i === items.length - 1}
                   onRemove={remove}
                   onMove={move}
-                  onToggleEdit={(code) => setEditing((current) => (current === code ? null : code))}
-                  onSaved={() => void reload()}
-                  onError={setError}
+                  onOpen={openDrawer}
                 />
               ))}
             </ul>
@@ -621,10 +747,12 @@ export function App(): React.JSX.Element {
         <div className="flex min-h-0 flex-col gap-4">
           {/* 信号是流水，占掉右栏剩下的全部高度；提醒日志是按需展开的，按内容给高 */}
           <SignalList
-            refreshKey={signalKey}
-            aiReady={aiReady}
-            onWatchCreated={refreshWatch}
-            onError={setError}
+            groups={groups}
+            suppressedCount={suppressedCount}
+            showSuppressed={showSuppressed}
+            onShowSuppressed={setShowSuppressed}
+            renderRow={renderSignalRow}
+            onOpen={(code) => openDrawer(code, 'SIGNAL')}
           />
           <AlertLog
             refreshKey={signalKey}
@@ -641,6 +769,33 @@ export function App(): React.JSX.Element {
         能力边界仍然对用户有意义，但现在的边界写在提醒日志里（每条为什么发/没发），
         比页脚上一句静态的话诚实得多。
       */}
+      {/*
+        详情抽屉。三个入口（自选行 / 「仓」按钮 / 信号徽标行）共用它 ——
+        一只股票只有一个详情页，不该因为从哪进来而看到不一样的东西。
+        它挂在 App 这一层而不是列表里：`fixed` 定位要躲开右栏的 overflow-hidden，
+        而信号页要用的分组数据与「展开了哪一条依据」也都在这一层。
+      */}
+      {drawer ? (
+        <StockDrawer
+          code={drawer.code}
+          name={items.find((item) => item.code === drawer.code)?.name ?? drawer.code}
+          initialTab={drawer.tab}
+          quote={quoteOf.get(drawer.code)}
+          group={groups.find((g) => g.code === drawer.code)}
+          ledger={ledger}
+          renderSignalRow={renderSignalRow}
+          countChips={(() => {
+            const group = groups.find((g) => g.code === drawer.code)
+            return group ? <CountChips group={group} /> : null
+          })()}
+          onSubmitTrade={submitTrade}
+          onRemoveTrade={removeTrade}
+          tradeBusy={tradeBusy}
+          onError={setError}
+          onClose={() => setDrawer(null)}
+        />
+      ) : null}
+
       <footer className="shrink-0 border-t border-white/10 px-5 py-2 text-xs text-white/35">
         {FOOTER_NOTE}
       </footer>

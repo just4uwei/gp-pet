@@ -15,6 +15,7 @@ import { PositionRepo } from './repositories/position'
 import { QuoteTickRepo } from './repositories/quote-tick'
 import { ShadowRepo } from './repositories/shadow'
 import { SignalRepo } from './repositories/signal'
+import { TradeRepo } from './repositories/trade'
 import { WatchPointRepo } from './repositories/watch'
 import { WatchlistRepo } from './repositories/watchlist'
 
@@ -34,6 +35,8 @@ export interface Storage {
   readonly watchPoints: WatchPointRepo
   /** 当日分时留痕：只服务面板上那张走势图，引擎与回测都不读它（见 004_quote_tick.sql） */
   readonly quoteTicks: QuoteTickRepo
+  /** 成交流水：用户自己的账本，不进裁剪、不挂自选的生命周期（见 007_trade_log.sql） */
+  readonly trades: TradeRepo
   readonly meta: MetaRepo
   close(): void
 }
@@ -52,6 +55,7 @@ export function createStorage(db: Database): Storage {
     shadow: new ShadowRepo(db),
     watchPoints: new WatchPointRepo(db),
     quoteTicks: new QuoteTickRepo(db),
+    trades: new TradeRepo(db),
     meta: new MetaRepo(db),
     close: () => db.close(),
   }

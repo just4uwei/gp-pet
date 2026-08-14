@@ -51,6 +51,85 @@ export interface IntradaySeries {
   points: { ts: number; last: number }[]
 }
 
+/**
+ * 日 K 图的一根（`kline:daily`）。
+ *
+ * **价格是不复权的**，与用户的成交价、`position.cost` 同一口径（docs/03 §2.3）——
+ * 用前复权画图的话价格轴与他在券商 App 上看到的、以及他自己填的成本价对不上。
+ *
+ * 代价写在这里，别在图上悄悄抹平：`ma20` / `ma60` 因此也是**画在不复权价上的展示线**，
+ * 不是引擎用的那两条（引擎一律用前复权）。除权日不复权价会跳空，这两条线跟着跳 ——
+ * **如实呈现，不做接续**。预热不足的那几根是 null，不是 0（约束 4）。
+ */
+export interface DailyBar {
+  date: string
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+  ma20: number | null
+  ma60: number | null
+}
+
+/** 一笔成交（007_trade_log.sql）。BUY / SELL 是真实成交，OPENING 是迁移或导入补的期初建仓 */
+export interface TradeView {
+  id: string
+  code: SecCode
+  side: 'BUY' | 'SELL' | 'OPENING'
+  /** 成交时刻（用户填的日期），不是录入时刻 */
+  tradedAt: number
+  price: number
+  shares: number
+  fee: number
+  /** 卖出结转的已实现盈亏（含费）。买入与期初**缺省** —— 不是 0 */
+  realized?: number
+  note?: string
+}
+
+/** 某只票的账本视图（`trade:list`）。汇总在主进程算，避免渲染层再实现一遍口径 */
+export interface TradeLedger {
+  code: SecCode
+  /** 按成交时刻**倒序**，新的在上 */
+  trades: TradeView[]
+  /** 已实现盈亏合计。一笔都没卖时是 0，这里的 0 是对的（就是没实现） */
+  realizedTotal: number
+  /** 手续费合计（含期初那笔的 0 —— 那个 0 是「不知道」，不是「没有」） */
+  feeTotal: number
+  /** 当前持仓；已清仓为 null */
+  position: PositionView | null
+}
+
+/**
+ * 录入前的试算（`trade:preview`）。
+ *
+ * **为什么走一趟 IPC 而不在渲染层算**：记账规则住在 `src/main/trades/ledger.ts`，
+ * 而 `renderer → main` 是禁止的反向依赖（CLAUDE.md 的分层）。在渲染层照抄一份口径
+ * 才是真正的坏选择 —— 症状会是「表单说成本变成 12.34，存完变成 12.31」，
+ * 而用户没法判断哪个才对。一次本地纯函数调用的往返可以忽略不计。
+ */
+export interface TradePreview {
+  /** 非空 = 这笔录不进去（超卖、数值非法），原样显示给用户；此时其余字段无意义 */
+  error?: string
+  fee: number
+  amount: number
+  /** 录入后的持仓；null = 清仓 */
+  position: { shares: number; cost: number } | null
+  /** 本笔已实现盈亏；买入为 null（**不是 0**） */
+  realized: number | null
+}
+
+/** 录一笔成交。价格是**不复权真实成交价**，股数为正整数 */
+export interface TradeDraft {
+  code: SecCode
+  side: 'BUY' | 'SELL'
+  price: number
+  shares: number
+  /** 成交时刻。缺省取现在 */
+  tradedAt?: number
+  note?: string
+}
+
 export interface SignalRecord {
   id: string
   code: SecCode
@@ -557,6 +636,16 @@ export interface IpcInvokeMap {
    * `to` 省略时取「现在」。
    */
   'quote:intraday': (query: { code: SecCode; from: number; to?: number }) => IntradaySeries
+  /** 日 K（不复权 + 展示用 MA）。`limit` 缺省 60 —— 抽屉里那张图就画这么多 */
+  'kline:daily': (query: { code: SecCode; limit?: number }) => DailyBar[]
+  /** 某只票的成交流水与盈亏汇总 */
+  'trade:list': (query: { code: SecCode }) => TradeLedger
+  /** 录入前试算。与 `trade:add` 走同一个 `applyTrade`，不许两处各算一遍 */
+  'trade:preview': (draft: TradeDraft) => TradePreview
+  /** 录一笔成交：追加流水 + 按加权平均更新持仓。参数非法时抛错，由渲染层显示 */
+  'trade:add': (draft: TradeDraft) => TradeLedger
+  /** 删一笔（录错了）。**按剩余流水重放重建持仓**，不做反向增量 */
+  'trade:remove': (id: string) => TradeLedger
   'signal:history': (query: { code?: SecCode; from?: number; to?: number; limit?: number }) => SignalRecord[]
   'signal:explain': (id: string) => SignalEvidence
   /** 提醒日志（docs/05 §6）：含被丢弃与被降级的条目 */

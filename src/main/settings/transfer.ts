@@ -243,6 +243,20 @@ export interface ConfigPositionStore {
 export interface ConfigApplyStores {
   watchlist: ConfigWatchlistStore
   positions: ConfigPositionStore
+  /**
+   * 成交流水（007_trade_log.sql）。导入的持仓要**补一笔期初建仓**，
+   * 否则持仓页会出现「现持 1000 股、历史成交 0 笔」，已实现盈亏的起算点也对不上。
+   *
+   * 可选：老的调用方（用例）没有这一项时就不补 —— 补流水是锦上添花，
+   * 不该让「导入自选与持仓」这件事因为少传一个 store 而失败。
+   */
+  trades?: ConfigTradeStore
+}
+
+export interface ConfigTradeStore {
+  /** 清掉该标的的全部流水。导入是覆盖式的，旧账本不能与新持仓混在一起 */
+  removeByCode(code: string): void
+  seedOpening(input: { code: string; shares: number; cost: number; at: number }): void
 }
 
 export interface ConfigApplyResult {
@@ -286,6 +300,15 @@ export function applyConfigBundle(bundle: ConfigBundle, stores: ConfigApplyStore
     stores.positions.set(held.code, held.shares, held.cost, held.openedAt)
     // set() 把 peak_price 置为成本价，持有期最高价要单独抬上去（bumpPeak 只升不降）
     stores.positions.bumpPeak(held.code, held.peakPrice)
+    // 账本与持仓要从导入那一刻起就对得上（与 007 迁移补期初建仓是同一件事）。
+    // 先清旧流水：导入是覆盖式的，上一份配置的成交记录留着会让盈亏算到另一个人的账上
+    stores.trades?.removeByCode(held.code)
+    stores.trades?.seedOpening({
+      code: held.code,
+      shares: held.shares,
+      cost: held.cost,
+      at: held.openedAt,
+    })
   }
 
   return {

@@ -60,6 +60,28 @@ export function registerHandlers(controller: AppController): void {
 
   handle('signal:explain', (_event, id) => controller.explainSignal(id))
 
+  // ── 日 K 与成交流水（007_trade_log.sql）───────────────────────────
+  // code 一律先过 normalizeCode：渲染层可以传 600000 / sh600000 / SH600000
+
+  handle('kline:daily', (_event, query) =>
+    controller.dailyBars({
+      code: normalizeCode(query.code),
+      ...(query.limit === undefined ? {} : { limit: query.limit }),
+    })
+  )
+
+  handle('trade:list', (_event, query) => controller.tradeLedger(normalizeCode(query.code)))
+
+  handle('trade:preview', (_event, draft) =>
+    controller.previewTrade({ ...draft, code: normalizeCode(draft.code) })
+  )
+
+  handle('trade:add', (_event, draft) =>
+    controller.addTrade({ ...draft, code: normalizeCode(draft.code) })
+  )
+
+  handle('trade:remove', (_event, id) => controller.removeTrade(id))
+
   // 当日分时留痕（004_quote_tick.sql）。**只在面板展开某个信号分组时才被调**，
   // 所以这里不做任何缓存 —— 一次查询就是一条 SQLite 索引扫描
   handle('quote:intraday', (_event, query) =>

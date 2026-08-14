@@ -77,6 +77,7 @@ describe('迁移', () => {
         'watch_point',
         'signal',
         'trade_calendar',
+        'trade_log',
         'watchlist',
       ])
     )
@@ -422,6 +423,75 @@ describe('新增列（005 / 006）', () => {
 
   it('bumpRepeat 对不存在的行返回 false —— 调用方据此退回插新行', () => {
     expect(storage.alerts.bumpRepeat('nope', 1)).toBe(false)
+  })
+})
+
+describe('TradeRepo（007）', () => {
+  let storage: Storage
+  beforeEach(async () => {
+    storage = await openMemory()
+  })
+  afterEach(() => storage.close())
+
+  const T = 1_700_000_000_000
+  const seedWatch = (): void => {
+    storage.watchlist.add(profile('SH600000', '浦发银行'), '自选', T)
+  }
+
+  it('迁移那条 INSERT…SELECT 把持仓补成一笔期初建仓 —— 否则「现持 1000 股、历史成交 0 笔」', () => {
+    // 迁移是建库时跑的（那时 position 还是空的），所以这里验的是那条语句的**形状**：
+    // 给一条持仓，按 007 里那句话补，应该得到一笔 OPENING
+    seedWatch()
+    storage.positions.set('SH600000', 1000, 10.5, T)
+    storage.db
+      .prepare(
+        `INSERT INTO trade_log (id, code, side, traded_at, price, shares, fee, realized, note, created_at)
+         SELECT 'opening-' || code, code, 'OPENING', opened_at, cost, shares, 0, NULL, '期初', opened_at
+         FROM position`
+      )
+      .run()
+
+    const seeded = storage.trades.listByCode('SH600000')
+    expect(seeded).toHaveLength(1)
+    expect(seeded[0]?.side).toBe('OPENING')
+    expect(seeded[0]?.shares).toBe(1000)
+    expect(seeded[0]?.price).toBe(10.5)
+    // fee = 0 是「不知道」，不是「没有」—— 迁移时无从得知当时的费用
+    expect(seeded[0]?.fee).toBe(0)
+    // 期初没有已实现盈亏：**缺省，不是 0**（约束 4）
+    expect(seeded[0]?.realized).toBeUndefined()
+  })
+
+  it('listByCode 升序（重放要的顺序），同一时刻按录入先后兜底', () => {
+    seedWatch()
+    const base = { code: 'SH600000' as const, price: 10, shares: 100, fee: 1 }
+    storage.trades.insert({ ...base, id: 'b', side: 'BUY', tradedAt: T, createdAt: 2 })
+    storage.trades.insert({ ...base, id: 'a', side: 'BUY', tradedAt: T, createdAt: 1 })
+    storage.trades.insert({ ...base, id: 'c', side: 'SELL', tradedAt: T + 1000, createdAt: 3 })
+    expect(storage.trades.listByCode('SH600000').map((t) => t.id)).toEqual(['a', 'b', 'c'])
+  })
+
+  it('已实现盈亏与手续费按标的求和；没有卖出时是 0（这里的 0 是对的）', () => {
+    seedWatch()
+    storage.trades.insert({
+      id: 't1', code: 'SH600000', side: 'BUY', tradedAt: T, price: 10, shares: 100, fee: 5, createdAt: T,
+    })
+    expect(storage.trades.sumRealized('SH600000')).toBe(0)
+    storage.trades.insert({
+      id: 't2', code: 'SH600000', side: 'SELL', tradedAt: T + 1, price: 12, shares: 100, fee: 6, realized: 189, createdAt: T,
+    })
+    expect(storage.trades.sumRealized('SH600000')).toBe(189)
+    expect(storage.trades.sumFees('SH600000')).toBe(11)
+  })
+
+  it('移出自选**不**连带删账本 —— 卖光之后把票删掉，赚了多少不该跟着消失', () => {
+    seedWatch()
+    storage.trades.insert({
+      id: 't1', code: 'SH600000', side: 'SELL', tradedAt: T, price: 12, shares: 100, fee: 6, realized: 189, createdAt: T,
+    })
+    storage.watchlist.remove('SH600000')
+    expect(storage.trades.listByCode('SH600000')).toHaveLength(1)
+    expect(storage.trades.sumRealized('SH600000')).toBe(189)
   })
 })
 

@@ -171,6 +171,17 @@ src/backtest 回测 CLI，复用 src/core
 理由：影子运行与回测量的是同一件事，成本模型、手数取整、绩效口径各写一份，两边数字就再也对不上，
 而「回测说赚、影子说亏」到底是策略退化还是口径差异会变成一个查不清的问题。
 
+**同一条边的第二个用例是 `main/trades → backtest/costs`**（2026-08-14，实盘成交记账）：
+用户录入的成交按同一套费率算手续费，实盘盈亏才与影子绩效可比。
+但**记账绝不套 `buyFill` / `sellFill` 的滑点** —— 那两个是回测在模拟「不知道会成交在哪」，
+而用户填的就是真实成交价，再偏一次等于凭空把它改坏，然后一路进成本、进止损线。
+这是那个文件里最容易被「顺手复用」错的地方，`src/main/trades/ledger.ts` 头注释写着。
+
+**渲染层不许 import `src/main`**（包括那个纯函数记账器）。成交表单的「录入后会变成什么样」
+走 `trade:preview` 这趟 IPC，与落库共用同一个 `applyTrade` ——
+在渲染层照抄一份口径才是坏选择：症状会是「表单说成本变成 12.34，存完变成 12.31」，
+而用户没法判断哪个才对。`tsconfig.web.json` 的 include 会直接把这种 import 拦下来。
+
 ## 上手前先读
 
 | 要做的事 | 先读 |
@@ -181,6 +192,7 @@ src/backtest 回测 CLI，复用 src/core
 | 换托盘 / 应用图标 | [resources/icons/README.md](./resources/icons/README.md)（png 是手绘资产；只有 `icon.ico` 是生成件，跑 `node tools/logo/make-ico.mjs` 重出，它**不在** package.json 的 scripts 里） |
 | 改提醒逻辑 | [docs/05](./docs/05-风控与提醒规则.md) |
 | 改影子运行 | [docs/07 §2.3](./docs/07-回测与验证方案.md)（四条前向纪律 + 记账口径） |
+| 改成交记账 / 持仓 | [`src/main/trades/ledger.ts`](./src/main/trades/ledger.ts) 头注释（含费摊薄、卖出不动成本、**不套滑点**）+ [007_trade_log.sql](./src/main/storage/migrations/007_trade_log.sql) |
 | 改设置页 / 参数表 | [docs/01 §5.5](./docs/01-产品需求与范围.md) + [ADR-0003](./docs/adr/ADR-0003-来源文档数值不作为出厂默认.md) |
 | 改 AI 解读 | [src/main/ai/index.ts](./src/main/ai/index.ts) 头注释（五条纪律）+ [docs/08 §后续](./docs/08-开发路线图.md) |
 | 改观察点 | [003_watch.sql](./src/main/storage/migrations/003_watch.sql) 头注释（它不是什么）+ [docs/05 §3.1](./docs/05-风控与提醒规则.md) |

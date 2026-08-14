@@ -23,16 +23,20 @@
  *
  * 详情从「就地展开」改成抽屉是因为右栏只有 ~300px 宽（2026-08-14）：
  * 旧信号、依据、AI 解读、走势图挤在那个宽度里都做不好，走势图连坐标轴都放不下。
- * 抽屉与列表**共用同一份 `expandedId` / `evidence`** —— 各存一套的话，
- * 在列表里展开的那条进抽屉会「忘记」自己是展开的，AI 解读还会因重新挂载被取消。
+ *
+ * ## 状态在 App 手上，这里只负责画（2026-08-14 二次改造）
+ *
+ * 抽屉合并成了 `StockDrawer`（行情 / 信号 / 持仓 三页签），而它的另外两个入口在
+ * **自选列表**那边。所以 `signal:history` 的拉取、分组、以及「展开了哪一条依据」
+ * 全部提到 `App`：抽屉与列表共用同一份 `expandedId` / `evidence`
+ * —— 各存一套的话，在列表里展开的那条进抽屉会「忘记」自己是展开的，
+ * AI 解读还会因重新挂载被取消（`AiExplain` 是卸载即取消的）。
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { AlertLevel, GatedDirection, Regime, SecCode } from '@core/types'
 import type { SignalEvidence, SignalRecord } from '@shared/ipc-types'
-import { groupSignals, type SignalGroup } from '@shared/signal-group'
+import type { SignalGroup } from '@shared/signal-group'
 import { AiExplain } from './AiExplain'
-import { SignalDrawer } from './SignalDrawer'
 
 const DIRECTION_LABEL: Record<GatedDirection, string> = {
   BUY: '买入',
@@ -152,7 +156,7 @@ function Evidence({ evidence }: { evidence: SignalEvidence }): React.JSX.Element
   )
 }
 
-function SignalRow({
+export function SignalRow({
   record,
   expanded,
   evidence,
@@ -241,7 +245,7 @@ function SignalRow({
 }
 
 /** 方向计数徽标。列表与抽屉共用一份 —— 两处对不上比不显示更难查 */
-function CountChips({ group }: { group: SignalGroup<SignalRecord> }): React.JSX.Element {
+export function CountChips({ group }: { group: SignalGroup<SignalRecord> }): React.JSX.Element {
   return (
     <>
       {group.counts.map((item) => (
@@ -265,34 +269,16 @@ function CountChips({ group }: { group: SignalGroup<SignalRecord> }): React.JSX.
  */
 function SignalGroupItem({
   group,
-  expandedId,
-  evidence,
-  aiReady,
-  onWatchCreated,
-  onError,
-  onToggle,
+  renderRow,
   onOpen,
 }: {
   group: SignalGroup<SignalRecord>
-  expandedId: string | null
-  evidence: Record<string, SignalEvidence>
-  aiReady: boolean
-  onWatchCreated: () => void
-  onError: (message: string) => void
-  onToggle: (id: string) => void
+  renderRow: (record: SignalRecord) => React.JSX.Element
   onOpen: (code: SecCode) => void
 }): React.JSX.Element {
   return (
     <li className="border-b border-white/[0.06] py-2 last:border-b-0">
-      <SignalRow
-        record={group.latest}
-        expanded={expandedId === group.latest.id}
-        evidence={evidence[group.latest.id] ?? null}
-        aiReady={aiReady}
-        onWatchCreated={onWatchCreated}
-        onError={onError}
-        onToggle={onToggle}
-      />
+      {renderRow(group.latest)}
 
       <button
         className="mt-1 flex w-full items-center gap-1 text-left"
@@ -311,93 +297,23 @@ function SignalGroupItem({
   )
 }
 
-/** 当天 00:00 的时间戳。信号按 created_at 存的是墙上时刻，列表按「今天」筛 */
-function startOfToday(): number {
-  const now = new Date()
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
-}
-
 export function SignalList({
-  refreshKey,
-  aiReady,
-  onWatchCreated,
-  onError,
+  groups,
+  suppressedCount,
+  showSuppressed,
+  onShowSuppressed,
+  renderRow,
+  onOpen,
 }: {
-  /** 每轮引擎跑完后由父组件递增，触发重新拉取 */
-  refreshKey: number
-  /**
-   * AI 解读是否可用。**由 App 传进来而不是自己读** —— 概览页常驻挂载，
-   * 自己读就只会在应用启动时读那一次（见 App 里 `aiReady` 的注释）。
-   */
-  aiReady: boolean
-  /** 新建观察点成功后通知上层刷新计数与「观察点」页 */
-  onWatchCreated: () => void
-  onError: (message: string) => void
+  /** 已按「含被静默的」筛过、并分好组的数据。拉取与分组都在 App（见文件头） */
+  groups: readonly SignalGroup<SignalRecord>[]
+  suppressedCount: number
+  showSuppressed: boolean
+  onShowSuppressed: (next: boolean) => void
+  /** 信号行交给 App 渲染 —— 展开依据 / AI 的状态在那边，与抽屉共用 */
+  renderRow: (record: SignalRecord) => React.JSX.Element
+  onOpen: (code: SecCode) => void
 }): React.JSX.Element {
-  const [records, setRecords] = useState<SignalRecord[]>([])
-  const [showSuppressed, setShowSuppressed] = useState(true)
-  const [expandedId, setExpandedId] = useState<string | null>(null)
-  const [evidence, setEvidence] = useState<Record<string, SignalEvidence>>({})
-  /** 抽屉里正在看哪只。null = 抽屉关着 */
-  const [drawerCode, setDrawerCode] = useState<SecCode | null>(null)
-  /*
-    「今天」只在挂载时算一次并存住。每次渲染现算的话，跨午夜那一刻
-    `startOfToday()` 会变，走势图的 x 轴与 `signal:history` 的起点就会对不上 ——
-    而面板是常驻挂载的（App.tsx 只切 display），真的会跨午夜。
-    refreshKey 每轮引擎跑完都递增，届时自然会重新对齐。
-  */
-  const [dayStart] = useState(startOfToday)
-
-  useEffect(() => {
-    let cancelled = false
-    void window.gp
-      .invoke('signal:history', { from: dayStart, limit: 200 })
-      .then((rows) => {
-        if (!cancelled) setRecords(rows)
-      })
-      .catch((error: unknown) => {
-        onError(error instanceof Error ? error.message : String(error))
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [refreshKey, dayStart, onError])
-
-  const toggle = useCallback(
-    (id: string): void => {
-      setExpandedId((current) => (current === id ? null : id))
-      if (evidence[id]) return
-      void window.gp
-        .invoke('signal:explain', id)
-        .then((detail) => setEvidence((current) => ({ ...current, [id]: detail })))
-        .catch((error: unknown) => {
-          onError(error instanceof Error ? error.message : String(error))
-        })
-    },
-    [evidence, onError]
-  )
-
-  const closeDrawer = useCallback(() => setDrawerCode(null), [])
-
-  /*
-    先按「含被静默的」过滤，**再**分组 —— 顺序不能倒过来。
-    倒过来的话徽标会数上几条用户当前看不到的信号，而「写着 4 条、展开只有 1 条」
-    这种对不上比少显示更难排查（groupSignals 的头注释记着同一条）。
-  */
-  const { groups, suppressedCount } = useMemo(() => {
-    const suppressed = records.filter((r) => r.suppressedReason !== undefined)
-    const visible = showSuppressed ? records : records.filter((r) => r.suppressedReason === undefined)
-    return { groups: groupSignals(visible), suppressedCount: suppressed.length }
-  }, [records, showSuppressed])
-
-  /*
-    抽屉认的是 code 而不是快照下来的那个 group 对象：引擎每轮都会推新数据，
-    存对象的话抽屉会一直显示打开那一刻的旧内容（而它看起来完全正常）。
-    那只票的信号全没了（被「含被静默的」筛掉、或跨了午夜）时 drawer 为 undefined，
-    抽屉自然收起来 —— 这比留一个空壳好。
-  */
-  const drawer = drawerCode === null ? undefined : groups.find((g) => g.code === drawerCode)
-
   // 卡片自己吃掉右栏剩下的高度，列表在卡片内部滚动 —— 信号是每轮都在长的流水，
   // 让它把整页顶长会把下面的提醒日志推出视野
   return (
@@ -408,7 +324,7 @@ export function SignalList({
           <input
             type="checkbox"
             checked={showSuppressed}
-            onChange={(e) => setShowSuppressed(e.target.checked)}
+            onChange={(e) => onShowSuppressed(e.target.checked)}
           />
           含被静默的 {suppressedCount} 条
         </label>
@@ -421,46 +337,10 @@ export function SignalList({
       ) : (
         <ul className="min-h-0 flex-1 overflow-y-auto px-3">
           {groups.map((group) => (
-            <SignalGroupItem
-              key={group.code}
-              group={group}
-              expandedId={expandedId}
-              evidence={evidence}
-              aiReady={aiReady}
-              onWatchCreated={onWatchCreated}
-              onError={onError}
-              onToggle={toggle}
-              onOpen={setDrawerCode}
-            />
+            <SignalGroupItem key={group.code} group={group} renderRow={renderRow} onOpen={onOpen} />
           ))}
         </ul>
       )}
-
-      {/*
-        抽屉里的信号行由这里渲染，**共用同一份 expandedId / evidence** ——
-        抽屉自己存一套的话，在列表里展开的那条进抽屉会「忘记」自己是展开的，
-        而 AI 解读那一块还会因为重新挂载被取消（AiExplain 的卸载即取消）。
-      */}
-      {drawer ? (
-        <SignalDrawer
-          group={drawer}
-          dayStart={dayStart}
-          countChips={<CountChips group={drawer} />}
-          renderRow={(record) => (
-            <SignalRow
-              record={record}
-              expanded={expandedId === record.id}
-              evidence={evidence[record.id] ?? null}
-              aiReady={aiReady}
-              onWatchCreated={onWatchCreated}
-              onError={onError}
-              onToggle={toggle}
-            />
-          )}
-          onError={onError}
-          onClose={closeDrawer}
-        />
-      ) : null}
     </section>
   )
 }
