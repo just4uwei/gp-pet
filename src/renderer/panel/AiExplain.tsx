@@ -1,5 +1,5 @@
 /**
- * 一条信号的 AI 解读正文块（P2，docs/08 §后续）。住在 `AiDrawer` 里，不再内嵌在信号行里。
+ * 一条信号的 AI 解读正文块（P2，docs/08 §后续）。住在抽屉的「AI」页签里（`AiPanel`），不再内嵌在信号行里。
  *
  * ## ⚠ 它**不再是**「卸载即取消」的（2026-08-14 改）
  *
@@ -13,7 +13,7 @@
  * 正在流式生成的解读跟着消失，用户看到的是「等了四十秒的界面自己没了」。
  *
  * 现在的取舍是：
- *   1. **搬进 `AiDrawer`**，状态挂在 `App` —— 列表怎么重排都碰不到它（这是根治）；
+ *   1. **搬进抽屉的 AI 页签**（`AiPanel`），状态挂在 `App` —— 列表怎么重排都碰不到它（这是根治）；
  *   2. **关抽屉不取消**，请求在主进程继续跑完并落库（钱已经花了，跑完存下来还能看）。
  *      重开抽屉时 `ai:explain` 会命中 service 的在途去重，把已吐出的部分补发一遍接上。
  *   3. **只有「停止」按钮真的调 `ai:cancel`**，那是用户明确说不要了。
@@ -21,13 +21,24 @@
  * ## 另外三条克制（都还成立）
  *
  * 1. **来源标注不靠提示词。** 提示词里写了「不许说成经过验证的」，但模型可能不照做 ——
- *    所以那行来源说明与底部那行免责是**固定拼在输出区外面**的 DOM（现在由 `AiDrawer` 画），
+ *    所以那行来源说明与底部那行免责是**固定拼在输出区外面**的 DOM（现在由 `AiPanel` 画），
  *    不经过模型，也不受模型输出影响。
  * 2. **流式渲染。** 一次解读跑几十秒是常态，一个转四十秒的圈在桌面应用里是不可接受的。
- * 3. **等待期间必须一直有反馈。** 推理模型先思考几十秒、一个字都不吐是常态，
- *    而思考过程本地刻意不显示（`ai/protocols.ts` 只取 `text_delta`，`thinking_delta` 直接丢）。
- *    所以等待期一直显示**已等待多少秒**，并在「有字了但停了很久」时单独说出来 ——
+ * 3. **等待期间必须一直有反馈。** 推理模型先思考几十秒、一个字都不吐是常态。
+ *    等待期一直显示**已等待多少秒**，并在「有字了但停了很久」时单独说出来 ——
  *    否则用户分不出「模型在想」和「连接死了」。
+ *
+ * ## 思考过程：显示，但与正文严格分开（2026-08-14）
+ *
+ * `thinking_delta` / `reasoning_content` 原先被 `protocols.ts` 直接丢掉，于是思考的
+ * 那几十秒里界面上只有一个秒数。现在两路都收，但：
+ *
+ * - **`thinkingRef` 与 `textRef` 是两份，绝不合并。** 正文要落库、要抽观察点建议
+ *   （`watch:suggest`），把草稿混进去会让建议块解析错位，也会把「想到一半的话」
+ *   当成结论存进历史。
+ * - **思考不入库**，只在这一次可见。翻历史时想看的是「当时它说了什么」，不是草稿。
+ * - **默认折叠**，标题写清它不是结论。生成中时自动展开一次（那时它是唯一的活口），
+ *   正文开始出字后不再强制。
  *
  * 与之配套的一条：**停止之后绝不退回 idle。** 早先「停止」时若一个字都没收到，
  * 就把整块收回去 —— 用户看到的是「点了一下，界面自己没了」，既不知道发生过什么，
@@ -61,6 +72,7 @@ export function AiExplain({
   signalId,
   code,
   name,
+  autoStart = false,
   onWatchCreated,
   onDone,
   onError,
@@ -68,6 +80,13 @@ export function AiExplain({
   signalId: string
   code: SecCode
   name: string
+  /**
+   * 挂载即发起。**默认 false，这是刻意的**：
+   * 用户点了「AI 解读」那个按钮才算他要花这笔钱，而「切到 AI 页签看看」不算。
+   * `ai:explain` 会先查两层缓存（内存 → `ai_explain` 表），所以已经解读过的信号
+   * 无论走哪条路都不会重复计费 —— 但**没解读过的那种，自动发就是真花钱**。
+   */
+  autoStart?: boolean
   /** 新建成功后通知上层刷新「观察点」页与计数 */
   onWatchCreated: () => void
   /** 一次解读真的完成了（已落库）—— 抽屉据此刷新历史列表 */
@@ -90,6 +109,11 @@ export function AiExplain({
   const [formOpen, setFormOpen] = useState(false)
   /** 累积正文。用 ref 而不是从 state 里读：done 那一刻要拿到**全量**去抽建议 */
   const textRef = useRef('')
+  /** 思考链。**与 textRef 是两份，永远不合并**（见文件头） */
+  const [thinking, setThinking] = useState('')
+  const thinkingRef = useRef('')
+  /** 思考区展开与否。生成中默认展开（那时它是唯一的活口），出正文之后收起 */
+  const [thinkingOpen, setThinkingOpen] = useState(false)
   /** 本轮开始的时刻与最后一次收到增量的时刻。等待期的全部反馈都从这两个数推出来 */
   const [startedAt, setStartedAt] = useState(0)
   const [lastDeltaAt, setLastDeltaAt] = useState(0)
@@ -134,6 +158,10 @@ export function AiExplain({
       setLastDeltaAt(0)
       textRef.current = ''
       setText('')
+      thinkingRef.current = ''
+      setThinking('')
+      // 生成刚开始时思考区是唯一会动的东西，先展开；出了正文再由用户自己决定
+      setThinkingOpen(true)
       setError(null)
       setSuggestions([])
       setFormOpen(false)
@@ -156,10 +184,21 @@ export function AiExplain({
           finish()
           return
         }
+        // 思考单独累积，**不碰 textRef**（见文件头）。它也算「有动静」，
+        // 所以一起刷 lastDeltaAt —— 不刷的话思考期间会被判成「卡住了」
+        if (chunk.thinking !== undefined) {
+          thinkingRef.current += chunk.thinking
+          setThinking(thinkingRef.current)
+          setLastDeltaAt(Date.now())
+        }
         if (chunk.delta !== undefined) {
+          // **只在第一个正文分片时收起思考区**，不是每一片都收 ——
+          // 每片都收的话，用户手动展开会在下一片到达时被弹回去
+          const firstText = textRef.current === ''
           textRef.current += chunk.delta
           setText(textRef.current)
           setLastDeltaAt(Date.now())
+          if (firstText) setThinkingOpen(false)
         }
         if (chunk.done === true) {
           setPhase('done')
@@ -194,10 +233,8 @@ export function AiExplain({
   )
 
   /*
-    换了一条信号就自动跑一次。**这不等于「无条件计费」**：`ai:explain` 会先查
-    内存缓存、再查历史库（008_ai_explain.sql），两层都没有才真发请求。
-    抽屉是用户点「AI 解读」才开的，所以「开了就开始」是他要的；
-    而重开抽屉看一条已经解读过的信号，走的是缓存那条路，一分钱不花。
+    只有 `autoStart` 时才自动跑（用户点了「AI 解读」那个按钮）。
+    单纯切到 AI 页签**不发请求** —— 没解读过的信号自动发就是真花钱。
 
     **用 ref 记住「已经为哪条信号自动发过」**，而不是依赖 `start` 的引用稳定性：
     上层哪天把某个回调写成每次渲染新建，这个 effect 就会反复重发 —— 而症状是
@@ -205,16 +242,55 @@ export function AiExplain({
   */
   const autoStartedFor = useRef<string | null>(null)
   useEffect(() => {
-    if (autoStartedFor.current === signalId) return
+    if (!autoStart || autoStartedFor.current === signalId) return
     autoStartedFor.current = signalId
     start(false)
-  }, [signalId, start])
+  }, [autoStart, signalId, start])
 
   const elapsed = Math.max(0, Math.round((now - startedAt) / 1000))
   const sinceDelta = lastDeltaAt === 0 ? 0 : Math.max(0, Math.round((now - lastDeltaAt) / 1000))
 
+  /*
+    还没开始：给一个按钮而不是自动发。按钮上要写清**会花钱** ——
+    这是全应用唯一一处按第三方规则计费的动作，不写出来就是替用户做了那个决定。
+    （已经解读过的信号点下去会命中缓存，一分钱不花，但按钮不该为此撒谎说「免费」。）
+  */
+  if (phase === 'idle') {
+    return (
+      <button className="gp-btn w-full justify-center text-[11px]" onClick={() => start(false)}>
+        生成 AI 解读（调用你配置的模型，按对方规则计费）
+      </button>
+    )
+  }
+
   return (
     <div className="text-xs">
+      {/*
+        思考过程。**标题必须说清它不是结论** —— 一段带推理味道的文字放在解读上方，
+        很容易被当成「软件的分析」，而它连模型自己的定稿都不是。
+        与正文分开渲染也顺带保证了「不会被复制进观察点建议」那条。
+      */}
+      {thinking !== '' ? (
+        <div className="mb-2 rounded border border-white/10 bg-black/20">
+          <button
+            className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[10px] text-white/40 hover:text-white/65"
+            onClick={() => setThinkingOpen((open) => !open)}
+          >
+            <span className="inline-block w-2">{thinkingOpen ? '▾' : '▸'}</span>
+            <span>模型的思考过程（草稿，不是结论）</span>
+            <span className="ml-auto font-mono text-white/25">{thinking.length} 字</span>
+          </button>
+          {thinkingOpen ? (
+            <p className="max-h-40 overflow-y-auto whitespace-pre-wrap border-t border-white/10 px-2 py-1.5 text-[11px] leading-relaxed text-white/40">
+              {thinking}
+              {phase === 'running' && text === '' ? (
+                <span className="animate-pulse text-white/30">▍</span>
+              ) : null}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
       {error === null ? (
         <p className="whitespace-pre-wrap leading-relaxed text-white/75">
           {visibleText}
@@ -232,10 +308,15 @@ export function AiExplain({
       {phase === 'running' ? (
         <p className="mt-1.5 text-[10px] leading-snug text-white/35">
           {textRef.current === '' ? (
-            <span>
-              已等待 {elapsed}s · 模型还没吐出第一个字。
-              推理模型会先思考几十秒（思考过程本地不显示），再等不到会自动报超时。
-            </span>
+            thinking !== '' ? (
+              // 有思考就说有思考：这时「还没出正文」是正常的，不该让用户以为卡了
+              <span>正在思考 · {elapsed}s · 还没开始写正文（上面可以展开看它在想什么）</span>
+            ) : (
+              <span>
+                已等待 {elapsed}s · 模型还没吐出第一个字。
+                推理模型会先思考几十秒，再等不到会自动报超时。
+              </span>
+            )
           ) : sinceDelta >= STALL_MS / 1000 ? (
             <span className="text-amber-200/60">
               已 {sinceDelta}s 没有新内容（共 {elapsed}s，{textRef.current.length} 字）——

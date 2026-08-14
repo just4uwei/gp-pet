@@ -23,7 +23,8 @@
 
 import { useEffect, useState } from 'react'
 import type { SecCode } from '@core/types'
-import type { QuoteTick, TradeLedger, TradePreview, TradeView } from '@shared/ipc-types'
+import type { PositionView, QuoteTick, TradeLedger, TradePreview, TradeView } from '@shared/ipc-types'
+import { StopFloorForm, StopFloorNotice } from './StopFloorForm'
 
 const FIELD =
   'rounded border border-white/15 bg-black/25 px-2 py-1 text-[11px] outline-none focus:border-white/35'
@@ -70,6 +71,8 @@ export function TradePanel({
   ledger,
   onSubmit,
   onRemove,
+  onStopChanged,
+  onError,
   busy,
 }: {
   code: SecCode
@@ -77,6 +80,9 @@ export function TradePanel({
   ledger: TradeLedger | null
   onSubmit: (draft: { side: 'BUY' | 'SELL'; price: number; shares: number; tradedAt: number; note?: string }) => void
   onRemove: (id: string) => void
+  /** 止损确认/撤销之后把新的持仓视图交回上层（账本里那份要跟着换） */
+  onStopChanged: (next: PositionView | null) => void
+  onError: (message: string) => void
   busy: boolean
 }): React.JSX.Element {
   const [side, setSide] = useState<'BUY' | 'SELL'>('BUY')
@@ -84,6 +90,7 @@ export function TradePanel({
   const [shares, setShares] = useState('')
   const [tradedAt, setTradedAt] = useState(() => dateValue(Date.now()))
   const [note, setNote] = useState('')
+  const [stopFormOpen, setStopFormOpen] = useState(false)
 
   const position = ledger?.position ?? null
 
@@ -159,6 +166,43 @@ export function TradePanel({
         ) : (
           <p className="text-xs text-white/40">当前没有持仓。</p>
         )}
+
+        {/*
+          止损确认（009_position_stop.sql）。**入口摆在持仓卡里**，因为这里同时能看到
+          成本、现价与浮亏 —— 那三个数是做这个决定的全部依据。
+
+          已确认时显示当前那条线 + 撤销；没确认且**正在亏**时才给入口 ——
+          赚着的时候提这件事没有意义，只会让人误以为软件在劝他别卖。
+        */}
+        {position?.stopAck ? (
+          <StopFloorNotice
+            code={code}
+            ack={position.stopAck}
+            onDone={onStopChanged}
+            onError={onError}
+          />
+        ) : position && floatingPct !== null && floatingPct < 0 ? (
+          stopFormOpen ? (
+            <StopFloorForm
+              code={code}
+              position={position}
+              price={last}
+              onDone={(next) => {
+                setStopFormOpen(false)
+                onStopChanged(next)
+              }}
+              onCancel={() => setStopFormOpen(false)}
+              onError={onError}
+            />
+          ) : (
+            <button
+              className="gp-btn mt-2 w-full justify-center text-[11px]"
+              onClick={() => setStopFormOpen(true)}
+            >
+              我接受这段亏损，把止损线往下挪
+            </button>
+          )
+        ) : null}
 
         {/* 已实现盈亏与持仓分开显示：清仓之后前者还在，那正是这张表存在的理由 */}
         <div className="mt-2 flex items-baseline justify-between border-t border-white/10 pt-2 text-xs">

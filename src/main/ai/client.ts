@@ -15,7 +15,7 @@
  */
 
 import type { AiConfig, AiHttpResponse, AiTransport } from './types'
-import { adapterOf, protocolHint, type ProtocolAdapter } from './protocols'
+import { adapterOf, protocolHint, type AiDelta, type ProtocolAdapter } from './protocols'
 import { normalizeBaseUrl } from './config'
 
 /** 首字超时。对面接受了连接却一个 token 都不吐，多半是挂了而不是在想 */
@@ -70,15 +70,15 @@ export interface AiChatRequest {
  * 分帧对两种协议是一样的（都是按行、`data:` 前缀），差异只在「怎么从一帧里取字」，
  * 所以把取字的那一步作为参数传进来 —— 容易写错的是分帧，那部分只写一份。
  */
-export function createSseParser(extract: (parsed: unknown) => string | null): {
-  push(chunk: string): string[]
+export function createSseParser(extract: (parsed: unknown) => AiDelta | null): {
+  push(chunk: string): AiDelta[]
   /** 流结束时把残留缓冲吐出来（有些实现最后一帧不带换行） */
-  flush(): string[]
+  flush(): AiDelta[]
 } {
   let buffer = ''
 
-  function drain(lines: string[]): string[] {
-    const deltas: string[] = []
+  function drain(lines: string[]): AiDelta[] {
+    const deltas: AiDelta[] = []
     for (const raw of lines) {
       const line = raw.trim()
       // `event:` 行不带内容（Anthropic 每帧都会先发一行），跳过即可 ——
@@ -146,8 +146,11 @@ export function errorMessageOf(
 }
 
 export interface AiClient {
-  /** 流式生成。逐段 yield 文本增量 */
-  stream(request: AiChatRequest): AsyncGenerator<string, void, void>
+  /**
+   * 流式生成。逐段 yield 增量，`kind` 区分正文与思考链 —— 调用方**必须分开累积**
+   * （见 protocols.ts 的 `AiDelta`）。
+   */
+  stream(request: AiChatRequest): AsyncGenerator<AiDelta, void, void>
 }
 
 export function createAiClient(transport: AiTransport): AiClient {
@@ -191,7 +194,17 @@ export function createAiClient(transport: AiTransport): AiClient {
       }
 
       const parser = createSseParser(adapter.delta)
-      let sawAny = false
+      /**
+       * **「有没有输出」只认正文。**
+       *
+       * 选错协议的典型症状是「HTTP 200 但一个字都没有」（用 OpenAI 的取字逻辑读
+       * Anthropic 的流，每一帧都取不出增量）。下面那段兜底靠这个标志抛错并点名协议。
+       * 若把思考也算进来，选错协议时会退化成「只有思考、没有正文」而**不报错**，
+       * 而那种状态在界面上看起来就是「模型想了半天什么也没说」。
+       */
+      let sawText = false
+      /** 思考单独记：只影响首字超时的判定（推理模型先想几十秒是常态） */
+      let sawThinking = false
       /**
        * 还没取到任何增量时留一份原文。
        *
@@ -204,18 +217,22 @@ export function createAiClient(transport: AiTransport): AiClient {
 
       try {
         for await (const chunk of response.chunks) {
-          // 首字超时单独看：连接建起来了却一直不吐字，与「全程超时」是两种故障
-          if (!sawAny && Date.now() - startedAt > FIRST_TOKEN_TIMEOUT_MS) {
+          // 首字超时单独看：连接建起来了却一直不吐字，与「全程超时」是两种故障。
+          // **思考也算「吐字了」**：推理模型先想几十秒是常态，把它算成「没有输出」
+          // 会让这类模型每次都被判超时
+          if (!sawText && !sawThinking && Date.now() - startedAt > FIRST_TOKEN_TIMEOUT_MS) {
             throw new AiError(`等了 ${FIRST_TOKEN_TIMEOUT_MS / 1000} 秒没有任何输出`, 'timeout')
           }
-          if (!sawAny && preview.length < 4000) preview += chunk
+          if (!sawText && preview.length < 4000) preview += chunk
           for (const delta of parser.push(chunk)) {
-            sawAny = true
+            if (delta.kind === 'text') sawText = true
+            else sawThinking = true
             yield delta
           }
         }
         for (const delta of parser.flush()) {
-          sawAny = true
+          if (delta.kind === 'text') sawText = true
+          else sawThinking = true
           yield delta
         }
       } catch (error) {
@@ -224,16 +241,19 @@ export function createAiClient(transport: AiTransport): AiClient {
         throw new AiError(`读取响应中断：${messageOf(error)}`, 'network')
       }
 
-      if (sawAny) return
+      if (sawText) return
 
-      // ── 一个增量都没取到 ────────────────────────────────────────────
+      // ── 一条正文都没取到 ────────────────────────────────────────────
+      // 注意这里**只看正文**：思考出了一堆但正文一个字没有，仍然要走到下面报错，
+      // 那正是「协议选错了」最常见的形状之一（见 sawText 的注释）。
+      //
       // 先试「对面根本没按流式返回」这一种：有些兼容网关不认 stream: true，
       // 照样回一整个 JSON。内容其实就在那儿，不该报成空
       const whole = tryParseJson(preview)
       if (whole !== null) {
         const text = adapter.fullText(whole)
         if (text !== null) {
-          yield text
+          yield { kind: 'text', value: text }
           return
         }
         // 是 JSON 但取不出文本 —— 多半是错误对象，把里面那句话捞出来比原样贴强
@@ -242,7 +262,12 @@ export function createAiClient(transport: AiTransport): AiClient {
       }
 
       throw new AiError(
-        `对面返回了 200，但没有解析出任何内容。\n` +
+        (sawThinking
+          ? // 这一种最容易被误读成「模型没想好」：思考链取到了，正文一个字都没有。
+            // 多半是模型把 max_tokens 全花在思考上了，或者思考块没有正常收尾
+            `对面只返回了思考过程，没有正文。可能是 max_tokens（当前 ${config.maxTokens}）` +
+            `全被思考用光了 —— 调大它，或换一个不带思考链的模型。\n`
+          : `对面返回了 200，但没有解析出任何内容。\n`) +
           `${protocolHint(config.protocol, config.baseUrl)}\n` +
           `实际发到：${url}\n` +
           `响应开头：${preview.trim().slice(0, 300) || '(空)'}`,

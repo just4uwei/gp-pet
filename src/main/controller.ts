@@ -49,7 +49,7 @@ import type {
   WatchPointDraft,
   WatchPointView,
 } from '@shared/ipc-types'
-import type { SecCode } from '@core/types'
+import type { Position, SecCode } from '@core/types'
 import { engineVersionOf, withSensitivity } from '@core/params'
 import { sma } from '@core/indicators/series'
 import {
@@ -321,7 +321,70 @@ export class AppController {
   }
 
   positions(): PositionView[] {
-    return this.data?.storage.positions.list() ?? []
+    const repo = this.data?.storage.positions
+    if (!repo) return []
+    return repo.list().map((held) => this.toPositionView(held.code, held))
+  }
+
+  /**
+   * 持仓 → 视图。**把止损确认一起带上** —— 那是用户主动关掉了一个安全提醒的凭据，
+   * 界面上不显示的话，他日后只会觉得「跌了这么多怎么没提醒我」。
+   */
+  private toPositionView(code: SecCode, held: Position): PositionView {
+    const ack = this.data?.storage.positions.stopAck(code) ?? null
+    return {
+      code: held.code,
+      shares: held.shares,
+      cost: held.cost,
+      peakPrice: held.peakPrice,
+      openedAt: held.openedAt,
+      // exactOptionalPropertyTypes：没确认过就不要这个键
+      ...(ack === null ? {} : { stopAck: ack }),
+    }
+  }
+
+  /**
+   * 用户确认「接受这一段亏损」。
+   *
+   * **不弹系统模态框**：这与「删掉花过钱的解读」不同 —— 它是可逆的（随时 clearStop），
+   * 而且确认动作本身发生在一个把代价写清楚的内联表单里
+   * （「跌到这个价之前，不会再因为亏损提醒你」）。
+   *
+   * 校验刻意只有两条：正数、且**低于现价**。不校验「必须低于成本」——
+   * 一只已经涨回成本上方的票，用户想把止损线抬到成本之上是完全合理的诉求。
+   */
+  acceptLoss(code: SecCode, stopFloor: number): PositionView | null {
+    const layer = this.requireData()
+    if (!Number.isFinite(stopFloor) || stopFloor <= 0) throw new Error('止损线必须是正数')
+
+    const held = layer.storage.positions.get(code)
+    if (!held) throw new Error('这只票没有持仓记录')
+
+    const price = layer.market.snapshotOf(code)?.last
+    if (price !== undefined && stopFloor >= price) {
+      // 设在现价之上等于「立刻触发」—— 那不是用户想要的「接受这一段」，
+      // 而且他下一轮就会收到一条一模一样的提醒，看起来像确认没生效
+      throw new Error(`止损线要低于现价 ${price}，否则下一轮就会立刻触发`)
+    }
+
+    const lossPct = held.cost > 0 && price !== undefined ? ((price - held.cost) / held.cost) * 100 : 0
+    layer.storage.positions.acceptLoss(code, stopFloor, lossPct, Date.now())
+    log.info(
+      `[risk] ${code} 用户确认接受 ${lossPct.toFixed(1)}% 的亏损，止损线顺延到 ${stopFloor}`
+    )
+    this.onStateChanged()
+    const updated = layer.storage.positions.get(code)
+    return updated ? this.toPositionView(code, updated) : null
+  }
+
+  /** 撤销确认，回到按 `risk.stopLossPct` 的出厂行为 */
+  clearStopFloor(code: SecCode): PositionView | null {
+    const layer = this.requireData()
+    layer.storage.positions.clearStop(code)
+    log.info(`[risk] ${code} 撤销止损确认，回到按百分比判定`)
+    this.onStateChanged()
+    const updated = layer.storage.positions.get(code)
+    return updated ? this.toPositionView(code, updated) : null
   }
 
   setPosition(code: SecCode, shares: number, cost: number): void {

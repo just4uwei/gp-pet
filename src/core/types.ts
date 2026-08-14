@@ -206,6 +206,18 @@ export interface Position {
   cost: number
   peakPrice: number
   openedAt: number
+  /**
+   * 用户确认「接受这一段亏损」后重新画的止损线（**绝对价、不复权**，009_position_stop.sql）。
+   *
+   * 有它时固定止损按 `price <= stopFloor` 判，没有时按 `params.risk.stopLossPct` 的百分比判。
+   * 它**只影响固定止损**：移动止损 / 回撤减仓 / 盈利保护照旧 ——
+   * 用户接受的是「这一段下跌」，不是「所有风控都别响了」。
+   *
+   * ⚠ **回测与影子运行绝不设这个字段。** 它是用户对某一次具体持仓的决定，
+   * 不是策略的一部分 —— 让它影响 `src/backtest` 或 `main/shadow` 会把
+   * 「我扛住了没卖」记成策略绩效。缺省即天然不受影响，**别去「补上」**。
+   */
+  stopFloor?: number
 }
 
 export interface RiskVerdict {

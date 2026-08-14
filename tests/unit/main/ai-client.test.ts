@@ -24,6 +24,7 @@ import {
   OPENAI_ADAPTER,
   detectProtocol,
   protocolHint,
+  type AiDelta,
 } from '@main/ai/protocols'
 import type { AiConfig, AiTransport } from '@main/ai/types'
 
@@ -42,9 +43,18 @@ function frame(content: string): string {
 }
 
 /** Anthropic 的一帧（真实形状：event 行 + data 行） */
-function aFrame(text: string): string {
-  const payload = { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } }
+function aFrame(body: string): string {
+  const payload = {
+    type: 'content_block_delta',
+    index: 0,
+    delta: { type: 'text_delta', text: body },
+  }
   return `event: content_block_delta\ndata: ${JSON.stringify(payload)}\n\n`
+}
+
+/** 一条正文增量。解析器现在产出 `{ kind, value }`，思考链走另一个 kind */
+function text(value: string): AiDelta {
+  return { kind: 'text', value }
 }
 
 function transportOf(status: number, pieces: string[]): AiTransport {
@@ -72,7 +82,7 @@ async function collect(
     user: 'u',
     signal: new AbortController().signal,
   })) {
-    text += delta
+    if (delta.kind === 'text') text += delta.value
   }
   return text
 }
@@ -86,11 +96,15 @@ describe('createSseParser', () => {
     const cut = Math.floor(whole.length / 2)
 
     expect(parser.push(whole.slice(0, cut))).toEqual([])
-    expect(parser.push(whole.slice(cut))).toEqual(['你好'])
+    expect(parser.push(whole.slice(cut))).toEqual([text('你好')])
   })
 
   it('一次到达多个帧要全部吐出来', () => {
-    expect(openai().push(`${frame('a')}${frame('b')}${frame('c')}`)).toEqual(['a', 'b', 'c'])
+    expect(openai().push(`${frame('a')}${frame('b')}${frame('c')}`)).toEqual([
+      text('a'),
+      text('b'),
+      text('c'),
+    ])
   })
 
   it('[DONE] 与非 data 行忽略掉', () => {
@@ -98,25 +112,51 @@ describe('createSseParser', () => {
   })
 
   it('单帧 JSON 坏掉时跳过它而不是终止整段', () => {
-    expect(openai().push(`data: {坏掉的\n\n${frame('后面还有')}`)).toEqual(['后面还有'])
+    expect(openai().push(`data: {坏掉的\n\n${frame('后面还有')}`)).toEqual([text('后面还有')])
   })
 
   it('flush 吐出最后一帧 —— 有些实现末帧不带换行', () => {
     const parser = openai()
     parser.push(`data: ${JSON.stringify({ choices: [{ delta: { content: '尾' } }] })}`)
-    expect(parser.flush()).toEqual(['尾'])
+    expect(parser.flush()).toEqual([text('尾')])
   })
 
-  it('Anthropic：只取 text_delta，thinking_delta 与 ping 一律丢掉', () => {
+  /*
+    思考链**必须与正文分开带出去**（2026-08-14 改）。
+    早先这里断言的是「thinking_delta 一律丢掉」—— 那让推理模型思考的几十秒里
+    界面上只有一个秒数，用户分不出「在想」和「卡死」。现在两路都出，但 kind 不同，
+    上层据此分开累积：正文进历史、思考只实时显示。
+  */
+  it('Anthropic：thinking_delta 与 text_delta 分成两路，ping 一类仍然丢掉', () => {
     const parser = createSseParser(ANTHROPIC_ADAPTER.delta)
     const thinking = `data: ${JSON.stringify({
       type: 'content_block_delta',
-      delta: { type: 'thinking_delta', thinking: '不该出现在给用户的解释里' },
+      delta: { type: 'thinking_delta', thinking: '先想一下' },
+    })}\n\n`
+    // 工具调用参数与思考链签名都没有可读内容，照旧丢掉
+    const junk = `data: ${JSON.stringify({
+      type: 'content_block_delta',
+      delta: { type: 'signature_delta', signature: 'abc' },
     })}\n\n`
     const ping = 'event: ping\ndata: {"type":"ping"}\n\n'
     const start = 'event: message_start\ndata: {"type":"message_start"}\n\n'
 
-    expect(parser.push(`${start}${ping}${thinking}${aFrame('正文')}`)).toEqual(['正文'])
+    expect(parser.push(`${start}${ping}${thinking}${junk}${aFrame('正文')}`)).toEqual([
+      { kind: 'thinking', value: '先想一下' },
+      text('正文'),
+    ])
+  })
+
+  it('OpenAI 兼容：reasoning_content 与 reasoning 两个键都认', () => {
+    // 这一侧没有统一键名，实测两种都存在。认漏一个的症状是「思考区永远空着」而不报错
+    const withUnderscore = `data: ${JSON.stringify({
+      choices: [{ delta: { reasoning_content: '甲' } }],
+    })}\n\n`
+    const bare = `data: ${JSON.stringify({ choices: [{ delta: { reasoning: '乙' } }] })}\n\n`
+    expect(openai().push(`${withUnderscore}${bare}`)).toEqual([
+      { kind: 'thinking', value: '甲' },
+      { kind: 'thinking', value: '乙' },
+    ])
   })
 
   it('两种协议的分帧共用一份：Anthropic 的帧被切两半也拼得回来', () => {
@@ -124,7 +164,7 @@ describe('createSseParser', () => {
     const whole = aFrame('切开我')
     const cut = Math.floor(whole.length / 2)
     expect(parser.push(whole.slice(0, cut))).toEqual([])
-    expect(parser.push(whole.slice(cut))).toEqual(['切开我'])
+    expect(parser.push(whole.slice(cut))).toEqual([text('切开我')])
   })
 })
 
@@ -335,7 +375,7 @@ describe('createAiClient', () => {
       user: 'u',
       signal: new AbortController().signal,
     })) {
-      expect(delta).toBe('ok')
+      expect(delta).toEqual({ kind: 'text', value: 'ok' })
     }
 
     expect(seen[0]?.url).toBe('https://ark.cn-beijing.volces.com/api/coding/v1/messages')
@@ -360,6 +400,19 @@ describe('createAiClient', () => {
   it('用 OpenAI 协议读 Anthropic 的流会一个字都取不到 —— 必须报错而不是空白', async () => {
     // 这正是协议选错时的真实症状：HTTP 200、有数据流、但取不出增量
     await expect(collect([aFrame('取不到')])).rejects.toThrow('没有解析出任何内容')
+  })
+
+  /*
+    **「有没有输出」只认正文。** 思考取到了一堆、正文一个字都没有，仍然要报错 ——
+    否则界面上就是「模型想了半天什么也没说」，而那既可能是协议选错、
+    也可能是 max_tokens 全被思考用光了，两种都需要一句能看懂的话。
+  */
+  it('只有思考、没有正文时必须报错，并点名 max_tokens', async () => {
+    const thinking = `data: ${JSON.stringify({
+      choices: [{ delta: { reasoning_content: '想了很久' } }],
+    })}\n\n`
+    await expect(collect([thinking, 'data: [DONE]\n\n'])).rejects.toThrow('只返回了思考过程')
+    await expect(collect([thinking, 'data: [DONE]\n\n'])).rejects.toThrow('max_tokens')
   })
 
   it('对面不认 stream:true、回了整包 JSON 时照样取得到文（OpenAI 形状）', async () => {
@@ -425,7 +478,7 @@ describe('createAiClient', () => {
       user: 'u',
       signal: new AbortController().signal,
     })) {
-      expect(delta).toBe('ok')
+      expect(delta).toEqual({ kind: 'text', value: 'ok' })
     }
     expect(seen[0]).not.toHaveProperty('Authorization')
   })

@@ -91,15 +91,37 @@ export function positionVerdict(input: GateInput): { verdict: RiskVerdict; direc
     peakProfitPct: peakProfit * 100,
   }
 
-  // ① 固定止损：亏损触及止损线 —— 最高优先级，不容降级
-  if (profit <= -risk.stopLossPct) {
+  /*
+    ① 固定止损：亏损触及止损线 —— 最高优先级，不容降级。
+
+    **用户可以重新画这条线**（`position.stopFloor`，009_position_stop.sql）：
+    确认「接受这一段亏损」之后，判据从「亏够百分比」换成「跌破他画的那个价」。
+    理由是反复提醒同一件已知的事与不提醒一样有害 —— 它会让用户开始整体忽略提醒。
+
+    三条边界，改这里之前先看：
+      * **只换判据，不取消提醒。** 跌破新线照样是 L3 强制类。
+      * **只作用于这一条规则。** 下面三条（移动止损 / 回撤减仓 / 盈利保护）不看 stopFloor：
+        用户接受的是「这一段下跌」，不是「所有风控都别响了」。
+      * **回测与影子运行不设这个字段**，所以它们的行为一个字都没变（见 Position.stopFloor）。
+  */
+  const floor = position.stopFloor !== undefined && position.stopFloor > 0 ? position.stopFloor : null
+  /**
+   * 固定止损的边界到没到。**③ 回撤减仓也要用它**，见那里的注释 ——
+   * 那条规则的「仍盈利或微亏」本来就是「① 还没接手」的另一种写法，
+   * 而用户重画止损线之后，「① 接手」的判据变了。
+   */
+  const belowStop = floor !== null ? price <= floor : profit <= -risk.stopLossPct
+  if (belowStop) {
     return {
       direction: 'SELL',
       level: 'L3',
       verdict: {
         rule: 'STOP_LOSS',
         action: 'FORCE_SELL',
-        reason: `已亏损 ${(profit * 100).toFixed(1)}%，触及 ${(risk.stopLossPct * 100).toFixed(0)}% 止损线`,
+        reason:
+          floor !== null
+            ? `已跌破你确认的止损线 ${floor}（现价 ${price}，累计亏损 ${(profit * 100).toFixed(1)}%）`
+            : `已亏损 ${(profit * 100).toFixed(1)}%，触及 ${(risk.stopLossPct * 100).toFixed(0)}% 止损线`,
         evidence: base,
       },
     }
@@ -125,9 +147,14 @@ export function positionVerdict(input: GateInput): { verdict: RiskVerdict; direc
     }
   }
 
-  // ③ 回撤减仓：从最高点回撤 7% 且当前仍盈利或微亏
-  //    「仍盈利或微亏」的边界取 -止损线：再往下就该由 ① 接手了
-  if (fromPeak <= -risk.drawdownReducePct && profit > -risk.stopLossPct) {
+  // ③ 回撤减仓：从最高点回撤 7% 且 ① 还没接手
+  //
+  //    「① 还没接手」原先写成 `profit > -risk.stopLossPct`，那是把 ① 的判据抄了一遍。
+  //    用户重画止损线之后那两者会分叉：抄的那份会在 −8% 就把 ③ 关掉，
+  //    而 ① 要等到跌破新线才响 —— 中间那一段两条规则**都不响**，
+  //    于是「接受一段亏损」变成了「回撤减仓也一起静默」，那不是用户答应的事。
+  //    所以这里直接复用 `belowStop`。
+  if (fromPeak <= -risk.drawdownReducePct && !belowStop) {
     return {
       direction: 'REDUCE',
       level: 'L3',

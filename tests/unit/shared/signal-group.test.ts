@@ -150,3 +150,102 @@ describe('pinnedSignal', () => {
     expect(pinnedSignal(g, 'watching')?.id).toBe('watching')
   })
 })
+
+/**
+ * 观察点命中合流成一条**按股票**的时间线（2026-08-14）。
+ *
+ * 用户看一只票时想看的是**变化**：早上出了买入信号 → 下午他自己设的失效条件命中了
+ * → 引擎又给了卖出。这三件事必须挨着看才有意义。
+ *
+ * 而 `counts` / `total` 仍然**只数信号** —— 「今天几条信号」与「命中几次观察点」
+ * 是两个问题，合成一个数就再也拆不开。
+ */
+describe('groupSignals · 合流观察点命中', () => {
+  const s = (code: string, createdAt: number, direction: GatedDirection = 'BUY') => ({
+    id: `sig-${code}-${createdAt}`,
+    code: code as SecCode,
+    name: code,
+    createdAt,
+    direction,
+  })
+  // exactOptionalPropertyTypes：'没命中' 要表达成「没有这个键」，不是 hitAt: undefined
+  const h = (code: string, hitAt: number | undefined, id = `hit-${code}-${hitAt}`) => ({
+    id,
+    code: code as SecCode,
+    ...(hitAt === undefined ? {} : { hitAt }),
+  })
+
+  it('不传命中时行为与以前一字不差', () => {
+    const groups = groupSignals([s('SH600000', 100)])
+    expect(groups[0]?.hits).toEqual([])
+    expect(groups[0]?.events.map((e) => e.kind)).toEqual(['SIGNAL'])
+  })
+
+  it('events 按时间倒序穿插，命中排在它该在的位置', () => {
+    const groups = groupSignals(
+      [s('SH600000', 100), s('SH600000', 300)],
+      [h('SH600000', 200), h('SH600000', 400)]
+    )
+    expect(groups[0]?.events.map((e) => `${e.kind}@${e.at}`)).toEqual([
+      'HIT@400',
+      'SIGNAL@300',
+      'HIT@200',
+      'SIGNAL@100',
+    ])
+  })
+
+  it('时间线的头可以是一次命中 —— 那正是「下午命中了失效条件」该有的位置', () => {
+    const groups = groupSignals([s('SH600000', 100)], [h('SH600000', 500)])
+    expect(groups[0]?.events[0]?.kind).toBe('HIT')
+    // 但 latest 仍然是最新那条**信号**：两个字段回答两个问题
+    expect(groups[0]?.latest.createdAt).toBe(100)
+  })
+
+  it('**counts 与 total 不把命中算进去**', () => {
+    const groups = groupSignals([s('SH600000', 100, 'SELL')], [h('SH600000', 200), h('SH600000', 300)])
+    expect(groups[0]?.total).toBe(1)
+    expect(groups[0]?.counts).toEqual([{ direction: 'SELL', count: 1 }])
+    expect(groups[0]?.hits).toHaveLength(2)
+  })
+
+  it('没有 hitAt 的一律丢掉 —— 编一个时刻会让它排到错的位置上', () => {
+    const groups = groupSignals([s('SH600000', 100)], [h('SH600000', undefined)])
+    expect(groups[0]?.hits).toEqual([])
+    expect(groups[0]?.events).toHaveLength(1)
+  })
+
+  it('命中挂到对应的票上，不串组', () => {
+    const groups = groupSignals(
+      [s('SH600000', 100), s('SZ000001', 100)],
+      [h('SZ000001', 500)]
+    )
+    const byCode = new Map(groups.map((g) => [g.code, g]))
+    expect(byCode.get('SZ000001')?.hits).toHaveLength(1)
+    expect(byCode.get('SH600000')?.hits).toHaveLength(0)
+  })
+
+  it('只有命中、没有信号的票不成组 —— 这个列表叫「今日信号」', () => {
+    // 那种票的命中在观察点页里看得到；硬塞进信号列表会让「今天有几只票出了信号」失真
+    expect(groupSignals([s('SH600000', 100)], [h('SZ000001', 500)])).toHaveLength(1)
+  })
+
+  it('组间按时间线的头排：刚命中的那只冒到最上面', () => {
+    const groups = groupSignals(
+      [s('SH600000', 100), s('SZ000001', 200)],
+      [h('SH600000', 900)]
+    )
+    expect(groups[0]?.code).toBe('SH600000')
+  })
+
+  it('同一时刻时命中排在信号前面（与提醒层同一取舍）', () => {
+    const groups = groupSignals([s('SH600000', 500)], [h('SH600000', 500)])
+    expect(groups[0]?.events.map((e) => e.kind)).toEqual(['HIT', 'SIGNAL'])
+  })
+
+  it('pinnedSignal：时间线头是命中时，组头那条信号不需要再钉一遍', () => {
+    const groups = groupSignals([s('SH600000', 100)], [h('SH600000', 500)])
+    const group = groups[0]
+    if (!group) throw new Error('fixture 至少要给一组')
+    expect(pinnedSignal(group, group.latest.id)).toBeNull()
+  })
+})

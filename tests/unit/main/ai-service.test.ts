@@ -49,7 +49,7 @@ function controlledClient(pieces: string[]): { client: AiClient; release: () => 
         await gate
         for (const piece of pieces) {
           if (request.signal.aborted) throw new AiError('已取消', 'canceled')
-          yield piece
+          yield { kind: 'text' as const, value: piece }
         }
       },
     },
@@ -63,7 +63,7 @@ function instantClient(pieces: string[]): { client: AiClient; calls: () => numbe
     client: {
       async *stream() {
         calls++
-        for (const piece of pieces) yield piece
+        for (const piece of pieces) yield { kind: 'text' as const, value: piece }
       },
     },
   }
@@ -243,7 +243,7 @@ describe('createAiService', () => {
       async *stream() {
         calls++
         stream()
-        yield 'x'
+        yield { kind: 'text' as const, value: 'x' }
       },
     }
     const service = createAiService({

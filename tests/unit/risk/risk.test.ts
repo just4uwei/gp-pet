@@ -307,6 +307,114 @@ describe('持仓强制通道（docs/05 §2.3）', () => {
   })
 })
 
+describe('用户确认接受的那一段亏损（009_position_stop.sql）', () => {
+  /*
+    这一组钉的是「主动关掉一个安全提醒」的边界。三条都是错了之后**用户发现不了**的：
+    少发一条止损提醒，他当时什么都察觉不到，事后也归不了因
+    （CLAUDE.md 里「少发的错误用户发现不了」说的就是这个）。
+  */
+
+  it('有 stopFloor 时按新线判：现价还在线上 → 不提醒', () => {
+    // 成本 11、现价 10（亏 9.1%，早就过了 8% 出厂线），但用户把线画在 9.2
+    const result = positionVerdict(
+      input({
+        // peak = 现价：把 ③ 回撤减仓排除掉，这条只测 ① 的判据换了没有
+        position: position({ cost: 11, peakPrice: 10, stopFloor: 9.2 }),
+        snapshot: snapshot({ last: 10 }),
+      })
+    )
+    expect(result).toBeNull()
+  })
+
+  it('跌破那条线照样 L3 强制卖出 —— 确认只换判据，不取消提醒', () => {
+    const result = positionVerdict(
+      input({
+        position: position({ cost: 11, stopFloor: 9.2 }),
+        snapshot: snapshot({ last: 9.2 }),
+      })
+    )
+    expect(result?.verdict.rule).toBe('STOP_LOSS')
+    expect(result?.level).toBe('L3')
+    // 文案要说清是「你确认的那条线」，不是那个百分比 —— 否则用户会以为确认没生效
+    expect(result?.verdict.reason).toContain('你确认的止损线')
+  })
+
+  it('边界取等：正好等于那条线就算跌破', () => {
+    // peakPrice 压到现价附近：否则 ③ 回撤减仓（自峰 −7%）会先抢答，测不到 ① 的边界
+    const at = positionVerdict(
+      input({
+        position: position({ cost: 11, peakPrice: 9.2, stopFloor: 9.2 }),
+        snapshot: snapshot({ last: 9.2 }),
+      })
+    )
+    const above = positionVerdict(
+      input({
+        position: position({ cost: 11, peakPrice: 9.2, stopFloor: 9.2 }),
+        snapshot: snapshot({ last: 9.21 }),
+      })
+    )
+    expect(at?.verdict.rule).toBe('STOP_LOSS')
+    expect(above).toBeNull()
+  })
+
+  it('没有 stopFloor 时出厂行为一个字不变', () => {
+    const result = positionVerdict(
+      input({ position: position({ cost: 11 }), snapshot: snapshot({ last: 10 }) })
+    )
+    expect(result?.verdict.reason).toContain('触及 8% 止损线')
+  })
+
+  it('stopFloor 为 0 / 负数当成没设 —— 0 会被读成「跌到 0 才止损」', () => {
+    // 约束 4 的形状：用 0 表示「没有」会静默关掉整条规则
+    const zero = positionVerdict(
+      input({ position: position({ cost: 11, stopFloor: 0 }), snapshot: snapshot({ last: 10 }) })
+    )
+    expect(zero?.verdict.rule).toBe('STOP_LOSS')
+  })
+
+  it('**只影响固定止损**：移动止损照旧响', () => {
+    // 成本 10、最高 11、现价 10.6：浮盈 6% 且自峰回撤 3.6% → ② 该响，
+    // 而它与 stopFloor 无关（用户接受的是下跌，不是「赚着的时候也别提醒」）
+    const result = positionVerdict(
+      input({
+        position: position({ cost: 10, peakPrice: 11, stopFloor: 8 }),
+        snapshot: snapshot({ last: 10.6 }),
+      })
+    )
+    expect(result?.verdict.rule).toBe('TRAILING_STOP')
+  })
+
+  it('**只影响固定止损**：深亏时回撤减仓仍然响，不能被一起静默', () => {
+    /*
+      成本 12、最高 13、现价 10：亏 16.7%、自峰回撤 23%。
+      用户把止损线画在 9.5，所以 ① 不响 —— 但 ③ 回撤减仓必须照响。
+
+      ③ 原先的条件写成 `profit > -stopLossPct`（把 ① 的判据抄了一遍），
+      那份抄写会在 −8% 就把 ③ 关掉，于是这一段两条规则**都不响** ——
+      「接受一段亏损」悄悄变成了「回撤减仓也一起静默」，那不是用户答应的事。
+    */
+    const result = positionVerdict(
+      input({
+        position: position({ cost: 12, peakPrice: 13, stopFloor: 9.5 }),
+        snapshot: snapshot({ last: 10 }),
+      })
+    )
+    expect(result?.verdict.rule).toBe('DRAWDOWN_REDUCE')
+  })
+
+  it('线上的深亏 + 没有回撤 → 确实一条都不响（这就是用户要的效果）', () => {
+    // 成本 12、**峰 = 现价 10**、线在 9.5：亏 16.7% 但自峰没有回撤 ——
+    // 注意 peak 要取现价而不是成本：peak = 成本时「自峰回撤」就是那 16.7%，③ 会响
+    const result = positionVerdict(
+      input({
+        position: position({ cost: 12, peakPrice: 10, stopFloor: 9.5 }),
+        snapshot: snapshot({ last: 10 }),
+      })
+    )
+    expect(result).toBeNull()
+  })
+})
+
 describe('分级（docs/05 §3）', () => {
   it('得分 ≥ 0.75 且已收盘确认 → L3', () => {
     expect(gateSignal(input({ signal: signalOf('BUY', 0.8, 'CONFIRMED') })).level).toBe('L3')

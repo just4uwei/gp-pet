@@ -45,6 +45,14 @@ export function registerHandlers(controller: AppController): void {
 
   handle('position:clear', (_event, code) => controller.clearPosition(normalizeCode(code)))
 
+  // 「接受这一段亏损」并顺延止损线（009_position_stop.sql）。
+  // 这是主动关掉一个安全提醒 —— 只换判据不取消提醒，且随时可以撤销
+  handle('position:acceptLoss', (_event, code, stopFloor) =>
+    controller.acceptLoss(normalizeCode(code), stopFloor)
+  )
+
+  handle('position:clearStop', (_event, code) => controller.clearStopFloor(normalizeCode(code)))
+
   // ── 信号（M2）─────────────────────────────────────────────────────
   // 「今日信号」列表与依据展开都走这两条；提醒日志（含被抑制条目）复用同一份数据，
   // 因为被抑制的信号也在 signal 表里（docs/05 §4：不制造信息黑洞）

@@ -244,6 +244,20 @@ export interface PositionView {
   cost: number
   peakPrice: number
   openedAt: number
+  /**
+   * 用户确认「接受这一段亏损」后重新画的止损线（009_position_stop.sql）。
+   *
+   * 有它时固定止损按「跌破这个价」判，而不是按 `risk.stopLossPct` 的百分比。
+   * **界面上必须把它显示出来**：这是用户主动关掉了一个安全提醒的凭据，
+   * 藏起来的话他日后只会觉得「跌了这么多怎么没提醒我」。
+   * 缺省 = 没确认过，按出厂百分比走。
+   */
+  stopAck?: {
+    stopFloor: number
+    ackAt: number
+    /** 确认时的浮亏百分比（负数）。「他当时接受的是多大一段」 */
+    ackLossPct: number
+  }
 }
 
 /**
@@ -501,10 +515,18 @@ export interface AiExplainStart {
   cached?: string
 }
 
-/** 流式分片。`done` 与 `error` 互斥，二者之一到达即本次请求结束 */
+/**
+ * 流式分片。`done` 与 `error` 互斥，二者之一到达即本次请求结束。
+ *
+ * `delta` 是**正文**，`thinking` 是模型的思考链 —— 两者**必须分开累积**：
+ * 正文要落库、要抽观察点建议，把草稿混进去会让建议块解析错位，
+ * 也会把「模型想到一半的话」当成结论存进历史。思考只实时显示，不入库。
+ */
 export interface AiChunk {
   requestId: string
   delta?: string
+  /** 思考链增量。推理模型先想几十秒是常态，不显示的话用户分不出「在想」和「卡死」 */
+  thinking?: string
   done?: boolean
   error?: string
 }
@@ -672,6 +694,16 @@ export interface IpcInvokeMap {
   'position:list': () => PositionView[]
   'position:set': (code: SecCode, shares: number, cost: number) => void
   'position:clear': (code: SecCode) => void
+  /**
+   * 用户确认「接受这一段亏损」，把固定止损线顺延到 `stopFloor`（不复权绝对价）。
+   *
+   * 这是**主动关掉一个安全提醒**，所以：只换判据不取消提醒（跌破新线照样 L3）、
+   * 只作用于固定止损（移动止损 / 回撤减仓 / 盈利保护照旧）、
+   * 且随时可以 `position:clearStop` 撤销。见 009_position_stop.sql。
+   */
+  'position:acceptLoss': (code: SecCode, stopFloor: number) => PositionView | null
+  /** 撤销上面那个确认，回到按 `risk.stopLossPct` 的出厂行为 */
+  'position:clearStop': (code: SecCode) => PositionView | null
   /**
    * 当日分时。**只在用户打开抽屉「行情」页时才发** —— 列表平时零额外 IPC。
    * `to` 省略时取「现在」。

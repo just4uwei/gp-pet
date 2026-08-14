@@ -17,28 +17,9 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import type { WatchPointView } from '@shared/ipc-types'
+// 标签表与主进程共用一份（@shared/watch-metrics）—— 两处各抄一张会静默分叉
+import { METRIC_LABELS } from '@shared/watch-metrics'
 
-const METRIC_LABELS: Record<string, string> = {
-  PRICE: '价格',
-  ma5: 'MA5',
-  ma10: 'MA10',
-  ma20: 'MA20',
-  ma60: 'MA60',
-  ma120: 'MA120',
-  dif: 'MACD DIF',
-  dea: 'MACD DEA',
-  hist: 'MACD 柱',
-  bollUpper: '布林上轨',
-  bollMid: '布林中轨',
-  bollLower: '布林下轨',
-  bbwPct: '带宽分位',
-  adx: 'ADX',
-  plusDI: '+DI',
-  minusDI: '−DI',
-  atr: 'ATR',
-  rsi: 'RSI',
-  volRatio: '量比',
-}
 
 function conditionText(point: WatchPointView): string {
   const metric = METRIC_LABELS[point.metric] ?? point.metric

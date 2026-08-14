@@ -1,5 +1,5 @@
 /**
- * 一只标的的详情抽屉（右侧滑出），三个页签：行情 / 信号 / 持仓。
+ * 一只标的的详情抽屉（右侧滑出），四个页签：行情 / 信号 / AI / 持仓。
  *
  * 由 `SignalDrawer` 扩成的：那个只有信号，而「点自选股看行情」与「看信号」
  * 想看的是同一只票的同一件事。做成两个抽屉的话，同一只股票会有两个长得差不多、
@@ -13,8 +13,6 @@
  * 2. **走 portal 挂到 `document.body`**：触发它的组件住在 `overflow-hidden` 的窄栏里，
  *    `absolute` 会被裁掉。
  * 3. **Esc 与点遮罩都能关。** 只能靠右上角小叉关掉的浮层，在键盘用户那里是个陷阱。
- *    但**上面还叠着 AI 抽屉时要让路**（`escDisabled`）：两层都在 `window` 上听 Esc，
- *    不让路的话按一次会把两层一起关掉，用户会以为自己点错了什么。
  * 4. **页签切换不卸载已加载的数据**（各页自己管自己的请求）—— 但也不预加载：
  *    没打开过的页签一个请求都不发。
  */
@@ -22,8 +20,9 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { SecCode } from '@core/types'
-import type { QuoteTick, SignalRecord, TradeLedger } from '@shared/ipc-types'
+import type { PositionView, QuoteTick, SignalRecord, TradeLedger, WatchPointView } from '@shared/ipc-types'
 import type { SignalGroup } from '@shared/signal-group'
+import { AiPanel } from './AiPanel'
 import { DailyChart } from './DailyChart'
 import { IntradayChart, type IntradayMark } from './IntradayChart'
 import { TradePanel } from './TradePanel'
@@ -31,7 +30,7 @@ import { TradePanel } from './TradePanel'
 /** 与 PanelWindow.ts 的 TITLE_BAR_HEIGHT 成对，改一处要改两处 */
 const TITLE_BAR_HEIGHT = 40
 
-export type StockTab = 'QUOTE' | 'SIGNAL' | 'POSITION'
+export type StockTab = 'QUOTE' | 'SIGNAL' | 'AI' | 'POSITION'
 
 /** 北京时间那一天的 00:00（epoch ms）。交易时段是交易所的，不看本机时区 */
 function beijingDayStart(at: number): number {
@@ -42,6 +41,7 @@ function beijingDayStart(at: number): number {
 const TABS: { key: StockTab; label: string }[] = [
   { key: 'QUOTE', label: '行情' },
   { key: 'SIGNAL', label: '信号' },
+  { key: 'AI', label: 'AI' },
   { key: 'POSITION', label: '持仓' },
 ]
 
@@ -56,8 +56,10 @@ export function StockDrawer({
   countChips,
   onSubmitTrade,
   onRemoveTrade,
+  onStopChanged,
   tradeBusy,
-  escDisabled = false,
+  aiSignalId,
+  onWatchCreated,
   onError,
   onClose,
 }: {
@@ -66,7 +68,7 @@ export function StockDrawer({
   initialTab: StockTab
   quote: QuoteTick | undefined
   /** 该股今日的信号分组；今天没有信号时为 undefined（页签仍在，给空态） */
-  group: SignalGroup<SignalRecord> | undefined
+  group: SignalGroup<SignalRecord, WatchPointView> | undefined
   ledger: TradeLedger | null
   /** 信号行交回上层渲染 —— 展开依据 / AI 的状态在那边，抽屉不该复制一份 */
   renderSignalRow: (record: SignalRecord) => React.JSX.Element
@@ -79,9 +81,13 @@ export function StockDrawer({
     note?: string
   }) => void
   onRemoveTrade: (id: string) => void
+  /** 止损确认/撤销之后刷新账本里的持仓视图 */
+  onStopChanged: (next: PositionView | null) => void
   tradeBusy: boolean
-  /** 上面还叠着 AI 抽屉：这一层让出 Esc（见文件头第 3 条） */
-  escDisabled?: boolean
+  /** 从信号行进来时指定「AI 页签解读哪一条」；缺省取该股最新那条 */
+  aiSignalId?: string
+  /** 观察点新建成功后通知上层刷新计数 */
+  onWatchCreated: () => void
   onError: (message: string) => void
   onClose: () => void
 }): React.JSX.Element {
@@ -91,15 +97,12 @@ export function StockDrawer({
   useEffect(() => setTab(initialTab), [code, initialTab])
 
   useEffect(() => {
-    // AI 抽屉叠在上面时整个不挂监听：留着并在回调里判断也行，但那样两层的
-    // 关闭顺序会依赖 addEventListener 的注册先后，而那个顺序没人保证
-    if (escDisabled) return
     const onKey = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') onClose()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onClose, escDisabled])
+  }, [onClose])
 
   const signals = group ? [group.latest, ...group.rest] : []
   const marks: IntradayMark[] = signals.map((record) => ({
@@ -202,6 +205,22 @@ export function StockDrawer({
             )
           ) : null}
 
+          {/*
+            AI 页签。**切走会卸载它，但不会取消在跑的请求** —— `AiExplain` 早就不是
+            「卸载即取消」了，切回来时 `ai:explain` 命中 service 的在途去重接上。
+            这就是「便于查看未分析完的记录」的全部实现，别把卸载即取消加回去。
+          */}
+          {tab === 'AI' ? (
+            <AiPanel
+              code={code}
+              name={name}
+              signals={signals}
+              {...(aiSignalId === undefined ? {} : { initialSignalId: aiSignalId })}
+              onWatchCreated={onWatchCreated}
+              onError={onError}
+            />
+          ) : null}
+
           {tab === 'POSITION' ? (
             <TradePanel
               code={code}
@@ -209,6 +228,8 @@ export function StockDrawer({
               ledger={ledger}
               onSubmit={onSubmitTrade}
               onRemove={onRemoveTrade}
+              onStopChanged={onStopChanged}
+              onError={onError}
               busy={tradeBusy}
             />
           ) : null}

@@ -223,6 +223,63 @@ describe('PositionRepo', () => {
     expect(position?.openedAt).toBe(100)
   })
 
+  /*
+    「用户确认接受的那一段亏损」（009_position_stop.sql）。
+
+    最要紧的是**清空的时机**：加仓会改摊薄成本，旧的那条线与新成本不再是同一个判断。
+    不清的话结果是静默少发止损提醒 —— 而少发的错误用户当时察觉不到、事后也归不了因。
+  */
+  it('acceptLoss 存下线与「当时接受了多大一段」', () => {
+    storage.positions.set('SH600000', 1000, 11, 1)
+    expect(storage.positions.acceptLoss('SH600000', 9.2, -9.1, 555)).toBe(true)
+
+    // 风控只要 stopFloor
+    expect(storage.positions.get('SH600000')?.stopFloor).toBeCloseTo(9.2, 6)
+    // 界面要那三项 —— 「止损线 9.2」离开「他当时是在 −9.1% 确认的」就读不出意思
+    expect(storage.positions.stopAck('SH600000')).toMatchObject({
+      stopFloor: 9.2,
+      ackAt: 555,
+      ackLossPct: -9.1,
+    })
+  })
+
+  it('没有这行持仓时 acceptLoss 什么都不做 —— 不给不存在的持仓建止损线', () => {
+    expect(storage.positions.acceptLoss('SH600000', 9.2, -9, 1)).toBe(false)
+    expect(storage.positions.stopAck('SH600000')).toBeNull()
+  })
+
+  it('**加仓（set）必须清掉止损确认**：成本变了，旧那条线不再是同一个判断', () => {
+    storage.positions.set('SH600000', 1000, 11, 1)
+    storage.positions.acceptLoss('SH600000', 9.2, -9.1, 555)
+    storage.positions.set('SH600000', 2000, 10, 2)
+
+    expect(storage.positions.stopAck('SH600000')).toBeNull()
+    expect(storage.positions.get('SH600000')?.stopFloor).toBeUndefined()
+  })
+
+  it('清仓后再建仓不带着旧的线 —— 否则下次会莫名其妙地不提醒', () => {
+    storage.positions.set('SH600000', 1000, 11, 1)
+    storage.positions.acceptLoss('SH600000', 9.2, -9.1, 555)
+    storage.positions.clear('SH600000')
+    storage.positions.set('SH600000', 1000, 11, 9)
+
+    expect(storage.positions.get('SH600000')?.stopFloor).toBeUndefined()
+  })
+
+  it('clearStop 撤销确认，回到按百分比判定', () => {
+    storage.positions.set('SH600000', 1000, 11, 1)
+    storage.positions.acceptLoss('SH600000', 9.2, -9.1, 555)
+    expect(storage.positions.clearStop('SH600000')).toBe(true)
+    expect(storage.positions.get('SH600000')?.stopFloor).toBeUndefined()
+  })
+
+  it('没确认过时 stopFloor 是 undefined，**不是 0**（约束 4）', () => {
+    // 0 会被风控读成「跌到 0 才止损」，等于静默关掉整条规则
+    storage.positions.set('SH600000', 1000, 11, 1)
+    expect(storage.positions.get('SH600000')?.stopFloor).toBeUndefined()
+    expect('stopFloor' in (storage.positions.get('SH600000') ?? {})).toBe(false)
+  })
+
   it('bumpPeak 只允许上调 —— 回撤提醒的基准不能被一次下跌抹掉', () => {
     storage.positions.set('SH600000', 1000, 10, 1)
     storage.positions.bumpPeak('SH600000', 12)

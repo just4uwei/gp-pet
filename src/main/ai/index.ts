@@ -21,7 +21,7 @@ export { AI_CONFIG_FILE, AiConfigStore, DEFAULT_AI_CONFIG, sanitizeAiConfig } fr
 export { buildSignalContext, renderContext } from './context'
 export { AI_SYSTEM_PROMPT, FORBIDDEN_WORDS } from './prompt'
 export { ANTHROPIC_ADAPTER, OPENAI_ADAPTER, adapterOf, detectProtocol, protocolHint } from './protocols'
-export type { ProtocolAdapter } from './protocols'
+export type { AiDelta, ProtocolAdapter } from './protocols'
 export { electronSecretCrypto } from './secret-crypto'
 export { createAiService } from './service'
 export type { AiHistorySink, AiService } from './service'

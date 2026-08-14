@@ -29,6 +29,19 @@
 import type { AiConfig, AiProtocol } from './types'
 import { normalizeBaseUrl } from './config'
 
+/**
+ * 一帧里取出来的增量。
+ *
+ * **`thinking` 与 `text` 必须分开**（2026-08-14）：推理模型会先思考几十秒，
+ * 那段内容要显示（否则用户分不出「在想」和「卡死」），但它**不是结论** ——
+ * 拼进正文会让观察点建议块的解析错位，也会把模型的草稿当成结论存进历史。
+ * 上游的「HTTP 200 但一个字都没有」判定也只认 `text`，见 client.ts 的 `sawAny`。
+ */
+export interface AiDelta {
+  kind: 'text' | 'thinking'
+  value: string
+}
+
 export interface ProtocolAdapter {
   readonly id: AiProtocol
   /** 人能看懂的名字，用在错误提示里 */
@@ -36,8 +49,8 @@ export interface ProtocolAdapter {
   endpoint(baseUrl: string): string
   headers(apiKey: string | null): Record<string, string>
   body(config: AiConfig, system: string, user: string): string
-  /** 从一个已 JSON.parse 的 SSE 帧里取文本增量；取不到返回 null */
-  delta(parsed: unknown): string | null
+  /** 从一个已 JSON.parse 的 SSE 帧里取增量；取不到返回 null */
+  delta(parsed: unknown): AiDelta | null
   /**
    * 从一个**非流式**响应体里取全文。
    *
@@ -95,7 +108,17 @@ export const OPENAI_ADAPTER: ProtocolAdapter = {
     if (!Array.isArray(choices) || choices.length === 0) return null
     const delta = record(record(choices[0])?.delta)
     const content = delta?.content
-    return typeof content === 'string' && content !== '' ? content : null
+    if (typeof content === 'string' && content !== '') return { kind: 'text', value: content }
+    /*
+      思考链。OpenAI 兼容这一侧**没有统一键名**，实测两种都存在：
+        reasoning_content —— DeepSeek、通义、多数国内网关
+        reasoning         —— 另一部分网关（含一些 OpenRouter 风格的转发）
+      两个都认。这一层本来就是「按形状适配」而不是「按厂商适配」，
+      多认一个键的代价是零，认漏了的症状是「思考区永远空着」而没有任何报错。
+    */
+    const thinking = delta?.reasoning_content ?? delta?.reasoning
+    if (typeof thinking === 'string' && thinking !== '') return { kind: 'thinking', value: thinking }
+    return null
   },
 
   fullText(parsed) {
@@ -147,11 +170,19 @@ export const ANTHROPIC_ADAPTER: ProtocolAdapter = {
     const root = record(parsed)
     if (root?.type !== 'content_block_delta') return null
     const delta = record(root.delta)
-    // **只取 text_delta**：thinking_delta 是模型的思考过程，不该出现在给用户的解释里；
-    // input_json_delta 是工具调用参数，我们不发工具
-    if (delta?.type !== 'text_delta') return null
-    const text = delta.text
-    return typeof text === 'string' && text !== '' ? text : null
+    if (delta?.type === 'text_delta') {
+      const text = delta.text
+      return typeof text === 'string' && text !== '' ? { kind: 'text', value: text } : null
+    }
+    // 思考链单独一路带出去，**不拼进正文**（见 AiDelta 的注释）
+    if (delta?.type === 'thinking_delta') {
+      const thinking = delta.thinking
+      return typeof thinking === 'string' && thinking !== ''
+        ? { kind: 'thinking', value: thinking }
+        : null
+    }
+    // input_json_delta 是工具调用参数，我们不发工具；signature_delta 是思考链签名，无内容
+    return null
   },
 
   fullText(parsed) {

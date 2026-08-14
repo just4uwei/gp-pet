@@ -120,10 +120,16 @@ export function createAiService(deps: AiServiceDeps): AiService {
         signal: entry.controller.signal,
       })
 
-      for await (const delta of stream) {
+      for await (const piece of stream) {
         if (entry.controller.signal.aborted) break
-        entry.text += delta
-        emit({ requestId, delta })
+        // 思考链**不进 `entry.text`**：那份正文要落库、要抽观察点建议，
+        // 混进模型的草稿会让建议块解析错位，也会把草稿当成结论存下来
+        if (piece.kind === 'thinking') {
+          emit({ requestId, thinking: piece.value })
+          continue
+        }
+        entry.text += piece.value
+        emit({ requestId, delta: piece.value })
       }
 
       if (entry.controller.signal.aborted) {

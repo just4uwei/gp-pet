@@ -12,8 +12,10 @@
  * 判定时直接按键取值。改那边的键名要同步改这里，`watch-metrics.test.ts` 钉着这一条。
  */
 
-/** 价格是特例：它不来自指标快照，而是**不复权**现价（见 evaluate.ts 的取值口径） */
-export const PRICE_METRIC = 'PRICE'
+// 中文标签住在 `@shared/watch-metrics`（渲染层也要用同一份，别在这里再抄一张表）。
+// 白名单留在本文件：它是「本地算不算得出来」的判据，要与 snapshotOfIndicators() 的键名成对。
+export { METRIC_LABELS, PRICE_METRIC, metricLabel } from '../../shared/watch-metrics'
+import { PRICE_METRIC } from '../../shared/watch-metrics'
 
 /**
  * 可盯的指标。刻意**不是**全部 25 个快照字段 ——
@@ -49,29 +51,3 @@ export function isWatchMetric(value: unknown): value is WatchMetric {
   return typeof value === 'string' && ALLOWED.has(value)
 }
 
-/** 给界面用的中文标签。缺省时回落到键名本身 —— 漏一个不该让界面显示空白 */
-export const METRIC_LABELS: Record<string, string> = {
-  PRICE: '价格',
-  ma5: 'MA5',
-  ma10: 'MA10',
-  ma20: 'MA20',
-  ma60: 'MA60',
-  ma120: 'MA120',
-  dif: 'MACD DIF',
-  dea: 'MACD DEA',
-  hist: 'MACD 柱',
-  bollUpper: '布林上轨',
-  bollMid: '布林中轨',
-  bollLower: '布林下轨',
-  bbwPct: '带宽分位',
-  adx: 'ADX',
-  plusDI: '+DI',
-  minusDI: '−DI',
-  atr: 'ATR',
-  rsi: 'RSI',
-  volRatio: '量比',
-}
-
-export function metricLabel(metric: string): string {
-  return METRIC_LABELS[metric] ?? metric
-}

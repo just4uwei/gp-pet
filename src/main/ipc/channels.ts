@@ -21,6 +21,8 @@ export const INVOKE_CHANNELS = [
   'position:list',
   'position:set',
   'position:clear',
+  'position:acceptLoss',
+  'position:clearStop',
   'signal:history',
   'signal:explain',
   'quote:intraday',

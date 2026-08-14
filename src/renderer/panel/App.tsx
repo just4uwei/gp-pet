@@ -32,10 +32,10 @@ import type {
   SignalRecord,
   TradeLedger,
   WatchItem,
+  WatchPointView,
 } from '@shared/ipc-types'
 import { groupSignals } from '@shared/signal-group'
 import type { SecCode } from '@core/types'
-import { AiDrawer } from './AiDrawer'
 import { AlertLog } from './AlertLog'
 import { BrandMark } from './BrandMark'
 import { ConfigTransferButtons, ConfigTransferNotice, type TransferOutcome } from './ConfigTransfer'
@@ -331,19 +331,28 @@ export function App(): React.JSX.Element {
     「展开了哪一条依据」也在这里（useSignalEvidence），列表与抽屉共用一份。
   */
   const [signalRecords, setSignalRecords] = useState<SignalRecord[]>([])
+  /*
+    今天命中的观察点。与信号合流成一条**按股票**的时间线（groupSignals 的第二个入参）
+    —— 用户看一只票时想看的是变化：早上出了买入信号 → 下午他自己设的失效条件命中了
+    → 引擎又给了卖出。这三件事挨着看才有意义。
+
+    **它不是信号**，所以不写进 signal 表、也不计入方向徽标的计数（见 groupSignals 头注释）。
+  */
+  const [watchHits, setWatchHits] = useState<WatchPointView[]>([])
   const [showSuppressed, setShowSuppressed] = useState(true)
   const signalEvidence = useSignalEvidence(setError)
-  /** 抽屉：看哪只、落在哪个页签。null = 关着 */
-  const [drawer, setDrawer] = useState<{ code: SecCode; tab: StockTab } | null>(null)
   /*
-    AI 解读抽屉（第二层，叠在 StockDrawer 之上）。**状态必须挂在这一层** ——
-    它原先内嵌在信号行里，而那个列表每轮 tick 都在重排：同一只票来条新信号就换组头，
-    正在流式生成的解读跟着被卸载、请求被取消，而那次调用已经计过费。
-    挂在这里之后，列表怎么分组、排序、条件渲染都碰不到它。见 AiDrawer 头注释。
+    抽屉：看哪只、落在哪个页签、AI 页签解读哪一条。null = 关着。
+
+    **AI 的状态挂在这一层是刻意的**：它原先内嵌在信号行里，而那个列表每轮 tick 都在重排
+    （同一只票来条新信号就换组头），正在流式生成的解读跟着被卸载、请求被取消，
+    而那次调用已经计过费。挂在这里之后，列表怎么分组、排序、条件渲染都碰不到它。
   */
-  const [aiDrawer, setAiDrawer] = useState<{ signalId: string; code: SecCode; name: string } | null>(
-    null
-  )
+  const [drawer, setDrawer] = useState<{
+    code: SecCode
+    tab: StockTab
+    aiSignalId?: string
+  } | null>(null)
   const [ledger, setLedger] = useState<TradeLedger | null>(null)
   const [tradeBusy, setTradeBusy] = useState(false)
   /*
@@ -391,6 +400,16 @@ export function App(): React.JSX.Element {
         if (!cancelled) setSignalRecords(rows)
       })
       .catch((err: unknown) => setError(errorText(err)))
+
+    // 命中的观察点只取**今天**的：这条时间线画的是「今天这只票怎么了」，
+    // 上周命中的那条挂在今天的信号旁边会让人以为它刚发生
+    void window.gp
+      .invoke('watch:list', { status: 'HIT', limit: 200 })
+      .then((rows) => {
+        if (!cancelled) setWatchHits(rows.filter((row) => (row.hitAt ?? 0) >= dayStart))
+      })
+      .catch((err: unknown) => setError(errorText(err)))
+
     return () => {
       cancelled = true
     }
@@ -406,23 +425,8 @@ export function App(): React.JSX.Element {
     const visible = showSuppressed
       ? signalRecords
       : signalRecords.filter((r) => r.suppressedReason === undefined)
-    return { groups: groupSignals(visible), suppressedCount: suppressed.length }
-  }, [signalRecords, showSuppressed])
-
-  /** 信号行由这一层渲染：列表与抽屉共用同一份展开状态（见 useSignalEvidence） */
-  const renderSignalRow = useCallback(
-    (record: SignalRecord): React.JSX.Element => (
-      <SignalRow
-        record={record}
-        expanded={signalEvidence.expandedId === record.id}
-        evidence={signalEvidence.evidence[record.id] ?? null}
-        aiReady={aiReady}
-        onOpenAi={(row) => setAiDrawer({ signalId: row.id, code: row.code, name: row.name })}
-        onToggle={signalEvidence.toggle}
-      />
-    ),
-    [signalEvidence, aiReady]
-  )
+    return { groups: groupSignals(visible, watchHits), suppressedCount: suppressed.length }
+  }, [signalRecords, showSuppressed, watchHits])
 
   // ── 详情抽屉与成交流水 ───────────────────────────────────────
   const loadLedger = useCallback((code: SecCode): void => {
@@ -432,14 +436,37 @@ export function App(): React.JSX.Element {
       .catch((err: unknown) => setError(errorText(err)))
   }, [])
 
+  /*
+    打开详情抽屉。`aiSignalId` 只在从信号行点「AI 解读」时给 —— 它决定 AI 页签
+    默认解读哪一条；不给时那一页取该股最新那条。
+
+    **必须定义在 renderSignalRow 之前**：那个回调里要用它，而 `const` 有 TDZ。
+    顺序反过来时首屏不会报错（回调体是延迟执行的），但一旦有人把它加进 deps 数组
+    就会变成启动即崩，而那个崩溃点看起来与本文件无关。
+  */
   const openDrawer = useCallback(
-    (code: SecCode, drawerTab: StockTab): void => {
-      setDrawer({ code, tab: drawerTab })
+    (code: SecCode, drawerTab: StockTab, aiSignalId?: string): void => {
+      setDrawer({ code, tab: drawerTab, ...(aiSignalId === undefined ? {} : { aiSignalId }) })
       // 账本每次打开都重拉：它可能在别处被改过（导入配置、另一只票的重放）
       setLedger(null)
       loadLedger(code)
     },
     [loadLedger]
+  )
+
+  /** 信号行由这一层渲染：列表与抽屉共用同一份展开状态（见 useSignalEvidence） */
+  const renderSignalRow = useCallback(
+    (record: SignalRecord): React.JSX.Element => (
+      <SignalRow
+        record={record}
+        expanded={signalEvidence.expandedId === record.id}
+        evidence={signalEvidence.evidence[record.id] ?? null}
+        aiReady={aiReady}
+        onOpenAi={(row) => openDrawer(row.code, 'AI', row.id)}
+        onToggle={signalEvidence.toggle}
+      />
+    ),
+    [signalEvidence, aiReady, openDrawer]
   )
 
   /**
@@ -801,25 +828,17 @@ export function App(): React.JSX.Element {
           onSubmitTrade={submitTrade}
           onRemoveTrade={removeTrade}
           tradeBusy={tradeBusy}
-          escDisabled={aiDrawer !== null}
+          {...(drawer.aiSignalId === undefined ? {} : { aiSignalId: drawer.aiSignalId })}
+          onWatchCreated={refreshWatch}
+          onStopChanged={(next) => {
+            // 账本里那份持仓视图要跟着换，否则确认完界面上还是旧的那行。
+            // 同时刷一次自选列表的持仓角标与引擎状态（止损通道的判据变了）
+            setLedger((prev) => (prev === null ? prev : { ...prev, position: next }))
+            void reload()
+            refreshStatus()
+          }}
           onError={setError}
           onClose={() => setDrawer(null)}
-        />
-      ) : null}
-
-      {/*
-        AI 解读抽屉：**第二层**，叠在 StockDrawer 之上。
-        两个入口（概览页的信号行、抽屉信号页的信号行）共用它 ——
-        它挂在这一层就是为了不被信号列表的重排摘掉（见 AiDrawer 头注释）。
-      */}
-      {aiDrawer ? (
-        <AiDrawer
-          signalId={aiDrawer.signalId}
-          code={aiDrawer.code}
-          name={aiDrawer.name}
-          onWatchCreated={refreshWatch}
-          onError={setError}
-          onClose={() => setAiDrawer(null)}
         />
       ) : null}
 

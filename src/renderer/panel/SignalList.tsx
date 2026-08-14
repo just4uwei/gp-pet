@@ -44,8 +44,9 @@
  */
 
 import type { AlertLevel, GatedDirection, Regime, SecCode } from '@core/types'
-import type { SignalEvidence, SignalRecord } from '@shared/ipc-types'
+import type { SignalEvidence, SignalRecord, WatchPointView } from '@shared/ipc-types'
 import { pinnedSignal, type SignalGroup } from '@shared/signal-group'
+import { metricLabel } from '@shared/watch-metrics'
 
 const DIRECTION_LABEL: Record<GatedDirection, string> = {
   BUY: '买入',
@@ -274,19 +275,64 @@ export function CountChips({ group }: { group: SignalGroup<SignalRecord> }): Rea
 }
 
 /**
- * 一只标的的一组信号：常显最新那条 + **正展开着的那条**，其余在抽屉里看。
+ * 观察点命中的一行。**与信号行长得明显不同**是刻意的。
  *
- * 徽标行是**主行之外**的另一个按钮（见文件头）。它同时管两件事：
+ * 它不是引擎判的，是用户自己设的一个条件到了 —— 所以没有方向徽章、没有置信度，
+ * 只有一面旗和「你设的条件」。给它一个买入/卖出徽章会让人以为引擎又出了信号，
+ * 而这两件事的可信度来源完全不同（一个是回测过的规则，一个是用户当时的判断）。
+ *
+ * 措辞与提醒层同源（`alerts/candidates.ts` 的 `watchHitAlert`）：
+ * `INVALIDATE` 写「你设的失效条件已出现」，**不许写成「快卖」**（措辞纪律）。
+ */
+function WatchHitRow({ hit }: { hit: WatchPointView }): React.JSX.Element {
+  const opLabel = hit.op === 'LTE' ? '跌破' : '升破'
+  return (
+    <div className="flex items-start gap-3 py-0.5">
+      <span className="shrink-0 rounded border border-sky-400/40 bg-sky-400/10 px-1.5 py-0.5 text-[11px] text-sky-200">
+        ⚑ 观察点
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-xs leading-snug text-white/70">
+          {hit.meaning === 'INVALIDATE' ? '你设的失效条件已出现' : '你设的观察条件已满足'}
+        </span>
+        <span className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-white/45">
+          <span>
+            {metricLabel(hit.metric)}
+            {opLabel} {hit.threshold}
+          </span>
+          {hit.hitValue !== undefined ? (
+            <>
+              <span>·</span>
+              <span className="font-mono">实际 {hit.hitValue}</span>
+            </>
+          ) : null}
+          {hit.hitAt !== undefined ? (
+            <>
+              <span>·</span>
+              <span>{timeOf(hit.hitAt)}</span>
+            </>
+          ) : null}
+        </span>
+      </span>
+    </div>
+  )
+}
+
+/**
+ * 一只标的的时间线：信号与观察点命中按时间穿插，**这只票今天怎么变的**一眼看完。
+ *
+ * 徽标行是**时间线之外**的另一个按钮（见文件头）。它同时管两件事：
  * 看同股的旧信号，以及看当日走势图 —— 两者回答的是同一个问题
  *（「今天这只票到底怎么了」），分开放反而要点两次。
  *
- * ## 为什么要多钉一条（2026-08-14）
+ * ## 只画时间线的头 + 正展开着的那条
  *
- * 只渲染 `latest` 时，同一只票再来一条信号会把用户**正展开着、正在读依据**
- * 的那条挤出列表 —— 界面在他眼皮底下换掉了内容，而他什么都没做。
- * 判据是纯函数 `pinnedSignal`（在 shared，有用例），这里只负责画。
+ * 全部都画会让一只活跃的票占满整个列表（这就是当初分组的理由）。但**只画头**时，
+ * 同一只票再来一条信号会把用户正展开着、正在读依据的那条挤掉 ——
+ * 界面在他眼皮底下换了内容，而他什么都没做。判据是纯函数 `pinnedSignal`
+ * （在 shared，有用例），这里只负责画。
  *
- * （这条最初是为了挡「正在跑的 AI 解读被卸载取消」加的。AI 已经搬进独立抽屉、
+ * （这条最初是为了挡「正在跑的 AI 解读被卸载取消」加的。AI 已经搬进抽屉页签、
  * 不再受这个列表影响了，但这一条本身仍然成立 —— 理由换了，行为不变。）
  */
 function SignalGroupItem({
@@ -295,26 +341,48 @@ function SignalGroupItem({
   renderRow,
   onOpen,
 }: {
-  group: SignalGroup<SignalRecord>
-  /** 当前展开的信号 id。组头之外的那条要靠它决定钉不钉住 */
+  group: SignalGroup<SignalRecord, WatchPointView>
+  /** 当前展开的信号 id。时间线头之外的那条要靠它决定钉不钉住 */
   expandedId: string | null
   renderRow: (record: SignalRecord) => React.JSX.Element
   onOpen: (code: SecCode) => void
 }): React.JSX.Element {
   const pinned = pinnedSignal(group, expandedId)
+  const head = group.events[0]
+  /*
+    时间线的头是命中时，把**最新那条信号**一起画出来 ——
+    「你设的条件到了」单独摆着回答不了「那现在该怎么看这只票」，
+    而那条信号就是当时的判断。两行挨着才是用户要的那个「变化」。
+  */
+  const headIsHit = head?.kind === 'HIT'
+
   return (
     <li className="border-b border-white/[0.06] py-2 last:border-b-0">
-      {renderRow(group.latest)}
+      {headIsHit && head.kind === 'HIT' ? <WatchHitRow hit={head.hit} /> : null}
+
+      <div className={headIsHit ? 'mt-1.5' : ''}>{renderRow(group.latest)}</div>
+
+      {/* 头之后的其余命中（一天里可能命中好几个观察点），按时间接着排 */}
+      {group.events
+        .slice(1)
+        .filter((event) => event.kind === 'HIT')
+        .map((event) =>
+          event.kind === 'HIT' ? (
+            <div key={event.hit.id} className="mt-1">
+              <WatchHitRow hit={event.hit} />
+            </div>
+          ) : null
+        )}
 
       {/*
-        钉住的那条画在新信号**下面**：新来的必须在最上面（这是这个列表的本职），
+        钉住的那条画在最后：新来的必须在最上面（这是这个列表的本职），
         用户正在看的那条跟在后面。加一行说明是因为「同一只票凭空多出一行」
         本身会让人困惑 —— 不说的话，看起来像列表出了重复。
       */}
       {pinned ? (
         <div className="mt-2 border-l-2 border-violet-400/25 pl-2">
           <p className="mb-1 text-[10px] leading-snug text-white/30">
-            上面是刚到的新信号；这条是你正在看的那条，留在这里没有打断它。
+            上面是刚到的新动态；这条是你正在看的那条，留在这里没有打断它。
           </p>
           {renderRow(pinned)}
         </div>
@@ -331,6 +399,12 @@ function SignalGroupItem({
           // 但入口留着：走势图对单条信号一样有用
           <span className="text-[10px] leading-4 text-white/30">当日走势</span>
         )}
+        {/* 命中数单独一个 chip：它与方向计数不是同一类东西，合进去就再也拆不开 */}
+        {group.hits.length > 0 ? (
+          <span className="rounded border border-sky-400/40 bg-sky-400/10 px-1 py-px text-[10px] leading-4 text-sky-200">
+            观察点命中 {group.hits.length} 次
+          </span>
+        ) : null}
         <span className="ml-auto shrink-0 text-[10px] leading-4 text-white/25">详情 ›</span>
       </button>
     </li>
@@ -347,7 +421,7 @@ export function SignalList({
   onOpen,
 }: {
   /** 已按「含被静默的」筛过、并分好组的数据。拉取与分组都在 App（见文件头） */
-  groups: readonly SignalGroup<SignalRecord>[]
+  groups: readonly SignalGroup<SignalRecord, WatchPointView>[]
   /** 当前展开的信号 id。用来把它钉在组里，别被新信号挤掉（见 SignalGroupItem） */
   expandedId: string | null
   suppressedCount: number
