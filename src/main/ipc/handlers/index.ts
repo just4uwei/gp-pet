@@ -163,6 +163,17 @@ export function registerHandlers(controller: AppController): void {
 
   handle('ai:cancel', (_event, requestId) => controller.cancelAi(requestId))
 
+  // 历史解读（008_ai_explain.sql）。**永不自动裁剪**，删除只有 ai:remove 一条路 ——
+  // 花过钱、且重新生成还要再花一次钱的东西，不该被任何保留策略静默删掉
+  handle('ai:history', (_event, query) =>
+    controller.aiHistory({
+      code: normalizeCode(query.code),
+      ...(query.limit === undefined ? {} : { limit: query.limit }),
+    })
+  )
+
+  handle('ai:remove', (_event, id) => controller.removeAiExplain(id))
+
   // ── 观察点（P2 续）─────────────────────────────────────────────────
   // 用户确认的一次性盯盘条件。**不是策略参数** —— 边界见 003_watch.sql 的头注释。
   // `watch:suggest` 只做解析（纯函数），不落库：数值要经过用户在表单里确认才算。

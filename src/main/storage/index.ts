@@ -5,6 +5,7 @@
  */
 
 import type { Database } from './db'
+import { AiExplainRepo } from './repositories/ai-explain'
 import { AlertRepo } from './repositories/alert'
 import { CalendarRepo } from './repositories/calendar'
 import { ProviderHealthRepo } from './repositories/health'
@@ -37,6 +38,8 @@ export interface Storage {
   readonly quoteTicks: QuoteTickRepo
   /** 成交流水：用户自己的账本，不进裁剪、不挂自选的生命周期（见 007_trade_log.sql） */
   readonly trades: TradeRepo
+  /** AI 解读历史：花过钱的记录，不进裁剪，只能用户手删（见 008_ai_explain.sql） */
+  readonly aiExplains: AiExplainRepo
   readonly meta: MetaRepo
   close(): void
 }
@@ -56,6 +59,7 @@ export function createStorage(db: Database): Storage {
     watchPoints: new WatchPointRepo(db),
     quoteTicks: new QuoteTickRepo(db),
     trades: new TradeRepo(db),
+    aiExplains: new AiExplainRepo(db),
     meta: new MetaRepo(db),
     close: () => db.close(),
   }

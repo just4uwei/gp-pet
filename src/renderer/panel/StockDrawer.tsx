@@ -13,6 +13,8 @@
  * 2. **走 portal 挂到 `document.body`**：触发它的组件住在 `overflow-hidden` 的窄栏里，
  *    `absolute` 会被裁掉。
  * 3. **Esc 与点遮罩都能关。** 只能靠右上角小叉关掉的浮层，在键盘用户那里是个陷阱。
+ *    但**上面还叠着 AI 抽屉时要让路**（`escDisabled`）：两层都在 `window` 上听 Esc，
+ *    不让路的话按一次会把两层一起关掉，用户会以为自己点错了什么。
  * 4. **页签切换不卸载已加载的数据**（各页自己管自己的请求）—— 但也不预加载：
  *    没打开过的页签一个请求都不发。
  */
@@ -55,6 +57,7 @@ export function StockDrawer({
   onSubmitTrade,
   onRemoveTrade,
   tradeBusy,
+  escDisabled = false,
   onError,
   onClose,
 }: {
@@ -77,6 +80,8 @@ export function StockDrawer({
   }) => void
   onRemoveTrade: (id: string) => void
   tradeBusy: boolean
+  /** 上面还叠着 AI 抽屉：这一层让出 Esc（见文件头第 3 条） */
+  escDisabled?: boolean
   onError: (message: string) => void
   onClose: () => void
 }): React.JSX.Element {
@@ -86,12 +91,15 @@ export function StockDrawer({
   useEffect(() => setTab(initialTab), [code, initialTab])
 
   useEffect(() => {
+    // AI 抽屉叠在上面时整个不挂监听：留着并在回调里判断也行，但那样两层的
+    // 关闭顺序会依赖 addEventListener 的注册先后，而那个顺序没人保证
+    if (escDisabled) return
     const onKey = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') onClose()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  }, [onClose, escDisabled])
 
   const signals = group ? [group.latest, ...group.rest] : []
   const marks: IntradayMark[] = signals.map((record) => ({

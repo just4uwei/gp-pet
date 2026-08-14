@@ -22,6 +22,7 @@ import type {
   AboutInfo,
   AiConfigPatch,
   AiConfigView,
+  AiExplainRecord,
   AiExplainStart,
   AiTestResult,
   AlertRecord,
@@ -60,6 +61,7 @@ import {
   createUndiciAiTransport,
   electronSecretCrypto,
   renderContext,
+  type AiHistorySink,
   type AiService,
 } from './ai'
 import { electronAutoLaunchDeps, syncAutoLaunch } from './auto-launch'
@@ -1058,8 +1060,53 @@ export class AppController {
       client: createAiClient(createUndiciAiTransport(store.config().timeoutMs)),
       emit: (chunk) => this.windows.push('push:aiChunk', chunk),
       buildUserMessage: (signalId) => this.aiUserMessage(signalId),
+      history: this.aiHistorySink(),
       log: { info: (m) => log.info(m), warn: (m, e) => log.warn(m, e) },
     })
+  }
+
+  /**
+   * AI 解读的落库口（008_ai_explain.sql）。
+   *
+   * **信号快照在这一层补齐**，不在 service 里：service 只知道 signalId 与正文，
+   * 让它去认识 `SignalRecord` 的形状就等于把存储的事推进那一层。
+   *
+   * 两处 `this.data?.` 都是可选链：数据层没起来时 AI 仍然要能用，
+   * 只是那几条不进历史 —— 而不是整块报错。
+   */
+  private aiHistorySink(): AiHistorySink {
+    return {
+      latest: (signalId) => this.data?.storage.aiExplains.latestOf(signalId)?.text,
+
+      save: ({ signalId, text, startedAt, finishedAt }) => {
+        const layer = this.data
+        if (!layer) return
+        // 与 aiUserMessage 同一条查法：一条信号的 id 唯一，倒查最近 500 条即可
+        const record = layer.signalHistory({ limit: 500 }).find((row) => row.id === signalId)
+        if (!record) {
+          // 信号已经被裁剪掉了 —— 存了也没有上下文可写，而没有上下文的一段正文
+          // 在历史列表里是读不懂的（正是 008 那张表冗余存快照要防的）
+          log.warn(`[ai] ${signalId} 解读完成但找不到原信号，未存入历史`)
+          return
+        }
+        const config = this.aiStore?.config()
+        layer.storage.aiExplains.insert({
+          id: randomUUID(),
+          signalId,
+          code: record.code,
+          createdAt: startedAt,
+          elapsedMs: Math.max(0, finishedAt - startedAt),
+          text,
+          model: config?.model ?? '未知',
+          protocol: config?.protocol ?? 'openai',
+          direction: record.direction,
+          stage: record.stage,
+          score: record.score,
+          ...(Number.isFinite(record.priceAt) ? { priceAt: record.priceAt } : {}),
+          signalAt: record.createdAt,
+        })
+      },
+    }
   }
 
   /** 把一条信号摊成发给模型的正文。拿不到信号就抛错 —— 让 service 报成一次失败 */
@@ -1111,6 +1158,7 @@ export class AppController {
       client: createAiClient(createUndiciAiTransport(this.aiStore.config().timeoutMs)),
       emit: (chunk) => this.windows.push('push:aiChunk', chunk),
       buildUserMessage: (signalId) => this.aiUserMessage(signalId),
+      history: this.aiHistorySink(),
       log: { info: (m) => log.info(m), warn: (m, e) => log.warn(m, e) },
     })
     return view
@@ -1128,6 +1176,41 @@ export class AppController {
 
   cancelAi(requestId: string): void {
     this.ai?.cancel(requestId)
+  }
+
+  /** 这只票的全部历史解读，新的在上。数据层没起来时给空数组，不抛错 */
+  aiHistory(query: { code: SecCode; limit?: number }): AiExplainRecord[] {
+    const rows = this.data?.storage.aiExplains.listByCode(query.code, query.limit ?? 100) ?? []
+    return rows.map((row) => ({ ...row }))
+  }
+
+  /**
+   * 用户手动删一条解读。**这是删除的唯一入口** —— `retention.ts` 一行都不碰这张表。
+   *
+   * 与 `removeWatchPoint` 同一条：删之前弹**系统模态框**。删掉的是花过钱的东西，
+   * 而重新生成还要再花一次 —— 页面里一个二次点击挡不住误操作。
+   * 返回 false = 用户取消，什么都没动。
+   */
+  async removeAiExplain(id: string): Promise<boolean> {
+    const layer = this.requireData()
+    const rows = layer.storage.aiExplains
+    const target = rows.get(id)
+    // 已经不在了：当成删成功，别为一个「本来就想让它消失」的东西弹错误
+    if (!target) return true
+
+    const confirmed = await confirmDestructive(this.windows.panelWindow.browserWindow, {
+      title: '删除这条 AI 解读',
+      message: `删掉 ${target.code} 在 ${new Date(target.createdAt).toLocaleString('zh-CN')} 那次解读？`,
+      detail:
+        '这一行会被直接删掉，找不回来。它是花过钱的 —— 想再看到同样的内容，' +
+        '得对同一条信号重新生成一次，而那会再调用一次模型接口。',
+      confirmLabel: '删除',
+    })
+    if (!confirmed) return false
+
+    rows.remove(id)
+    log.info(`[ai] 删除历史解读 ${id}`)
+    return true
   }
 
   // ── 窗口 ──────────────────────────────────────────────────────────

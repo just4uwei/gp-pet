@@ -14,6 +14,7 @@ import quoteTick004 from './004_quote_tick.sql?raw'
 import watchVerdict005 from './005_watch_verdict.sql?raw'
 import alertRepeat006 from './006_alert_repeat.sql?raw'
 import tradeLog007 from './007_trade_log.sql?raw'
+import aiExplain008 from './008_ai_explain.sql?raw'
 
 export interface Migration {
   version: number
@@ -29,6 +30,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 5, name: '005_watch_verdict', sql: watchVerdict005 },
   { version: 6, name: '006_alert_repeat', sql: alertRepeat006 },
   { version: 7, name: '007_trade_log', sql: tradeLog007 },
+  { version: 8, name: '008_ai_explain', sql: aiExplain008 },
 ]
 
 export const LATEST_SCHEMA_VERSION = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)

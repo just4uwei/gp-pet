@@ -45,6 +45,8 @@ export const INVOKE_CHANNELS = [
   'ai:test',
   'ai:explain',
   'ai:cancel',
+  'ai:history',
+  'ai:remove',
   'watch:list',
   'watch:create',
   'watch:remove',

@@ -30,21 +30,22 @@
  * **自选列表**那边。所以 `signal:history` 的拉取、分组、以及「展开了哪一条依据」
  * 全部提到 `App`：抽屉与列表共用同一份 `expandedId` / `evidence`
  * —— 各存一套的话，在列表里展开的那条进抽屉会「忘记」自己是展开的，
- * AI 解读还会因重新挂载被取消（`AiExplain` 是卸载即取消的）。
+ * 展开状态因此共用一份。
  *
- * ## ⚠ 这个列表能把正在跑的 AI 解读摘掉（2026-08-14 修过一次）
+ * ## AI 解读已经搬走了（2026-08-14）
  *
- * 上面那句「卸载即取消」不只在抽屉那条路上成立，**组头换人也会触发它**：
- * 每组常显的只有 `latest`，同一只票再来一条信号（盘中每轮 tick 都可能）就把
- * 用户正展开着的那条挤出列表 —— 分析界面自己消失，而那次调用已经计过费。
- * 修法见 `SignalGroupItem` 的 `pinnedSignal`。
- * **改分组、排序、`key`、条件渲染之前先问一句：会不会把某个正在跑的 `AiExplain` 摘掉。**
+ * 这里曾经内嵌 `<AiExplain>`，于是列表的重渲染能把一次正在跑的模型调用摘掉：
+ * 每组常显的只有 `latest`，同一只票再来一条信号（盘中每轮 tick 都可能）就换组头，
+ * 用户正展开着的那条被挤出列表 → 组件卸载 → 请求取消，而那次调用已经计过费。
+ *
+ * 现在展开区里只剩一个**打开 AI 抽屉**的按钮，抽屉的状态挂在 `App`，
+ * 与这个列表没有父子关系 —— 那才是根治。`pinnedSignal` 保留下来是另一个理由：
+ * **正读着的那一行凭空消失本身就烦人**，与 AI 无关。
  */
 
 import type { AlertLevel, GatedDirection, Regime, SecCode } from '@core/types'
 import type { SignalEvidence, SignalRecord } from '@shared/ipc-types'
 import { pinnedSignal, type SignalGroup } from '@shared/signal-group'
-import { AiExplain } from './AiExplain'
 
 const DIRECTION_LABEL: Record<GatedDirection, string> = {
   BUY: '买入',
@@ -169,8 +170,7 @@ export function SignalRow({
   expanded,
   evidence,
   aiReady,
-  onWatchCreated,
-  onError,
+  onOpenAi,
   onToggle,
 }: {
   record: SignalRecord
@@ -178,8 +178,8 @@ export function SignalRow({
   evidence: SignalEvidence | null
   /** AI 已配置且已启用。false → 整块不渲染，而不是渲染一个点了报错的按钮 */
   aiReady: boolean
-  onWatchCreated: () => void
-  onError: (message: string) => void
+  /** 打开 AI 解读抽屉（第二层，状态在 App —— 见展开区里那段注释） */
+  onOpenAi: (record: SignalRecord) => void
   onToggle: (id: string) => void
 }): React.JSX.Element {
   const suppressed = record.suppressedReason !== undefined
@@ -232,16 +232,21 @@ export function SignalRow({
         evidence ? (
           <>
             <Evidence evidence={evidence} />
-            {/* AI 解读是**只读的解释层**：它不参与闸门，也不点亮状态点。
-                未配置时整块不渲染 —— 一个点了就报错的按钮比没有按钮更烦人 */}
+            {/*
+              AI 解读**开在另一层抽屉里**，不再内嵌在这里（2026-08-14）。
+              内嵌时它长在一个每轮 tick 都在重排的列表里，同一只票来条新信号就被卸载 ——
+              而它当时是「卸载即取消」的，用户看到的是分析界面自己没了。
+              抽屉的状态挂在 App，与这个列表没有父子关系，这是结构性保证。
+
+              AI 未配置时整块不渲染 —— 一个点了就报错的按钮比没有按钮更烦人。
+            */}
             {aiReady ? (
-              <AiExplain
-                signalId={record.id}
-                code={record.code}
-                name={record.name}
-                onWatchCreated={onWatchCreated}
-                onError={onError}
-              />
+              <button
+                className="gp-btn mt-2 w-full justify-center text-[11px]"
+                onClick={() => onOpenAi(record)}
+              >
+                AI 解读（调用你配置的模型，按对方规则计费）›
+              </button>
             ) : null}
           </>
         ) : (
@@ -275,12 +280,14 @@ export function CountChips({ group }: { group: SignalGroup<SignalRecord> }): Rea
  * 看同股的旧信号，以及看当日走势图 —— 两者回答的是同一个问题
  *（「今天这只票到底怎么了」），分开放反而要点两次。
  *
- * ## 为什么要多钉一条（2026-08-14 修）
+ * ## 为什么要多钉一条（2026-08-14）
  *
- * 只渲染 `latest` 时，同一只票再来一条信号会把用户**正展开着、AI 解读正在生成**
- * 的那条挤出列表 —— 组件卸载、请求被取消（`AiExplain` 是卸载即取消的），
- * 用户看到的是「等了四十秒的分析界面自己没了」，而那次调用已经计过费。
+ * 只渲染 `latest` 时，同一只票再来一条信号会把用户**正展开着、正在读依据**
+ * 的那条挤出列表 —— 界面在他眼皮底下换掉了内容，而他什么都没做。
  * 判据是纯函数 `pinnedSignal`（在 shared，有用例），这里只负责画。
+ *
+ * （这条最初是为了挡「正在跑的 AI 解读被卸载取消」加的。AI 已经搬进独立抽屉、
+ * 不再受这个列表影响了，但这一条本身仍然成立 —— 理由换了，行为不变。）
  */
 function SignalGroupItem({
   group,

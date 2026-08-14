@@ -24,5 +24,5 @@ export { ANTHROPIC_ADAPTER, OPENAI_ADAPTER, adapterOf, detectProtocol, protocolH
 export type { ProtocolAdapter } from './protocols'
 export { electronSecretCrypto } from './secret-crypto'
 export { createAiService } from './service'
-export type { AiService } from './service'
+export type { AiHistorySink, AiService } from './service'
 export type { AiConfig, AiProtocol, AiSignalContext, AiTransport, SecretCrypto } from './types'

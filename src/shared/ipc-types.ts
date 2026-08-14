@@ -509,6 +509,34 @@ export interface AiChunk {
   error?: string
 }
 
+/**
+ * 一条已完成的 AI 解读（008_ai_explain.sql）。
+ *
+ * 下面那组信号字段（`direction` / `stage` / `score` / `priceAt` / `signalAt`）是
+ * **落库时冗余存下来的快照**，不是 join 出来的：`signal` 按 2 年裁剪，而这张表永不裁剪，
+ * 两年后原信号没了，历史列表要还能说出「哪天、什么方向、多少置信」。
+ *
+ * `model` / `protocol` 同理要显示出来 —— 换个模型再解读一次，结论不同是正常的，
+ * 不标出来的话两条打架的解读会让人以为软件出了错。
+ */
+export interface AiExplainRecord {
+  id: string
+  signalId: string
+  code: SecCode
+  /** 发起时刻。列表按它倒序 —— 用户记得的是「我什么时候点的」 */
+  createdAt: number
+  elapsedMs: number
+  text: string
+  model: string
+  protocol: 'openai' | 'anthropic'
+  direction: GatedDirection
+  stage: SignalStage
+  score: number
+  /** 拿不到时不给这个键 —— **不是 0**（约束 4） */
+  priceAt?: number
+  signalAt: number
+}
+
 // ─────────────────────── 观察点（AI 解读的失效条件落地）───────────────────────
 
 /**
@@ -712,6 +740,19 @@ export interface IpcInvokeMap {
    */
   'ai:explain': (signalId: string, force?: boolean) => AiExplainStart
   'ai:cancel': (requestId: string) => void
+  /**
+   * 这只票的全部历史解读，**新的在上**（008_ai_explain.sql）。`limit` 缺省 100。
+   *
+   * 记录**永不自动裁剪**：它是花过钱、且重新生成还要再花一次钱的东西，
+   * 删除只有 `ai:remove` 一条路。
+   */
+  'ai:history': (query: { code: SecCode; limit?: number }) => AiExplainRecord[]
+  /**
+   * 用户手动删一条解读。删之前**主进程弹系统确认框**（同 `watch:remove`）——
+   * 删掉的是花过钱的东西，误点一下没有任何办法找回来。
+   * 返回 false = 用户在确认框里取消了，什么都没动。
+   */
+  'ai:remove': (id: string) => boolean
   /**
    * 观察点（P2 续）。`create` 的数值一律是**用户确认过**的 ——
    * 模型的建议只走到表单预填那一步，不会自己落库。

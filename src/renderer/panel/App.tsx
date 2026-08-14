@@ -35,6 +35,7 @@ import type {
 } from '@shared/ipc-types'
 import { groupSignals } from '@shared/signal-group'
 import type { SecCode } from '@core/types'
+import { AiDrawer } from './AiDrawer'
 import { AlertLog } from './AlertLog'
 import { BrandMark } from './BrandMark'
 import { ConfigTransferButtons, ConfigTransferNotice, type TransferOutcome } from './ConfigTransfer'
@@ -334,6 +335,15 @@ export function App(): React.JSX.Element {
   const signalEvidence = useSignalEvidence(setError)
   /** 抽屉：看哪只、落在哪个页签。null = 关着 */
   const [drawer, setDrawer] = useState<{ code: SecCode; tab: StockTab } | null>(null)
+  /*
+    AI 解读抽屉（第二层，叠在 StockDrawer 之上）。**状态必须挂在这一层** ——
+    它原先内嵌在信号行里，而那个列表每轮 tick 都在重排：同一只票来条新信号就换组头，
+    正在流式生成的解读跟着被卸载、请求被取消，而那次调用已经计过费。
+    挂在这里之后，列表怎么分组、排序、条件渲染都碰不到它。见 AiDrawer 头注释。
+  */
+  const [aiDrawer, setAiDrawer] = useState<{ signalId: string; code: SecCode; name: string } | null>(
+    null
+  )
   const [ledger, setLedger] = useState<TradeLedger | null>(null)
   const [tradeBusy, setTradeBusy] = useState(false)
   /*
@@ -407,12 +417,11 @@ export function App(): React.JSX.Element {
         expanded={signalEvidence.expandedId === record.id}
         evidence={signalEvidence.evidence[record.id] ?? null}
         aiReady={aiReady}
-        onWatchCreated={refreshWatch}
-        onError={setError}
+        onOpenAi={(row) => setAiDrawer({ signalId: row.id, code: row.code, name: row.name })}
         onToggle={signalEvidence.toggle}
       />
     ),
-    [signalEvidence, aiReady, refreshWatch]
+    [signalEvidence, aiReady]
   )
 
   // ── 详情抽屉与成交流水 ───────────────────────────────────────
@@ -792,8 +801,25 @@ export function App(): React.JSX.Element {
           onSubmitTrade={submitTrade}
           onRemoveTrade={removeTrade}
           tradeBusy={tradeBusy}
+          escDisabled={aiDrawer !== null}
           onError={setError}
           onClose={() => setDrawer(null)}
+        />
+      ) : null}
+
+      {/*
+        AI 解读抽屉：**第二层**，叠在 StockDrawer 之上。
+        两个入口（概览页的信号行、抽屉信号页的信号行）共用它 ——
+        它挂在这一层就是为了不被信号列表的重排摘掉（见 AiDrawer 头注释）。
+      */}
+      {aiDrawer ? (
+        <AiDrawer
+          signalId={aiDrawer.signalId}
+          code={aiDrawer.code}
+          name={aiDrawer.name}
+          onWatchCreated={refreshWatch}
+          onError={setError}
+          onClose={() => setAiDrawer(null)}
         />
       ) : null}
 
