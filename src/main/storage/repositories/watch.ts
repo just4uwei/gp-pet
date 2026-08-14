@@ -177,12 +177,22 @@ export class WatchPointRepo {
     )
   }
 
-  cancel(id: string): boolean {
-    return (
-      this.db
-        .prepare(`UPDATE watch_point SET status = 'CANCELED' WHERE id = ? AND status = 'ACTIVE'`)
-        .run(id).changes > 0
-    )
+  /**
+   * 用户点「不盯了」：**直接删掉这一行**，不是改成 CANCELED（2026-08-14 改）。
+   *
+   * 一条被主动放弃的观察点不构成结论 —— 与「到期未命中」不同，后者答的是
+   * 「当时那个判断没兑现」，是有信息的；而「我不想盯了」只是把列表越攒越长。
+   * 所以这里是 DELETE，调用方**必须先做二次确认**（controller.removeWatchPoint 走系统模态框）。
+   *
+   * **`CANCELED` 这个状态值保留**：改动之前的库里可能已经有 CANCELED 行，
+   * 列表要照常把它们显示成「已取消」。滤掉会让用户当初取消过的记录看起来凭空消失
+   * —— 与 alert_log 里 `TRAY` / `OS_NOTIFY` 那两个已删渠道同一条处置。
+   * 只是从此不再产生新的 CANCELED 行。
+   *
+   * 不限 `status = 'ACTIVE'`：已命中/已过期的行用户同样可以清掉。
+   */
+  remove(id: string): boolean {
+    return this.db.prepare(`DELETE FROM watch_point WHERE id = ?`).run(id).changes > 0
   }
 
   /** 移出自选时连带清理（外键指向 watchlist，见 WatchlistRepo.remove） */

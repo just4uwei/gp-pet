@@ -612,7 +612,11 @@ export interface IpcInvokeMap {
    */
   'watch:list': (query?: { status?: WatchPointView['status']; limit?: number }) => WatchPointView[]
   'watch:create': (draft: WatchPointDraft) => WatchPointView
-  'watch:cancel': (id: string) => void
+  /**
+   * 用户点「不盯了」：**直接删记录**，删之前弹系统确认框。
+   * 返回 false = 用户在确认框里取消了，什么都没动。
+   */
+  'watch:remove': (id: string) => boolean
   /** 从一段解读正文里抽建议，用于预填表单。抽不到返回空数组 */
   'watch:suggest': (text: string) => WatchSuggestion[]
   'pet:setHitRegion': (rects: Rect[]) => void

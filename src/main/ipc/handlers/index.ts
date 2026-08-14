@@ -148,7 +148,7 @@ export function registerHandlers(controller: AppController): void {
 
   handle('watch:create', (_event, draft) => controller.createWatchPoint(draft))
 
-  handle('watch:cancel', (_event, id) => controller.cancelWatchPoint(id))
+  handle('watch:remove', (_event, id) => controller.removeWatchPoint(id))
 
   handle('watch:suggest', (_event, text) => parseWatchSuggestions(text))
 

@@ -127,12 +127,23 @@ describe('WatchPointRepo', () => {
     expect(row?.hitValue).toBe(8.15)
   })
 
-  it('过期与取消同样只对 ACTIVE 生效', () => {
+  it('过期只对 ACTIVE 生效', () => {
     seed()
     storage.watchPoints.insert(point())
     expect(storage.watchPoints.markExpired('w1')).toBe(true)
     expect(storage.watchPoints.markExpired('w1')).toBe(false)
-    expect(storage.watchPoints.cancel('w1')).toBe(false)
+  })
+
+  it('remove() 真删行，且不限状态 —— 已命中/已过期的也能清掉', () => {
+    // 「不盯了」是删记录不是改状态：一条被主动放弃的观察点不构成结论，
+    // 与「到期未命中」（那是「当时那个判断没兑现」）不是一回事
+    seed()
+    storage.watchPoints.insert(point())
+    storage.watchPoints.markExpired('w1')
+    expect(storage.watchPoints.remove('w1')).toBe(true)
+    expect(storage.watchPoints.get('w1')).toBeNull()
+    // 已经不在了：返回 false，让调用方能分辨「删掉了」与「本来就没有」
+    expect(storage.watchPoints.remove('w1')).toBe(false)
   })
 
   it('list() 把 ACTIVE 排在最前 —— 「在盯什么」比历史重要', () => {

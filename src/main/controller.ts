@@ -751,9 +751,44 @@ export class AppController {
     return toWatchPointView(row, layer.signals.engineVersion, () => record.name)
   }
 
-  cancelWatchPoint(id: string): void {
-    this.requireData().storage.watchPoints.cancel(id)
+  /**
+   * 用户点「不盯了」：**二次确认之后真删这一行**。
+   *
+   * 为什么是删而不是改成 CANCELED：一条被主动放弃的观察点不构成结论
+   * —— 与「到期未命中」不同（那个答的是「当时那个判断没兑现」，有信息），
+   * 「我不想盯了」只会把列表越攒越长。
+   *
+   * 为什么确认框走**系统模态框**而不是页面里的一个二次点击：删掉之后
+   * 「当时押了什么」这条记录就找不回来了，与清空影子账本、覆盖导入同一类操作
+   * （见 resetShadow / confirmOverwrite）。默认按钮是「取消」，
+   * 这个框可能在用户没看清的情况下被回车掉。
+   *
+   * 返回 false = 用户取消，什么都没动。
+   */
+  async removeWatchPoint(id: string): Promise<boolean> {
+    const layer = this.requireData()
+    const row = layer.storage.watchPoints.get(id)
+    // 已经不在了：当成删成功，别为一个「本来就想让它消失」的东西弹错误
+    if (!row) return true
+
+    const name = layer.storage.watchlist.get(row.code)?.profile.name ?? row.code
+    const arrow = row.op === 'LTE' ? '≤' : '≥'
+    const confirmed = await confirmDestructive(this.windows.panelWindow.browserWindow, {
+      title: '移除观察点',
+      message: `不再盯 ${name} 的「${row.metric} ${arrow} ${row.threshold}」？`,
+      detail:
+        '这一行会被直接删掉，不是标记成已取消 —— 当时为什么设它、判断的是什么方向，' +
+        '都一并消失，找不回来。\n\n' +
+        '如果只是想让它自然结束，可以什么都不做：到期未命中会留一条「没兑现」的记录，' +
+        '那本身也是一个结论。',
+      confirmLabel: '移除',
+    })
+    if (!confirmed) return false
+
+    layer.storage.watchPoints.remove(id)
+    log.info(`[watch] 移除：${row.code} ${row.metric} ${row.op} ${row.threshold}`)
     this.onStateChanged()
+    return true
   }
 
   // ── 提醒（M3）─────────────────────────────────────────────────────

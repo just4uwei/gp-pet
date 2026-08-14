@@ -71,11 +71,11 @@ const VERDICT_STYLE: Record<'UP' | 'DOWN' | 'RANGE', { label: string; tone: stri
 function Row({
   point,
   now,
-  onCancel,
+  onRemove,
 }: {
   point: WatchPointView
   now: number
-  onCancel?: (id: string) => void
+  onRemove?: (id: string) => void
 }): React.JSX.Element {
   const meaning = point.meaning === 'INVALIDATE' ? '命中 = 原判断失效' : '命中 = 判断得到确认'
   return (
@@ -128,12 +128,12 @@ function Row({
             <span className="text-white/35">已取消</span>
           </>
         ) : null}
-        {onCancel ? (
+        {onRemove ? (
           <button
             className="ml-auto text-[10px] text-white/30 hover:text-rose-300"
-            onClick={() => onCancel(point.id)}
+            onClick={() => onRemove(point.id)}
           >
-            不盯了
+            不盯了，移除
           </button>
         ) : null}
       </div>
@@ -169,13 +169,13 @@ function Section({
   hint,
   points,
   now,
-  onCancel,
+  onRemove,
 }: {
   title: string
   hint?: string
   points: WatchPointView[]
   now: number
-  onCancel?: (id: string) => void
+  onRemove?: (id: string) => void
 }): React.JSX.Element | null {
   if (points.length === 0) return null
   return (
@@ -188,12 +188,12 @@ function Section({
       {hint ? <p className="px-3 pb-1 text-[10px] leading-snug text-white/30">{hint}</p> : null}
       <ul>
         {points.map((point) => (
-          // exactOptionalPropertyTypes：onCancel 缺省时不要传这个 prop（传 undefined 不等价）
+          // exactOptionalPropertyTypes：onRemove 缺省时不要传这个 prop（传 undefined 不等价）
           <Row
             key={point.id}
             point={point}
             now={now}
-            {...(onCancel === undefined ? {} : { onCancel })}
+            {...(onRemove === undefined ? {} : { onRemove })}
           />
         ))}
       </ul>
@@ -222,11 +222,20 @@ export function WatchPoints({
 
   useEffect(reload, [reload, refreshKey])
 
-  const cancel = useCallback(
+  /**
+   * 「不盯了」= **直接删记录**（2026-08-14 改，此前是标记成已取消）。
+   *
+   * 确认框在**主进程**弹（系统模态框），不在这里做二次点击 —— 删掉之后
+   * 「当时押了什么」找不回来，那种操作该长成系统对话框的样子
+   * （与覆盖导入、清空影子账本同一条，见 controller.removeWatchPoint）。
+   * 返回 false = 用户在框里点了取消，此时**不刷新**：什么都没变，刷一下只会让人以为动过了。
+   */
+  const remove = useCallback(
     (id: string): void => {
       void window.gp
-        .invoke('watch:cancel', id)
-        .then(() => {
+        .invoke('watch:remove', id)
+        .then((removed) => {
+          if (!removed) return
           reload()
           onChanged()
         })
@@ -275,14 +284,16 @@ export function WatchPoints({
         hint="盘中每轮取数后都会比一次。命中即提醒，且照过防抖、冷却、每日上限与免打扰"
         points={active}
         now={now}
-        onCancel={cancel}
+        onRemove={remove}
       />
-      <Section title="已命中" points={hit} now={now} />
+      {/* 已命中 / 已结束的也能清掉：那是用户自己的记录，该由他决定留不留 */}
+      <Section title="已命中" points={hit} now={now} onRemove={remove} />
       <Section
         title="已结束"
-        hint="到期未命中就是「当时那个判断没兑现」—— 这本身也是一个结论"
+        hint="到期未命中就是「当时那个判断没兑现」—— 这本身也是一个结论，删之前想一下"
         points={done}
         now={now}
+        onRemove={remove}
       />
     </div>
   )

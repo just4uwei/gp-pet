@@ -40,7 +40,12 @@ CREATE TABLE watch_point (
   -- 几十条永不触发的噪音，而用户会逐渐不再相信这个列表。
   -- 到期未命中**本身就是结论**（「没兑现」），不需要另一套机制表达
   expires_at  INTEGER NOT NULL,
-  status      TEXT NOT NULL,              -- ACTIVE | HIT | EXPIRED | CANCELED
+  -- ACTIVE | HIT | EXPIRED | CANCELED。
+  -- **CANCELED 从 2026-08-14 起不再产生**：用户点「不盯了」是直接删这一行
+  -- （WatchPointRepo.remove，删前走系统确认框）—— 一条被主动放弃的观察点不构成结论，
+  -- 与「到期未命中」不是一回事。旧库里已有的 CANCELED 行照常显示成「已取消」，
+  -- 不做数据迁移：删用户的历史记录比留一个不再产生的状态值贵得多
+  status      TEXT NOT NULL,
   hit_at      INTEGER,
   hit_value   REAL
 );

@@ -42,7 +42,7 @@ export const INVOKE_CHANNELS = [
   'ai:cancel',
   'watch:list',
   'watch:create',
-  'watch:cancel',
+  'watch:remove',
   'watch:suggest',
   'app:backupDatabase',
   'app:clearCache',
