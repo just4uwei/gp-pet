@@ -58,6 +58,13 @@ function fakeRepo(): { repo: AlertRepo; rows: AlertRow[] } {
     get: (id: string) => rows.find((r) => r.id === id) ?? null,
     markRead: () => 0,
     markAllRead: () => rows.length,
+    bumpRepeat: (id: string, at: number) => {
+      const row = rows.find((r) => r.id === id)
+      if (!row) return false
+      row.repeatCount = (row.repeatCount ?? 1) + 1
+      row.lastAt = at
+      return true
+    },
     unreadCount: () => rows.filter((r) => r.channels.length > 0 && r.readAt === null).length,
     countSince: () => rows.length,
   } as unknown as AlertRepo
@@ -119,6 +126,43 @@ describe('不制造信息黑洞：每一条候选都留一行', () => {
     expect(second?.channels).toEqual([])
     expect(second?.level).toBe('L3')
     expect(second?.suppressedReason).toContain('冷却')
+  })
+
+  it('结论与依据都没变时不新增行，把首行的重复计数 +1', () => {
+    // 盘中每 30s 一轮都会对同一个持续中的信号造一次候选、被同键冷却挡一次。
+    // 那不是 N 件事，是 1 件事持续了 N 轮（006_alert_repeat.sql）
+    const h = harness()
+    h.service.handle([outcome()], { at: T0, debounce: false })
+    for (let i = 1; i <= 4; i++) {
+      h.service.handle([outcome()], { at: T0 + i * 30_000, debounce: false })
+    }
+    // 第一行是「发出去了」，第二行是「被冷却挡掉」—— 两种裁决，两行；
+    // 后面三轮与第二行一模一样，全部并进它
+    expect(h.rows).toHaveLength(2)
+    expect(h.rows[1]?.repeatCount).toBe(4)
+    expect(h.rows[1]?.lastAt).toBe(T0 + 4 * 30_000)
+  })
+
+  it('signalId 变了就是新事件，哪怕裁决一模一样也要新行', () => {
+    const h = harness()
+    h.service.handle([outcome()], { at: T0, debounce: false })
+    h.service.handle([outcome()], { at: T0 + 30_000, debounce: false })
+    expect(h.rows).toHaveLength(2)
+    // 同样是「被冷却挡掉」，但换了一条信号 —— 不能记成同一件事
+    h.service.handle([outcome({ signalId: 'sig-2' })], { at: T0 + 60_000, debounce: false })
+    expect(h.rows).toHaveLength(3)
+    expect(h.rows[2]?.repeatCount).toBeUndefined()
+  })
+
+  it('重复不把已读的行改回未读 —— 未读数答的是「有几件新事」', () => {
+    const h = harness()
+    h.service.handle([outcome()], { at: T0, debounce: false })
+    h.service.handle([outcome()], { at: T0 + 30_000, debounce: false })
+    const suppressed = h.rows[1]
+    if (suppressed) suppressed.readAt = T0 + 40_000
+    h.service.handle([outcome()], { at: T0 + 60_000, debounce: false })
+    expect(h.rows).toHaveLength(2)
+    expect(h.rows[1]?.readAt).toBe(T0 + 40_000)
   })
 
   it('一条候选都没有时不写库、也不打扰任何渠道', () => {

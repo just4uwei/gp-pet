@@ -74,6 +74,7 @@ describe('迁移', () => {
         'position',
         'provider_health',
         'quote_tick',
+        'watch_point',
         'signal',
         'trade_calendar',
         'watchlist',
@@ -374,6 +375,53 @@ describe('ProviderHealthRepo', () => {
     expect(percentile([5], 0.95)).toBe(5)
     expect(percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.95)).toBe(10)
     expect(percentile([1, 2, 3, 4], 0.5)).toBe(2)
+  })
+})
+
+describe('新增列（005 / 006）', () => {
+  let storage: Storage
+  beforeEach(async () => {
+    storage = await openMemory()
+  })
+  afterEach(() => storage.close())
+
+  it('watch_point 的 verdict / verdict_text 可空可读写', () => {
+    const cols = storage.db
+      .prepare(`SELECT name FROM pragma_table_info('watch_point')`)
+      .all<{ name: string }>()
+      .map((r) => r.name)
+    expect(cols).toEqual(expect.arrayContaining(['verdict', 'verdict_text']))
+  })
+
+  it('alert_log 的 repeat_count 对既有行默认 1，bumpRepeat 递增且不动 read_at', () => {
+    storage.db
+      .prepare(
+        `INSERT INTO signal (id, code, created_at, trade_date, direction, score, votes, regime, stage, price_at, evidence, engine_version)
+         VALUES ('sig', 'SH600000', 0, '2024-01-02', 'BUY', 0.7, 3, 'RANGE', 'CONFIRMED', 10, '{}', 'v')`
+      )
+      .run()
+    storage.alerts.insert({
+      id: 'a1',
+      signalId: 'sig',
+      level: 'L2',
+      channels: ['BUBBLE'],
+      suppressedReason: null,
+      readAt: 123,
+      createdAt: 100,
+    })
+    expect(storage.alerts.get('a1')?.repeatCount).toBe(1)
+
+    expect(storage.alerts.bumpRepeat('a1', 200)).toBe(true)
+    expect(storage.alerts.bumpRepeat('a1', 300)).toBe(true)
+    const row = storage.alerts.get('a1')
+    expect(row?.repeatCount).toBe(3)
+    expect(row?.lastAt).toBe(300)
+    // 已读的行不该因为这个状态还在持续就变回未读
+    expect(row?.readAt).toBe(123)
+  })
+
+  it('bumpRepeat 对不存在的行返回 false —— 调用方据此退回插新行', () => {
+    expect(storage.alerts.bumpRepeat('nope', 1)).toBe(false)
   })
 })
 

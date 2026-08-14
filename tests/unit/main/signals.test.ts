@@ -10,7 +10,12 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { createSignalEngine, snapshotOfIndicators, type SignalEngineDeps } from '@main/engine/signals'
+import {
+  createSignalEngine,
+  signalSignature,
+  snapshotOfIndicators,
+  type SignalEngineDeps,
+} from '@main/engine/signals'
 import { computeIndicators } from '@core/indicators'
 import { DEFAULT_PARAMS, engineVersionOf, withParams } from '@core/params'
 import type { Candle, Position, SecCode, SecProfile, SignalStage, Snapshot } from '@core/types'
@@ -153,6 +158,70 @@ describe('时段与开关', () => {
     const outcomes = engine.run(TICK)
     expect(outcomes.map((o) => o.evaluation.code)).toEqual(['SZ000001'])
     expect(warn).toHaveBeenCalled()
+  })
+})
+
+describe('落库签名（signalSignature）', () => {
+  /**
+   * 只造签名函数用得到的那几个字段。这里刻意不去构造一个完整的 Evaluation ——
+   * 这个函数的契约就是「读这几项」，多造出来的东西只会让用例看不出重点。
+   */
+  const evalOf = (over: {
+    subs?: [string, string][]
+    adjustments?: string[]
+    verdicts?: [string, string][]
+    direction?: string
+    score?: number
+    reasons?: string[]
+  } = {}): Parameters<typeof signalSignature>[0] =>
+    ({
+      date: '2024-01-02',
+      gated: {
+        direction: over.direction ?? 'BUY',
+        level: 'L2',
+        suppressed: false,
+        reasons: over.reasons ?? ['均线交叉'],
+        verdicts: (over.verdicts ?? []).map(([rule, action]) => ({ rule, action, reason: '' })),
+      },
+      signal: {
+        stage: 'PROVISIONAL',
+        score: over.score ?? 0.62,
+        votes: 3,
+        subSignals: (over.subs ?? [['T1_MA_CROSS', 'BUY']]).map(([id, direction]) => ({ id, direction })),
+        adjustments: (over.adjustments ?? []).map((id) => ({ id })),
+      },
+    }) as unknown as Parameters<typeof signalSignature>[0]
+
+  it('得分变了签名不变 —— 连续量一个都不许进签名，否则等于没有去重', () => {
+    expect(signalSignature(evalOf({ score: 0.61 }))).toBe(signalSignature(evalOf({ score: 0.88 })))
+  })
+
+  it('结论没变但子信号集合变了 → 新签名（这是 2026-08-14 补的那条）', () => {
+    // 旧签名只看 reasons[0]，于是这两种情况被判成同一条，
+    // 而落库的 evidence 还停在三小时前那一份
+    const before = signalSignature(evalOf({ subs: [['T1_MA_CROSS', 'BUY'], ['T3_BREAKOUT', 'BUY']] }))
+    const after = signalSignature(
+      evalOf({ subs: [['T1_MA_CROSS', 'BUY'], ['T3_BREAKOUT', 'BUY'], ['T4_ALIGNMENT', 'BUY']] })
+    )
+    expect(after).not.toBe(before)
+  })
+
+  it('子信号顺序变了签名不变 —— 产出顺序不保证稳定', () => {
+    const a = signalSignature(evalOf({ subs: [['T1_MA_CROSS', 'BUY'], ['T3_BREAKOUT', 'BUY']] }))
+    const b = signalSignature(evalOf({ subs: [['T3_BREAKOUT', 'BUY'], ['T1_MA_CROSS', 'BUY']] }))
+    expect(a).toBe(b)
+  })
+
+  it('同一个子信号换了方向算依据变了', () => {
+    const a = signalSignature(evalOf({ subs: [['R1_RSI_BAND', 'BUY']] }))
+    const b = signalSignature(evalOf({ subs: [['R1_RSI_BAND', 'SELL']] }))
+    expect(a).not.toBe(b)
+  })
+
+  it('风控裁决与多周期调整也进签名', () => {
+    const base = signalSignature(evalOf())
+    expect(signalSignature(evalOf({ verdicts: [['STOP_LOSS', 'FORCE']] }))).not.toBe(base)
+    expect(signalSignature(evalOf({ adjustments: ['M1_WEEK_MACD_DAY_RSI'] }))).not.toBe(base)
   })
 })
 

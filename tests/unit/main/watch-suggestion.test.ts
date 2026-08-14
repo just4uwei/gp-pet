@@ -110,6 +110,59 @@ metric=adx op=GTE threshold=25 meaning=CONFIRM
   })
 })
 
+describe('判断结论（005_watch_verdict.sql）', () => {
+  const block = (body: string): string => `<观察点建议>
+${body}
+</观察点建议>`
+
+  it('独占一行的「判断=」归一化后套到该块的每条建议上', () => {
+    const out = parseWatchSuggestions(
+      block(`判断=上涨
+metric=PRICE op=LTE threshold=8.2
+metric=rsi op=GTE threshold=70`)
+    )
+    expect(out).toHaveLength(2)
+    expect(out.every((s) => s.verdict === 'UP')).toBe(true)
+    expect(out[0]?.verdictText).toBe('上涨')
+  })
+
+  it('归不了类时 verdict 留空、但原文照存 —— 认不出不是错误，猜才是', () => {
+    // 「继续走高一线」不在白名单里。硬归成 UP 会让用户在观察点列表上
+    // 看到一个他从没确认过的方向，而他多半不会去核对
+    const out = parseWatchSuggestions(block(`判断=后市有待观察一线
+metric=PRICE op=LTE threshold=8.2`))
+    expect(out[0]?.verdict).toBeUndefined()
+    expect(out[0]?.verdictText).toBe('后市有待观察一线')
+  })
+
+  it('说不清方向的说法归到 RANGE，不许被「上行」二字带成 UP', () => {
+    const out = parseWatchSuggestions(block(`判断=震荡上行
+metric=PRICE op=LTE threshold=8.2`))
+    expect(out[0]?.verdict).toBe('RANGE')
+  })
+
+  it('没有判断行时观察点照样能建 —— 它是可选的', () => {
+    const out = parseWatchSuggestions(block('metric=PRICE op=LTE threshold=8.2'))
+    expect(out).toHaveLength(1)
+    expect(out[0]?.verdict).toBeUndefined()
+    expect(out[0]?.verdictText).toBeUndefined()
+  })
+
+  it('判断行本身不会被当成一条建议', () => {
+    const out = parseWatchSuggestions(block(`判断=下跌
+metric=PRICE op=LTE threshold=8.2`))
+    expect(out).toHaveLength(1)
+    expect(out[0]?.verdict).toBe('DOWN')
+  })
+
+  it('原文截到 40 字 —— 模型会把整段正文塞进来', () => {
+    const long = '很'.repeat(80)
+    const out = parseWatchSuggestions(block(`判断=${long}
+metric=PRICE op=LTE threshold=8.2`))
+    expect(out[0]?.verdictText).toHaveLength(40)
+  })
+})
+
 describe('stripSuggestionBlock', () => {
   it('把建议块摘掉 —— 它是给程序读的，显示出来只是噪音', () => {
     expect(stripSuggestionBlock(GOOD)).toBe('第一段正文。')
