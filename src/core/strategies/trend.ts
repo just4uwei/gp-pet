@@ -125,7 +125,23 @@ export function trendSignals(ctx: StrategyContext): SubSignal[] {
   const volumeConfirmed = volRatio !== null && volRatio >= ctx.params.volume.breakoutRatio
   const t3Evidence = { close, upper, lower, bbwPct, bbwRising, volRatio }
 
-  if (close !== null && upper !== null && close > upper && bbwRising && volumeConfirmed) {
+  // **`TREND_UP` 里不给 BUY 票**（2026-08-15，docs/04 §3.1a 有完整论证）。
+  //
+  // 一句话理由：在已经被判定为上升趋势的状态里，「又创了新高 + 带宽扩张」不提供新信息 ——
+  // 「在涨」是判定前提，`T4_ALIGNMENT` 几乎必然同时成立（实测 396/396 = 100%，
+  // 在这个状态下已退化成常量），而带宽扩张在趋势中段是延续、在末端是加速赶顶，
+  // 日线上分不开。于是 T3 这一票投给的恰恰是最危险的时刻。
+  //
+  // 实测：TREND_UP 的 396 次建仓里 **365 次（92.2%）恰好 3 票**，正好卡在票数线上，
+  // 所以这一票是不是有信息，直接决定那批信号存不存在。
+  //
+  // 三条边界，改之前想清楚：
+  //   ① 只动 BUY —— 跌破下轨 + 带宽扩张在任何状态下都是风险扩大，上面的推理对 SELL 不成立；
+  //   ② 只动 TREND_UP —— RANGE/TRANSITION 里突破是**状态转换**信号，那是它本来的用途；
+  //   ③ **不引入任何数值** —— 这是结构条件不是阈值，所以不产生新的 GUESS 参数。
+  //      （被否掉的另一个方案「趋势持续 N 根后不买」的 N 只能从绩效数据里读，是循环论证。）
+  const breakoutInformative = ctx.regime !== 'TREND_UP'
+  if (close !== null && upper !== null && close > upper && bbwRising && volumeConfirmed && breakoutInformative) {
     drafts.push({
       id: 'T3_BREAKOUT',
       direction: 'BUY',

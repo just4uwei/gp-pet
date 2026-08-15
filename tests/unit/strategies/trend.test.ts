@@ -150,6 +150,45 @@ describe('T3 轨道突破', () => {
     expect(deepScore).toBeGreaterThan(shallowScore)
     expect(deepScore).toBeLessThanOrEqual(1)
   })
+
+  /**
+   * `TREND_UP` 里不给 BUY 票（2026-08-15，docs/04 §3.1a）。
+   *
+   * **这一组必须写成「同一根 K 线、同一套指标，只换 `ctx.regime`」的对照**，
+   * 理由是这个项目踩过的两个坑叠在一起：
+   *
+   * ① 没有任何既有 fixture 能走到 `TREND_UP`（实测 `goldenCrossBreakout` /
+   *    `limitUpBreakout` 在突破那几根上都是 `TRANSITION`，`rangeBound` 是 `RANGE`）——
+   *    所以「造一个上升趋势 fixture 然后断言 T3 不触发」会**因为构造不出 TREND_UP 而假通过**，
+   *    与 §5.19 那六条从未绿过的用例是同一形状。
+   * ② 只断言「不触发」永远有可能是别的条件没满足。所以先用 `RANGE` 那一档证明
+   *    **突破的三个原始条件确实都成立**，再换成 `TREND_UP` 看它消失。
+   */
+  describe('TREND_UP 里 BUY 不计票（docs/04 §3.1a）', () => {
+    it('同一根 K 线：RANGE 下成立 → TREND_UP 下消失', () => {
+      // 先证明三个原始条件（越上轨 / 带宽扩张 / 放量）在这根上都满足
+      expect(ids(trendSignals(ctx(breakout, above, 'RANGE')))).toContain('T3_BREAKOUT:BUY')
+      // 只换 regime，别的一个字没动
+      expect(ids(trendSignals(ctx(breakout, above, 'TREND_UP')))).not.toContain('T3_BREAKOUT:BUY')
+    })
+
+    it('TRANSITION 不受影响 —— 突破在那里是「状态可能要转换」的信号，正是它的本职', () => {
+      expect(ids(trendSignals(ctx(breakout, above, 'TRANSITION')))).toContain('T3_BREAKOUT:BUY')
+    })
+
+    it('SELL 不受影响：跌破下轨在任何状态下都是风险扩大，论证对它不成立', () => {
+      const below: Record<number, BarOverride> = { [LAST]: { close: 9, high: 9.6, low: 8.9 } }
+      expect(ids(trendSignals(ctx(breakout, below, 'TREND_UP')))).toContain('T3_BREAKOUT:SELL')
+    })
+
+    it('只掐掉 T3，同一根上的其它子信号照旧 —— 改的是一票不是整条路径', () => {
+      // 让 T4 也在这根成立（多头排列 + 收盘在 MA20 上 + ADX 够）
+      const withT4: IndicatorSpec = { ...breakout, ma: { 5: 10.9, 20: 10.8, 60: 9.5 }, adx: 30, adxTrend: 24 }
+      const got = ids(trendSignals(ctx(withT4, above, 'TREND_UP')))
+      expect(got).not.toContain('T3_BREAKOUT:BUY')
+      expect(got).toContain('T4_ALIGNMENT:BUY')
+    })
+  })
 })
 
 describe('T4 均线排列', () => {
