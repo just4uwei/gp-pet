@@ -65,7 +65,12 @@ const STATUS: Record<string, { status: Status; note?: string }> = {
   },
   'risk.profitProtectFallback': { status: 'KEPT', note: '随 risk 块一同上过网格（§5.18）' },
   'risk.trailingStopPct': { status: 'KEPT', note: '随 risk 块一同上过网格（§5.18）' },
-  'risk.industryConcentrationCap': { status: 'KEPT', note: '随 risk 块一同上过网格（§5.18）' },
+  'risk.industryConcentrationCap': {
+    status: 'UNTESTABLE',
+    note:
+      '2026-08-14 改档（原 KEPT）：回测**两重**读不到它 —— `industryShare` 只有主进程会传，' +
+      '而这条规则只产 `DOWNGRADE`（改提醒级别，不改 direction）。§5.18 那轮的 KEEP 对它无信息量（§5.20）',
+  },
   'risk.newListingMinBars': { status: 'KEPT', note: '随 risk 块一同上过网格（§5.18）' },
 
   // ── 已判参数惰性或算术无效（M2 清单 4.9c 的另一半）───────────────
@@ -88,6 +93,46 @@ const STATUS: Record<string, { status: Status; note?: string }> = {
   'multiTf.weekAdxWeak': { status: 'INERT', note: '同上（§5.18）' },
   'multiTf.resonanceDelta': { status: 'INERT', note: '同上（§5.18）' },
   'multiTf.falseBreakoutDelta': { status: 'INERT', note: '同上（§5.18）' },
+  /*
+    下面四条是 2026-08-14 在 B1 的准备工作里**读代码**判出来的（M2 §5.20），
+    不是跑网格跑出来的 —— 它们在网格上会表现为「动 0/84 折」，而那种证据比
+    「这个数没有读者」弱：前者只说明这一次没测出差别，后者是算术上不可能有差别。
+    往这一档加行之前先确认是**没有读者**或**分支走不到**，不是「效应小」。
+  */
+  'ma.periods': {
+    status: 'INERT',
+    note:
+      '信号层只读 5/20/60 三条（trend.ts 里是字面量），这张表只决定「算哪几条」——' +
+      '加 10/120 对信号零影响，去掉 5/20/60 则是关掉 T1/T4 而不是调参。' +
+      '10/120 有读者但不在信号层（观察点指标、AI 上下文），所以**不能删**（§5.20）',
+  },
+  'volume.shrinkRatio': {
+    status: 'INERT',
+    note: '全仓搜索无读者：docs/04 §1.6 的「ratio ≤ 0.8 为缩量」从未被任何子信号消费（§5.20）',
+  },
+  'macd.preset': {
+    status: 'INERT',
+    note:
+      '纯标签：MacdParams 只有 fast/slow/signal，没有任何代码读 preset。' +
+      '改它会变参数指纹（指标缓存作废、影子运行停止累积）却不改任何行为 —— 有代价没效果（§5.20）',
+  },
+  'data.minBars': {
+    status: 'UNTESTABLE',
+    note:
+      '回测的预热下限是 fullBars = 300 > minBars = 40，这条分支在回测里走不到；' +
+      '它管的是「新股上市初期不出信号」，判据只能来自真机（§5.20）',
+  },
+  'data.insufficientPenalty': {
+    status: 'UNTESTABLE',
+    note: '同一条分支（bars < fullBars 或 BBW 分位未预热）在回测里走不到，除非把 --warmup 钉住（§5.20）',
+  },
+  'strategy.expandedBbwPct': {
+    status: 'UNTESTABLE',
+    note:
+      '2026-08-14 实测 70/80/95/98 四档与出厂 90 **逐位相同**（建仓 1187、胜率 43.30% 一字不差）——' +
+      '因为它只产 `VOLATILITY_EXPANDED` 这条 `DOWNGRADE`（改提醒级别），而回测的 toOrder() 只读 direction。' +
+      '判据与 `alert.bubbleScore` 同一档：提醒日志，不是 Calmar（§5.20 ⑦）',
+  },
 
   // ── 日线回测原理上测不到（归影子运行 / M3 提醒日志）───────────────
   'combine.provisionalDiscount': {
@@ -111,22 +156,50 @@ const STATUS: Record<string, { status: Status; note?: string }> = {
     note: '日线回测看不见日内路径（不知先到高点还是低点），依据只能来自实盘使用',
   },
 
-  // ── 一个网格都没跑过（docs/08 M2 那一行点了名的四块）──────────────
-  macd: { status: 'GUESS', note: '一个网格都没跑过。12/17/9 来自来源文档转述（docs/04 §1.2）' },
-  boll: { status: 'GUESS', note: '一个网格都没跑过。标准差除 n 而非 n−1 是国内平台口径' },
-  volume: { status: 'GUESS', note: '一个网格都没跑过' },
-  rsi: { status: 'GUESS', note: '一个网格都没跑过' },
-  ma: { status: 'GUESS', note: '一个网格都没跑过' },
-  'strategy.pullbackLookback': { status: 'GUESS', note: '未测' },
-  'strategy.midReversionStd': { status: 'GUESS', note: '未测' },
-  'strategy.expandedBbwPct': { status: 'GUESS', note: '未测（docs/04 §1.4 的「> 90 趋势末端」转述）' },
-  'regime.rangeBbwPct': { status: 'GUESS', note: '未测（docs/04 §1.4 的「< 30 收敛」转述）' },
-  'regime.adxSlopeWindow': { status: 'GUESS', note: '未测' },
-  'regime.adxSlopeTrigger': { status: 'GUESS', note: '未测' },
-  'regime.bbwPctJump': { status: 'GUESS', note: '未测' },
-  'data.minBars': { status: 'GUESS', note: '未测' },
-  'data.fullBars': { status: 'GUESS', note: '未测' },
-  'data.insufficientPenalty': { status: 'GUESS', note: '未测' },
+  /*
+    ── 一个网格都没跑过（docs/08 M2 那一行点了名的四块）──────────────
+
+    ⚠ 2026-08-14：网格文件已经备好（`params/grid-{volume,rsi,boll,macd,strategy,regime-rest,data}.json`），
+    但**这一批在 261 只的宽基池上跑不出裁决** —— 出厂参数本身在 6 年训练窗口上亏钱
+    （−2.55% / Calmar −0.12），被标定工具的红线「训练集 Calmar ≤ 0 直接淘汰」判掉，
+    于是每一张网格的裁决都只能是 `INCONCLUSIVE`（M2 §5.20）。
+    **这不是工具坏了**，是那条红线在说「先解决出厂值自己站不住这件事」。
+    在那之前把这些行改成 KEPT / CALIBRATED 都是没有依据的。
+  */
+  macd: {
+    status: 'GUESS',
+    note:
+      '12/17/9 来自来源文档转述（docs/04 §1.2）。2026-08-14 上过网格但**裁决 INCONCLUSIVE**：' +
+      '13 组训练集绩效落在 −2.25% ~ −2.79% 的一片平地上（经典 12/26/9 是里面最好的 −2.25%），' +
+      '而出厂值自己被红线淘汰 ⇒ 拿不到配对 Δ（§5.20 ⑦）',
+  },
+  boll: {
+    status: 'GUESS',
+    note:
+      '标准差除 n 而非 n−1 是国内平台口径。2026-08-14 网格 INCONCLUSIVE：`k` 2.5 与 `period` 22 ' +
+      '把训练集从 −2.55% 拉到 −0.73%/−0.99%，但靠的是**少做**（建仓 1187 → 782）。' +
+      '⚠ `bbwLookback` 375/500 那两组不可按「更差」读：分位数要够长的样本才有值，被 --warmup 300 confound 了（§5.20 ⑦）',
+  },
+  volume: {
+    status: 'GUESS',
+    note:
+      '2026-08-14 网格 INCONCLUSIVE：`breakoutRatio` 1.1 → 1.6 单调变好（最好 −2.21%），' +
+      '`maPeriod` 与 `suspiciousRatio` 一片平地（§5.20 ⑦）',
+  },
+  rsi: { status: 'GUESS', note: '2026-08-14 上过网格，裁决 INCONCLUSIVE（§5.20 ⑦）' },
+  'strategy.pullbackLookback': { status: 'GUESS', note: '2026-08-14 网格 INCONCLUSIVE：3/8/12 三档都在 ±0.5pp 内' },
+  'strategy.midReversionStd': {
+    status: 'GUESS',
+    note: '2026-08-14 网格 INCONCLUSIVE：2.0 是全场第二好（−1.13%），但同样靠少做（建仓 1187 → 945）',
+  },
+  'regime.rangeBbwPct': { status: 'GUESS', note: 'docs/04 §1.4 的「< 30 收敛」转述。2026-08-14 网格 INCONCLUSIVE，四档取值差 < 0.4pp' },
+  'regime.adxSlopeWindow': { status: 'GUESS', note: '2026-08-14 网格 INCONCLUSIVE' },
+  'regime.adxSlopeTrigger': { status: 'GUESS', note: '2026-08-14 网格 INCONCLUSIVE；8 与 12 逐位相同（该侧已饱和）' },
+  'regime.bbwPctJump': { status: 'GUESS', note: '2026-08-14 网格 INCONCLUSIVE' },
+  'data.fullBars': {
+    status: 'GUESS',
+    note: '它在回测里同时充当预热下限，扫它必须钉住 --warmup，否则测的是判定窗口不是参数（§5.20）',
+  },
 }
 
 /**

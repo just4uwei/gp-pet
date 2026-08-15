@@ -51,7 +51,21 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-const ENDPOINT = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get'
+/**
+ * 同一个接口的几个「门」。**换门不换源** —— 三条 URL 返回的是同一份腾讯日线
+ * （2026-08-14 实测同一根 `hfqday` 逐位相同），所以混用不会让 fixture 里混进两种口径。
+ *
+ * 为什么要有第二第三条：`web.` 那个门会**按机器**把人挡在外面（HTTP 501 + JS 挑战页，
+ * 见 MAX_CONCURRENCY 的注释），而拦截是**按 host** 的 —— 被拦之后这两个门照样通。
+ * 顺序即优先级，`fetchPage` 一旦撞上 501 就换门并**记住**换到了哪个（不然每个请求都要撞一次）。
+ */
+const ENDPOINTS = [
+  'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get',
+  'https://ifzq.gtimg.cn/appstock/app/fqkline/get',
+  'https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get',
+]
+/** 当前在用的门。被 501 拦下时前移，之后所有请求都走新的那个 */
+let endpointIndex = 0
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 
@@ -59,6 +73,27 @@ const UA =
 const PAGE_COUNT = 300
 /** 请求间隔。docs/03 §2.4 的自我限制：单源并发 ≤ 2，这里更保守地串行 + 间隔 */
 const DELAY_MS = 300
+/**
+ * `--concurrency` 的上限：同时在拉的**标的**数（每只内部仍是串行 + 300ms 间隔）。
+ *
+ * 默认仍是 1 —— 一次性补几十只时串行完全够用，而串行是可复现、最不容易被限流的形态。
+ * 加这个开关是因为 [docs/09 §2.2 B0](../docs/09-下一阶段开发计划.md) 把标定池扩到了
+ * 264 只：一只要 9 年 × 2 轨 = 18 个请求 ≈ 35 s，串行是 **2.5 小时**，
+ * 而 B0 是后面每一批标定的地基，卡在取数上等于整条主线停摆。
+ *
+ * ⚠ **2026-08-14 实测：`--concurrency 4` 跑到第 99 只（约 1800 个请求）被腾讯挡下**，
+ * 之后每个请求都是 **HTTP 501 + 一张 JS 挑战页**（`window.btoa(location.href)` 那种），
+ * 单只重试三次全部失败，一次跑掉了 165 只。**501 不是「这只没数据」，是本机被拦**：
+ * 换代码、换区间都一样，而且十分钟后仍未恢复 —— 判断它有没有恢复只能拿**同一个 URL**
+ * 再探一次，别拿别的接口（sina 全集那条一直是通的，看它会以为网络没问题）。
+ * 从这次的数据分不出触发条件是并发还是累计请求量（串行那一版只跑了 6 只就被换掉），
+ * 所以上限压到 **2**，并按「宁可慢一小时」处理。要补的量再大也不要绕过这条 ——
+ * 被拦之后**已经拉到的那些只也一起丢**（本脚本先全拉完再写盘），代价是整批重来。
+ *
+ * 另外两条相关的事实：失败的那只只会在末尾打一行 ✗，而 `loadAll` 对缺文件只 warn ——
+ * 于是「少了 165 只标的」在回测里表现为标的数变少、不报错。**每次补数后要点一遍文件数。**
+ */
+const MAX_CONCURRENCY = 2
 const TIMEOUT_MS = 20_000
 const RETRIES = 3
 
@@ -73,6 +108,7 @@ const USAGE = `用法：
   --out <dir>         输出目录，默认 ./data/history
   --benchmark <code>  基准指数，默认 SH000300；给 none 可关闭
                       （它同时充当交易日历，用来标 has_gap）
+  --concurrency <n>   同时在拉的**标的**数，默认 1（串行）。上限 2（4 实测会被 501 拦）
   --dry               只拉不写盘
 `
 
@@ -83,6 +119,7 @@ function parseArgs(argv) {
     to: today(),
     out: join('data', 'history'),
     benchmark: 'SH000300',
+    concurrency: 1,
     dry: false,
   }
   for (let i = 0; i < argv.length; i++) {
@@ -97,7 +134,13 @@ function parseArgs(argv) {
     else if (flag === '--to') args.to = next()
     else if (flag === '--out') args.out = next()
     else if (flag === '--benchmark') args.benchmark = next().toUpperCase()
-    else if (flag === '--dry') args.dry = true
+    else if (flag === '--concurrency') {
+      const parsed = Number(next())
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_CONCURRENCY) {
+        fail(`--concurrency 要是 1..${MAX_CONCURRENCY} 的整数`)
+      }
+      args.concurrency = parsed
+    } else if (flag === '--dry') args.dry = true
     else if (flag === '--help' || flag === '-h') {
       process.stdout.write(USAGE)
       process.exit(0)
@@ -143,15 +186,22 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 async function fetchPage(code, from, to, fq) {
   const tc = toTencent(code)
   const param = `${tc},day,${from},${to},${PAGE_COUNT},${fq}`
-  const url = `${ENDPOINT}?param=${encodeURIComponent(param)}`
 
   let lastError
-  for (let attempt = 1; attempt <= RETRIES; attempt++) {
+  // 次数 = 重试次数 × 门数：被拦下时换门不算掉一次重试机会，否则三个门够撞两下就没了
+  for (let attempt = 1; attempt <= RETRIES * ENDPOINTS.length; attempt++) {
+    const url = `${ENDPOINTS[endpointIndex]}?param=${encodeURIComponent(param)}`
     try {
       const response = await fetch(url, {
         headers: { 'User-Agent': UA },
         signal: AbortSignal.timeout(TIMEOUT_MS),
       })
+      // 501 是「本机被这个门拦了」，不是「这只没数据」—— 立刻换门，别睡也别重试同一个门
+      if (response.status === 501 && endpointIndex + 1 < ENDPOINTS.length) {
+        endpointIndex++
+        process.stderr.write(`  [warn] HTTP 501（被拦），换门 → ${ENDPOINTS[endpointIndex]}\n`)
+        continue
+      }
       if (response.status !== 200) throw new Error(`HTTP ${response.status}`)
       const payload = await response.json()
       const block = payload?.data?.[tc]
@@ -160,10 +210,14 @@ async function fetchPage(code, from, to, fq) {
       return { rows: assertKey(code, block, fq, param), name: block?.qt?.[tc]?.[1] ?? null }
     } catch (error) {
       lastError = error
-      if (attempt < RETRIES) await sleep(DELAY_MS * attempt * 2)
+      if (attempt < RETRIES * ENDPOINTS.length) await sleep(DELAY_MS * attempt * 2)
     }
   }
-  throw new Error(`${param}：${lastError instanceof Error ? lastError.message : String(lastError)}`)
+  throw new Error(
+    `${param}（门 ${ENDPOINTS[endpointIndex]}）：${
+      lastError instanceof Error ? lastError.message : String(lastError)
+    }`
+  )
 }
 
 /**
@@ -321,11 +375,11 @@ function summarize(result) {
 // ─────────────────────────── 主流程 ───────────────────────────
 
 async function fetchCode(code, args) {
-  process.stdout.write(`[fetch] ${code} …`)
   const raw = await fetchTrack(code, args.from, args.to, '')
   // 指数无复权：复权轨与不复权轨同源，省一半请求
   const adj = isIndex(code) ? raw : await fetchTrack(code, args.from, args.to, 'hfq')
-  process.stdout.write(` ${raw.byDate.size} 根\n`)
+  // 一只一行、拉完才打：并发下「先打半行再等 20 秒」会把几只的进度串成一行乱码
+  process.stdout.write(`[fetch] ${code} … ${raw.byDate.size} 根\n`)
   return { raw, adj, name: raw.name ?? adj.name ?? null }
 }
 
@@ -338,40 +392,42 @@ async function main(argv) {
   const targets = [...new Set([...args.codes, ...(wantBenchmark ? [args.benchmark] : [])])]
 
   process.stdout.write(
-    `[fetch-history] ${targets.length} 个代码 · ${args.from} → ${args.to} · 源 tencent · 输出 ${args.out}${args.dry ? '（dry run）' : ''}\n`
+    `[fetch-history] ${targets.length} 个代码 · ${args.from} → ${args.to} · 源 tencent · ` +
+      `并发 ${args.concurrency} · 输出 ${args.out}${args.dry ? '（dry run）' : ''}\n`
   )
 
-  // 基准先拉：它同时充当交易日历，后面每只股票标 has_gap 都要用
-  let tradingDays = null
-  const fetched = new Map()
-  for (const code of targets) {
-    try {
-      const bundle = await fetchCode(code, args)
-      fetched.set(code, bundle)
-      if (wantBenchmark && code === args.benchmark) {
-        tradingDays = [...bundle.raw.byDate.keys()].filter((d) => d < cutoff).sort()
-      }
-    } catch (error) {
-      process.stdout.write('\n')
-      process.stderr.write(`  ✗ ${code}：${error instanceof Error ? error.message : String(error)}\n`)
-    }
-  }
-  if (wantBenchmark && !tradingDays) {
-    process.stderr.write(`  [warn] 基准 ${args.benchmark} 未取到，停牌段（has_gap）无法标记\n`)
-  }
-
   if (!args.dry) mkdirSync(args.out, { recursive: true })
-  process.stdout.write('\n[结果]\n')
 
+  let tradingDays = null
+  let ok = 0
   let written = 0
-  for (const [code, bundle] of fetched) {
+  const lines = []
+
+  /**
+   * 拉一只 → 合并 → **立刻写盘**。
+   *
+   * 「先全拉完再统一写盘」那一版丢过一整批：2026-08-14 补 264 只时第 99 只之后被腾讯
+   * 501 拦下（见 MAX_CONCURRENCY 的注释），前面 98 只已经拉到手、却因为还没写盘
+   * 一起没了。逐只落盘之后被拦的代价只是「剩下的没补上」，把失败清单再喂一次即可。
+   * 代价是并发下写盘顺序按完成先后 —— 但文件名是代码，顺序不进任何产物；
+   * 打印用的摘要仍然按 `targets` 的顺序统一在末尾输出。
+   */
+  const collect = async (code) => {
+    let bundle
+    try {
+      bundle = await fetchCode(code, args)
+    } catch (error) {
+      process.stderr.write(`  ✗ ${code}：${error instanceof Error ? error.message : String(error)}\n`)
+      return null
+    }
+    ok++
     const result = merge(code, bundle.raw.byDate, bundle.adj.byDate, tradingDays, cutoff)
-    process.stdout.write(`${summarize(result)}\n`)
+    lines.push([code, summarize(result)])
     if (result.candles.length === 0) {
       process.stderr.write(`  ✗ ${code} 没有可用日线，不写盘\n`)
-      continue
+      return bundle
     }
-    if (args.dry) continue
+    if (args.dry) return bundle
 
     writeFileSync(
       join(args.out, `${code}.json`),
@@ -380,7 +436,9 @@ async function main(argv) {
           // src/backtest/data.ts 的 openFixtureSource 只读 candles（profile 见文件头注释）
           candles: result.candles,
           _meta: {
-            source: 'tencent:web.ifzq.gtimg.cn/appstock/app/fqkline/get',
+            // 记的是**实际用了哪个门**（三个门同源，见 ENDPOINTS 的注释）——
+            // 写死一个的话，日后对不上时会以为两批数据来自同一次抓取
+            source: `tencent:${ENDPOINTS[endpointIndex].replace(/^https:\/\//, '')}`,
             fetchedAt,
             // *Adj 是**后复权**而非前复权，理由见 scripts/fetch-history.mjs 文件头。
             // 后复权的历史值不随抓取日变，所以这条序列是可复现的
@@ -397,11 +455,38 @@ async function main(argv) {
       'utf8'
     )
     written++
+    return bundle
+  }
+
+  // 基准**单独先拉**：它同时充当交易日历，后面每只股票标 has_gap 都要用。
+  // 混进并发池里就成了「谁先回来算谁」，而它必须在所有个股之前拿到
+  if (wantBenchmark) {
+    const bundle = await collect(args.benchmark)
+    if (bundle) tradingDays = [...bundle.raw.byDate.keys()].filter((d) => d < cutoff).sort()
+    else process.stderr.write(`  [warn] 基准 ${args.benchmark} 未取到，停牌段（has_gap）无法标记\n`)
+  }
+
+  // 并发池：每只内部仍是串行 + 间隔，只是同时有 n 只在拉（见 MAX_CONCURRENCY 的注释）
+  const queue = targets.filter((code) => code !== args.benchmark || !wantBenchmark)
+  let cursor = 0
+  await Promise.all(
+    Array.from({ length: Math.min(args.concurrency, queue.length) }, async () => {
+      for (let i = cursor++; i < queue.length; i = cursor++) await collect(queue[i])
+    })
+  )
+
+  process.stdout.write('\n[结果]\n')
+  // 按 targets 而不是完成先后打印：并发下同一份输入会跑出两份不同顺序的日志，
+  // 而这份日志是「可疑计数」的唯一出口，顺序不稳会让两次跑的结果无法对读
+  const byCode = new Map(lines)
+  for (const code of targets) {
+    const line = byCode.get(code)
+    if (line !== undefined) process.stdout.write(`${line}\n`)
   }
 
   if (args.dry) {
     process.stdout.write('\ndry run，未写盘。\n')
-    return fetched.size === targets.length ? 0 : 1
+    return ok === targets.length ? 0 : 1
   }
 
   process.stdout.write(

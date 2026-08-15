@@ -1,0 +1,14 @@
+{
+  "data": [
+    { "minBars": 20, "fullBars": 300, "insufficientPenalty": 0.8, "staleSnapshotMs": 300000 },
+    { "minBars": 60, "fullBars": 300, "insufficientPenalty": 0.8, "staleSnapshotMs": 300000 },
+    { "minBars": 80, "fullBars": 300, "insufficientPenalty": 0.8, "staleSnapshotMs": 300000 },
+
+    { "minBars": 40, "fullBars": 250, "insufficientPenalty": 0.8, "staleSnapshotMs": 300000 },
+    { "minBars": 40, "fullBars": 400, "insufficientPenalty": 0.8, "staleSnapshotMs": 300000 },
+    { "minBars": 40, "fullBars": 500, "insufficientPenalty": 0.8, "staleSnapshotMs": 300000 },
+
+    { "minBars": 40, "fullBars": 300, "insufficientPenalty": 0.5, "staleSnapshotMs": 300000 },
+    { "minBars": 40, "fullBars": 300, "insufficientPenalty": 0.95, "staleSnapshotMs": 300000 }
+  ]
+}

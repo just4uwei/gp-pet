@@ -1,0 +1,18 @@
+{
+  "boll": [
+    { "period": 15, "k": 2, "bbwLookback": 250 },
+    { "period": 18, "k": 2, "bbwLookback": 250 },
+    { "period": 22, "k": 2, "bbwLookback": 250 },
+    { "period": 26, "k": 2, "bbwLookback": 250 },
+
+    { "period": 20, "k": 1.6, "bbwLookback": 250 },
+    { "period": 20, "k": 1.8, "bbwLookback": 250 },
+    { "period": 20, "k": 2.2, "bbwLookback": 250 },
+    { "period": 20, "k": 2.5, "bbwLookback": 250 },
+
+    { "period": 20, "k": 2, "bbwLookback": 120 },
+    { "period": 20, "k": 2, "bbwLookback": 180 },
+    { "period": 20, "k": 2, "bbwLookback": 375 },
+    { "period": 20, "k": 2, "bbwLookback": 500 }
+  ]
+}

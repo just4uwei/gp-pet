@@ -18,6 +18,16 @@ pnpm backtest -- --codes SH600000,SZ000001 --to 2025-06-30 \
               --grid ./params/grid.example.json --out ./reports/calibration.json
 ```
 
+> ⚠ **2026-08-14：在 261 只的宽基池上，上面这些网格暂时**跑不出裁决**。**
+> 出厂参数在 6 年训练窗口上亏钱（−2.55% / Calmar −0.125），被下面那条「训练集 Calmar ≤ 0」
+> 的红线淘汰 —— 而所有配对比较都是**与出厂值**比的，出厂值被淘汰之后 Δ 全是 null，
+> 裁决只能是 `INCONCLUSIVE`（退出码 2）。**这不是工具坏了**，是红线在说
+> 「先解决出厂值自己站不住这件事」。判据与三条可选方向见
+> [docs/09 开头那一节](../docs/09-下一阶段开发计划.md) 与 [M2 §5.20](../docs/notes/M2-偏差报告.md)。
+>
+> 另外：**扩池不会自己变成 84 折**。`--code-folds` 默认 4，261 只上也还是 4 × 3 = 12 折 ——
+> 要用上 B0 买到的分辨力必须显式给 `--code-folds 28`。
+
 标定模式的额外开关（都只在 `--grid` 下生效）：
 
 | 开关 | 默认 | 作用 |
@@ -62,6 +72,13 @@ JSON 没有注释，网格文件里也**不要**塞 `_comment` / `_label` 之类
 | `grid-adx-fine.json` | `adx` 三数（OFAT 8 组） | **已跑：`KEEP`，8 个候选没有一个 Δ 为正**（16/18 让训练集亏钱被淘汰，22 −0.17pp 且被判孤峰，24 −0.48pp / t 2.2 被淘汰，volScale 6 与 10 各 −0.16pp，maxThreshold 24 −0.18pp、26 −0.05pp）⇒ 出厂 20 / 8 / 28 三个数**都有正面证据**（M2 §5.17 读数 1）。`maxThreshold` 只扫了下侧，上侧算术无效（§5.16）。**这一轴已经扫到两侧红线，别再跑** |
 | `grid-regime-fine.json` | `regime` 两数（OFAT 8 组） | **已跑：`KEEP`。`hysteresisDays` 1 是 −0.34pp，2–5 分辨不出；`rangeMidBand` 四个取值全负但非单调、t ≤ 1.6 = 噪音**（M2 §5.17 读数 3/4）。这一轮 `hysteresisDays` 的最高分（5）压在上边界，因此又补了下面那张 —— `rangeMidBand` 两侧都测到了，不必再跑 |
 | `grid-regime-hysteresis-wide.json` | `regime.hysteresisDays` 3–12（7 组） | 上一张的边界补跑。**已跑：`KEEP`。整条轴的形状是单峰** —— 1 更差 / 2–6 一片高原（顶点 6 = 0.599 对出厂 2 只有 +0.06pp、t 0.4）/ 8 转负并被判孤峰 / 10 触发过拟合红线 / 12 验证集年化为负。**上边界的疑问已消掉，别再往上扫。** 触发笔数随迟滞单调下降（489 → 406 → 279），M3 若为「少改口」上调迟滞，上限是 6（M2 §5.17 读数 3）。注意 3/4/5 与上一张重复是**故意**的：同一条轴必须落在同一份报告里，见下面的方框 |
+| `grid-volume.json` | `volume` 三数（OFAT 12 组） | 2026-08-14 备好。`maPeriod` 10/15/30/40 · `breakoutRatio` 1.1–1.6 · `suspiciousRatio` 1.25–2.2。**`shrinkRatio` 刻意不在网格里**：全仓无读者，已按 4.9c 归档为 `INERT`（M2 §5.20 ⑤）。`suspiciousRatio` 是 TRANSITION 死区最大的单一成因（`audit:regime`：命中 13.5%、独因 9.9%） |
+| `grid-rsi.json` | `rsi` 四数（OFAT 16 组） | 2026-08-14 备好。`obBase`/`osBase` 是**基线**，实际阈值还要叠大盘情绪标量，所以 `sentimentScale` 与它们必须在**同一张报告**里（docs/04 §1.3）。`sentimentIndex` 不扫（它选的是「大盘」用哪个指数，是代表性假设不是参数） |
+| `grid-boll.json` | `boll` 三数（OFAT 12 组） | 2026-08-14 备好。⚠ **`bbwLookback` 动了就等于动了 `squeezeBbwPct = 20` 的含义**（那个 20 是分位数，分位的定义域由它给），全项目唯一的标定结论挂在这上面 —— 若 `bbwLookback` 真要改，必须与 `squeezeBbwPct` **成对**重标。它还同时定义 ADX 阈值用的波动率分位（`indicators/index.ts`） |
+| `grid-macd.json` | `macd` 三数（OFAT 13 组） | 2026-08-14 备好。`slow = 26` 那一组就是经典 12/26/9，不必另开一组。**`preset` 不在网格里**：纯标签、无读者，改它只会变指纹（缓存作废 + 影子停摆）而不改行为（M2 §5.20 ⑤） |
+| `grid-strategy.json` | `strategy` 三数（OFAT 11 组） | 2026-08-14 备好。`expandedBbwPct = 90` 与已被推翻的 `squeezeBbwPct = 10` 是**同一来源同一形状**的转述值（docs/04 §1.4），预期「出厂值太紧」 |
+| `grid-regime-rest.json` | `regime` 四数（OFAT 14 组） | 2026-08-14 备好。先读 `audit:regime`：三条突变条件**加起来**最多买回 12.9 个百分点的死区，而 `rangeBbwPct` 那条「只差 BBW 分位 < 30」占 6.8% |
+| `grid-data.json` | `data` 三数（OFAT 8 组） | 2026-08-14 备好，**必须配 `--warmup 300`** —— `fullBars` 在回测里同时充当预热下限，不钉住的话每个候选的判定窗口都不一样，测出来的是窗口不是参数。`minBars` 与 `insufficientPenalty` 已归档 `UNTESTABLE`（那条分支在回测里走不到），留在网格里只为把「动 0/84 折」记下来 |
 | `grid-regime.json` | `adx` × `regime`（7 × 3 = 21 组） | **已跑（2026-08-13）：裁决 `KEEP`，但有正面证据** —— 4 个候选被红线淘汰、3 个显著更差（最差 `baseThreshold = 16`：−1.06pp / t 4.1），出厂 20 的两侧邻居都更差。`maxThreshold` 上侧**算术无效**别再扫。**这张网格每维只有中心 ± 一档，唯一的正向候选落在边界上不能用** —— 要加宽重跑（M2 §5.16 给了取值） |
 
 > **同一条轴上的候选必须落在同一份报告里。** `plateauFlags()` 判「孤峰 / 该侧邻域未测」

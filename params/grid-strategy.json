@@ -1,0 +1,83 @@
+{
+  "strategy": [
+    {
+      "pullbackLookback": 3,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 90
+    },
+    {
+      "pullbackLookback": 8,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 90
+    },
+    {
+      "pullbackLookback": 12,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 90
+    },
+
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.0,
+      "expandedBbwPct": 90
+    },
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.25,
+      "expandedBbwPct": 90
+    },
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 2.0,
+      "expandedBbwPct": 90
+    },
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 2.5,
+      "expandedBbwPct": 90
+    },
+
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 70
+    },
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 80
+    },
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 95
+    },
+    {
+      "pullbackLookback": 5,
+      "revertLookback": 3,
+      "squeezeBbwPct": 20,
+      "midReversionStd": 1.5,
+      "expandedBbwPct": 98
+    }
+  ]
+}

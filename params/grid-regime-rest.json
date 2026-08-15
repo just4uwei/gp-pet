@@ -1,0 +1,119 @@
+{
+  "regime": [
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 20,
+      "adxSlopeWindow": 3,
+      "adxSlopeTrigger": 5,
+      "bbwPctJump": 30
+    },
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 25,
+      "adxSlopeWindow": 3,
+      "adxSlopeTrigger": 5,
+      "bbwPctJump": 30
+    },
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 40,
+      "adxSlopeWindow": 3,
+      "adxSlopeTrigger": 5,
+      "bbwPctJump": 30
+    },
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 50,
+      "adxSlopeWindow": 3,
+      "adxSlopeTrigger": 5,
+      "bbwPctJump": 30
+    },
+
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 30,
+      "adxSlopeWindow": 2,
+      "adxSlopeTrigger": 5,
+      "bbwPctJump": 30
+    },
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 30,
+      "adxSlopeWindow": 5,
+      "adxSlopeTrigger": 5,
+      "bbwPctJump": 30
+    },
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 30,
+      "adxSlopeWindow": 8,
+      "adxSlopeTrigger": 5,
+      "bbwPctJump": 30
+    },
+
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 30,
+      "adxSlopeWindow": 3,
+      "adxSlopeTrigger": 3,
+      "bbwPctJump": 30
+    },
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 30,
+      "adxSlopeWindow": 3,
+      "adxSlopeTrigger": 8,
+      "bbwPctJump": 30
+    },
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 30,
+      "adxSlopeWindow": 3,
+      "adxSlopeTrigger": 12,
+      "bbwPctJump": 30
+    },
+
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 30,
+      "adxSlopeWindow": 3,
+      "adxSlopeTrigger": 5,
+      "bbwPctJump": 15
+    },
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 30,
+      "adxSlopeWindow": 3,
+      "adxSlopeTrigger": 5,
+      "bbwPctJump": 20
+    },
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 30,
+      "adxSlopeWindow": 3,
+      "adxSlopeTrigger": 5,
+      "bbwPctJump": 45
+    },
+    {
+      "hysteresisDays": 2,
+      "rangeMidBand": 0.03,
+      "rangeBbwPct": 30,
+      "adxSlopeWindow": 3,
+      "adxSlopeTrigger": 5,
+      "bbwPctJump": 60
+    }
+  ]
+}

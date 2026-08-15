@@ -1,0 +1,19 @@
+{
+  "macd": [
+    { "preset": "AShareOptimized", "fast": 8, "slow": 17, "signal": 9 },
+    { "preset": "AShareOptimized", "fast": 10, "slow": 17, "signal": 9 },
+    { "preset": "AShareOptimized", "fast": 14, "slow": 17, "signal": 9 },
+    { "preset": "AShareOptimized", "fast": 16, "slow": 17, "signal": 9 },
+
+    { "preset": "AShareOptimized", "fast": 12, "slow": 14, "signal": 9 },
+    { "preset": "AShareOptimized", "fast": 12, "slow": 20, "signal": 9 },
+    { "preset": "AShareOptimized", "fast": 12, "slow": 23, "signal": 9 },
+    { "preset": "AShareOptimized", "fast": 12, "slow": 26, "signal": 9 },
+    { "preset": "AShareOptimized", "fast": 12, "slow": 30, "signal": 9 },
+
+    { "preset": "AShareOptimized", "fast": 12, "slow": 17, "signal": 6 },
+    { "preset": "AShareOptimized", "fast": 12, "slow": 17, "signal": 7 },
+    { "preset": "AShareOptimized", "fast": 12, "slow": 17, "signal": 12 },
+    { "preset": "AShareOptimized", "fast": 12, "slow": 17, "signal": 15 }
+  ]
+}

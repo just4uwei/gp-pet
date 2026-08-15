@@ -1,0 +1,18 @@
+{
+  "volume": [
+    { "maPeriod": 10, "breakoutRatio": 1.2, "shrinkRatio": 0.8, "suspiciousRatio": 1.5 },
+    { "maPeriod": 15, "breakoutRatio": 1.2, "shrinkRatio": 0.8, "suspiciousRatio": 1.5 },
+    { "maPeriod": 30, "breakoutRatio": 1.2, "shrinkRatio": 0.8, "suspiciousRatio": 1.5 },
+    { "maPeriod": 40, "breakoutRatio": 1.2, "shrinkRatio": 0.8, "suspiciousRatio": 1.5 },
+
+    { "maPeriod": 20, "breakoutRatio": 1.1, "shrinkRatio": 0.8, "suspiciousRatio": 1.5 },
+    { "maPeriod": 20, "breakoutRatio": 1.35, "shrinkRatio": 0.8, "suspiciousRatio": 1.5 },
+    { "maPeriod": 20, "breakoutRatio": 1.5, "shrinkRatio": 0.8, "suspiciousRatio": 1.5 },
+    { "maPeriod": 20, "breakoutRatio": 1.6, "shrinkRatio": 0.8, "suspiciousRatio": 1.5 },
+
+    { "maPeriod": 20, "breakoutRatio": 1.2, "shrinkRatio": 0.8, "suspiciousRatio": 1.25 },
+    { "maPeriod": 20, "breakoutRatio": 1.2, "shrinkRatio": 0.8, "suspiciousRatio": 1.35 },
+    { "maPeriod": 20, "breakoutRatio": 1.2, "shrinkRatio": 0.8, "suspiciousRatio": 1.8 },
+    { "maPeriod": 20, "breakoutRatio": 1.2, "shrinkRatio": 0.8, "suspiciousRatio": 2.2 }
+  ]
+}
