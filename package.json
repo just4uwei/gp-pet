@@ -26,6 +26,7 @@
     "audit:regime": "tsx src/backtest/regime-audit.ts",
     "audit:subsignals": "tsx src/backtest/subsignal-audit.ts",
     "audit:random": "tsx src/backtest/random-audit.ts",
+    "iterate": "tsx --tsconfig tsconfig.base.json tools/iterate/status.ts",
     "verify:indicators": "node scripts/verify/run.mjs",
     "fixtures:record": "node scripts/record-fixtures.mjs",
     "fetch:history": "node scripts/fetch-history.mjs",

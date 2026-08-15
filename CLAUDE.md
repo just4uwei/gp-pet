@@ -200,6 +200,7 @@ pnpm backtest -- --codes SH600000 --fixtures ./data/history --from 2020-01-01 --
 pnpm backtest -- --codes ... --fixtures ./data/history --grid params/grid.json   # 参数标定
 pnpm audit:regime -- --codes ... --fixtures ./data/history --to 2026-08-11       # Regime 判定的成因分解
 pnpm audit:subsignals -- --codes ... --fixtures ./data/history --to 2026-08-11   # 子信号触发数 + R2 合取项分解
+pnpm iterate          # 迭代看板：当前指标 + 今天该做什么（-- --write 刷新 docs/iteration/看板.md）
 pnpm package          # electron-builder 打包 Windows
 ```
 
