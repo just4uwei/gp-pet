@@ -109,6 +109,8 @@ export interface AiSignalContext {
     kept: number
     inert: number
     untestable: number
+    /** 已上网格，但出厂值自己被红线淘汰 ⇒ 裁决只能是 INCONCLUSIVE（M2 §5.20 ⑨） */
+    blocked: number
     guess: number
     /** 已标定并写回的参数名，逐个列出 —— 目前只有一项 */
     calibratedKeys: string[]

@@ -46,6 +46,7 @@ function trade(overrides: Partial<BacktestTrade> = {}): BacktestTrade {
     holdingBars: 3,
     costs: 30,
     regimeAtEntry: 'TREND_UP',
+    barsInRegimeAtEntry: 5,
     entryScore: 0.8,
     entrySignals: ['T1_MA_CROSS'],
     exitRule: 'T1_MA_CROSS',

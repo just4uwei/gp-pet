@@ -134,6 +134,13 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
       level: decision.level ?? decision.candidate.level,
       channels: decision.channels,
       suppressedReason: decision.reason,
+      // ⚠ 这两列**刻意不进 `decisionSignature`**。
+      // `blockedBy` 由 `reason` 唯一决定（文案变了签名本来就变），加进去是冗余；
+      // 而 `wouldBlock` 会随时间自己变（冷却到期、小时配额滚出窗口），把它算进签名
+      // 会让同一条裁决在结果完全没变的情况下反复落新行 —— 那正是 006 那次去重要解决的问题。
+      // 代价是被去重的行保留**第一次**的 `wouldBlock`，聚合时按「候选出现次数」读即可。
+      suppressedGate: decision.blockedBy,
+      wouldBlock: decision.wouldBlock,
       readAt: null,
       createdAt: at,
     }

@@ -3,7 +3,10 @@ import js from '@eslint/js'
 import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
-  { ignores: ['out/**', 'dist/**', 'node_modules/**', 'release/**'] },
+  // 与 .gitignore 对齐：`reports/` 与 `data/history/` 是本机运行产物（回测报告、临时分析脚本、
+  // 抓下来的日线），不进版本控制也不该进 lint —— 否则 `pnpm lint` 会被别人机器上的
+  // 一次性脚本弄红，而那些脚本根本不在仓库里
+  { ignores: ['out/**', 'dist/**', 'node_modules/**', 'release/**', 'reports/**', 'data/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {

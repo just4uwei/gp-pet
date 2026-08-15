@@ -51,7 +51,7 @@ export function buildSignalContext(input: BuildContextInput): AiSignalContext {
     .filter((row) => row.status === 'CALIBRATED')
     .map((row) => `${row.group}.${row.key}`)
 
-  const counts = { CALIBRATED: 0, KEPT: 0, INERT: 0, UNTESTABLE: 0, GUESS: 0 }
+  const counts = { CALIBRATED: 0, KEPT: 0, INERT: 0, UNTESTABLE: 0, BLOCKED: 0, GUESS: 0 }
   for (const row of params) counts[row.status]++
 
   const context: AiSignalContext = {
@@ -94,6 +94,7 @@ export function buildSignalContext(input: BuildContextInput): AiSignalContext {
       kept: counts.KEPT,
       inert: counts.INERT,
       untestable: counts.UNTESTABLE,
+      blocked: counts.BLOCKED,
       guess: counts.GUESS,
       calibratedKeys,
     },
@@ -237,7 +238,7 @@ export function renderReportContext(input: {
   at: string
 }): string {
   const { report, params, engineVersion, at } = input
-  const counts = { CALIBRATED: 0, KEPT: 0, INERT: 0, UNTESTABLE: 0, GUESS: 0 }
+  const counts = { CALIBRATED: 0, KEPT: 0, INERT: 0, UNTESTABLE: 0, BLOCKED: 0, GUESS: 0 }
   for (const row of params) counts[row.status]++
   const calibratedKeys = params
     .filter((row) => row.status === 'CALIBRATED')
@@ -312,9 +313,10 @@ export function renderReportContext(input: {
   lines.push(`## 参数标定状态（重要，回答时必须据此把握口径）`)
   lines.push(`引擎版本 ${engineVersion}`)
   lines.push(
-    `参数共 ${counts.CALIBRATED + counts.KEPT + counts.INERT + counts.UNTESTABLE + counts.GUESS} 项：` +
+    `参数共 ${counts.CALIBRATED + counts.KEPT + counts.INERT + counts.UNTESTABLE + counts.BLOCKED + counts.GUESS} 项：` +
       `已标定并写回 ${counts.CALIBRATED} 项、已上网格但保持出厂值 ${counts.KEPT} 项、` +
       `已判惰性 ${counts.INERT} 项、日线回测原理上测不到 ${counts.UNTESTABLE} 项、` +
+      `**已上网格但出厂值自己被红线淘汰、无法产出裁决 ${counts.BLOCKED} 项**、` +
       `**一个网格都没跑过 ${counts.GUESS} 项**。`
   )
   lines.push(

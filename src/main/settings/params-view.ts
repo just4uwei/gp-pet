@@ -157,47 +157,54 @@ const STATUS: Record<string, { status: Status; note?: string }> = {
   },
 
   /*
-    ── 一个网格都没跑过（docs/08 M2 那一行点了名的四块）──────────────
+    ── BLOCKED：网格跑过了，但出厂值自己被红线淘汰 ⇒ 裁决必为 INCONCLUSIVE ──────
 
-    ⚠ 2026-08-14：网格文件已经备好（`params/grid-{volume,rsi,boll,macd,strategy,regime-rest,data}.json`），
-    但**这一批在 261 只的宽基池上跑不出裁决** —— 出厂参数本身在 6 年训练窗口上亏钱
-    （−2.55% / Calmar −0.12），被标定工具的红线「训练集 Calmar ≤ 0 直接淘汰」判掉，
-    于是每一张网格的裁决都只能是 `INCONCLUSIVE`（M2 §5.20）。
+    网格文件都在（`params/grid-{volume,rsi,boll,macd,strategy,regime-rest,data}.json`），
+    2026-08-14 在 261 只宽基池上**全部跑完**（八张、82 组候选）。
+    但出厂参数本身在 6 年训练窗口上亏钱（−2.55% / Calmar −0.125），
+    被标定工具的红线「训练集 Calmar ≤ 0 直接淘汰」判掉 ⇒ 出厂值没有逐折分数
+    ⇒ 配对 Δ 全是 null ⇒ **每一张网格的裁决都只能是 `INCONCLUSIVE`**（M2 §5.20）。
+
     **这不是工具坏了**，是那条红线在说「先解决出厂值自己站不住这件事」。
     在那之前把这些行改成 KEPT / CALIBRATED 都是没有依据的。
+
+    ⚠ 2026-08-15 这一批从 `GUESS` 改档 `BLOCKED`（计划文档 §1.1 拍板题 A / 方向 ③）。
+    **两者的后续动作完全不同**：`GUESS` 要去跑网格，`BLOCKED` 要**先让基线转正**再重测。
+    混成一档已经制造过一次「同一张网格跑两遍」。
+    **失效条件**：基线在代表性池上训练窗口 Calmar > 0 之后，这一批全部退回重跑。
   */
   macd: {
-    status: 'GUESS',
+    status: 'BLOCKED',
     note:
       '12/17/9 来自来源文档转述（docs/04 §1.2）。2026-08-14 上过网格但**裁决 INCONCLUSIVE**：' +
       '13 组训练集绩效落在 −2.25% ~ −2.79% 的一片平地上（经典 12/26/9 是里面最好的 −2.25%），' +
       '而出厂值自己被红线淘汰 ⇒ 拿不到配对 Δ（§5.20 ⑦）',
   },
   boll: {
-    status: 'GUESS',
+    status: 'BLOCKED',
     note:
       '标准差除 n 而非 n−1 是国内平台口径。2026-08-14 网格 INCONCLUSIVE：`k` 2.5 与 `period` 22 ' +
       '把训练集从 −2.55% 拉到 −0.73%/−0.99%，但靠的是**少做**（建仓 1187 → 782）。' +
       '⚠ `bbwLookback` 375/500 那两组不可按「更差」读：分位数要够长的样本才有值，被 --warmup 300 confound 了（§5.20 ⑦）',
   },
   volume: {
-    status: 'GUESS',
+    status: 'BLOCKED',
     note:
       '2026-08-14 网格 INCONCLUSIVE：`breakoutRatio` 1.1 → 1.6 单调变好（最好 −2.21%），' +
       '`maPeriod` 与 `suspiciousRatio` 一片平地（§5.20 ⑦）',
   },
-  rsi: { status: 'GUESS', note: '2026-08-14 上过网格，裁决 INCONCLUSIVE（§5.20 ⑦）' },
-  'strategy.pullbackLookback': { status: 'GUESS', note: '2026-08-14 网格 INCONCLUSIVE：3/8/12 三档都在 ±0.5pp 内' },
+  rsi: { status: 'BLOCKED', note: '2026-08-14 上过网格，裁决 INCONCLUSIVE（§5.20 ⑦）' },
+  'strategy.pullbackLookback': { status: 'BLOCKED', note: '2026-08-14 网格 INCONCLUSIVE：3/8/12 三档都在 ±0.5pp 内' },
   'strategy.midReversionStd': {
-    status: 'GUESS',
+    status: 'BLOCKED',
     note: '2026-08-14 网格 INCONCLUSIVE：2.0 是全场第二好（−1.13%），但同样靠少做（建仓 1187 → 945）',
   },
-  'regime.rangeBbwPct': { status: 'GUESS', note: 'docs/04 §1.4 的「< 30 收敛」转述。2026-08-14 网格 INCONCLUSIVE，四档取值差 < 0.4pp' },
-  'regime.adxSlopeWindow': { status: 'GUESS', note: '2026-08-14 网格 INCONCLUSIVE' },
-  'regime.adxSlopeTrigger': { status: 'GUESS', note: '2026-08-14 网格 INCONCLUSIVE；8 与 12 逐位相同（该侧已饱和）' },
-  'regime.bbwPctJump': { status: 'GUESS', note: '2026-08-14 网格 INCONCLUSIVE' },
+  'regime.rangeBbwPct': { status: 'BLOCKED', note: 'docs/04 §1.4 的「< 30 收敛」转述。2026-08-14 网格 INCONCLUSIVE，四档取值差 < 0.4pp' },
+  'regime.adxSlopeWindow': { status: 'BLOCKED', note: '2026-08-14 网格 INCONCLUSIVE' },
+  'regime.adxSlopeTrigger': { status: 'BLOCKED', note: '2026-08-14 网格 INCONCLUSIVE；8 与 12 逐位相同（该侧已饱和）' },
+  'regime.bbwPctJump': { status: 'BLOCKED', note: '2026-08-14 网格 INCONCLUSIVE' },
   'data.fullBars': {
-    status: 'GUESS',
+    status: 'BLOCKED',
     note: '它在回测里同时充当预热下限，扫它必须钉住 --warmup，否则测的是判定窗口不是参数（§5.20）',
   },
 }
@@ -261,13 +268,14 @@ export function paramRows(params: object = DEFAULT_PARAMS): ParamRow[] {
   return rows
 }
 
-/** 供 UI 显示「已标定 1 / 已测 16 / 惰性 10 / 测不到 4 / 未测 15」这一行 */
+/** 供 UI 显示「已标定 1 / 已测 n / 惰性 n / 测不到 n / 卡住 n / 未测 n」这一行 */
 export function countByStatus(rows: readonly ParamRow[]): Record<Status, number> {
   const counts: Record<Status, number> = {
     CALIBRATED: 0,
     KEPT: 0,
     INERT: 0,
     UNTESTABLE: 0,
+    BLOCKED: 0,
     GUESS: 0,
   }
   for (const row of rows) counts[row.status]++

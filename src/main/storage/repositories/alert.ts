@@ -24,6 +24,7 @@
  */
 
 import type { AlertLevel, GatedDirection, Regime, SecCode, SignalStage } from '@core/types'
+import type { AlertGate } from '../../alerts/dispatcher'
 import type { Database } from '../db'
 
 /** 分发渠道。与 `src/main/alerts/dispatcher.ts` 的 `AlertChannel` 同一集合 */
@@ -38,8 +39,12 @@ export interface AlertRow {
   /** 最终生效的级别；被丢弃时是**候选原本的**级别 */
   level: AlertLevel
   channels: readonly AlertChannelName[]
-  /** 非空 = 被丢弃或被降级及原因 */
+  /** 非空 = 被丢弃或被降级及原因。**给人读的，不要拿去分组**（见 011 迁移） */
   suppressedReason: string | null
+  /** 实际拦下它的第一道闸门。历史行为 null（改动前没有这一列，**不回填**） */
+  suppressedGate?: AlertGate | null
+  /** 假设前置闸门放行，哪几道各自也会拦。历史行为 null */
+  wouldBlock?: readonly AlertGate[] | null
   readAt: number | null
   createdAt: number
   /**
@@ -71,6 +76,9 @@ interface RawRow {
   created_at: number
   repeat_count: number
   last_at: number | null
+  /** `undefined` = 该查询没 SELECT 这一列；`null` = 早于 011 迁移的历史行 */
+  suppressed_gate?: string | null
+  would_block?: string | null
 }
 
 interface RawJoinedRow extends RawRow {
@@ -83,13 +91,20 @@ interface RawJoinedRow extends RawRow {
 }
 
 const COLUMNS = `id, signal_id, level, channel, suppressed_reason, read_at, created_at,
-                 repeat_count, last_at`
+                 repeat_count, last_at, suppressed_gate, would_block`
 /** 插入时用的列（不含 repeat_count / last_at —— 那两列由 bumpRepeat 维护） */
-const INSERT_COLUMNS = `id, signal_id, level, channel, suppressed_reason, read_at, created_at`
+const INSERT_COLUMNS = `id, signal_id, level, channel, suppressed_reason, read_at, created_at,
+                        suppressed_gate, would_block`
 
 function parseChannels(raw: string): AlertChannelName[] {
   if (raw === NO_CHANNEL || raw === '') return []
   return raw.split(',').filter((part): part is AlertChannelName => part !== '')
+}
+
+function parseGates(raw: string | null | undefined): AlertGate[] | null {
+  if (raw === undefined || raw === null) return null
+  if (raw === '') return []
+  return raw.split(',').filter((part): part is AlertGate => part !== '')
 }
 
 function toRow(raw: RawRow): AlertRow {
@@ -99,6 +114,13 @@ function toRow(raw: RawRow): AlertRow {
     level: raw.level as AlertLevel,
     channels: parseChannels(raw.channel),
     suppressedReason: raw.suppressed_reason,
+    suppressedGate: (raw.suppressed_gate as AlertGate | null | undefined) ?? null,
+    // 三种取值要分清：
+    //   undefined = 这次查询压根没 SELECT 这一列（多个查询点，漏一个就炸）
+    //   null      = 这一行早于 011 迁移，没有结构化记录
+    //   ''        = 记录了，而且四道闸门一道都不会拦 ← **不能滤成 null**，
+    //               那会让「全放行」看起来像「没记录」
+    wouldBlock: parseGates(raw.would_block),
     readAt: raw.read_at,
     repeatCount: raw.repeat_count,
     lastAt: raw.last_at,
@@ -140,7 +162,7 @@ export class AlertRepo {
 
   insert(row: AlertRow): void {
     this.db
-      .prepare(`INSERT INTO alert_log (${INSERT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .prepare(`INSERT INTO alert_log (${INSERT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         row.id,
         row.signalId,
@@ -148,7 +170,9 @@ export class AlertRepo {
         row.channels.length > 0 ? row.channels.join(',') : NO_CHANNEL,
         row.suppressedReason,
         row.readAt,
-        row.createdAt
+        row.createdAt,
+        row.suppressedGate ?? null,
+        row.wouldBlock === undefined || row.wouldBlock === null ? null : row.wouldBlock.join(',')
       )
   }
 
@@ -198,7 +222,7 @@ export class AlertRepo {
     return this.db
       .prepare(
         `SELECT a.id, a.signal_id, a.level, a.channel, a.suppressed_reason, a.read_at, a.created_at,
-                a.repeat_count, a.last_at,
+                a.repeat_count, a.last_at, a.suppressed_gate, a.would_block,
                 s.code, s.direction, s.score, s.regime, s.stage, s.evidence
          FROM alert_log a JOIN signal s ON s.id = a.signal_id
          ${where} ORDER BY a.created_at DESC LIMIT ?`
@@ -248,4 +272,114 @@ export class AlertRepo {
         .get<{ n: number }>(from)?.n ?? 0
     )
   }
+
+  /**
+   * 闸门漏斗：一段时间里，信号从「引擎判了」走到「真的弹出来」的每一步各掉了多少。
+   *
+   * ## 两个陷阱，两个都在这里处理掉
+   *
+   * **① 分母不在 alert_log 里。** 风控硬抑制的信号**根本不进这张表**
+   * （它带着原因留在 `signal` 表里，CLAUDE.md「两张表两件事」那条）。
+   * 只查 alert_log 算出来的分母已经是过滤后的流量 ⇒ 系统性低估整条链路。
+   * 所以 `signals` / `notDispatched` 两个数来自 `signal` 表，
+   * 而 `candidates` 才是进了闸门的那一批。
+   *
+   * **② 短路顺序。** `suppressed_gate` 记的是**第一个**拦下它的闸门，
+   * 被防抖挡下的候选根本走不到冷却 ⇒ 靠后的闸门看起来永远很松。
+   * 所以 `blockedBy`（实际拦截，四项互斥、加起来 = 被拦总数）与
+   * `wouldBlock`（独立判定，四项**会重叠**、加起来可以超过总数）分开给。
+   * **判断「某道闸门是不是形同虚设」只能看 `wouldBlock`。**
+   *
+   * `legacy` 是 011 迁移之前落的行（有文案、没有结构化闸门）。
+   * 单列一档而不是算进任何一格 —— 让「这段时间没有结构化记录」看得见，而不是变成 0。
+   */
+  gateFunnel(from: number, to: number): AlertGateFunnel {
+    const zero = (): Record<AlertGate, number> => ({
+      DEBOUNCE: 0,
+      COOLDOWN: 0,
+      CAP: 0,
+      QUIET: 0,
+    })
+
+    // ① 分母：这段时间引擎判出的信号，以及其中**压根没走到闸门**的。
+    //
+    // 用 LEFT JOIN 数「没有对应 alert_log 行」，而不是去 evidence JSON 里读 `suppressed` ——
+    // 后者只覆盖风控硬抑制，而「没进闸门」还有别的成因（方向不可执行的 HOLD_WARN 等）。
+    // 漏斗要的是「掉在这一步的总量」，不是「掉的理由」。
+    const sig = this.db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN a.signal_id IS NULL THEN 1 ELSE 0 END) AS orphan
+           FROM signal s LEFT JOIN (SELECT DISTINCT signal_id FROM alert_log) a
+             ON a.signal_id = s.id
+          WHERE s.created_at >= ? AND s.created_at < ?`
+      )
+      .get<{ total: number; orphan: number | null }>(from, to)
+
+    const rows = this.db
+      .prepare(
+        `SELECT suppressed_gate, would_block, channel, suppressed_reason
+           FROM alert_log WHERE created_at >= ? AND created_at < ?`
+      )
+      .all<{
+        suppressed_gate: string | null
+        would_block: string | null
+        channel: string
+        suppressed_reason: string | null
+      }>(from, to)
+
+    const blockedBy = zero()
+    const wouldBlock = zero()
+    let delivered = 0
+    let legacy = 0
+    for (const row of rows) {
+      if (row.channel !== NO_CHANNEL && row.suppressed_reason === null) delivered++
+      if (row.suppressed_gate === null && row.would_block === null) {
+        if (row.suppressed_reason !== null) legacy++
+        continue
+      }
+      const gate = row.suppressed_gate as AlertGate | null
+      if (gate !== null && gate in blockedBy) blockedBy[gate]++
+      for (const g of row.would_block === null || row.would_block === '' ? [] : row.would_block.split(',')) {
+        if (g in wouldBlock) wouldBlock[g as AlertGate]++
+      }
+    }
+
+    return {
+      from,
+      to,
+      signals: sig?.total ?? 0,
+      notDispatched: sig?.orphan ?? 0,
+      candidates: rows.length,
+      delivered,
+      blockedBy,
+      wouldBlock,
+      legacy,
+    }
+  }
+}
+
+export interface AlertGateFunnel {
+  from: number
+  to: number
+  /** 引擎判出的信号总数（`signal` 表，闸门的真正分母） */
+  signals: number
+  /**
+   * 其中**根本没走到闸门**的条数（没有任何 alert_log 行）。
+   *
+   * 主要是风控硬抑制（它带着原因留在 signal 表里，不进 alert_log），
+   * 也包含方向不可执行等其它「产不出候选」的成因 —— 所以名字是 `notDispatched`
+   * 而不是 `riskSuppressed`：这一格量的是**掉在这一步的总量**，不是掉的理由。
+   */
+  notDispatched: number
+  /** 进了闸门的候选数（= alert_log 行数） */
+  candidates: number
+  /** 一路通过、真的发出去的条数 */
+  delivered: number
+  /** 实际拦截：四项**互斥**，和 = 被拦总数 */
+  blockedBy: Record<AlertGate, number>
+  /** 独立判定：四项**会重叠**，和可以超过候选数。判断「闸门是否形同虚设」只能看这个 */
+  wouldBlock: Record<AlertGate, number>
+  /** 011 迁移之前落的行（有文案、没有结构化闸门）。单列一档，不并进上面任何一格 */
+  legacy: number
 }

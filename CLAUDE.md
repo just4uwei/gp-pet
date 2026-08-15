@@ -69,11 +69,19 @@ M2 的「回测报告产出并据此确定出厂参数」还差大半 —— 但
 `staleSnapshotMs`）是**日线回测原理上测不到**的，归影子运行与 M3，不属于这条出口条件。
 （M3 接线后，`alert.bubbleScore` 的依据来源已经有了：提醒日志里「今天发出的几条值不值得
 被打断」，见 [M3 验收清单 §4](./docs/checklists/M3-提醒层验收.md)。判据是日志，不是回测 Calmar。）
-目前 62 个叶子参数：**写回 1 项**、已测保持出厂值 **17 项**（`adx` 4 + `regime` 2 +
-`combine` 4 + `risk` 7；其中 `adx.baseThreshold = 20` / `volScale = 8` **有正面证据** ——
-±2 邻域里每个方向都更差，两个邻居还被训练集红线淘汰）、已判惰性或算术无效 **13 项**
-（`multiTf` 整块 7 个 + 6 个零散）、日线回测测不到 **9 项**（含 `tTrade` 3 个），
-而 `macd`/`boll`/`rsi`/`volume` 与 `strategy`/`regime`/`data` 的零散项 **共 22 项还没有依据**。
+目前 62 个叶子参数（2026-08-15 实测）：`CALIBRATED` **1** · `KEPT` **16**（`adx` 4 +
+`regime` 2 + `combine` 4 + `risk` 6；其中 `adx.baseThreshold = 20` / `volScale = 8`
+**有正面证据** —— ±2 邻域里每个方向都更差，两个邻居还被训练集红线淘汰）·
+`INERT` **13**（`multiTf` 整块 7 个 + 6 个零散）· `UNTESTABLE` **11**（含 `tTrade` 3 个）·
+`BLOCKED` **21** · `GUESS` **0**。
+
+**⚠ `GUESS = 0` 不等于「都测过了」，恰恰相反。** 2026-08-15 新增了 `BLOCKED` 档
+（`macd`/`boll`/`rsi`/`volume` 与 `strategy`/`regime`/`data` 的零散项，共 21 个）：
+**网格跑过了，但出厂值自己被「训练集 Calmar ≤ 0」淘汰 ⇒ 裁决必为 `INCONCLUSIVE`**。
+它与 `GUESS` 必须分开，因为**后续动作相反**：`GUESS` 是去跑网格，
+`BLOCKED` 是**先让基线转正**再重测（把两者混成一档已经制造过一次「同一张网格跑两遍」）。
+摘 `-unvalidated` 的条件因此是 **`GUESS` 与 `BLOCKED` 两档都为 0**，
+`params-view.test.ts` 有两条用例钉着这件事。
 `src/core/params.ts` 里的数值因此仍整体是未标定的初始猜测（见约束 2）。
 **以 `src/main/settings/params-view.ts` 的 `STATUS` 表为准**（有用例钉着），
 这里的概述会过期 —— 补完计划见 [docs/09](./docs/09-下一阶段开发计划.md)。

@@ -80,6 +80,8 @@ interface ReportTrade {
   pnl: number
   holdingBars: number
   regimeAtEntry: Regime
+  /** regime 已连续持续的判定根数。011 之前的基线报告没有这一列 ⇒ undefined */
+  barsInRegimeAtEntry?: number
   entryScore: number
   entrySignals: string[]
   exitRule: string
@@ -109,6 +111,8 @@ interface Position {
   /** 最后一笔卖出的日期 —— 建仓级的持有跨度按它算 */
   exitDate: TradeDate
   regimeAtEntry: Regime
+  /** regime 已连续持续的判定根数；旧基线报告里没有这一列 */
+  barsInRegime: number | null
   entryScore: number
   entrySignals: string[]
   /** 入场投入的本金（前复权口径）= 入场价 × 总股数 */
@@ -132,6 +136,7 @@ function groupPositions(trades: readonly ReportTrade[]): Position[] {
         entryDate: t.entryDate,
         exitDate: t.exitDate,
         regimeAtEntry: t.regimeAtEntry,
+        barsInRegime: t.barsInRegimeAtEntry ?? null,
         entryScore: t.entryScore,
         entrySignals: t.entrySignals,
         deployed: t.entryPrice * t.shares,
@@ -140,6 +145,69 @@ function groupPositions(trades: readonly ReportTrade[]): Position[] {
     }
   }
   return [...map.values()]
+}
+
+// ── 分层键 ───────────────────────────────────────────────────────────────
+
+/**
+ * 得分分档。边界照 §5.20 ⑧ 那张表切（0.75–0.8 打平、≥0.8 是 −1.39%），
+ * 换一套边界会让两处数字对不上号。出厂 `scoreThreshold = 0.6`，所以 0.6 以下不该有建仓。
+ */
+function scoreBand(score: number): string {
+  if (score < 0.65) return '0.60-0.65'
+  if (score < 0.7) return '0.65-0.70'
+  if (score < 0.75) return '0.70-0.75'
+  if (score < 0.8) return '0.75-0.80'
+  return '≥0.80'
+}
+
+/**
+ * 子信号组合键：取每个 ID 的首段（`T3_BREAKOUT` → `T3`）、排序、`+` 连接。
+ * 与 §5.20 ⑧ 的写法（`T2+T3+T4`）一致 —— 那一节的读数要能直接对上。
+ */
+function signalKey(ids: readonly string[]): string {
+  const shorts = [...new Set(ids.map((id) => id.split('_')[0] ?? id))].sort()
+  return shorts.length > 0 ? shorts.join('+') : '(空)'
+}
+
+/**
+ * regime 持续时长分档 —— 「刚进入」与「走了一段」的分界。
+ *
+ * 边界取 `1-3 / 4-10 / 11-30 / >30`：`regime.hysteresisDays = 2` 决定了 1–3 根几乎就是
+ * 「刚翻转过来」，而 10 根以上已经是一段成形的趋势。
+ * 这一档是 §5.20 ⑧ 没量过的**时间维度** —— 子信号组合与得分档都答不了「是不是追高」。
+ */
+function heldBand(bars: number | null): string | null {
+  if (bars === null) return null
+  if (bars <= 3) return '1-3 根（刚进入）'
+  if (bars <= 10) return '4-10 根'
+  if (bars <= 30) return '11-30 根'
+  return '>30 根（走了很久）'
+}
+
+/** 无论多薄都要打印的层：总体与四个市场状态是全局读数，不受 --min-count 过滤 */
+const ALWAYS_SHOWN = new Set<string>(['ALL', ...REGIMES])
+
+/**
+ * 一次建仓同时进多个层。交叉层只对 TREND_UP 展开 ——
+ * 它是 §5.21 定位到的负 alpha 集中处，其余状态展开只会把表撑大而没有读数。
+ */
+function stratumKeysOf(p: Position): string[] {
+  const band = scoreBand(p.entryScore)
+  const sig = signalKey(p.entrySignals)
+  const keys = [
+    'ALL',
+    p.regimeAtEntry,
+    `得分 ${band}`,
+    `信号 ${sig}`,
+  ]
+  const held = heldBand(p.barsInRegime)
+  if (held !== null) keys.push(`持续 ${held}`)
+  if (p.regimeAtEntry === 'TREND_UP') {
+    keys.push(`TREND_UP · 得分 ${band}`, `TREND_UP · 信号 ${sig}`)
+    if (held !== null) keys.push(`TREND_UP · 持续 ${held}`)
+  }
+  return keys
 }
 
 // ── 可复现 RNG（mulberry32）──────────────────────────────────────────────
@@ -222,23 +290,37 @@ interface Summary {
   winRate: number
   /** 仓位加权收益 = Σpnl / Σ本金 —— 与 §5.20 ⑧ 那张表同口径 */
   weightedPnlPct: number
+  /**
+   * 逐次建仓收益率的**中位数**。
+   *
+   * 加权收益会被单次极端行情整段带走：实测 `T1+T2+T3+T4` 那 78 次建仓里，
+   * SZ002969 一笔 **+325.8%**（2025-12-03 → 2026-01-14，不复权 +375.6%，数据无误），
+   * 最赚的 3 笔占总盈亏 **235%** —— 去掉它们加权收益从 +1.90% 翻成 **−2.56%**。
+   * 细分层只有几十次建仓，**不给中位数就会把一次妖股读成一个机制**。
+   */
+  medianPnlPct: number
   netPnl: number
 }
 
 function summarize(items: readonly FillResult[]): Summary {
-  if (items.length === 0) return { count: 0, winRate: 0, weightedPnlPct: 0, netPnl: 0 }
+  if (items.length === 0)
+    return { count: 0, winRate: 0, weightedPnlPct: 0, medianPnlPct: 0, netPnl: 0 }
   let wins = 0
   let pnl = 0
   let deployed = 0
+  const each: number[] = []
   for (const it of items) {
     if (it.pnl > 0) wins++
     pnl += it.pnl
     deployed += it.deployed
+    each.push(it.deployed > 0 ? it.pnl / it.deployed : 0)
   }
+  each.sort((a, b) => a - b)
   return {
     count: items.length,
     winRate: wins / items.length,
     weightedPnlPct: deployed > 0 ? pnl / deployed : 0,
+    medianPnlPct: quantile(each, 0.5),
     netPnl: pnl,
   }
 }
@@ -280,7 +362,11 @@ export interface StratumResult {
   trials: number
   /** 每次试验的仓位加权收益 */
   randomWeighted: number[]
+  randomMedian: number[]
   randomWinRate: number[]
+  /** 打散跨度模式下「真实入场·被动」的分布（未开启时为空） */
+  shufPassiveWeighted: number[]
+  shufPassiveMedian: number[]
   /** 每次试验里成功抽到的样本数（涨停/跌停/边界会作废一部分） */
   randomCounts: number[]
 }
@@ -297,6 +383,22 @@ export interface StratumRow {
   passiveWinRate: number
   passivePercentile: number
   passiveWinRatePercentile: number
+  /** 抗离群：逐次建仓收益率中位数，及其在随机中位数分布里的分位 */
+  passiveMedianPnlPct: number
+  randomMedianMean: number
+  passiveMedianPercentile: number
+  /**
+   * 打散跨度下的配对读数（未开启 --shuffle-spans 时为 null）。
+   * `pairedWinFraction` = 有多少比例的试验里「真实入场」赢过「随机入场」——
+   * 同一次试验里两组用**同一个 span 置换**，所以这是一个逐试验配对的直接检验。
+   */
+  shuffled: {
+    passiveWeightedMean: number
+    randomWeightedMean: number
+    passiveMedianMean: number
+    randomMedianMean: number
+    pairedWinFraction: number
+  } | null
   randomWeightedMean: number
   randomWeightedSd: number
   randomWeightedP05: number
@@ -323,6 +425,7 @@ export interface RandomAuditPayload {
     seed: number
     matchRegime: boolean
     warmup: number
+    minCount: number
     positionsTotal: number
     positionsPaired: number
     skipped: number
@@ -357,7 +460,17 @@ interface Options {
   trials: number
   seed: number
   matchRegime: boolean
+  /**
+   * 打散跨度：每次试验把 span 在全部建仓之间随机置换，**真实组与随机组用同一个置换**。
+   *
+   * 为什么需要它：`holdingBars` 是内生的 —— 跌得快的被止损在 8 根、涨上去的被拖到 15 根。
+   * 于是「真实入场 + 原 span」这一列里，短 span 天然配着下跌，而随机组的短 span 配的是
+   * 随机结果。**这会凭空放大真实组的负 alpha**，中位数口径上尤其严重。
+   * 打散之后 span 与结果解耦，两组的 span 分布仍然一致，剩下的差异才是入场质量。
+   */
+  shuffleSpans: boolean
   warmup: number
+  minCount: number
   out?: string
   json: boolean
 }
@@ -377,14 +490,28 @@ const USAGE = `用法：
   --seed <n>             RNG 种子，默认 1（可复现是硬要求）
   --match-regime         随机入场日限定在与真实建仓相同的市场状态里
                          （慢很多：要为每只票重算一遍 regime 序列）
+  --shuffle-spans        每次试验把持仓跨度在建仓之间随机置换（两组用同一置换）。
+                         用来剥掉 holdingBars 的内生性 —— 不加这个开关，
+                         真实组的负 alpha 会被「短跨度天然配着下跌」放大
   --warmup <根>          随机入场日的最早位置，默认 300（= params.data.fullBars）
+  --min-count <n>        细分层的最小建仓数，低于它不打印，默认 30
+                         （总体与四个市场状态不受此过滤）
   --out <file>           JSON 落盘
   --json                 只输出 JSON
 `
 
 function parse(argv: readonly string[]): Options | 'help' {
-  const o: Options = { baseline: '', trials: 200, seed: 1, matchRegime: false, warmup: 300, json: false }
-  const flags = new Set(['--match-regime', '--json', '--help', '-h'])
+  const o: Options = {
+    baseline: '',
+    trials: 200,
+    seed: 1,
+    matchRegime: false,
+    shuffleSpans: false,
+    warmup: 300,
+    minCount: 30,
+    json: false,
+  }
+  const flags = new Set(['--match-regime', '--shuffle-spans', '--json', '--help', '-h'])
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i]
     if (key === undefined || key === '--') continue
@@ -416,8 +543,14 @@ function parse(argv: readonly string[]): Options | 'help' {
       case '--warmup':
         o.warmup = Number(need())
         break
+      case '--min-count':
+        o.minCount = Number(need())
+        break
       case '--match-regime':
         o.matchRegime = true
+        break
+      case '--shuffle-spans':
+        o.shuffleSpans = true
         break
       case '--out':
         o.out = need()
@@ -506,6 +639,8 @@ export async function run(argv: readonly string[]): Promise<number> {
     position: Position
     code: SecCode
     span: number
+    /** 真实成交那一根的下标 —— 打散跨度模式要用它重算被动持有 */
+    entryIdx: number
     /** 合格的随机入场下标 */
     pool: number[]
     real: FillResult
@@ -558,6 +693,7 @@ export async function run(argv: readonly string[]): Promise<number> {
       position: p,
       code,
       span,
+      entryIdx,
       pool,
       real: { deployed: p.deployed, pnl: p.pnl },
       passive: fillTrade(entry.series, entryIdx, span, capital, costs),
@@ -566,50 +702,106 @@ export async function run(argv: readonly string[]): Promise<number> {
 
   // ④ 跑 N 次随机试验
   const rng = makeRng(opts.seed)
-  const strata = ['ALL', ...REGIMES] as const
-  const realByStratum = new Map<string, FillResult[]>()
-  const passiveByStratum = new Map<string, FillResult[]>()
-  const randByStratum = new Map<string, { weighted: number[]; win: number[]; counts: number[] }>()
-  for (const s of strata) {
-    realByStratum.set(s, [])
-    passiveByStratum.set(s, [])
-    randByStratum.set(s, { weighted: [], win: [], counts: [] })
-  }
+  // 分层键是**逐建仓**算出来的，一次建仓同时进多个层（总体 / 状态 / 得分档 / 子信号组合 / 交叉）。
+  // 随机组按同一批建仓配对，所以每一层的随机基准都是「这一层里的那些票、那些持有跨度」——
+  // 换句话说层与层之间的零点不同，**不同层的分位可以横比，绝对收益不可以**。
+  const keysOf = new Map<Position, string[]>()
+  for (const t of tasks) keysOf.set(t.position, stratumKeysOf(t.position))
+  const strata: string[] = []
+  const seenKey = new Set<string>()
   for (const t of tasks) {
-    realByStratum.get('ALL')?.push(t.real)
-    realByStratum.get(t.position.regimeAtEntry)?.push(t.real)
-    if (t.passive) {
-      passiveByStratum.get('ALL')?.push(t.passive)
-      passiveByStratum.get(t.position.regimeAtEntry)?.push(t.passive)
+    for (const k of keysOf.get(t.position) ?? []) {
+      if (!seenKey.has(k)) {
+        seenKey.add(k)
+        strata.push(k)
+      }
     }
   }
 
-  process.stderr.write(`配对 ${tasks.length} 次建仓 × ${opts.trials} 次试验…\n`)
+  const realByStratum = new Map<string, FillResult[]>()
+  const passiveByStratum = new Map<string, FillResult[]>()
+  const randByStratum = new Map<
+    string,
+    { weighted: number[]; median: number[]; win: number[]; counts: number[] }
+  >()
+  for (const s of strata) {
+    realByStratum.set(s, [])
+    passiveByStratum.set(s, [])
+    randByStratum.set(s, { weighted: [], median: [], win: [], counts: [] })
+  }
+  for (const t of tasks) {
+    for (const k of keysOf.get(t.position) ?? []) {
+      realByStratum.get(k)?.push(t.real)
+      if (t.passive) passiveByStratum.get(k)?.push(t.passive)
+    }
+  }
+
+  // 打散跨度模式下「真实入场·被动」也随试验变，所以它同样是一条分布
+  const shufPassiveByStratum = new Map<string, { weighted: number[]; median: number[] }>()
+  for (const s of strata) shufPassiveByStratum.set(s, { weighted: [], median: [] })
+
+  process.stderr.write(
+    `配对 ${tasks.length} 次建仓 × ${opts.trials} 次试验 · ${strata.length} 个分层` +
+      `${opts.shuffleSpans ? ' · 打散跨度' : ''}…\n`
+  )
+  const spans = tasks.map((t) => t.span)
   for (let trial = 0; trial < opts.trials; trial++) {
+    // Fisher-Yates：真实组与随机组共用同一个置换，两边的 span 分布逐位相同
+    const perm = spans.slice()
+    if (opts.shuffleSpans) {
+      for (let i = perm.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1))
+        const a = perm[i]
+        const b = perm[j]
+        if (a === undefined || b === undefined) continue
+        perm[i] = b
+        perm[j] = a
+      }
+    }
     const bucket = new Map<string, FillResult[]>()
-    for (const s of strata) bucket.set(s, [])
-    for (const t of tasks) {
+    const passiveBucket = new Map<string, FillResult[]>()
+    for (const s of strata) {
+      bucket.set(s, [])
+      passiveBucket.set(s, [])
+    }
+    for (let i = 0; i < tasks.length; i++) {
+      const t = tasks[i]
+      if (!t) continue
       const entry = loaded.get(t.code)
       if (!entry) continue
+      const span = opts.shuffleSpans ? (perm[i] ?? t.span) : t.span
       // 一次抽样可能因涨跌停/边界作废，最多重抽 8 次再放弃
       let fill: FillResult | null = null
       for (let attempt = 0; attempt < 8 && fill === null; attempt++) {
         const pick = t.pool[Math.floor(rng() * t.pool.length)]
         if (pick === undefined) break
-        fill = fillTrade(entry.series, pick, t.span, capital, costs)
+        fill = fillTrade(entry.series, pick, span, capital, costs)
       }
-      if (!fill) continue
-      bucket.get('ALL')?.push(fill)
-      bucket.get(t.position.regimeAtEntry)?.push(fill)
+      // 打散模式下真实入场那一侧也要按新 span 重算，否则两组的 span 不是同一批
+      const passiveFill = opts.shuffleSpans
+        ? fillTrade(entry.series, t.entryIdx, span, capital, costs)
+        : null
+      const keys = keysOf.get(t.position) ?? []
+      if (fill) for (const k of keys) bucket.get(k)?.push(fill)
+      if (passiveFill) for (const k of keys) passiveBucket.get(k)?.push(passiveFill)
     }
     for (const s of strata) {
-      const items = bucket.get(s) ?? []
-      const sum = summarize(items)
+      const sum = summarize(bucket.get(s) ?? [])
       const acc = randByStratum.get(s)
-      if (!acc) continue
-      acc.weighted.push(sum.weightedPnlPct)
-      acc.win.push(sum.winRate)
-      acc.counts.push(sum.count)
+      if (acc) {
+        acc.weighted.push(sum.weightedPnlPct)
+        acc.median.push(sum.medianPnlPct)
+        acc.win.push(sum.winRate)
+        acc.counts.push(sum.count)
+      }
+      if (opts.shuffleSpans) {
+        const ps = summarize(passiveBucket.get(s) ?? [])
+        const pacc = shufPassiveByStratum.get(s)
+        if (pacc && ps.count > 0) {
+          pacc.weighted.push(ps.weightedPnlPct)
+          pacc.median.push(ps.medianPnlPct)
+        }
+      }
     }
   }
 
@@ -618,6 +810,8 @@ export async function run(argv: readonly string[]): Promise<number> {
   for (const s of strata) {
     const real = summarize(realByStratum.get(s) ?? [])
     if (real.count === 0) continue
+    // 细分层薄到几十次建仓时，单次试验的随机均值本身就抖得厉害，分位读不出意义
+    if (!ALWAYS_SHOWN.has(s) && real.count < opts.minCount) continue
     const acc = randByStratum.get(s)
     if (!acc) continue
     results.push({
@@ -626,7 +820,10 @@ export async function run(argv: readonly string[]): Promise<number> {
       passive: summarize(passiveByStratum.get(s) ?? []),
       trials: opts.trials,
       randomWeighted: acc.weighted,
+      randomMedian: acc.median,
       randomWinRate: acc.win,
+      shufPassiveWeighted: shufPassiveByStratum.get(s)?.weighted ?? [],
+      shufPassiveMedian: shufPassiveByStratum.get(s)?.median ?? [],
       randomCounts: acc.counts,
     })
   }
@@ -643,6 +840,7 @@ export async function run(argv: readonly string[]): Promise<number> {
       seed: opts.seed,
       matchRegime: opts.matchRegime,
       warmup: opts.warmup,
+      minCount: opts.minCount,
       positionsTotal: positions.length,
       positionsPaired: tasks.length,
       skipped: skipped.length,
@@ -650,6 +848,7 @@ export async function run(argv: readonly string[]): Promise<number> {
     },
     strata: results.map((r) => {
       const w = [...r.randomWeighted].sort((a, b) => a - b)
+      const med = [...r.randomMedian].sort((a, b) => a - b)
       const win = [...r.randomWinRate].sort((a, b) => a - b)
       return {
         label: r.label,
@@ -662,6 +861,21 @@ export async function run(argv: readonly string[]): Promise<number> {
         passiveWinRate: r.passive.winRate,
         passivePercentile: percentileOf(w, r.passive.weightedPnlPct),
         passiveWinRatePercentile: percentileOf(win, r.passive.winRate),
+        passiveMedianPnlPct: r.passive.medianPnlPct,
+        randomMedianMean: mean(r.randomMedian),
+        passiveMedianPercentile: percentileOf(med, r.passive.medianPnlPct),
+        shuffled:
+          r.shufPassiveWeighted.length > 0
+            ? {
+                passiveWeightedMean: mean(r.shufPassiveWeighted),
+                randomWeightedMean: mean(r.randomWeighted),
+                passiveMedianMean: mean(r.shufPassiveMedian),
+                randomMedianMean: mean(r.randomMedian),
+                pairedWinFraction:
+                  r.shufPassiveWeighted.filter((v, i) => v > (r.randomWeighted[i] ?? Infinity))
+                    .length / r.shufPassiveWeighted.length,
+              }
+            : null,
         randomWeightedMean: mean(r.randomWeighted),
         randomWeightedSd: stdev(r.randomWeighted),
         randomWeightedP05: quantile(w, 0.05),
@@ -712,49 +926,81 @@ function renderText(p: RandomAuditPayload): string {
       `regime 自检 ${c.hit}/${c.total} = ${((c.hit / Math.max(1, c.total)) * 100).toFixed(2)}% 与报告一致`
     )
   }
-  lines.push('')
-  lines.push('仓位加权收益（Σ盈亏 / Σ本金）')
-  lines.push('-'.repeat(94))
-  lines.push(
-    ['状态', '建仓', '真实(含风控)', '真实入场·被动', '随机·被动', '随机 p5', '随机 p95', '被动分位']
-      .map((h, i) => (i === 0 ? h.padEnd(12) : h.padStart(14)))
-      .join('')
-  )
-  for (const s of p.strata) {
+  lines.push(`细分层门槛 建仓数 ≥ ${m.minCount}（总体与四个市场状态不受此过滤）`)
+
+  // 分层按类别切成几段打印。一张 30 行的平表读不动，而这个工具的产出就是给人读的
+  const sections: { title: string; pick: (label: string) => boolean }[] = [
+    { title: '总体与市场状态', pick: (l) => ALWAYS_SHOWN.has(l) },
+    { title: '按入场得分档（全池）', pick: (l) => l.startsWith('得分 ') },
+    { title: '按入场得分档（TREND_UP）', pick: (l) => l.startsWith('TREND_UP · 得分 ') },
+    { title: '按入场子信号组合（全池）', pick: (l) => l.startsWith('信号 ') },
+    { title: '按入场子信号组合（TREND_UP）', pick: (l) => l.startsWith('TREND_UP · 信号 ') },
+    { title: '按 regime 已持续根数（全池）', pick: (l) => l.startsWith('持续 ') },
+    { title: '按 regime 已持续根数（TREND_UP）', pick: (l) => l.startsWith('TREND_UP · 持续 ') },
+  ]
+
+  const W = 30
+  for (const section of sections) {
+    const rows = p.strata.filter((s) => section.pick(s.label))
+    if (rows.length === 0) continue
+    // 负 alpha 排前面：这张表是用来找「谁在拖后腿」的
+    rows.sort((a, b) => a.passivePercentile - b.passivePercentile)
+    lines.push('')
+    lines.push(`【${section.title}】仓位加权收益 / 建仓胜率`)
+    lines.push('-'.repeat(W + 84))
     lines.push(
-      [
-        s.label.padEnd(12),
-        String(s.realCount).padStart(14),
-        pct(s.realWeightedPnlPct).padStart(14),
-        pct(s.passiveWeightedPnlPct).padStart(14),
-        pct(s.randomWeightedMean).padStart(14),
-        pct(s.randomWeightedP05).padStart(14),
-        pct(s.randomWeightedP95).padStart(14),
-        pct(s.passivePercentile).padStart(14),
-      ].join('')
+      ['分层', '建仓', '真实(含风控)', '被动·加权', '随机·加权', '加权分位', '被动·中位', '随机·中位', '中位分位']
+        .map((h, i) => (i === 0 ? h.padEnd(W) : h.padStart(13)))
+        .join('')
     )
+    for (const s of rows) {
+      lines.push(
+        [
+          s.label.padEnd(W),
+          String(s.realCount).padStart(13),
+          pct(s.realWeightedPnlPct).padStart(13),
+          pct(s.passiveWeightedPnlPct).padStart(13),
+          pct(s.randomWeightedMean).padStart(13),
+          pct(s.passivePercentile).padStart(13),
+          pct(s.passiveMedianPnlPct).padStart(13),
+          pct(s.randomMedianMean).padStart(13),
+          pct(s.passiveMedianPercentile).padStart(13),
+        ].join('')
+      )
+    }
   }
   lines.push('')
-  lines.push('建仓胜率')
-  lines.push('-'.repeat(94))
-  lines.push(
-    ['状态', '真实(含风控)', '真实入场·被动', '随机·被动', '随机 p5', '随机 p95', '被动分位']
-      .map((h, i) => (i === 0 ? h.padEnd(12) : h.padStart(14)))
-      .join('')
-  )
-  for (const s of p.strata) {
+  const shuffled = p.strata.filter((s) => s.shuffled !== null)
+  if (shuffled.length > 0) {
+    lines.push('')
+    lines.push('【打散跨度】剥掉 holdingBars 内生性之后的配对检验')
+    lines.push('-'.repeat(W + 84))
     lines.push(
-      [
-        s.label.padEnd(12),
-        pct(s.realWinRate).padStart(14),
-        pct(s.passiveWinRate).padStart(14),
-        pct(s.randomWinRateMean).padStart(14),
-        pct(s.randomWinRateP05).padStart(14),
-        pct(s.randomWinRateP95).padStart(14),
-        pct(s.passiveWinRatePercentile).padStart(14),
-      ].join('')
+      ['分层', '建仓', '真实入场·加权', '随机入场·加权', '真实入场·中位', '随机入场·中位', '真实赢的试验占比']
+        .map((h, i) => (i === 0 ? h.padEnd(W) : h.padStart(16)))
+        .join('')
     )
+    shuffled.sort((a, b) => (a.shuffled?.pairedWinFraction ?? 0) - (b.shuffled?.pairedWinFraction ?? 0))
+    for (const s of shuffled) {
+      const sh = s.shuffled
+      if (!sh) continue
+      lines.push(
+        [
+          s.label.padEnd(W),
+          String(s.realCount).padStart(16),
+          pct(sh.passiveWeightedMean).padStart(16),
+          pct(sh.randomWeightedMean).padStart(16),
+          pct(sh.passiveMedianMean).padStart(16),
+          pct(sh.randomMedianMean).padStart(16),
+          pct(sh.pairedWinFraction).padStart(16),
+        ].join('')
+      )
+    }
+    lines.push('')
+    lines.push('  同一次试验里两组用**同一个 span 置换**，所以「真实赢的试验占比」是逐试验配对的')
+    lines.push('  直接检验：50% ⇒ 入场与随机无异，接近 0% ⇒ 入场系统性更差。')
   }
+
   lines.push('')
   lines.push('读法')
   lines.push('-'.repeat(94))
@@ -766,6 +1012,13 @@ function renderText(p: RandomAuditPayload): string {
   lines.push('  所以只有这两列之差才是**入场质量**；前两列之差是风控离场的作用。')
   lines.push('· 「被动分位」= 「真实入场·被动」落在随机分布的第几百分位。')
   lines.push('  接近 50% ⇒ 入场与随机无异；接近 0% ⇒ 入场**系统性更差**（在反向挑点）。')
+  lines.push('· **各层的零点不同**（每层的随机基准只用该层那些票、那些持有跨度），')
+  lines.push('  所以层与层之间**分位可以横比、绝对收益不可以**。')
+  lines.push('· 细分层是事后切的，切法本身没有做多重比较校正 —— 一个 30 次建仓的层')
+  lines.push('  落在 5% 分位并不稀奇。**只有跨得分档单调、或跨种子稳定的形状才算读数。**')
+  lines.push('· **加权分位与中位分位背离时，以中位分位为准**：加权会被单次极端行情整段带走。')
+  lines.push('  实测 T1+T2+T3+T4 那 78 次建仓的加权 +1.90% 里，最赚的 3 笔占总盈亏 235%，')
+  lines.push('  去掉后翻成 −2.56%（SZ002969 一笔 +325.8%，数据无误，就是一次妖股行情）。')
   lines.push('· holdingBars 是内生的（跌得快的被止损在 8 根、涨上去的被拖到 15 根），')
   lines.push('  配对时照抄了这个分布 —— 这是刻意的，否则比的是两种持有策略。')
   lines.push('· 本工具只统计，不改参数。')

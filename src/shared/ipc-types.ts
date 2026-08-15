@@ -411,17 +411,27 @@ export interface ParamRow {
   key: string
   value: string
   /**
-   * 标定状态。五档，对应 M2 验收清单 4.9 的归档位置：
+   * 标定状态。六档，对应 M2 验收清单 4.9 的归档位置：
    *   `CALIBRATED` 已标定并写回（**目前只有一项**）
    *   `KEPT`       已上网格、裁决保持出厂值
    *   `INERT`      已判参数惰性或算术无效（改了等于没改）
    *   `UNTESTABLE` 日线回测原理上测不到，依据只能来自影子运行或提醒日志
+   *   `BLOCKED`    **已上网格，但出厂值自己被红线淘汰 ⇒ 裁决必为 `INCONCLUSIVE`**
    *   `GUESS`      **一个网格都没跑过**的转述猜测
    *
    * `GUESS` 不是「大概对」的意思，是「没有任何本地证据」。UI 必须把这一档显式标出来 ——
    * 一张不分档的参数表会让整套数值看起来同等可信（ADR-0003 要防的正是这件事）。
+   *
+   * **`BLOCKED` 与 `GUESS` 必须分开**（2026-08-15 新增，M2 §5.20 ⑨）：
+   * 出厂参数在 261 只池上训练窗口 Calmar −0.125，被 `calibrate.ts` 的红线
+   * 「训练集 Calmar ≤ 0 直接淘汰」淘汰掉 ⇒ 出厂值没有逐折分数 ⇒ 配对 Δ 全是 null
+   * ⇒ 八张网格 82 组候选**全部裁 `INCONCLUSIVE`**。这些参数**跑过**，
+   * 只是当前基线下产不出裁决 —— 与「压根没跑」是两件事，后续动作也完全不同：
+   * `GUESS` 要去跑网格，`BLOCKED` 要**先让基线转正**再重测。
+   * 混成一档的代价是具体的：已经发生过「同一张网格被跑两遍」。
+   * **失效条件**：基线在代表性池上训练窗口 Calmar > 0 之后，`BLOCKED` 全部退回 `GUESS` 重跑。
    */
-  status: 'CALIBRATED' | 'KEPT' | 'INERT' | 'UNTESTABLE' | 'GUESS'
+  status: 'CALIBRATED' | 'KEPT' | 'INERT' | 'UNTESTABLE' | 'BLOCKED' | 'GUESS'
   note?: string
 }
 

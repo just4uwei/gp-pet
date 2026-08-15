@@ -54,6 +54,9 @@ const STATUS_LABEL: Record<ParamRow['status'], { text: string; cls: string }> = 
   KEPT: { text: '已测·保持', cls: 'bg-sky-500/15 text-sky-300' },
   INERT: { text: '惰性', cls: 'bg-white/10 text-white/40' },
   UNTESTABLE: { text: '回测测不到', cls: 'bg-violet-500/15 text-violet-300' },
+  // 「已测·无结论」不是「未测」：网格跑过了，是出厂值自己被红线淘汰所以产不出裁决。
+  // 用橙色而不是琥珀色，与 GUESS 分开 —— 两者的后续动作不同（见 ipc-types 的 ParamRow）
+  BLOCKED: { text: '已测·无结论', cls: 'bg-orange-500/15 text-orange-300' },
   GUESS: { text: '未测', cls: 'bg-amber-500/15 text-amber-300' },
 }
 

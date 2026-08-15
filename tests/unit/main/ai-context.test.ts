@@ -70,6 +70,7 @@ describe('buildSignalContext', () => {
       kept: 1,
       inert: 1,
       untestable: 1,
+      blocked: 0,
       guess: 2,
       calibratedKeys: ['strategy.squeezeBbwPct'],
     })

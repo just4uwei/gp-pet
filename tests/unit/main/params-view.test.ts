@@ -29,7 +29,9 @@ describe('归档完整性', () => {
       expect(row.group).not.toBe('')
       expect(row.key).not.toBe('')
       expect(row.value).not.toBe('')
-      expect(['CALIBRATED', 'KEPT', 'INERT', 'UNTESTABLE', 'GUESS']).toContain(row.status)
+      expect(['CALIBRATED', 'KEPT', 'INERT', 'UNTESTABLE', 'BLOCKED', 'GUESS']).toContain(
+        row.status
+      )
     }
   })
 
@@ -59,8 +61,31 @@ describe('已标定清单', () => {
     expect(row?.value).toBe(String(DEFAULT_PARAMS.strategy.squeezeBbwPct))
   })
 
-  it('仍有「未测」的参数 —— 这一档空了才该考虑摘 -unvalidated 后缀', () => {
-    expect(countByStatus(paramRows()).GUESS).toBeGreaterThan(0)
+  /**
+   * ⚠ 2026-08-15 起这条不再只看 `GUESS`。
+   *
+   * 21 个参数从 `GUESS` 改档 `BLOCKED`（网格跑过了，但出厂值自己被红线淘汰
+   * ⇒ 裁决必为 INCONCLUSIVE，M2 §5.20 ⑨），于是 `GUESS` 归零 ——
+   * 但那**不代表可以摘 `-unvalidated`**，恰恰相反：那 21 项一个结论都没有。
+   * 只看 `GUESS` 的写法会在这次改档之后变成一条**反向**的红线。
+   */
+  it('仍有没有结论的参数（GUESS + BLOCKED）—— 两档都空了才该考虑摘 -unvalidated 后缀', () => {
+    const counts = countByStatus(paramRows())
+    expect(counts.GUESS + counts.BLOCKED).toBeGreaterThan(0)
+  })
+
+  it('BLOCKED 非空，且与 GUESS 是两件事 —— 前者要先让基线转正，后者要去跑网格', () => {
+    const counts = countByStatus(paramRows())
+    expect(counts.BLOCKED).toBeGreaterThan(0)
+    // 改档时漏掉一项会让它掉回 GUESS，而 GUESS 的后续动作是「去跑网格」——
+    // 那张网格已经跑过了，跑第二遍仍然只会得到 INCONCLUSIVE（已经发生过一次）
+    const blocked = paramRows()
+      .filter((row) => row.status === 'BLOCKED')
+      .map((row) => `${row.group}.${row.key}`)
+    expect(blocked).toContain('macd.fast')
+    expect(blocked).toContain('rsi.period')
+    expect(blocked).toContain('boll.k')
+    expect(blocked).toContain('volume.breakoutRatio')
   })
 })
 

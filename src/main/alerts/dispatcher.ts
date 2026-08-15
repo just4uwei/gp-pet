@@ -75,6 +75,15 @@ export interface DispatchContext {
   debounce?: boolean
 }
 
+/**
+ * 四道闸门的离散标识（`alert_log.suppressed_gate` / `would_block` 的取值）。
+ *
+ * **`reason` 那句话不能拿去分组** —— 它嵌着连续量（「1/2 个 tick」「还有 87 分钟」），
+ * 按它 GROUP BY 会得到成百上千个只差一个数字的桶。与 `signalSignature` 里
+ * `reasons[0]` 那个坑同一个形状（两天落了 243 行同一条止损）。见 011 迁移的头注释。
+ */
+export type AlertGate = 'DEBOUNCE' | 'COOLDOWN' | 'CAP' | 'QUIET'
+
 export interface AlertDecision {
   candidate: AlertCandidate
   /** 最终级别（可能被降级）；被丢弃时为 null */
@@ -82,6 +91,22 @@ export interface AlertDecision {
   channels: readonly AlertChannel[]
   /** 非空表示被抑制/降级及原因，一律写 alert_log（docs/05 §6） */
   reason: string | null
+  /**
+   * 实际把它拦下/降级的**第一道**闸门。四道是串行的，所以这是「为什么没发出去」的答案。
+   * null = 一路通过。
+   */
+  blockedBy: AlertGate | null
+  /**
+   * **假设前置闸门都放行**，哪几道各自也会拦。答的是「每道闸门各自有多严」。
+   *
+   * 为什么必须单独有这一项：闸门短路，被防抖挡下的候选**根本走不到冷却**，
+   * 于是只看 `blockedBy` 会让靠后的闸门看起来永远很松 —— 而那只是前面的把流量吃光了。
+   * **「某道闸门拦截率 < 10% ⇒ 形同虚设」这个判据只有拿这一项读才成立。**
+   *
+   * 独立评估不花钱：`checkCooldown` / `checkCaps` 都是纯读，只有 `checkDebounce` 会改
+   * `streaks`，而它本来就是第一道、不存在被短路的问题。
+   */
+  wouldBlock: readonly AlertGate[]
 }
 
 export interface DispatcherOptions {
@@ -165,22 +190,35 @@ export class AlertDispatcher {
     // 闸门①②：逐条判，先把「不该发」的丢掉
     const survivors: AlertCandidate[] = []
     const seen = new Set<string>()
+    // 幸存者的独立评估结果留到闸门③④那一轮再用（那时 quiet 已经确定）
+    const wouldBlockOf = new Map<AlertCandidate, AlertGate[]>()
 
     for (const candidate of candidates) {
       const debounceKey = `${candidate.code}:${candidate.direction}:${candidate.topSubSignalId}`
       seen.add(debounceKey)
 
       const gate1 = this.checkDebounce(candidate, debounceKey, ctx)
+      // ⚠ 无论 ① 有没有拦下来都要算 ②③④ —— 那是 `wouldBlock` 的全部意义。
+      // 三个 check 都是纯读（记账在 commit 里），所以提前算不会改变分发行为
+      const gate2 = this.checkCooldown(candidate, now)
+      const gate3 = candidate.level === 'L1' ? null : this.checkCaps(candidate, candidate.level)
+      const quiet = ctx.quiet === true && candidate.level !== 'L1'
+      const wouldBlock: AlertGate[] = []
+      if (gate1) wouldBlock.push('DEBOUNCE')
+      if (gate2) wouldBlock.push('COOLDOWN')
+      if (gate3) wouldBlock.push('CAP')
+      if (quiet) wouldBlock.push('QUIET')
+
       if (gate1) {
-        decisions.push(drop(candidate, gate1))
+        decisions.push(drop(candidate, gate1, 'DEBOUNCE', wouldBlock))
         continue
       }
-      const gate2 = this.checkCooldown(candidate, now)
       if (gate2) {
-        decisions.push(drop(candidate, gate2))
+        decisions.push(drop(candidate, gate2, 'COOLDOWN', wouldBlock))
         continue
       }
       survivors.push(candidate)
+      wouldBlockOf.set(candidate, wouldBlock)
     }
 
     // 本轮没出现的防抖键清零 —— 指标在阈值附近抖动时，「消失过」就得重新连续 N 次
@@ -190,10 +228,14 @@ export class AlertDispatcher {
     for (const candidate of [...survivors].sort((a, b) => b.score - a.score)) {
       let level = candidate.level
       const reasons: string[] = []
+      // ③④ 是**降级**不是丢弃，所以「第一道拦下它的」取先触发的那个。
+      // 免打扰在前（先判），频率上限在后
+      let blockedBy: AlertGate | null = null
 
       // ④ 免打扰：L2/L3 一律降为 L1（不弹气泡，只改状态点 + 进未读计数）
       if (ctx.quiet && level !== 'L1') {
         reasons.push(`免打扰${ctx.quietReason ? `（${ctx.quietReason}）` : ''}，降为 L1`)
+        blockedBy = 'QUIET'
         level = 'L1'
       }
 
@@ -202,6 +244,7 @@ export class AlertDispatcher {
         const cap = this.checkCaps(candidate, level)
         if (cap) {
           reasons.push(cap)
+          blockedBy ??= 'CAP'
           level = 'L1'
         }
       }
@@ -212,6 +255,8 @@ export class AlertDispatcher {
         level,
         channels: CHANNELS_BY_LEVEL[level],
         reason: reasons.length > 0 ? reasons.join('；') : null,
+        blockedBy,
+        wouldBlock: wouldBlockOf.get(candidate) ?? [],
       })
     }
 
@@ -309,6 +354,11 @@ export class AlertDispatcher {
   }
 }
 
-function drop(candidate: AlertCandidate, reason: string): AlertDecision {
-  return { candidate, level: null, channels: [], reason }
+function drop(
+  candidate: AlertCandidate,
+  reason: string,
+  blockedBy: AlertGate,
+  wouldBlock: readonly AlertGate[]
+): AlertDecision {
+  return { candidate, level: null, channels: [], reason, blockedBy, wouldBlock }
 }

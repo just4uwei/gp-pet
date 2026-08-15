@@ -73,6 +73,23 @@ export interface BacktestTrade {
   holdingBars: number
   costs: number
   regimeAtEntry: Regime
+  /**
+   * 建仓时该 regime 已经连续持续了多少根（含判定当根，最小 1）。
+   *
+   * 加它是因为 §5.21 把负 alpha 定位到「TREND_UP 里的挑选」之后，还剩一个没量过的维度：
+   * **是「刚进入上升趋势就买」还是「趋势走了一段之后买」**。
+   * 那是「追高」的时间维度度量，而 §5.20 ⑧ 已有的两个维度（子信号组合、得分档）都答不了。
+   *
+   * 取的是**引擎自己发布的** `RegimeState.heldDays`，不在这里重算 ——
+   * 重算一份的话，「回测统计出来的持续根数」与「引擎判定时用的持续根数」会悄悄分叉，
+   * 而分叉之后所有基于它的结论都不可信（与 `audit:regime` 读 `evidence` 而不复写判定逻辑同理）。
+   *
+   * ⚠ 两条边界：① 单位是**判定根**不是自然日，停牌与节假日天然跳过；
+   * ② 上界由 `lookback` 决定（引擎每次只看到 320 根），一段超长趋势会被截断在窗口长度上 ——
+   * 这与实盘一致（`MarketDataService.initialBars` 也是 320），
+   * 用全序列去算反而会让回测比实盘「多知道」一截。
+   */
+  barsInRegimeAtEntry: number
   entryScore: number
   /** 触发买入的子信号 ID，归因用 */
   entrySignals: string[]
@@ -111,6 +128,8 @@ interface PendingOrder {
   signals: string[]
   score: number
   regime: Regime
+  /** 判定当根为止，该 regime 已连续持续的根数（≥ 1） */
+  barsInRegime: number
   /** 已顺延的次数（跌停卖不掉时会顺延） */
   deferred: number
 }
@@ -166,7 +185,12 @@ export function simulateCode(
   let entryPriceAdj = 0
   let entryPriceRaw = 0
   let entryCosts = 0
-  let entryContext: { regime: Regime; signals: string[]; score: number } | null = null
+  let entryContext: {
+    regime: Regime
+    signals: string[]
+    score: number
+    barsInRegime: number
+  } | null = null
   let pending: PendingOrder | null = null
 
   const result: CodeResult = {
@@ -223,6 +247,7 @@ export function simulateCode(
                 regime: order.regime,
                 signals: order.signals,
                 score: order.score,
+                barsInRegime: order.barsInRegime,
               }
             }
             pending = null
@@ -261,6 +286,7 @@ export function simulateCode(
               holdingBars: i - entryIndex,
               costs: fees + allocatedEntryCosts,
               regimeAtEntry: entryContext?.regime ?? 'TRANSITION',
+              barsInRegimeAtEntry: entryContext?.barsInRegime ?? 0,
               entryScore: entryContext?.score ?? 0,
               entrySignals: entryContext?.signals ?? [],
               exitRule: order.rule,
@@ -355,6 +381,7 @@ export function simulateCode(
         .map((sub) => sub.id),
       score: evaluation.signal.score,
       regime: evaluation.regime.regime,
+      barsInRegime: evaluation.regime.heldDays,
       deferred: 0,
     }
   }
