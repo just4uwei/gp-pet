@@ -70,6 +70,32 @@ export interface GateInput {
   params: EngineParams
 }
 
+/**
+ * 用户重画的那条固定止损线；没画过返回 null（**不是 0** —— 0 会被读成
+ * 「跌到 0 才止损」，等于静默关掉整条规则，见约束 4）。
+ */
+export function stopLineOf(position: Position): number | null {
+  return position.stopFloor !== undefined && position.stopFloor > 0 ? position.stopFloor : null
+}
+
+/**
+ * 现价有没有触及固定止损线。**这是「① 固定止损」那条规则的唯一判据定义。**
+ *
+ * 单独导出是因为它有**两个**调用方：`positionVerdict()`（决定发不发提醒）与
+ * 主进程的 `PositionView.stopBreached`（决定界面给不给「重画止损线」的入口）。
+ * 两边各写一遍的症状是「界面说该改止损线了，而引擎还没打算提醒」——
+ * 分叉之后没有人分得清哪个才对，与 `trade:preview` 那条纪律同一个形状。
+ *
+ * 判据本身：画过线 → 比那个**绝对价**；没画过 → 比 `risk.stopLossPct` 那个百分比。
+ * 两者在深套时差别最大，而那正是这个功能存在的场景。
+ */
+export function belowStopLine(price: number, position: Position, params: EngineParams): boolean {
+  const floor = stopLineOf(position)
+  if (floor !== null) return price <= floor
+  if (position.cost <= 0) return false
+  return (price - position.cost) / position.cost <= -params.risk.stopLossPct
+}
+
 /** 持仓风控的四条强制规则，按严重程度排序 —— 命中第一条即定案 */
 export function positionVerdict(input: GateInput): { verdict: RiskVerdict; direction: GatedDirection; level: AlertLevel } | null {
   const { position, params } = input
@@ -105,13 +131,13 @@ export function positionVerdict(input: GateInput): { verdict: RiskVerdict; direc
         用户接受的是「这一段下跌」，不是「所有风控都别响了」。
       * **回测与影子运行不设这个字段**，所以它们的行为一个字都没变（见 Position.stopFloor）。
   */
-  const floor = position.stopFloor !== undefined && position.stopFloor > 0 ? position.stopFloor : null
+  const floor = stopLineOf(position)
   /**
    * 固定止损的边界到没到。**③ 回撤减仓也要用它**，见那里的注释 ——
    * 那条规则的「仍盈利或微亏」本来就是「① 还没接手」的另一种写法，
    * 而用户重画止损线之后，「① 接手」的判据变了。
    */
-  const belowStop = floor !== null ? price <= floor : profit <= -risk.stopLossPct
+  const belowStop = belowStopLine(price, position, params)
   if (belowStop) {
     return {
       direction: 'SELL',

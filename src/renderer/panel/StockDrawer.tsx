@@ -22,6 +22,7 @@ import { createPortal } from 'react-dom'
 import type { SecCode } from '@core/types'
 import type { PositionView, QuoteTick, SignalRecord, TradeLedger, WatchPointView } from '@shared/ipc-types'
 import type { SignalGroup } from '@shared/signal-group'
+import { shanghaiDayStartMs } from '@shared/time'
 import { AiPanel } from './AiPanel'
 import { DailyChart } from './DailyChart'
 import { IntradayChart, type IntradayMark } from './IntradayChart'
@@ -31,12 +32,6 @@ import { TradePanel } from './TradePanel'
 const TITLE_BAR_HEIGHT = 40
 
 export type StockTab = 'QUOTE' | 'SIGNAL' | 'AI' | 'POSITION'
-
-/** 北京时间那一天的 00:00（epoch ms）。交易时段是交易所的，不看本机时区 */
-function beijingDayStart(at: number): number {
-  const offset = 8 * 60 * 60_000
-  return Math.floor((at + offset) / 86_400_000) * 86_400_000 - offset
-}
 
 const TABS: { key: StockTab; label: string }[] = [
   { key: 'QUOTE', label: '行情' },
@@ -59,6 +54,7 @@ export function StockDrawer({
   onStopChanged,
   tradeBusy,
   aiSignalId,
+  stopIntent = false,
   onWatchCreated,
   onError,
   onClose,
@@ -86,6 +82,12 @@ export function StockDrawer({
   tradeBusy: boolean
   /** 从信号行进来时指定「AI 页签解读哪一条」；缺省取该股最新那条 */
   aiSignalId?: string
+  /**
+   * 从自选行的「止损线」入口进来的。持仓页据此**直接展开**那个表单，
+   * 并强制渲染止损那一段 —— 否则用户点「止损线」落地看到的是成交录入
+   * （见 TradePanel.stopIntent）。
+   */
+  stopIntent?: boolean
   /** 观察点新建成功后通知上层刷新计数 */
   onWatchCreated: () => void
   onError: (message: string) => void
@@ -115,7 +117,8 @@ export function StockDrawer({
   // 当天 00:00 —— 按**北京时间**，不是本机时区。它同时是分时的查询窗口下界，
   // 而 quote_tick.ts 与数据源的分时时刻都是交易所时间：机器设成别的时区时，
   // 用本机零点会把窗口整体挪走，图上会缺掉一头
-  const dayStart = beijingDayStart(Date.now())
+  // 北京日界走 shared/time.ts 那一份 —— 这里原先自己算了一遍（第三份 +08:00 常量）
+  const dayStart = shanghaiDayStartMs(Date.now())
 
   return createPortal(
     <>
@@ -231,6 +234,7 @@ export function StockDrawer({
               onStopChanged={onStopChanged}
               onError={onError}
               busy={tradeBusy}
+              stopIntent={stopIntent}
             />
           ) : null}
         </div>

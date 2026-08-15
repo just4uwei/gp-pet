@@ -8,7 +8,15 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { downgrade, downgrades, gateSignal, hardSuppressions, positionVerdict, type GateInput } from '@core/risk'
+import {
+  belowStopLine,
+  downgrade,
+  downgrades,
+  gateSignal,
+  hardSuppressions,
+  positionVerdict,
+  type GateInput,
+} from '@core/risk'
 import { composeHeadline, confidenceText, describeSubSignal, topReasons } from '@core/risk/text'
 import { DEFAULT_PARAMS } from '@core/params'
 import type {
@@ -226,6 +234,89 @@ describe('持仓强制通道（docs/05 §2.3）', () => {
     expect(result?.verdict.rule).toBe('STOP_LOSS')
     expect(result?.direction).toBe('SELL')
     expect(result?.level).toBe('L3')
+  })
+
+  /*
+    用户重画的止损线（`position.stopFloor`，009_position_stop.sql）。
+
+    这一组钉的是它的**判据换了**：从「亏够 `risk.stopLossPct` 这个百分比」
+    换成「现价跌破他画的那个绝对价」。两者的差别在深套时最大 ——
+    一只成本 20、现价 12 的票（−40%）如果用户把线画在 10，
+    **不该再提醒**，因为他已经决定扛到 10；按百分比判的话它每天都响。
+
+    这一段此前一条用例都没有，而它是「重画止损线」这个功能的全部意义所在。
+  */
+  it('有 stopFloor 时判据是现价 vs 那条线，与成本百分比无关', () => {
+    // 成本 20、现价 12 —— 按百分比早就该止损了（−40%），但用户把线画在 10
+    const held = position({ cost: 20, peakPrice: 20, stopFloor: 10 })
+    const result = positionVerdict(input({ position: held, snapshot: snapshot({ last: 12 }) }))
+
+    expect(result?.verdict.rule).not.toBe('STOP_LOSS')
+  })
+
+  it('跌破那条线照样是 L3 强制卖出 —— 重画不等于关掉', () => {
+    const held = position({ cost: 20, peakPrice: 20, stopFloor: 10 })
+    const result = positionVerdict(input({ position: held, snapshot: snapshot({ last: 9.9 }) }))
+
+    expect(result?.verdict.rule).toBe('STOP_LOSS')
+    expect(result?.direction).toBe('SELL')
+    expect(result?.level).toBe('L3')
+    // 文案要报出他自己画的那个数，否则用户读不出「这是我定的线」
+    expect(result?.verdict.reason).toContain('10')
+  })
+
+  it('线画在现价下方一点点时不触发 —— 边界是 `price <= floor`', () => {
+    const held = position({ cost: 20, peakPrice: 20, stopFloor: 10 })
+    expect(
+      positionVerdict(input({ position: held, snapshot: snapshot({ last: 10.01 }) }))?.verdict.rule
+    ).not.toBe('STOP_LOSS')
+    // 恰好等于线：触发（`<=`）
+    expect(
+      positionVerdict(input({ position: held, snapshot: snapshot({ last: 10 }) }))?.verdict.rule
+    ).toBe('STOP_LOSS')
+  })
+
+  /*
+    用户接受的是「这一段下跌」，不是「所有风控都别响了」。
+
+    ⚠ 回撤减仓这一条尤其容易被改坏：它的「仍盈利或微亏」原先是把固定止损的判据
+    抄了一遍（`profit > -stopLossPct`），重画线之后那两者会分叉，
+    中间一段**两条都不响**。现在两处共用 `belowStop`，这条用例钉着它。
+  */
+  it('重画止损线不影响回撤减仓：自峰回撤够了照样响', () => {
+    // 与上面那条回撤减仓用例同一组数（成本 10、峰值 11、现价 10.2：浮盈 2%、自峰 −7.3%），
+    // 只多一条画在 9 的止损线 —— 远未触及，所以裁决必须一字不变
+    const held = position({ cost: 10, peakPrice: 11, stopFloor: 9 })
+    const result = positionVerdict(input({ position: held, snapshot: snapshot({ last: 10.2 }) }))
+
+    expect(result?.verdict.rule).toBe('DRAWDOWN_REDUCE')
+    expect(result?.direction).toBe('REDUCE')
+  })
+
+  /*
+    `belowStopLine()` 被导出，是因为它有**两个**调用方：这里的 `positionVerdict()`
+    与主进程的 `PositionView.stopBreached`（界面据此决定给不给「重画止损线」的入口）。
+    两边各写一遍的症状是「界面说该改止损线了，引擎却还没打算提醒」。
+
+    所以下面这几条直接测那个函数：它一改，两个调用方一起变，不会分叉。
+  */
+  it('belowStopLine：画过线就比绝对价，没画过才比百分比', () => {
+    const withFloor = position({ cost: 20, stopFloor: 10 })
+    expect(belowStopLine(10.01, withFloor, P)).toBe(false)
+    expect(belowStopLine(10, withFloor, P)).toBe(true)
+    expect(belowStopLine(9, withFloor, P)).toBe(true)
+
+    // 没画线：−8% 才算触及（出厂 risk.stopLossPct）
+    const noFloor = position({ cost: 10 })
+    expect(belowStopLine(9.3, noFloor, P)).toBe(false)
+    expect(belowStopLine(9.2, noFloor, P)).toBe(true)
+  })
+
+  it('belowStopLine：stopFloor 为 0 / 负数当成「没画过」，不是「跌到 0 才止损」', () => {
+    // 0 若被当成线，`price <= 0` 恒假 —— 等于静默关掉整条规则（约束 4 的形状）
+    for (const bad of [0, -1]) {
+      expect(belowStopLine(9.2, position({ cost: 10, stopFloor: bad }), P)).toBe(true)
+    }
   })
 
   it('移动止损：**当前**仍盈利 ≥ 5%，但自最高点回撤 3%', () => {

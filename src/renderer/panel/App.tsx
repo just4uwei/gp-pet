@@ -285,6 +285,7 @@ function WatchRow({
   onRemove,
   onMove,
   onOpen,
+  onEditStop,
 }: {
   item: WatchItem
   quote: QuoteTick | undefined
@@ -311,6 +312,11 @@ function WatchRow({
   onMove: (code: SecCode, delta: number) => void
   /** 打开详情抽屉。`tab` 决定落在哪一页 */
   onOpen: (code: SecCode, tab: StockTab) => void
+  /**
+   * 打开「重画止损线」。**与 `onOpen(code, 'POSITION')` 不是一回事** ——
+   * 后者落在成交录入那一屏，而止损那一段在没有报价时根本不渲染。
+   */
+  onEditStop: (code: SecCode) => void
 }): React.JSX.Element {
   // 没有报价 ≠ 报价为 0。这一栏在拿到第一轮快照前显示 '—'，不显示数字
   const stale = quote?.stale === true
@@ -403,6 +409,38 @@ function WatchRow({
           {floatingPct === null ? null : (
             <span className={changeTone(floatingPct)}>{signed(floatingPct)}</span>
           )}
+          {/*
+            止损线的入口与状态（2026-08-15）。**摆在浮亏这个数旁边**，
+            因为用户想起「这条线该挪一挪」的那一刻，看的正是这个数。
+
+            以前它只在抽屉 → 持仓页里，于是「跌破 8% 之后每天都提醒同一件事」
+            这个已经解决了的问题，在用户那里仍然是个没解决的问题 —— 他找不到开关。
+
+            **两个态都点进同一个表单，这里不做任何修改动作。** 一键重置会把
+            009 那个刻意的确认流程（填一个价 + 把代价原话写出来）退化成
+            「让它别响」，而这个按钮关掉的是一条 L3 强制提醒。
+          */}
+          {position.stopAck ? (
+            // 已确认过的**一直显示**：这是用户主动关掉了一个安全提醒的凭据，
+            // 藏起来的话他日后只会觉得「跌了这么多怎么没提醒我」（PositionView.stopAck）
+            <button
+              className="text-amber-200/70 underline decoration-dotted underline-offset-2 hover:text-amber-100"
+              title={`你已接受 ${position.stopAck.ackLossPct.toFixed(1)}% 的亏损，跌破 ${position.stopAck.stopFloor} 才会再提醒。点开可改或撤销`}
+              onClick={() => onEditStop(item.code)}
+            >
+              止损 {position.stopAck.stopFloor}
+            </button>
+          ) : position.stopBreached ? (
+            // 还没跌破的票不给这个入口：那时提「要不要改止损线」只是噪音。
+            // 判据由主进程算（`stopBreached`），渲染层不许自己拿 0.08 去比
+            <button
+              className="text-amber-200/70 underline decoration-dotted underline-offset-2 hover:text-amber-100"
+              title="已触及止损线。可以确认接受这一段亏损并把线往下挪：挪之后跌到新线之前不再因为亏损提醒你（移动止损、回撤减仓、盈利保护照旧）"
+              onClick={() => onEditStop(item.code)}
+            >
+              重画止损线
+            </button>
+          ) : null}
         </div>
       ) : null}
     </li>
@@ -470,6 +508,8 @@ export function App(): React.JSX.Element {
     code: SecCode
     tab: StockTab
     aiSignalId?: string
+    /** 从自选行的「止损线」入口进来的：持仓页要直接把那个表单展开（见 TradePanel.stopIntent） */
+    stopIntent?: boolean
   } | null>(null)
   const [ledger, setLedger] = useState<TradeLedger | null>(null)
   const [tradeBusy, setTradeBusy] = useState(false)
@@ -572,6 +612,23 @@ export function App(): React.JSX.Element {
     (code: SecCode, drawerTab: StockTab, aiSignalId?: string): void => {
       setDrawer({ code, tab: drawerTab, ...(aiSignalId === undefined ? {} : { aiSignalId }) })
       // 账本每次打开都重拉：它可能在别处被改过（导入配置、另一只票的重放）
+      setLedger(null)
+      loadLedger(code)
+    },
+    [loadLedger]
+  )
+
+  /**
+   * 从自选行的「止损线」入口打开抽屉。
+   *
+   * 与 `openDrawer(code, 'POSITION')` 的差别是那个 `stopIntent` ——
+   * 少了它，用户点「止损线」落地看到的是**成交录入表单**，
+   * 而止损那一段可能根本没渲染（它要求「有报价且正在亏损」，休市时没有报价）。
+   * 那正是用户报的「让我录入成交，我很疑惑」。
+   */
+  const openStopEditor = useCallback(
+    (code: SecCode): void => {
+      setDrawer({ code, tab: 'POSITION', stopIntent: true })
       setLedger(null)
       loadLedger(code)
     },
@@ -1012,6 +1069,7 @@ export function App(): React.JSX.Element {
                   onRemove={remove}
                   onMove={(code, delta) => move(code, delta, visibleWatch)}
                   onOpen={openDrawer}
+                  onEditStop={openStopEditor}
                 />
               ))}
             </ul>
@@ -1067,6 +1125,7 @@ export function App(): React.JSX.Element {
           onRemoveTrade={removeTrade}
           tradeBusy={tradeBusy}
           {...(drawer.aiSignalId === undefined ? {} : { aiSignalId: drawer.aiSignalId })}
+          {...(drawer.stopIntent === true ? { stopIntent: true } : {})}
           onWatchCreated={refreshWatch}
           onStopChanged={(next) => {
             // 账本里那份持仓视图要跟着换，否则确认完界面上还是旧的那行。

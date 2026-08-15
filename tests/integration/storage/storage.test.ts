@@ -243,6 +243,42 @@ describe('PositionRepo', () => {
     })
   })
 
+  /*
+    **重画止损线不碰任何交易数据。**
+
+    它改的只是「什么价位再提醒我」，不是「我这笔买入是多少钱」。
+    成本、股数、建仓时刻、峰值价、`trade_log` 全部原样 —— 一列都不许动：
+    成本一旦被改，`realized`（已实现盈亏）、影子运行的对照、
+    以及用户自己对账用的那张成交表就全错了，而错法是静默的。
+
+    判据用逐字段比较而不是「跑完没报错」：`acceptLoss` 是一条 UPDATE，
+    日后有人往 SET 里多加一列（比如「顺手把 peak_price 重置一下」）时，
+    这一条会红。
+  */
+  it('acceptLoss 只改止损线，成本 / 股数 / 建仓时刻 / 峰值价一律不动', () => {
+    storage.positions.set('SH600000', 1000, 11, 1)
+    const before = storage.positions.get('SH600000')
+
+    storage.positions.acceptLoss('SH600000', 9.2, -9.1, 555)
+    const after = storage.positions.get('SH600000')
+
+    expect(after?.shares).toBe(before?.shares)
+    expect(after?.cost).toBe(before?.cost)
+    expect(after?.openedAt).toBe(before?.openedAt)
+    expect(after?.peakPrice).toBe(before?.peakPrice)
+    // 变的只有这一样
+    expect(after?.stopFloor).toBeCloseTo(9.2, 6)
+  })
+
+  it('acceptLoss 不写 trade_log —— 它不是一笔成交', () => {
+    storage.positions.set('SH600000', 1000, 11, 1)
+    const before = storage.trades.listByCode('SH600000').length
+
+    storage.positions.acceptLoss('SH600000', 9.2, -9.1, 555)
+
+    expect(storage.trades.listByCode('SH600000')).toHaveLength(before)
+  })
+
   it('没有这行持仓时 acceptLoss 什么都不做 —— 不给不存在的持仓建止损线', () => {
     expect(storage.positions.acceptLoss('SH600000', 9.2, -9, 1)).toBe(false)
     expect(storage.positions.stopAck('SH600000')).toBeNull()

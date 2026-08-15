@@ -97,7 +97,17 @@ export function StopFloorForm({
         「不会再提醒」这五个字，否则他日后会觉得是软件漏报了
       */}
       <p className="mt-2 leading-relaxed text-white/50">
-        {valid ? (
+        {/*
+          还没输入时不报错。拿不到现价（休市、取数失败）就给不出建议值，输入框是空的，
+          这时先弹一句红色的「要填一个正数」会让刚打开表单的人以为自己已经做错了什么
+          —— 而他一个字都还没打。空态说明这一栏是干什么的就够了。
+        */}
+        {value.trim() === '' ? (
+          <span className="text-white/40">
+            填一个价：跌破它才会再因为亏损提醒你。
+            {price === undefined ? '（当前拿不到现价，所以没有建议值）' : ''}
+          </span>
+        ) : valid ? (
           <>
             跌到 <span className="font-mono text-amber-100/80">{floor}</span> 之前，
             <span className="text-amber-100/80">不会再因为亏损提醒你</span>

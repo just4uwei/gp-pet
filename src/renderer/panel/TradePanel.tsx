@@ -74,10 +74,23 @@ export function TradePanel({
   onStopChanged,
   onError,
   busy,
+  stopIntent = false,
 }: {
   code: SecCode
   quote: QuoteTick | undefined
   ledger: TradeLedger | null
+  /**
+   * 用户是从「止损线」那个入口点进来的（自选行上那个），不是来记账的。
+   *
+   * 两件事都要做，缺一个都会变成「点了止损线，跳到一个让我录成交的表单」：
+   *   ① **强制渲染止损那一段** —— 下面那个 `floatingPct < 0` 的条件需要报价，
+   *      而休市或取数失败时没有报价，整块会消失；
+   *   ② **直接把表单展开**，不要求再点一次「我接受这段亏损」。
+   *
+   * 反过来，**没有这个意图时那条规则一个字不改**：赚着的时候不主动提这件事，
+   * 免得看起来像软件在劝他别卖（见下面那段注释）。
+   */
+  stopIntent?: boolean
   onSubmit: (draft: { side: 'BUY' | 'SELL'; price: number; shares: number; tradedAt: number; note?: string }) => void
   onRemove: (id: string) => void
   /** 止损确认/撤销之后把新的持仓视图交回上层（账本里那份要跟着换） */
@@ -90,7 +103,8 @@ export function TradePanel({
   const [shares, setShares] = useState('')
   const [tradedAt, setTradedAt] = useState(() => dateValue(Date.now()))
   const [note, setNote] = useState('')
-  const [stopFormOpen, setStopFormOpen] = useState(false)
+  // 带着「要改止损线」的意图进来时直接展开表单（见 stopIntent 的注释）
+  const [stopFormOpen, setStopFormOpen] = useState(stopIntent)
 
   const position = ledger?.position ?? null
 
@@ -171,8 +185,14 @@ export function TradePanel({
           止损确认（009_position_stop.sql）。**入口摆在持仓卡里**，因为这里同时能看到
           成本、现价与浮亏 —— 那三个数是做这个决定的全部依据。
 
-          已确认时显示当前那条线 + 撤销；没确认且**正在亏**时才给入口 ——
-          赚着的时候提这件事没有意义，只会让人误以为软件在劝他别卖。
+          已确认时显示当前那条线 + 撤销；没确认时**只在已经触及止损线时**才给入口
+          （2026-08-15 收紧，原先是「正在亏就给」）—— 还没跌破就提这件事只是噪音，
+          赚着的时候更会让人误以为软件在劝他别卖。
+
+          **判据用 `position.stopBreached`（主进程算的），不在这里拿浮亏比 8%。**
+          `risk.stopLossPct` 在 `src/core/params.ts`，而 `renderer → core` 是禁止的；
+          在这里抄一个 0.08 出来，两个口径分叉之后症状是
+          「界面说该改止损线了，引擎却还没打算提醒」。
         */}
         {position?.stopAck ? (
           <StopFloorNotice
@@ -181,7 +201,7 @@ export function TradePanel({
             onDone={onStopChanged}
             onError={onError}
           />
-        ) : position && floatingPct !== null && floatingPct < 0 ? (
+        ) : position && (stopIntent || position.stopBreached === true) ? (
           stopFormOpen ? (
             <StopFloorForm
               code={code}

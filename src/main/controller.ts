@@ -54,6 +54,7 @@ import type {
 import type { Candle, Position, SecCode, Snapshot, TradeDate } from '@core/types'
 import { DEFAULT_PARAMS, engineVersionOf, withSensitivity } from '@core/params'
 import { sma } from '@core/indicators/series'
+import { belowStopLine } from '@core/risk'
 import {
   AI_CONFIG_FILE,
   AI_REPORT_PROMPT,
@@ -356,7 +357,43 @@ export class AppController {
       openedAt: held.openedAt,
       // exactOptionalPropertyTypes：没确认过就不要这个键
       ...(ack === null ? {} : { stopAck: ack }),
+      ...(this.stopBreached(code, held) ? { stopBreached: true } : {}),
     }
+  }
+
+  /**
+   * 现价有没有触及固定止损线。**判据不在这里写**，调 `src/core/risk` 导出的
+   * `belowStopLine()` —— 那是「① 固定止损」那条规则的唯一定义，
+   * `positionVerdict()`（决定发不发提醒）用的是同一个函数。
+   *
+   * 为什么算在主进程而不是渲染层：`risk.stopLossPct` 在 `src/core/params.ts`，
+   * 而 `renderer → core` 是禁止的（依赖方向）。渲染层照抄一个 0.08 出来的症状是
+   * 「界面说该改止损线了，而引擎还没打算提醒」，与 `trade:preview` 那条纪律同一形状。
+   *
+   * 拿不到报价（休市、取数失败）时返回 **false**：不知道就不说「已跌破」，
+   * 而不是拿一个未知去点亮一个入口。
+   *
+   * 用 `DEFAULT_PARAMS` 而不是当前引擎那套是对的：`withSensitivity()` 只改
+   * `combine.scoreThreshold` 与 `combine.voteThreshold`，**不碰 `risk`**，
+   * 所以三档灵敏度下的止损幅是同一个数。
+   */
+  private stopBreached(code: SecCode, held: Position): boolean {
+    /*
+      现价拿不到（休市、盘前、取数失败）时退到**最后一根收盘价**。
+
+      少了这条退路，周末与盘前打开面板时每一行都判「没跌破」，于是入口整个消失 ——
+      而用户想安安静静重画止损线的时刻，恰恰多半是收盘之后。
+
+      ⚠ 用 `close` 不是 `closeAdj`：成本是不复权的真实成交价（docs/03 §2.3），
+      拿后复权价去比会在除权后凭空判出「已跌破」。
+    */
+    const snapshot = this.data?.market.snapshotOf(code)?.last
+    const price =
+      snapshot !== undefined && Number.isFinite(snapshot) && snapshot > 0
+        ? snapshot
+        : this.data?.storage.klines.recent(code, 1).at(-1)?.close
+    if (price === undefined || !Number.isFinite(price) || price <= 0) return false
+    return belowStopLine(price, held, DEFAULT_PARAMS)
   }
 
   /**
@@ -771,7 +808,19 @@ export class AppController {
       trades: [...rows].reverse().map(toTradeLogView),
       realizedTotal: layer.storage.trades.sumRealized(code),
       feeTotal: layer.storage.trades.sumFees(code),
-      position: layer.storage.positions.get(code) ?? null,
+      /*
+        ⚠ 必须走 `toPositionView()`，不能直接把仓储那行 `Position` 丢出去（2026-08-15 修）。
+
+        两者**结构兼容**（code/shares/cost/peakPrice/openedAt 都有），所以 TS 一声不响 ——
+        但 `Position` 带的是 `stopFloor`，而 `PositionView` 要的是 `stopAck` 与 `stopBreached`，
+        两个都是这一层**算出来**的。少了它们的症状是：抽屉里那只已经确认过止损线的票
+        看不到「你已接受 −N%」那条凭据，而自选列表里看得到（那条路走的是 `positions()`）
+        —— 同一个事实两处不一致，且没有任何报错。
+      */
+      position: (() => {
+        const held = layer.storage.positions.get(code)
+        return held ? this.toPositionView(code, held) : null
+      })(),
     }
   }
 
