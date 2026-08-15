@@ -57,9 +57,11 @@ import {
   type QuoteProvider,
 } from './providers'
 import {
+  createClockSync,
   createScheduler,
   createTradingCalendar,
   loadHolidayTable,
+  type ClockReport,
   type Scheduler,
   type TickContext,
   type TradingCalendar,
@@ -72,6 +74,9 @@ import { pruneIfDue } from './storage/retention'
 
 /** 健康度统计窗口。出口条件「成功率 > 99%」按当日统计，取 24h（docs/08 M1） */
 const HEALTH_WINDOW_MS = 24 * 60 * 60_000
+
+/** 主动校时探测的节流。唤醒事件可能连着来好几个，不能一个事件一次请求 */
+const CLOCK_PROBE_THROTTLE_MS = 5 * 60_000
 
 export interface DataLayerOptions {
   /** %APPDATA%/gp-pet 或其覆盖值（AppSettings.dataDir） */
@@ -108,7 +113,16 @@ export interface DataLayer {
   status(): Pick<EngineStatus, 'session' | 'lastTickAt' | 'watchCount' | 'offline'> & {
     calendarUncertain: boolean
     stale: boolean
+    clock: ClockReport
   }
+  /**
+   * 主动取一次校时样本（`scheduler/clock-sync.ts`）。
+   *
+   * 休市时不发请求 ⇒ 没有样本，所以启动与休眠唤醒后各要主动探一次。
+   * 走的是**已有**的 registry 路径、只拉基准指数一只：顺带记一次健康、暖一次缓存，
+   * 不新增第三方端点。自带 5 分钟节流，唤醒风暴不会变成请求风暴。
+   */
+  syncClock(): Promise<void>
   health(): ProviderHealth[]
   quoteTicks(): QuoteTick[]
   /**
@@ -135,11 +149,29 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     userDataDir,
     resourcesRoot,
     log = { info: () => {}, warn: () => {} },
-    now = () => Date.now(),
+    now: localNow = () => Date.now(),
     onQuotes,
     onSignals,
     onTickError,
   } = options
+
+  /*
+    两个钟，别混（`scheduler/clock-sync.ts` 头注释「哪些钟不归它管」那一节）：
+
+      localNow   本机系统钟。量「过了多久」的用它 —— HTTP 的 latencyMs、
+                 provider 健康统计、分时那 30s 缓存 TTL。
+                 校准量一挪，正在计时的请求就会算出个偏了的延迟，
+                 而延迟直接进健康统计，那是判断数据源好不好的唯一依据。
+
+      now        校准钟。答「现在几点」的用它 —— 调度器、取数编排、自选资料时间戳。
+                 **调度器是关键的那一个**：它的 now 产出 ctx.at，
+                 而 ctx.at 一路流到时段判定、signal/alert_log 的 created_at、
+                 AlertDispatcher 的冷却与跨日、以及风控的 atMs（STALE_SNAPSHOT
+                 拿它减远端成交时刻 —— 本机快几分钟就会静默压掉所有买入信号）。
+  */
+  const clock = createClockSync({ localNow, log: (m) => log.info(m) })
+  const now = (): number => clock.now()
+  let lastClockProbeAt = Number.NEGATIVE_INFINITY
 
   // ── 设置与数据库 ────────────────────────────────────────────────
   const settingsStore = new SettingsStore(join(userDataDir, 'settings.json'), (m) => log.info(m))
@@ -161,20 +193,23 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
       limiter: perProviderLimited(globalLimiter, DEFAULT_REGISTRY_OPTIONS.perProviderConcurrency),
       timeoutMs: DEFAULT_REGISTRY_OPTIONS.timeoutMs,
       retries: DEFAULT_REGISTRY_OPTIONS.retries,
-      now,
+      now: localNow,
+      // 校时的样本来源：盘中每 30s 一次的快照请求顺带带回来，零额外请求
+      onTiming: (timing) => clock.observe(timing),
     })
-    providers[id] = createProvider(id, { http, now })
+    providers[id] = createProvider(id, { http, now: localNow })
   }
 
   const registry = createProviderRegistry({
     providers,
     health: storage.health,
     options: { priority: [...settings.providerPriority] },
-    now,
+    now: localNow,
   })
 
   // ── 分时缓存（engine/intraday.ts，它是这条取数路径自己的请求闸门）───────
-  const minuteCache = createMinuteCache((code) => registry.fetchMinutes(code).then((r) => r.value), now)
+  // TTL 是「过了多久」，用本地钟
+  const minuteCache = createMinuteCache((code) => registry.fetchMinutes(code).then((r) => r.value), localNow)
 
   // ── 交易日历 ───────────────────────────────────────────────────
   const holidays = loadHolidayTable(resourcesRoot)
@@ -357,6 +392,21 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
       return scheduler.tick()
     },
 
+    async syncClock() {
+      // 节流用**本地**钟：它问的是「上次探是多久以前」，是一段时长
+      const at = localNow()
+      if (at - lastClockProbeAt < CLOCK_PROBE_THROTTLE_MS) return
+      lastClockProbeAt = at
+      try {
+        // 样本从 http 层的 onTiming 自己流进 clock，这里不需要读返回值 ——
+        // 要的只是「发生过一次成功的请求」
+        await registry.fetchSnapshots([BENCHMARK_CODE])
+      } catch (error) {
+        // 探不到就探不到：校准是附带品，报 warn 不报错（拿不到样本时 report() 会如实说 NONE）
+        log.warn(`[clock] 校时探测失败：${String(error)}`)
+      }
+    },
+
     applySettings(next) {
       const previous = settings
       settings = next
@@ -390,6 +440,7 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
           (lastSnapshots === null || lastSnapshots.stale || lastSnapshots.lastOkAt === null),
         calendarUncertain: peeked.verdict.uncertain,
         stale: lastSnapshots?.stale ?? false,
+        clock: clock.report(),
       }
     },
 

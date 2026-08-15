@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { chainLimiters, createLimiter } from '@main/net/limiter'
-import { createHttpClient, HttpError, USER_AGENT, type Transport } from '@main/net/http'
+import { createHttpClient, HttpError, parseHttpDate, USER_AGENT, type Transport } from '@main/net/http'
 
 const utf8 = (text: string): Uint8Array => new TextEncoder().encode(text)
 
@@ -96,6 +96,55 @@ describe('createHttpClient', () => {
     expect((await http.get('u')).latencyMs).toBe(25)
   })
 
+  it('带 Date 头时回调计时，供时钟校准取样', async () => {
+    const seen: unknown[] = []
+    const http = client(async () => ({ status: 200, bytes: utf8('ok'), serverDateMs: 777_000 }), {
+      onTiming: (t) => seen.push(t),
+    })
+
+    const response = await http.get('u')
+
+    expect(response.serverDateMs).toBe(777_000)
+    // now 每调一次 +25：sentAt=1025、receivedAt=1050
+    expect(seen).toEqual([{ sentAt: 1025, receivedAt: 1050, serverDateMs: 777_000 }])
+  })
+
+  it('没有 Date 头就不回调 —— 「没有样本」不能退化成「样本是 0」', async () => {
+    let calls = 0
+    const http = client(async () => ({ status: 200, bytes: utf8('ok') }), {
+      onTiming: () => {
+        calls++
+      },
+    })
+
+    const response = await http.get('u')
+
+    expect(calls).toBe(0)
+    expect(response.serverDateMs).toBeUndefined()
+  })
+
+  it('onTiming 抛错不能把一次成功的取数变成失败', async () => {
+    const http = client(async () => ({ status: 200, bytes: utf8('ok'), serverDateMs: 1 }), {
+      onTiming: () => {
+        throw new Error('校时炸了')
+      },
+    })
+
+    await expect(http.get('u')).resolves.toMatchObject({ body: 'ok' })
+  })
+
+  it('非 2xx 不取样：被挡下来的中间页上那个 Date 不是数据源的钟', async () => {
+    let calls = 0
+    const http = client(async () => ({ status: 403, bytes: utf8(''), serverDateMs: 1 }), {
+      onTiming: () => {
+        calls++
+      },
+    })
+
+    await expect(http.get('u', { retries: 0 })).rejects.toThrow()
+    expect(calls).toBe(0)
+  })
+
   it('5xx 重试一次后成功', async () => {
     let calls = 0
     const http = client(async () => {
@@ -170,5 +219,27 @@ describe('createHttpClient', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('parseHttpDate', () => {
+  it('解析标准 HTTP 日期', () => {
+    expect(parseHttpDate('Sat, 15 Aug 2026 07:31:20 GMT')).toBe(Date.UTC(2026, 7, 15, 7, 31, 20))
+  })
+
+  it('同名头出现多次时取第一条', () => {
+    expect(parseHttpDate(['Sat, 15 Aug 2026 07:31:20 GMT', 'bogus'])).toBe(
+      Date.UTC(2026, 7, 15, 7, 31, 20)
+    )
+  })
+
+  /*
+    这一条是「绝不用 0 兜底」那条纪律在这里的形状：解析失败返回 0 的话，
+    校准量会变成「服务器停在 1970 年」≈ −56 年，而应用会一声不响地照着它算时段。
+  */
+  it('解析不出返回 null，不返回 0', () => {
+    expect(parseHttpDate(undefined)).toBeNull()
+    expect(parseHttpDate('')).toBeNull()
+    expect(parseHttpDate('不是日期')).toBeNull()
   })
 })

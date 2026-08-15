@@ -26,6 +26,7 @@
  */
 
 import type { AlertLevel, GatedDirection, SecCode } from '@core/types'
+import { shanghaiDayStartMs } from '../../shared/time'
 
 /**
  * 分发渠道，与 `alert_log.channel` 的取值一致。
@@ -136,10 +137,14 @@ const DEFAULT_COOLDOWN: Record<AlertLevel, number> = {
   L3: Number.POSITIVE_INFINITY,
 }
 
-function localStartOfDay(ts: number): number {
-  const at = new Date(ts)
-  return new Date(at.getFullYear(), at.getMonth(), at.getDate()).getTime()
-}
+/*
+  日界走**北京时间**，不是宿主本地时区（2026-08-15 改）。
+
+  原先是 `new Date(y, m, d)`，在 UTC+8 上恰好对、在 UTC+7 上无害（日界落到北京 01:00），
+  但在西半球会落进交易时段中间：UTC−5 的本机 00:00 是北京 13:00，
+  于是「每日 L2+L3 ≤ 4」「当日 L3 一次」会在午盘开盘那一刻重置。
+  **少发的错误用户发现不了，多发的更发现不了** —— 两边日志都显示自己守规矩。
+*/
 
 /**
  * 分发器。**有状态**（防抖计数、冷却时间、各级计数器），所以整个应用只应有一个实例。
@@ -175,7 +180,7 @@ export class AlertDispatcher {
     this.hourlyLimit = options.hourlyLimit ?? 6
     this.dailyL3Limit = options.dailyL3Limit ?? 10
     this.forcedStepPct = options.forcedStepPct ?? 0.02
-    this.startOfDay = options.startOfDay ?? localStartOfDay
+    this.startOfDay = options.startOfDay ?? shanghaiDayStartMs
   }
 
   /**

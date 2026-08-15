@@ -21,6 +21,13 @@ export type Encoding = 'utf-8' | 'gbk'
 export interface TransportResult {
   status: number
   bytes: Uint8Array
+  /**
+   * 响应 `Date` 头解析出的服务器时刻（epoch ms）。拿不到时省略。
+   *
+   * **可选是刻意的**：测试里的假 Transport 有十几个，加成必填会把它们全部推翻，
+   * 而它们关心的从来不是校时。没有这个字段的传输层就是「不提供校时样本」。
+   */
+  serverDateMs?: number
 }
 
 export type Transport = (
@@ -39,6 +46,20 @@ export interface HttpResponse {
   status: number
   body: string
   latencyMs: number
+  /** 服务器时刻（epoch ms）。响应没带 `Date` 头时省略 */
+  serverDateMs?: number
+}
+
+/**
+ * 一次成功请求的计时，供时钟校准取样（`scheduler/clock-sync.ts`）。
+ *
+ * `sentAt` / `receivedAt` 用的是**本地**钟 —— 校准量正是拿它们与服务器时刻比出来的，
+ * 喂校准钟进去会变成自己校自己。
+ */
+export interface HttpTiming {
+  sentAt: number
+  receivedAt: number
+  serverDateMs: number
 }
 
 export interface HttpClient {
@@ -51,9 +72,17 @@ export interface HttpClientOptions {
   timeoutMs?: number
   retries?: number
   backoffMs?: number
-  /** 由调用方注入，便于测试；生产传 Date.now */
+  /**
+   * 由调用方注入，便于测试；生产传 Date.now。
+   *
+   * ⚠ **这里必须是本地钟，不能传校准钟。** 它只用来量 `latencyMs`：校准量一挪，
+   * 正在计时的那次请求就会算出个偏了的（甚至负的）延迟，而延迟直接进 provider
+   * 健康统计 —— 那是判断数据源好不好的唯一依据。
+   */
   now?: () => number
   sleep?: (ms: number) => Promise<void>
+  /** 每次**成功且带 `Date` 头**的请求回调一次。抛错会被吞掉，校时不该拖垮取数 */
+  onTiming?: (timing: HttpTiming) => void
 }
 
 export class HttpError extends Error {
@@ -92,6 +121,7 @@ export function createHttpClient(options: HttpClientOptions): HttpClient {
     backoffMs = 300,
     now = () => Date.now(),
     sleep = defaultSleep,
+    onTiming,
   } = options
 
   async function once(url: string, opts: GetOptions, timeoutMs: number): Promise<HttpResponse> {
@@ -111,10 +141,20 @@ export function createHttpClient(options: HttpClientOptions): HttpClient {
       if (result.status < 200 || result.status >= 300) {
         throw new HttpError(`HTTP ${result.status}`, result.status, 'status')
       }
+      const receivedAt = now()
+      // 只有 2xx 才取样：4xx/5xx 常常是被挡下来的中间页，那上面的 Date 未必是数据源的钟
+      if (result.serverDateMs !== undefined && onTiming) {
+        try {
+          onTiming({ sentAt: startedAt, receivedAt, serverDateMs: result.serverDateMs })
+        } catch {
+          // 校时是附带品，它出错不该让一次成功的取数变成失败
+        }
+      }
       return {
         status: result.status,
         body: decode(result.bytes, opts.encoding ?? 'utf-8'),
-        latencyMs: now() - startedAt,
+        latencyMs: receivedAt - startedAt,
+        ...(result.serverDateMs === undefined ? {} : { serverDateMs: result.serverDateMs }),
       }
     } catch (error) {
       if (timedOut) throw new HttpError(`请求超时（${timeoutMs}ms）`, undefined, 'timeout')
@@ -172,8 +212,26 @@ export async function createUndiciTransport(): Promise<Transport> {
       // 上层会把它当成 status 错误并降级 —— 这正是想要的行为
     })
     const buffer = await response.body.arrayBuffer()
-    return { status: response.statusCode, bytes: new Uint8Array(buffer) }
+    const serverDateMs = parseHttpDate(response.headers['date'])
+    return {
+      status: response.statusCode,
+      bytes: new Uint8Array(buffer),
+      ...(serverDateMs === null ? {} : { serverDateMs }),
+    }
   }
+}
+
+/**
+ * `Date` 响应头 → epoch ms。解析不出返回 null（**不返回 0** —— 那会被当成 1970 年
+ * 的服务器时刻，把校准量拉成 −56 年）。
+ *
+ * undici 的 headers 值可能是数组（同名头出现多次），取第一条。
+ */
+export function parseHttpDate(raw: string | string[] | undefined): number | null {
+  const value = Array.isArray(raw) ? raw[0] : raw
+  if (value === undefined || value === '') return null
+  const ms = Date.parse(value)
+  return Number.isFinite(ms) ? ms : null
 }
 
 export { createLimiter, chainLimiters }

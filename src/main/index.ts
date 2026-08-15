@@ -88,6 +88,8 @@ function bootstrap(): void {
         // （用户可能在「任务管理器 → 启动」里手动改过，见 auto-launch.ts）
         syncAutoLaunch(layer.settings.get().autoLaunch, electronAutoLaunchDeps(log))
         log.info(`[app] 数据层、引擎与提醒分发就绪（${layer.signals.engineVersion}）。`)
+        // 校时探一次。休市时段一个请求都不发 ⇒ 没有样本，而「现在几点」在第一跳就要用
+        void layer.syncClock()
       })
       .catch((error: unknown) => {
         // 数据层起不来是「行情离线」，不是崩溃 —— engineStatus 会如实报 offline
@@ -98,6 +100,8 @@ function bootstrap(): void {
     powerMonitor.on('resume', () => {
       log.info('[power] resume')
       controller?.revalidateOverlayPosition()
+      // 唤醒是本地钟最容易偏的时刻（长待机、虚拟机挂起）。探测自带 5 分钟节流
+      void controller?.syncClock()
     })
 
     // 这一行只说「窗口与托盘已起来」。数据层是异步装配的，它自己会再打一行 ——

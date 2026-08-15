@@ -38,6 +38,7 @@ import type {
 import { groupSignals } from '@shared/signal-group'
 import { watchMarkOf } from '@shared/watch-mark'
 import { T_HINT_LABEL, T_HINT_TITLE } from '@shared/intraday-t'
+import { shanghaiDayStartMs } from '@shared/time'
 import type { SecCode } from '@core/types'
 import { AlertLog } from './AlertLog'
 import { BrandMark } from './BrandMark'
@@ -95,6 +96,12 @@ const HEALTH_TONE: Record<ProviderHealth['status'], string> = {
   DEGRADED: 'text-amber-300',
   DOWN: 'text-rose-300',
 }
+
+/**
+ * 时钟偏差提示的门槛。取 60s：应用对时间的敏感度是分钟级（时段边界、尾盘窗口），
+ * 秒级偏差已经被校正掉且不影响任何判定，为它常亮一条横幅只会训练用户无视横幅。
+ */
+const CLOCK_WARN_MS = 60_000
 
 /**
  * Electron 会把主进程抛出的 Error 包成 "Error invoking remote method 'x': Error: 真正的原因"。
@@ -391,7 +398,7 @@ export function App(): React.JSX.Element {
     而面板是常驻挂载的（下面只切 display），真的会跨午夜。
     refreshKey 每轮引擎跑完都递增，届时自然重新对齐。
   */
-  const [dayStart] = useState(() => new Date(new Date().setHours(0, 0, 0, 0)).getTime())
+  const [dayStart] = useState(() => shanghaiDayStartMs(Date.now()))
 
   /** ACTIVE 观察点数，显示在标签上 —— 「软件在盯什么」要一眼看见 */
   const [watchActive, setWatchActive] = useState(0)
@@ -664,6 +671,14 @@ export function App(): React.JSX.Element {
     [reload, refreshStatus]
   )
 
+  /*
+    本机时钟偏差。只在**分钟级**才提 —— 秒级偏差对时段判定没有影响，
+    而一条常亮的提示条会让用户学会无视所有横幅。
+    注意 `clockOffsetMs` 可能是 0（已校准且刚好对齐），所以判 undefined 而不是判真值。
+  */
+  const clockOffMs = status?.clockOffsetMs
+  const clockSkewed = clockOffMs !== undefined && Math.abs(clockOffMs) >= CLOCK_WARN_MS
+
   // 逐条显式比较而不是 `a ?? b ?? c`：这些字段是 `boolean | undefined`，
   // `false ?? x` 会停在 false 上，把后面几条横幅一起吞掉
   const hasBanner =
@@ -671,6 +686,7 @@ export function App(): React.JSX.Element {
     status?.offline === true ||
     status?.stale === true ||
     status?.calendarUncertain === true ||
+    clockSkewed ||
     transfer !== null
 
   // 还没读到设置：画一屏空白而不是先画引导。引导闪一下又消失比多等 20ms 难看得多
@@ -753,6 +769,12 @@ export function App(): React.JSX.Element {
           ) : null}
           {status?.calendarUncertain ? (
             <Banner tone="info">交易日历尚未核对，休市判断可能不准（节假日会照常轮询）。</Banner>
+          ) : null}
+          {clockSkewed ? (
+            <Banner tone="info">
+              本机时钟比行情服务器{(clockOffMs as number) > 0 ? '慢' : '快'}
+              {Math.round(Math.abs(clockOffMs as number) / 1000)} 秒，已按服务器校正；建议检查系统时间同步。
+            </Banner>
           ) : null}
           {transfer ? (
             <ConfigTransferNotice outcome={transfer} onDismiss={() => setTransfer(null)} />

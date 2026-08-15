@@ -20,6 +20,7 @@ import {
   type DispatcherOptions,
 } from '@main/alerts/dispatcher'
 import type { SecCode } from '@core/types'
+import { shanghaiDayStartMs } from '@shared/time'
 
 const MIN = 60_000
 const HOUR = 60 * MIN
@@ -304,5 +305,40 @@ describe('不制造信息黑洞（docs/05 §4 开头）', () => {
     const c = candidate({ code, topSubSignalId: 'S9' })
     d.dispatch([c], nextDay, calm)
     expect(d.dispatch([c], nextDay + MIN, calm)[0]?.level).toBe('L2')
+  })
+
+  /*
+    默认日界是**北京时间**，不是宿主本地时区（2026-08-15）。
+
+    上面那些用例都注入了 `utcStartOfDay`，所以它们测不到默认值 —— 而默认值正是
+    生产在用的那个。原先默认是 `new Date(y, m, d)`：在 UTC−5 上本机 00:00 是北京 13:00，
+    「每日 L2+L3 ≤ 4」会在午盘开盘那一刻重置，多发的配额没有任何人看得见。
+
+    判据是**跨北京日界的那一对时刻**：北京 23:59 仍受限、北京次日 00:01 已重置。
+    按本地日实现的话这一对在几乎任何时区都落在同一个本地日里（UTC+7 上是
+    本机 22:59 与 23:01，UTC+0 上是 15:59 与 16:01），于是第二条断言必红。
+  */
+  it('默认日界走北京时间，不受宿主时区影响', () => {
+    const d = new AlertDispatcher({ cooldownMs: { L1: 0, L2: 0, L3: 0 }, hourlyLimit: 999 })
+    const code = 'SH600000' as SecCode
+    // 北京时间某日 14:00
+    const dayStart = shanghaiDayStartMs(T0)
+    const base = dayStart + 14 * HOUR
+
+    for (let i = 0; i < 4; i++) {
+      const c = candidate({ code, topSubSignalId: `S${i}` })
+      d.dispatch([c], base + i * MIN, calm)
+      d.dispatch([c], base + i * MIN + 1000, calm)
+    }
+
+    const beforeMidnight = candidate({ code, topSubSignalId: 'S9' })
+    const lateAt = dayStart + 23 * HOUR + 59 * MIN
+    d.dispatch([beforeMidnight], lateAt, calm)
+    expect(d.dispatch([beforeMidnight], lateAt + 1000, calm)[0]?.level).toBe('L1')
+
+    const afterMidnight = candidate({ code, topSubSignalId: 'S10' })
+    const earlyAt = dayStart + 86_400_000 + MIN
+    d.dispatch([afterMidnight], earlyAt, calm)
+    expect(d.dispatch([afterMidnight], earlyAt + 1000, calm)[0]?.level).toBe('L2')
   })
 })

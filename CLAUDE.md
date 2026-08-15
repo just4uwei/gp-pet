@@ -14,7 +14,7 @@ Electron + React + TypeScript · 本地 SQLite · 免登录 · 无服务端 · *
 当前处于 **M4（打磨）代码就绪**：五层引擎、回测 CLI、标定工具、面板列表（M2）、
 提醒分发（M3：`tick → SignalEngine → AlertService → 四道闸门 → alert_log + 状态点 / 气泡`）之上，
 M4 补齐了**影子运行**（前向模拟绩效，schema v2）、**设置页全项**（含只读参数表）、
-**数据库周期备份**、**首启免责声明引导**与 **Playwright E2E**（8 条，真启 Electron）。
+**数据库周期备份**、**首启免责声明引导**与 **Playwright E2E**（9 条，真启 Electron）。
 **M3 的出口条件（自用一周）与 M4 的三项真机验收都未做** ——
 逐条见 [M3 验收](./docs/checklists/M3-提醒层验收.md) 与 [M4 验收](./docs/checklists/M4-打磨验收.md)。
 M4 剩下的是：125%/150% DPI 走查、**装一遍 / 卸一遍**、代码签名（无证书）——
@@ -191,7 +191,7 @@ M2 的「回测报告产出并据此确定出厂参数」还差大半 —— 但
 pnpm dev              # 启动开发环境（electron-vite）
 pnpm test             # 单元 + 集成测试（Vitest，不需要启动 Electron）
 pnpm test:cov         # 覆盖率；src/core 门槛 90%，其余 60%
-pnpm test:e2e         # Playwright E2E：先 build，再真启 Electron 跑 8 条（workers=1）
+pnpm test:e2e         # Playwright E2E：先 build，再真启 Electron 跑 9 条（workers=1）
 pnpm typecheck        # 三个 tsconfig（node / web / e2e）分别校验
 pnpm lint
 pnpm verify:indicators           # 重出指标黄金用例；加 -- --check 只校验不重写
@@ -490,6 +490,23 @@ src/backtest 回测 CLI，复用 src/core
 - **状态点只跟 `push:petState` 走，不许自己从信号里推断。** 闸门（docs/05 §4）是唯一的
   点亮路径，主进程的 `PetStateMachine` 是唯一的判定者。渲染层若自己去读 `signal:history`
   点亮 WATCHING/EXCITED/ALERT，就等于开了一条绕过冷却与免打扰的旁路。
+- **`now` 已经不是本机系统钟了（2026-08-15）。** 它是「本机钟 + 校准量」，校准量由
+  HTTP `Date` 响应头估计（`scheduler/clock-sync.ts`，搭盘中快照取样，零额外请求）。
+  三件事别踩：① **不要拿 `Snapshot.at` 去校时** —— 那是「最后成交时刻」不是「服务器当前时刻」，
+  停牌与冷门股会让它合法地落后，于是「远端比本地小」分不清是本地快了还是没人成交；
+  ② **首次直接采用、之后每轮最多挪 ±2s** —— 冷却窗口、每小时配额、跨日重置全部假设 `now`
+  单调，一次回拨会让刚发过的提醒重新变成「冷却已过」（首次安全是因为那时状态还是空的）；
+  ③ **`data-layer.ts` 里 `localNow` 与 `now` 是两个钟，别合并** —— 量「过了多久」的
+  （`latencyMs`、provider 健康统计、分时 30s 缓存）必须用本地钟，校准量一挪它们就会算出
+  偏了的延迟，而延迟是判断数据源好坏的唯一依据。
+  这条修掉的是一个静默失真：风控的 `age = atMs - snapshot.at` **左边本地钟、右边远端时刻**，
+  本机快 6 分钟就会把连续竞价里所有买入信号判成 `STALE_SNAPSHOT` 压掉。见 docs/03 §3.1。
+- **「今天」一律走 `shared/time.ts` 的 `shanghaiDayStartMs`，不要写 `setHours(0,0,0,0)`。**
+  提醒配额的日界、面板与悬浮条的「今天」原先用宿主本地日：UTC+8 上恰好对、UTC+7 上无害
+  （日界落到北京 01:00），但 UTC−5 上本机 00:00 是**北京 13:00** ——「每日 L2+L3 ≤ 4」
+  会在午盘开盘那一刻重置，而多发的配额没有任何人看得见。
+  `tests/unit/main/alerts.test.ts` 有一条钉着默认日界（其余用例注入了 `utcStartOfDay`，
+  测不到默认值 —— 这正是它单独存在的理由）。
 - **提醒相关的一切都不读时钟。** `AlertDispatcher` / `PetStateMachine` / `resolveQuiet`
   的 `now` 全部由调用方传入，与 `src/core` 同一条纪律 —— 「15:00 那一轮会不会重发」
   「跨午夜的静默时段算不算」必须能写成用例，而不是靠改系统时间试。

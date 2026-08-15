@@ -1566,6 +1566,8 @@ export class AppController {
     if (verdict.reason !== undefined) base.doNotDisturbReason = verdict.reason
     if (status?.calendarUncertain === true) base.calendarUncertain = true
     if (status?.stale === true) base.stale = true
+    // null = 一个校时样本都没取到，这时**不带这个字段** —— 带个 0 出去会被读成「已校准，偏差为零」
+    if (status?.clock.offsetMs != null) base.clockOffsetMs = status.clock.offsetMs
     return base
   }
 
@@ -1584,6 +1586,11 @@ export class AppController {
 
   revalidateOverlayPosition(): void {
     this.windows.overlayWindow?.revalidatePosition()
+  }
+
+  /** 主动取一次校时样本（休眠唤醒后）。数据层没起来时静默跳过 */
+  async syncClock(): Promise<void> {
+    await this.data?.syncClock()
   }
 
   quit(): void {

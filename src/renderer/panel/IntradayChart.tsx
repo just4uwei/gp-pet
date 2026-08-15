@@ -41,6 +41,7 @@
 import { useEffect, useState } from 'react'
 import type { GatedDirection, SecCode } from '@core/types'
 import type { IntradaySeries } from '@shared/ipc-types'
+import { SHANGHAI_OFFSET_MS } from '@shared/time'
 
 /** 相邻两点超过这个间隔就认为中间没有观测，断开折线 */
 const GAP_MS = 5 * 60_000
@@ -111,14 +112,16 @@ export interface IntradayMark {
   direction: GatedDirection
 }
 
-/**
+/*
  * 分时的时刻一律按**北京时间**读写：交易时段是交易所的，不是本机时区的。
  * 机器设成别的时区时，用 `getHours()` 会让 09:30 那根竖线跑到曲线中间去。
+ *
+ * 偏移量原先在这里自己定义了一份，2026-08-15 并进 `shared/time.ts` ——
+ * 提醒配额的日界也要用它，两份常量早晚会漂。
  */
-const CST_OFFSET_MS = 8 * 60 * 60_000
 
 function hhmm(ms: number): string {
-  const at = new Date(ms + CST_OFFSET_MS)
+  const at = new Date(ms + SHANGHAI_OFFSET_MS)
   return `${String(at.getUTCHours()).padStart(2, '0')}:${String(at.getUTCMinutes()).padStart(2, '0')}`
 }
 
@@ -126,7 +129,7 @@ function hhmm(ms: number): string {
 function dayStartOf(tradeDate: string): number | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(tradeDate)
   if (!m) return null
-  return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) - CST_OFFSET_MS
+  return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) - SHANGHAI_OFFSET_MS
 }
 
 function mdText(tradeDate: string): string {

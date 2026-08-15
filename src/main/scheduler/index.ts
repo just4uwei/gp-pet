@@ -185,6 +185,8 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
 }
 
 export { SHANGHAI_OFFSET_MIN, formatShanghaiTime, shanghaiEpochMs, shanghaiTime } from './clock'
+export { createClockSync } from './clock-sync'
+export type { ClockReport, ClockSample, ClockSync } from './clock-sync'
 export { createTradingCalendar, parseHolidayTable } from './calendar'
 export type {
   CalendarSource,

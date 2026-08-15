@@ -682,6 +682,12 @@ export interface EngineStatus {
   calendarUncertain?: boolean
   /** 最近一轮行情取自缓存 —— UI 显示灰态而非假装实时（docs/03 §2.2） */
   stale?: boolean
+  /**
+   * 时钟校准量（服务器 − 本地，ms）。正数 = 本机慢了。**已经作用在引擎上了**，
+   * 带出来是为了让用户知道本机时间不准 —— UI 文案必须说清「已校正」，
+   * 否则会被读成「软件在带病运行」。从未取到校时样本时省略。
+   */
+  clockOffsetMs?: number
 }
 
 /**

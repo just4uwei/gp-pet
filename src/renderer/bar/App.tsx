@@ -30,6 +30,7 @@ import { hitTest } from '@shared/hit-test'
 import { applyOrder, buildTicker, orderFingerprint, type TickerEntry } from '@shared/ticker'
 import { WATCH_MARK_LABEL } from '@shared/watch-mark'
 import { T_HINT_LABEL, T_HINT_TITLE } from '@shared/intraday-t'
+import { shanghaiDayStartMs } from '@shared/time'
 import type { GatedDirection, SecCode } from '@core/types'
 import type {
   EngineStatus,
@@ -93,10 +94,14 @@ interface DragState {
   travelled: number
 }
 
-/** 当天 00:00。信号按 created_at 存的是墙上时刻，按「今天」筛（与面板列表同一口径） */
+/**
+ * 当天 00:00。信号按 created_at 存的是墙上时刻，按「今天」筛（与面板列表同一口径）。
+ *
+ * 日界走**北京时间**而不是宿主本地时区：在西半球本机 00:00 会落进午盘，
+ * 列表会在交易时段中途清空一半（见 `shared/time.ts`）。
+ */
 function startOfToday(): number {
-  const now = new Date()
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  return shanghaiDayStartMs(Date.now())
 }
 
 /**
