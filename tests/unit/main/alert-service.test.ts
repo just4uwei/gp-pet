@@ -82,7 +82,7 @@ function fakeSink(): { sink: AlertSink; bubbles: AlertPayload[]; unread: number[
   return { sink, bubbles, unread }
 }
 
-function harness(settings: Partial<AppSettings> = {}) {
+function harness(settings: Partial<AppSettings> = {}, over: { alertable?: (code: SecCode) => boolean } = {}) {
   const { repo, rows } = fakeRepo()
   const sink = fakeSink()
   let counter = 0
@@ -95,6 +95,7 @@ function harness(settings: Partial<AppSettings> = {}) {
     // 分发器不防抖：这里测的是编排，防抖已经在 alerts.test.ts 里逐条测过
     dispatcher: new AlertDispatcher({ debounceTicks: 1, startOfDay: (ts) => Math.floor(ts / 86_400_000) * 86_400_000 }),
     newId: () => `alert-${++counter}`,
+    ...(over.alertable ? { alertable: over.alertable } : {}),
   })
   return {
     service,
@@ -269,5 +270,77 @@ describe('落库失败不能把提醒一起吃掉', () => {
     expect(summary.delivered).toBe(1)
     expect(sink.bubbles).toHaveLength(1)
     expect(warn).toHaveBeenCalled()
+  })
+})
+
+/*
+  观察名单（「行业ETF」分组）不进提醒链路（2026-08-15）。
+
+  这一组的每一条都在防同一类错误：**少发**。少发的提醒用户发现不了 ——
+  他不会知道自己漏了什么，而日志里也不会有那条记录。所以既要钉「ETF 不发」，
+  更要钉「个股照发」与「不留假的拦截记录」。
+*/
+describe('行业ETF 观察名单：不进提醒闸门', () => {
+  const ETF = 'SH512880' as SecCode
+  const STOCK = 'SH600000' as SecCode
+  /** 真实的判据是「分组是不是 行业ETF」，这里用代码段模拟：SH5128xx 一律当观察名单 */
+  const notEtf = (code: SecCode): boolean => !code.startsWith('SH5128')
+
+  it('ETF 的信号不弹气泡、不进 alert_log、不计未读', () => {
+    const h = harness({}, { alertable: notEtf })
+
+    const summary = h.service.handle([outcome({ evaluation: evaluation({ code: ETF }) })], {
+      at: T0,
+      debounce: false,
+    })
+
+    expect(summary.delivered).toBe(0)
+    expect(h.sink.bubbles).toHaveLength(0)
+    // ⚠ 一行都不该有。记一行「被挡」会谎报一个不存在的拦截 ——
+    // alert_log 答的是「被哪道闸门挡的」，而这条根本没进过闸门
+    expect(h.rows).toHaveLength(0)
+  })
+
+  it('同一轮里个股照常发 —— 摘掉的只是 ETF 那几条', () => {
+    const h = harness({}, { alertable: notEtf })
+
+    const summary = h.service.handle(
+      [
+        outcome({ evaluation: evaluation({ code: ETF }), signalId: 'sig-etf' }),
+        outcome({ evaluation: evaluation({ code: STOCK }), signalId: 'sig-stock' }),
+      ],
+      { at: T0, debounce: false }
+    )
+
+    expect(summary.delivered).toBe(1)
+    expect(h.rows).toHaveLength(1)
+    expect(h.rows[0]?.signalId).toBe('sig-stock')
+    expect(h.sink.bubbles.map((b) => b.code)).toEqual([STOCK])
+  })
+
+  it('ETF 不占全局配额：它被摘掉之后个股仍拿得到 L3', () => {
+    const h = harness({}, { alertable: notEtf })
+
+    // 先来一批 ETF 信号，再来个股那条。若 ETF 参与了分发，
+    // 全局每小时 L2+L3 ≤ 6 会把后面这条降成 L1
+    const etfs = Array.from({ length: 8 }, (_, i) =>
+      outcome({ evaluation: evaluation({ code: `SH51288${i}` as SecCode }), signalId: `etf-${i}` })
+    )
+    h.service.handle(etfs, { at: T0, debounce: false })
+    h.service.handle([outcome({ evaluation: evaluation({ code: STOCK }), signalId: 'sig-stock' })], {
+      at: T0 + 1000,
+      debounce: false,
+    })
+
+    const stockRow = h.rows.find((r) => r.signalId === 'sig-stock')
+    expect(stockRow?.level).toBe('L3')
+    expect(stockRow?.channels).toEqual(['PET', 'BUBBLE'])
+  })
+
+  it('默认全放行 —— 不传 alertable 时行为一字不变', () => {
+    const h = harness()
+    h.service.handle([outcome({ evaluation: evaluation({ code: ETF }) })], { at: T0, debounce: false })
+    expect(h.rows).toHaveLength(1)
+    expect(h.sink.bubbles).toHaveLength(1)
   })
 })

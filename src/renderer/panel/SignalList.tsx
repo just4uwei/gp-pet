@@ -66,6 +66,19 @@ const DIRECTION_TONE: Record<GatedDirection, string> = {
   NONE: 'border-white/15 bg-white/5 text-white/50',
 }
 
+/**
+ * 「行业ETF」分组那些标的的方向标签色（2026-08-15）。
+ *
+ * **刻意压掉买卖的红/黄**：这一屏的红色在整个应用里只有一个意思 ——「引擎建议买入，
+ * 而且它已经过了风控、可能已经弹给你了」。行业 ETF 的结论**不进提醒闸门、
+ * 不参与持仓风控**（没有持仓，止损/回撤减仓那套根本不会跑），
+ * 把它画成同一个红色等于把两类完全不同的结论摆成同一个东西。
+ *
+ * 方向文字（买入/卖出）保留 —— 信息不能丢，丢的只是「可执行」那层暗示。
+ * 青色在面板里没被别的东西占用（红=买 · 黄=卖/警告 · 天蓝=观察点 · 紫=做T与AI）。
+ */
+const OBSERVED_TONE = 'border-teal-400/40 bg-teal-400/10 text-teal-200/90'
+
 const REGIME_LABEL: Record<Regime, string> = {
   TREND_UP: '上升趋势',
   TREND_DOWN: '下跌趋势',
@@ -170,6 +183,7 @@ function Evidence({ evidence }: { evidence: SignalEvidence }): React.JSX.Element
 export function SignalRow({
   record,
   mark = null,
+  observational = false,
   expanded,
   evidence,
   aiReady,
@@ -183,6 +197,11 @@ export function SignalRow({
    * 两处不许各写一套（watch-mark.ts 头注释）。
    */
   mark?: WatchMark | null
+  /**
+   * 这条结论来自「行业ETF」观察名单（`INDUSTRY_ETF_GROUP`）。
+   * true → 方向标签换成中性青色 + 加一枚「行业」标记，见 `OBSERVED_TONE`。
+   */
+  observational?: boolean
   expanded: boolean
   evidence: SignalEvidence | null
   /** AI 已配置且已启用。false → 整块不渲染，而不是渲染一个点了报错的按钮 */
@@ -206,7 +225,9 @@ export function SignalRow({
           </span>
         ) : (
           <span
-            className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${DIRECTION_TONE[record.direction]}`}
+            className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${
+              observational ? OBSERVED_TONE : DIRECTION_TONE[record.direction]
+            }`}
           >
             {DIRECTION_LABEL[record.direction]}
           </span>
@@ -216,6 +237,15 @@ export function SignalRow({
           <span className="flex items-center gap-2">
             <span className="truncate text-sm">{record.name}</span>
             <span className="font-mono text-xs text-white/35">{record.code}</span>
+            {/* 光靠颜色不够：色弱与截图转发都会丢掉那层信息，所以把来源写出来 */}
+            {observational ? (
+              <span
+                className="shrink-0 rounded bg-teal-400/15 px-1 text-[10px] text-teal-200/85"
+                title="来自行业 ETF 观察名单：不发提醒、不设持仓，仅供观察行业动向"
+              >
+                行业
+              </span>
+            ) : null}
           </span>
           <span className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-white/45">
             <span>{REGIME_LABEL[record.regime]}</span>

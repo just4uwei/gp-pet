@@ -38,7 +38,8 @@ import type {
 import { groupSignals } from '@shared/signal-group'
 import { watchMarkOf } from '@shared/watch-mark'
 import { T_HINT_LABEL, T_HINT_TITLE } from '@shared/intraday-t'
-import { shanghaiDayStartMs } from '@shared/time'
+import { SHANGHAI_OFFSET_MS, shanghaiDayStartMs } from '@shared/time'
+import { INDUSTRY_ETF_GROUP, INDUSTRY_ETFS } from '@shared/industry-etf'
 import type { SecCode } from '@core/types'
 import { AlertLog } from './AlertLog'
 import { BrandMark } from './BrandMark'
@@ -104,6 +105,20 @@ const HEALTH_TONE: Record<ProviderHealth['status'], string> = {
 const CLOCK_WARN_MS = 60_000
 
 /**
+ * 自选卡片里的两个 tab（2026-08-15）。
+ *
+ * 分的是 `WatchItem.group`，不是 `board` —— 「它怎么进来的」而不是「它是什么」。
+ * 用 board 分的话，用户自己挑着买的黄金ETF 会被拽进「行业ETF」那一屏，
+ * 而那一屏的语义是「不发提醒、不设持仓的观察名单」，与他的持仓标的正好相反。
+ */
+const WATCH_TABS = [
+  { id: 'STOCK', label: '自选股' },
+  { id: 'ETF', label: '行业ETF' },
+] as const
+
+type WatchTab = (typeof WATCH_TABS)[number]['id']
+
+/**
  * Electron 会把主进程抛出的 Error 包成 "Error invoking remote method 'x': Error: 真正的原因"。
  * 直接显示这串会把「代码不认识」这种用户能自己修的问题埋在噪音里。
  */
@@ -130,6 +145,48 @@ function Banner({ tone, children }: { tone: 'warn' | 'info'; children: React.Rea
       ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
       : 'border-white/15 bg-white/5 text-white/60'
   return <p className={`rounded border px-3 py-2 text-xs ${cls}`}>{children}</p>
+}
+
+/**
+ * 底部时钟（2026-08-15）。
+ *
+ * 显示的是**引擎正在用的那个时间**：校准后的北京时间，不是系统托盘上那个。
+ * 这两者在两种情况下会不一样，而它们恰恰是最需要看见的时候 ——
+ * 机器不在 +08 时区（托盘显示本地时间），或者本机时钟真的偏了（已被校正）。
+ * 时段判定、尾盘窗口、信号的 created_at 用的都是这里显示的这个时刻。
+ *
+ * **自带 state 与 interval，不挂在 App 上**：面板是常驻挂载的，
+ * 每秒钟让整棵树重渲染一次太贵，而这里只需要一个 `<span>` 重画。
+ *
+ * 拿不到校准量时显式说「未校准」。这一档看着多余，但它是「读不到就说读不到」的落点：
+ * 校时探测失败（离线、被挡）时这个时刻退化成本机钟，而那正是它可能不准的时候。
+ */
+function FooterClock({ offsetMs }: { offsetMs?: number }): React.JSX.Element {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [])
+
+  // 先加偏移再用 getUTC* 读 —— 用 getHours() 会按宿主时区二次偏移（与 IntradayChart 同一口径）
+  const at = new Date(now + (offsetMs ?? 0) + SHANGHAI_OFFSET_MS)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  const clock = `${pad(at.getUTCMonth() + 1)}-${pad(at.getUTCDate())} ${pad(at.getUTCHours())}:${pad(at.getUTCMinutes())}:${pad(at.getUTCSeconds())}`
+
+  return (
+    <span
+      className="shrink-0 tabular-nums"
+      title={
+        offsetMs === undefined
+          ? '尚未取到校时样本，暂用本机时钟'
+          : `已按行情服务器校正 ${Math.round(offsetMs)} ms`
+      }
+    >
+      北京时间 {clock}
+      {offsetMs === undefined ? '（未校准）' : ''}
+    </span>
+  )
 }
 
 function StatusBar({
@@ -171,7 +228,13 @@ function StatusBar({
   )
 }
 
-function AddForm({ onAdd }: { onAdd: (code: string) => Promise<void> }): React.JSX.Element {
+function AddForm({
+  onAdd,
+  placeholder,
+}: {
+  onAdd: (code: string) => Promise<void>
+  placeholder: string
+}): React.JSX.Element {
   const [value, setValue] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -197,7 +260,7 @@ function AddForm({ onAdd }: { onAdd: (code: string) => Promise<void> }): React.J
       <div className="flex gap-2">
         <input
           className="min-w-0 flex-1 rounded border border-white/15 bg-black/25 px-2.5 py-1.5 text-sm outline-none placeholder:text-white/25 focus:border-white/35"
-          placeholder="添加自选：600000 / sh600000 / 000001.SZ"
+          placeholder={placeholder}
           value={value}
           onChange={(e) => setValue(e.target.value)}
         />
@@ -217,6 +280,8 @@ function WatchRow({
   tHint,
   first,
   last,
+  showPosition = true,
+  removable = true,
   onRemove,
   onMove,
   onOpen,
@@ -232,6 +297,16 @@ function WatchRow({
   tHint: IntradayTHint | undefined
   first: boolean
   last: boolean
+  /**
+   * 显示持仓相关的东西（「仓」按钮、持仓标签、浮盈亏那一行）。
+   *
+   * 「行业ETF」分组传 false：那 15 只是**观察名单**，不设持仓（2026-08-15 的取舍）。
+   * 留着入口会让人以为该在这儿记仓位，而一旦真记了，止损/回撤减仓那套持仓强制类风控
+   * 就会对一只观察标的生效 —— 那与「不进提醒闸门」是自相矛盾的两个决定。
+   */
+  showPosition?: boolean
+  /** 显示移除按钮。内置的「行业ETF」组传 false —— 删了下次启动会被补回来 */
+  removable?: boolean
   onRemove: (code: SecCode) => void
   onMove: (code: SecCode, delta: number) => void
   /** 打开详情抽屉。`tab` 决定落在哪一页 */
@@ -253,7 +328,7 @@ function WatchRow({
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-2">
               <span className="truncate">{item.name}</span>
-              {item.hasPosition ? (
+              {showPosition && item.hasPosition ? (
                 <span className="shrink-0 rounded bg-white/10 px-1 text-[10px] text-white/60">持仓</span>
               ) : null}
               {/*
@@ -287,13 +362,15 @@ function WatchRow({
         </button>
 
         <div className="flex shrink-0 justify-end gap-0.5 text-xs text-white/40">
-          <button
-            className="px-1 hover:text-white/80"
-            title="持仓与成交录入"
-            onClick={() => onOpen(item.code, 'POSITION')}
-          >
-            仓
-          </button>
+          {showPosition ? (
+            <button
+              className="px-1 hover:text-white/80"
+              title="持仓与成交录入"
+              onClick={() => onOpen(item.code, 'POSITION')}
+            >
+              仓
+            </button>
+          ) : null}
           <button
             className="px-1 hover:text-white/80 disabled:opacity-25"
             disabled={first}
@@ -310,14 +387,16 @@ function WatchRow({
           >
             ↓
           </button>
-          <button className="px-1 hover:text-rose-300" title="移除" onClick={() => onRemove(item.code)}>
-            ×
-          </button>
+          {removable ? (
+            <button className="px-1 hover:text-rose-300" title="移除" onClick={() => onRemove(item.code)}>
+              ×
+            </button>
+          ) : null}
         </div>
       </div>
 
       {/* 有持仓时把浮盈亏摆在行里：那是用户最常想看的一个数，不该要点进抽屉才知道 */}
-      {position ? (
+      {showPosition && position ? (
         <div className="flex items-baseline gap-2 px-3 pb-1.5 text-[10px] text-white/35">
           <span>{position.shares} 股</span>
           <span>成本 {position.cost.toFixed(3)}</span>
@@ -340,6 +419,7 @@ export function App(): React.JSX.Element {
   const [accepted, setAccepted] = useState<boolean | null>(null)
   const [tab, setTab] = useState<Tab>('OVERVIEW')
   const [items, setItems] = useState<WatchItem[]>([])
+  const [watchTab, setWatchTab] = useState<WatchTab>('STOCK')
   const [quotes, setQuotes] = useState<QuoteTick[]>([])
   const [status, setStatus] = useState<EngineStatus | null>(null)
   const [health, setHealth] = useState<ProviderHealth[]>([])
@@ -498,6 +578,17 @@ export function App(): React.JSX.Element {
     [loadLedger]
   )
 
+  /**
+   * 「行业ETF」分组的标的。信号列表拿它决定要不要把那条结论画成中性色。
+   *
+   * 与 `openDrawer` 同一条理由，**必须定义在 renderSignalRow 之前**（`const` 有 TDZ，
+   * 而它进了那个回调的 deps 数组 —— 顺序反过来是启动即崩）。
+   */
+  const etfCodes = useMemo(
+    () => new Set(items.filter((item) => item.group === INDUSTRY_ETF_GROUP).map((item) => item.code)),
+    [items]
+  )
+
   /** 信号行由这一层渲染：列表与抽屉共用同一份展开状态（见 useSignalEvidence） */
   const renderSignalRow = useCallback(
     (record: SignalRecord): React.JSX.Element => (
@@ -505,6 +596,8 @@ export function App(): React.JSX.Element {
         record={record}
         // 用户自己设的条件把这条结论否掉了 / 确认了。与悬浮条共用同一份判据
         mark={watchMarkOf(record.id, watchHits)}
+        // 行业 ETF 的结论不进提醒、不参与持仓风控，颜色必须与可执行的买卖分开
+        observational={etfCodes.has(record.code)}
         expanded={signalEvidence.expandedId === record.id}
         evidence={signalEvidence.evidence[record.id] ?? null}
         aiReady={aiReady}
@@ -512,7 +605,7 @@ export function App(): React.JSX.Element {
         onToggle={signalEvidence.toggle}
       />
     ),
-    [signalEvidence, aiReady, openDrawer, watchHits]
+    [signalEvidence, aiReady, openDrawer, watchHits, etfCodes]
   )
 
   /**
@@ -615,12 +708,13 @@ export function App(): React.JSX.Element {
   }, [])
 
   const add = useCallback(
-    async (code: string): Promise<void> => {
-      await window.gp.invoke('watchlist:add', code)
+    async (code: string, group?: string): Promise<void> => {
+      await window.gp.invoke('watchlist:add', code, group)
       await reload()
     },
     [reload]
   )
+
 
   const remove = useCallback(
     (code: SecCode): void => {
@@ -632,15 +726,28 @@ export function App(): React.JSX.Element {
     [reload]
   )
 
+  /**
+   * 上移/下移。
+   *
+   * ⚠ `delta` 是**在当前 tab 这一屏里**的位移，不是全局列表里的。
+   * `sort_order` 只有一份（全局），而界面按分组切成了两屏 ——
+   * 直接在全局数组里 ±1 会让「在行业ETF 里点上移」跟一只**股票**换位置，
+   * 表现是那一行原地不动（它换到了另一个 tab 里去）。
+   * 所以先在可见子集里找到邻居，再把这两只在全局数组里**对调**。
+   */
   const move = useCallback(
-    (code: SecCode, delta: number): void => {
-      const index = items.findIndex((item) => item.code === code)
-      const target = index + delta
-      if (index < 0 || target < 0 || target >= items.length) return
+    (code: SecCode, delta: number, visible: readonly WatchItem[]): void => {
+      const at = visible.findIndex((item) => item.code === code)
+      const neighbour = at < 0 ? undefined : visible[at + delta]
+      if (!neighbour) return
       const next = [...items]
-      const [moved] = next.splice(index, 1)
-      if (!moved) return
-      next.splice(target, 0, moved)
+      const a = next.findIndex((item) => item.code === code)
+      const b = next.findIndex((item) => item.code === neighbour.code)
+      if (a < 0 || b < 0) return
+      const [itemA, itemB] = [next[a], next[b]]
+      if (!itemA || !itemB) return
+      next[a] = itemB
+      next[b] = itemA
       setItems(next) // 先动 UI，落库失败再由 reload 纠正回来
       void window.gp
         .invoke(
@@ -676,6 +783,15 @@ export function App(): React.JSX.Element {
     而一条常亮的提示条会让用户学会无视所有横幅。
     注意 `clockOffsetMs` 可能是 0（已校准且刚好对齐），所以判 undefined 而不是判真值。
   */
+  /** 当前 tab 这一屏的自选项。顺序沿用全局 sort_order，过滤不重排 */
+  const visibleWatch = useMemo(
+    () =>
+      items.filter((item) =>
+        watchTab === 'ETF' ? item.group === INDUSTRY_ETF_GROUP : item.group !== INDUSTRY_ETF_GROUP
+      ),
+    [items, watchTab]
+  )
+
   const clockOffMs = status?.clockOffsetMs
   const clockSkewed = clockOffMs !== undefined && Math.abs(clockOffMs) >= CLOCK_WARN_MS
 
@@ -831,19 +947,57 @@ export function App(): React.JSX.Element {
           tab === 'OVERVIEW' ? 'grid' : 'hidden'
         }`}
       >
+        {/*
+          两个 tab 分的是**分组**（`WatchItem.group`），不是「是不是 ETF」。
+          `watchlist` 的主键是 code，一只标的只属于一个分组 —— 所以
+          手动加进「自选股」的 ETF（比如黄金ETF）就留在自选股这一屏，
+          不会被这里的 tab 拽走。两屏都可能有 ETF，那是对的。
+        */}
         <section className="gp-card max-h-full">
           <div className="gp-card-head">
-            <h2 className="gp-card-title">自选股</h2>
-            <span className="text-xs text-white/30">{items.length} 只</span>
+            <div className="flex items-center gap-1">
+              {WATCH_TABS.map((t) => (
+                <button
+                  key={t.id}
+                  className={`rounded px-2 py-0.5 text-sm transition-colors ${
+                    watchTab === t.id ? 'bg-white/10 text-white/90' : 'text-white/40 hover:text-white/70'
+                  }`}
+                  onClick={() => setWatchTab(t.id)}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+            <span className="text-xs text-white/30">{visibleWatch.length} 只</span>
           </div>
 
-          <AddForm onAdd={add} />
+          {/*
+            行业ETF 那一屏**不给添加框**：这一组是内置的（`INDUSTRY_ETFS`，每次启动补齐）。
+            给了输入框就等于说「这是你的列表」，而它不是 —— 用户加进去的那只在
+            下次启动时仍在，但整组的构成不归他管，两种预期混在一起只会让人困惑。
+          */}
+          {watchTab === 'ETF' ? (
+            <p className="shrink-0 border-b border-white/10 px-3 py-2 text-xs leading-relaxed text-white/35">
+              内置 {INDUSTRY_ETFS.length} 只行业 ETF，每个行业一只。看的是<span className="text-white/55">行业整体动向</span>
+              ，结论只针对行业指数本身 —— <span className="text-white/55">不发提醒、不设持仓</span>。
+            </p>
+          ) : (
+            <AddForm onAdd={(code) => add(code)} placeholder="添加自选：600000 / sh600000 / 000001.SZ" />
+          )}
 
-          {items.length === 0 ? (
-            <p className="px-3 py-10 text-center text-sm text-white/35">还没有自选股，先在上面添加一只。</p>
+          {visibleWatch.length === 0 ? (
+            watchTab === 'ETF' ? (
+              // 内置组理应非空。真空了说明播种没跑成（库打不开、代码清单坏了），
+              // 那时说「暂时为空」比画一片空白诚实
+              <p className="px-3 py-10 text-center text-sm text-white/35">
+                内置行业 ETF 暂时为空，重启应用会自动补齐。
+              </p>
+            ) : (
+              <p className="px-3 py-10 text-center text-sm text-white/35">还没有自选股，先在上面添加一只。</p>
+            )
           ) : (
             <ul className="min-h-0 flex-1 overflow-y-auto">
-              {items.map((item, i) => (
+              {visibleWatch.map((item, i) => (
                 <WatchRow
                   key={item.code}
                   item={item}
@@ -851,9 +1005,12 @@ export function App(): React.JSX.Element {
                   position={positionOf.get(item.code)}
                   tHint={tHintOf.get(item.code)}
                   first={i === 0}
-                  last={i === items.length - 1}
+                  last={i === visibleWatch.length - 1}
+                  showPosition={watchTab !== 'ETF'}
+                  // 内置组不给删除：删了下次启动又回来，那是一个点了会复活的按钮
+                  removable={watchTab !== 'ETF'}
                   onRemove={remove}
-                  onMove={move}
+                  onMove={(code, delta) => move(code, delta, visibleWatch)}
                   onOpen={openDrawer}
                 />
               ))}
@@ -923,8 +1080,10 @@ export function App(): React.JSX.Element {
         />
       ) : null}
 
-      <footer className="shrink-0 border-t border-white/10 px-5 py-2 text-xs text-white/35">
-        {FOOTER_NOTE}
+      {/* 免责小字靠左固定（措辞纪律：每一屏底部都要有），时钟靠右 */}
+      <footer className="flex shrink-0 items-center justify-between gap-4 border-t border-white/10 px-5 py-2 text-xs text-white/35">
+        <span>{FOOTER_NOTE}</span>
+        <FooterClock {...(clockOffMs === undefined ? {} : { offsetMs: clockOffMs })} />
       </footer>
     </main>
   )

@@ -31,6 +31,7 @@ import { applyOrder, buildTicker, orderFingerprint, type TickerEntry } from '@sh
 import { WATCH_MARK_LABEL } from '@shared/watch-mark'
 import { T_HINT_LABEL, T_HINT_TITLE } from '@shared/intraday-t'
 import { shanghaiDayStartMs } from '@shared/time'
+import { INDUSTRY_ETF_GROUP } from '@shared/industry-etf'
 import type { GatedDirection, SecCode } from '@core/types'
 import type {
   EngineStatus,
@@ -431,9 +432,20 @@ export function App(): React.JSX.Element {
 
   // ── 绘制 ─────────────────────────────────────────────────────────
   const actionable = useMemo(() => signals.filter((s) => s.suppressedReason === undefined), [signals])
+  /*
+    跑马灯**不含「行业ETF」分组**（2026-08-15）。
+
+    悬浮条是常驻的、被动进入视野的那一面 —— 它的注意力预算最紧（300px，一次只看得见
+    一两条）。行业 ETF 是观察名单：不发提醒、不设持仓，用户要看它是**主动**去开面板看，
+    而不是让它把 7 只真持仓标的的露出频次摊薄到三分之一。
+
+    这是个取舍不是铁律：想让它们也跑，把这一行 filter 去掉即可（`bar` 与面板共用
+    同一份 `watchlist:list`，别的都不用改）。
+  */
+  const barItems = useMemo(() => items.filter((item) => item.group !== INDUSTRY_ETF_GROUP), [items])
   const fresh = useMemo(
-    () => buildTicker(items, quotes, signals, hits, tHints),
-    [items, quotes, signals, hits, tHints]
+    () => buildTicker(barItems, quotes, signals, hits, tHints),
+    [barItems, quotes, signals, hits, tHints]
   )
 
   /**

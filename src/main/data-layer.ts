@@ -26,7 +26,9 @@ import type {
   SignalRecord,
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
+import { parseCode } from '@core/code'
 import { withSensitivity } from '@core/params'
+import { INDUSTRY_ETF_GROUP, INDUSTRY_ETFS } from '@shared/industry-etf'
 import {
   BENCHMARK_CODE,
   createMarketDataService,
@@ -206,6 +208,53 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     options: { priority: [...settings.providerPriority] },
     now: localNow,
   })
+
+  /*
+    行业 ETF 是**内置**的观察名单（2026-08-15），不由用户添加。
+
+    ## 为什么在这里播种，且只在「库里没有」时插
+
+    `WatchlistRepo.add()` 的 ON CONFLICT **不动 `group_name`**，所以重复调用不会把
+    用户手动加进「自选」的 ETF 拽进这一组 —— 但它**会覆盖 `name`**，
+    而库里那个名字是数据源刷出来的（「证券ETF国泰」），比清单里的「证券ETF」准。
+    所以判据是「不存在才插」，不是「无脑 upsert」。
+
+    这也定义了「内置」的确切含义：**每次启动补齐缺的那些**。
+    用户删掉一只，下次启动它会回来 —— 界面上因此不给这一组删除按钮，
+    给了就是一个点了会复活的按钮。
+
+    ## 不发网络请求
+
+    名称与行业直接用清单里的，`market`/`board` 由 `parseCode` 从代码段算出来。
+    真正的名称由 `refreshProfiles()`（每周一次）覆盖成数据源的版本。
+    在装配路径上等 15 次 profile 请求会让首启多几秒，而那几秒买到的只是更准的名字。
+  */
+  {
+    let seeded = 0
+    for (const etf of INDUSTRY_ETFS) {
+      const parsed = parseCode(etf.code)
+      // 清单写错一位不该让整个应用起不来（有单测钉着这份清单，见 industry-etf.test.ts）
+      if (!parsed.ok) {
+        log.warn(`[watchlist] 内置行业 ETF ${etf.code} 代码非法，已跳过：${parsed.reason}`)
+        continue
+      }
+      if (storage.watchlist.get(parsed.value.code)) continue
+      storage.watchlist.add(
+        {
+          code: parsed.value.code,
+          name: etf.name,
+          market: parsed.value.market,
+          board: parsed.value.board,
+          isST: false,
+          industry: etf.industry,
+        },
+        INDUSTRY_ETF_GROUP,
+        localNow()
+      )
+      seeded++
+    }
+    if (seeded > 0) log.info(`[watchlist] 已补齐 ${seeded} 只内置行业 ETF（共 ${INDUSTRY_ETFS.length} 只）`)
+  }
 
   // ── 分时缓存（engine/intraday.ts，它是这条取数路径自己的请求闸门）───────
   // TTL 是「过了多久」，用本地钟

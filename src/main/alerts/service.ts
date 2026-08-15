@@ -52,6 +52,21 @@ export interface AlertServiceDeps {
   quotes?: () => ReadonlyMap<SecCode, QuoteView>
   /** code → 名称。提醒日志要显示名称，而 alert_log 里只有代码 */
   nameOf?: (code: SecCode) => string
+  /**
+   * 这只标的允不允许发提醒。默认全允许。
+   *
+   * 现在只有一个 false 的来源：**「行业ETF」分组**（2026-08-15）。
+   * 那 15 只是观察名单，目的是攒「行业 ETF 的信号质量 vs 个股」的对照数据，
+   * 而提醒配额是**全局**的（每小时 L2+L3 ≤ 6、每日 L3 ≤ 10）——
+   * 让 15 只观察标的去和 7 只真持仓标的抢同一份配额，等于用观察数据换掉真提醒。
+   *
+   * **拦在这里而不是拦在引擎里**，是因为两者要的东西正好相反：
+   * 信号**要**照常算、照常落 `signal` 表、照常进「今日信号」（那正是观察的载体），
+   * 只是不进闸门、不弹气泡、不点状态点、**也不进 `alert_log`**。
+   * 最后那条是刻意的：`alert_log` 答的是「有没有真的提醒我、被哪道闸门挡的」，
+   * 而这些候选**根本没有进过闸门** —— 记一行「被挡」会谎报一个不存在的拦截。
+   */
+  alertable?: (code: SecCode) => boolean
   dispatcher?: AlertDispatcher
   pet?: PetStateMachine
   newId?: () => string
@@ -87,6 +102,7 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
     quiet,
     quotes,
     nameOf = (code) => code,
+    alertable = () => true,
     dispatcher = new AlertDispatcher(),
     pet = new PetStateMachine(),
     newId = () => randomUUID(),
@@ -151,12 +167,22 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
 
     handle(outcomes, ctx) {
       const app = settings()
-      const prepared = buildAlerts(outcomes, {
+      /*
+        观察名单在**进闸门之前**就被摘掉（见 `alertable` 的注释）。
+
+        摘的是「候选」不是「信号」：`outcomes` 已经在引擎那边落过 `signal` 表了，
+        这里只决定它进不进提醒链路。观察点命中（`ctx.watchHits`）同理过滤 ——
+        用户给一只观察标的设了观察点，命中也只在面板里看得见。
+      */
+      const alertableOutcomes = outcomes.filter((outcome) => alertable(outcome.evaluation.code))
+      const hits = ctx.watchHits?.filter((hit) => alertable(hit.point.code))
+
+      const prepared = buildAlerts(alertableOutcomes, {
         levelOffset: app.alertLevelOffset,
         ...(quotes ? { quotes: quotes() } : {}),
         at: ctx.at,
         // 观察点命中与信号走同一套闸门 —— 不新开分发路径（见 candidates.ts 的 watchHitAlert）
-        ...(ctx.watchHits === undefined ? {} : { watchHits: ctx.watchHits }),
+        ...(hits === undefined ? {} : { watchHits: hits }),
       })
 
       if (prepared.length === 0) {

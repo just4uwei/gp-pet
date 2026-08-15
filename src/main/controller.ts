@@ -101,6 +101,8 @@ import {
 } from './settings/transfer-io'
 import { paramRows } from './settings/params-view'
 import { isReportTarget, reportDateOf } from '@shared/ai-target'
+import { INDUSTRY_ETF_GROUP } from '@shared/industry-etf'
+import { shanghaiDayStartMs } from '@shared/time'
 import { buildDailyReport } from './report/build'
 import { reportFactDigest } from './report/digest'
 import {
@@ -250,6 +252,10 @@ export class AppController {
       quiet: () => this.quietVerdict(),
       quotes: () => this.quoteViews(),
       nameOf: (code) => layer.storage.watchlist.get(code)?.profile.name ?? code,
+      // 「行业ETF」分组是观察名单，信号照出、照落库、照进面板，但不进提醒闸门
+      // （理由在 AlertServiceDeps.alertable 的注释里）。**每次现读**，
+      // 用户把某只从 ETF 组移出来的下一轮就该能收到它的提醒
+      alertable: (code) => layer.storage.watchlist.get(code)?.group !== INDUSTRY_ETF_GROUP,
       log,
     })
     this.unread = layer.storage.alerts.unreadCount()
@@ -1139,9 +1145,17 @@ export class AppController {
     const layer = this.data
     if (!layer) return null
 
-    // 「最近一个交易日」取**库里最新的那根日线**，不取本机日期：
-    // 周末与节假日打开时，本机的「今天」根本没有行情
-    const items = layer.watchlist.list()
+    /*
+      日报**不含内置的「行业ETF」组**（2026-08-15）。
+
+      那 15 只是行业观察名单：不设持仓、不发提醒。日报答的是「我这些票今天怎么样」，
+      把 15 只观察标的混进 7 只真持仓里，用户自己的票会被埋掉一多半，
+      而 `highlights` / `tomorrow` 的计数也会被它们顶满。
+
+      **代价说清楚**：日报里因此看不到行业动向。要看行业得去概览页那一屏。
+      真要在日报里给行业一段，那是独立的一节（与个股分开列），不是把它们混进来。
+    */
+    const items = layer.watchlist.list().filter((item) => item.group !== INDUSTRY_ETF_GROUP)
     const dates = items
       .map((item) => layer.storage.klines.lastDate(item.code))
       .filter((d): d is TradeDate => d !== null)
@@ -1165,7 +1179,10 @@ export class AppController {
       if (snapshot) snapshots.set(item.code, snapshot)
     }
 
-    const dayStart = new Date(new Date().setHours(0, 0, 0, 0)).getTime()
+    // 日界走北京时间，不是宿主本地时区（shared/time.ts）——
+    // 这一处在 2026-08-15 统一日界那轮被漏掉了：UTC−5 上本机 00:00 是北京 13:00，
+    // 于是日报里「今天的信号」会从午盘开始算
+    const dayStart = shanghaiDayStartMs(Date.now())
     return buildDailyReport({
       date,
       at: Date.now(),

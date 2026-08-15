@@ -70,9 +70,10 @@ test.describe('首次启动引导', () => {
     const panel = await openPanel(app)
 
     // ① 引导挡在前面：免责声明可见，而主界面的「自选股」卡片不存在（不是隐藏，是没渲染）
+    // 用那个 tab 按钮当主界面的标记：卡片头 2026-08-15 从 h2 改成了两个 tab（自选股 / 行业ETF）
     await expect(panel.getByRole('heading', { name: '免责声明' })).toBeVisible()
     await expect(panel.getByText('不构成任何投资建议')).toBeVisible()
-    await expect(panel.getByRole('heading', { name: '自选股' })).toHaveCount(0)
+    await expect(panel.getByRole('button', { name: '自选股', exact: true })).toHaveCount(0)
 
     // ② 读到底才亮按钮
     const accept = panel.getByRole('button', { name: /我已阅读并理解/ })
@@ -85,7 +86,7 @@ test.describe('首次启动引导', () => {
     await accept.click()
 
     // ③ 确认后进主界面
-    await expect(panel.getByRole('heading', { name: '自选股' })).toBeVisible()
+    await expect(panel.getByRole('button', { name: '自选股', exact: true })).toBeVisible()
 
     // ④ 真的落盘了 —— 时刻而不是布尔值
     const settings = JSON.parse(readFileSync(join(userData, 'settings.json'), 'utf8')) as {
@@ -98,7 +99,7 @@ test.describe('首次启动引导', () => {
     await app.close()
     app = await launch(userData)
     const again = await openPanel(app)
-    await expect(again.getByRole('heading', { name: '自选股' })).toBeVisible()
+    await expect(again.getByRole('button', { name: '自选股', exact: true })).toBeVisible()
     await expect(again.getByRole('heading', { name: '免责声明' })).toHaveCount(0)
   })
 })
@@ -123,6 +124,47 @@ test.describe('面板五屏', () => {
     await app?.close().catch(() => {})
     app = null
     rmSync(userData, { recursive: true, force: true })
+  })
+
+  /*
+    底部时钟画的是**引擎在用的时刻**（校准后的北京时间），不是宿主本地时间。
+    这一条只钉「它在场且格式对」—— 断言具体钟点会变成一条随机红的用例，
+    而「时刻算得对不对」归 clock-sync 与 shared/time 的单测管。
+  */
+  test('底部时钟在场，画的是北京时间', async () => {
+    const panel = await openPanel(app as ElectronApplication)
+    await expect(panel.getByText(/北京时间 \d{2}-\d{2} \d{2}:\d{2}:\d{2}/)).toBeVisible()
+    // 免责小字没有被时钟挤掉 —— 措辞纪律要求每一屏底部都有它
+    await expect(panel.getByText('仅供参考，非投资建议')).toBeVisible()
+  })
+
+  /*
+    自选卡片的两个 tab（2026-08-15）。三条一起钉：
+
+    ① 行业 ETF 是**内置**的 —— 空库首启就该有 15 只，不需要用户做任何事。
+       这一条同时验了 data-layer 的播种真的跑了（单测测不到装配路径）。
+    ② 那一屏必须把**边界**说出来（不发提醒、不设持仓）：它与自选股的差别全在这，
+       只画一个列表的话用户会以为它就是第二个自选列表。
+    ③ 不给添加框、不给移除按钮 —— 内置组的构成不归用户管，
+       给了就是一个「删了下次启动会复活」的按钮。
+  */
+  test('行业ETF 是内置的一屏：首启即有、说清边界、不给增删', async () => {
+    const panel = await openPanel(app as ElectronApplication)
+    await expect(panel.getByRole('button', { name: '自选股', exact: true })).toBeVisible()
+
+    await panel.getByRole('button', { name: '行业ETF', exact: true }).click()
+
+    await expect(panel.getByText(/不发提醒、不设持仓/)).toBeVisible()
+    await expect(panel.getByText(/内置 \d+ 只行业 ETF/)).toBeVisible()
+    // 空库首启就该有内容 —— 播种没跑的话这里是「暂时为空」
+    await expect(panel.getByText('内置行业 ETF 暂时为空，重启应用会自动补齐。')).toHaveCount(0)
+    await expect(panel.getByText('证券ETF', { exact: false }).first()).toBeVisible()
+
+    // 没有添加框、没有移除按钮
+    await expect(panel.getByPlaceholder(/添加/)).toHaveCount(0)
+    await expect(panel.getByTitle('移除')).toHaveCount(0)
+    // 也没有持仓入口
+    await expect(panel.getByTitle('持仓与成交录入')).toHaveCount(0)
   })
 
   test('影子运行页在还没有交易日时说「尚未开始」，不显示一屏 0', async () => {

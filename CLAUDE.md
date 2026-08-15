@@ -14,7 +14,7 @@ Electron + React + TypeScript · 本地 SQLite · 免登录 · 无服务端 · *
 当前处于 **M4（打磨）代码就绪**：五层引擎、回测 CLI、标定工具、面板列表（M2）、
 提醒分发（M3：`tick → SignalEngine → AlertService → 四道闸门 → alert_log + 状态点 / 气泡`）之上，
 M4 补齐了**影子运行**（前向模拟绩效，schema v2）、**设置页全项**（含只读参数表）、
-**数据库周期备份**、**首启免责声明引导**与 **Playwright E2E**（9 条，真启 Electron）。
+**数据库周期备份**、**首启免责声明引导**与 **Playwright E2E**（11 条，真启 Electron）。
 **M3 的出口条件（自用一周）与 M4 的三项真机验收都未做** ——
 逐条见 [M3 验收](./docs/checklists/M3-提醒层验收.md) 与 [M4 验收](./docs/checklists/M4-打磨验收.md)。
 M4 剩下的是：125%/150% DPI 走查、**装一遍 / 卸一遍**、代码签名（无证书）——
@@ -191,7 +191,7 @@ M2 的「回测报告产出并据此确定出厂参数」还差大半 —— 但
 pnpm dev              # 启动开发环境（electron-vite）
 pnpm test             # 单元 + 集成测试（Vitest，不需要启动 Electron）
 pnpm test:cov         # 覆盖率；src/core 门槛 90%，其余 60%
-pnpm test:e2e         # Playwright E2E：先 build，再真启 Electron 跑 9 条（workers=1）
+pnpm test:e2e         # Playwright E2E：先 build，再真启 Electron 跑 11 条（workers=1）
 pnpm typecheck        # 三个 tsconfig（node / web / e2e）分别校验
 pnpm lint
 pnpm verify:indicators           # 重出指标黄金用例；加 -- --check 只校验不重写
@@ -501,6 +501,15 @@ src/backtest 回测 CLI，复用 src/core
   偏了的延迟，而延迟是判断数据源好坏的唯一依据。
   这条修掉的是一个静默失真：风控的 `age = atMs - snapshot.at` **左边本地钟、右边远端时刻**，
   本机快 6 分钟就会把连续竞价里所有买入信号判成 `STALE_SNAPSHOT` 压掉。见 docs/03 §3.1。
+- **内置的「行业ETF」组（15 只）不是自选股，四处出口都要记得排除它。**
+  `shared/industry-etf.ts` 每个行业一只，`data-layer` 每次启动补齐缺的（**只在库里没有时插**
+  —— 无脑 upsert 会把数据源刷出来的名字覆盖回清单里那个短名，也会让用户手动加进「自选」
+  的同一只 ETF 被拽走）。它们**照常评估、照常落 `signal` 表、照常进「今日信号」**，
+  但**不进提醒闸门**（`AlertService.alertable`，摘在 `buildAlerts` 之前 ——
+  摘晚了会在 `alert_log` 里留下「被挡」的假记录）、**不进日报**、**不进悬浮条跑马灯**、
+  **不给持仓入口**。理由是全局配额：15 只观察标的会把 7 只真持仓标的的提醒挤掉，
+  而被挤掉的那条止损用户发现不了。见 [docs/05 §3.2](./docs/05-风控与提醒规则.md)。
+  界面上它们的方向标签是**中性青色 + 「行业」标记**，不许画成买卖的红/黄。
 - **「今天」一律走 `shared/time.ts` 的 `shanghaiDayStartMs`，不要写 `setHours(0,0,0,0)`。**
   提醒配额的日界、面板与悬浮条的「今天」原先用宿主本地日：UTC+8 上恰好对、UTC+7 上无害
   （日界落到北京 01:00），但 UTC−5 上本机 00:00 是**北京 13:00** ——「每日 L2+L3 ≤ 4」
