@@ -45,6 +45,7 @@ import { AlertLog } from './AlertLog'
 import { BrandMark } from './BrandMark'
 import { ConfigTransferButtons, ConfigTransferNotice, type TransferOutcome } from './ConfigTransfer'
 import { DailyReportPanel } from './DailyReport'
+import { BriefPanel } from './BriefPanel'
 import { FOOTER_NOTE } from './disclaimer'
 import { Onboarding } from './Onboarding'
 import { Settings } from './Settings'
@@ -63,12 +64,15 @@ import { WatchPoints } from './WatchPoints'
  * 「观察点」的标题带 ACTIVE 计数 —— 那是「软件现在在盯什么」最直接的回答，
  * 而这个功能的全部意义就在于让用户看得见它在盯。
  */
-type Tab = 'OVERVIEW' | 'REPORT' | 'WATCH' | 'SHADOW' | 'SETTINGS'
+type Tab = 'OVERVIEW' | 'REPORT' | 'BRIEF' | 'WATCH' | 'SHADOW' | 'SETTINGS'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'OVERVIEW', label: '概览' },
   // 日报排在概览之后：它是「一天结束后看一眼」的东西，比观察点更常用
   { id: 'REPORT', label: '日报' },
+  // 公告排在日报之后：日报答「今天怎么样」，公告答「引擎看不见的那部分」。
+  // 它**不是提醒渠道** —— 不进闸门、不占配额，出口只有这一页签（docs/11 §2.3）
+  { id: 'BRIEF', label: '公告' },
   { id: 'WATCH', label: '观察点' },
   { id: 'SHADOW', label: '影子运行' },
   { id: 'SETTINGS', label: '设置' },
@@ -324,7 +328,19 @@ function WatchRow({
     position && quote && position.cost > 0 ? ((quote.last - position.cost) / position.cost) * 100 : null
 
   return (
-    <li className="border-b border-white/[0.06] last:border-b-0 hover:bg-white/[0.02]">
+    /*
+      持仓行左侧一条竖线（2026-08-16）。**用左边框而不是整行底色**：
+      这一行里已经有涨跌的红/绿、做T的紫、行业的青，再加一层底色会把它们压掉。
+      非持仓行给一条**透明**的同宽边框，否则两种行会差 2px、看起来像没对齐。
+
+      色系选 sky：与「公告」页的持仓标记同一个色，且避开 rose/emerald（涨跌）、
+      teal（行业ETF 观察名单）、violet（做T建议）—— 那三个都已经有确定含义。
+    */
+    <li
+      className={`border-b border-l-2 border-b-white/[0.06] last:border-b-0 hover:bg-white/[0.02] ${
+        showPosition && item.hasPosition ? 'border-l-sky-400/60 bg-sky-400/[0.03]' : 'border-l-transparent'
+      }`}
+    >
       <div className="flex items-center gap-3 px-3 py-2 text-sm">
         {/*
           整行是打开详情的按钮。上移/下移/移除三个小按钮在它外面 ——
@@ -335,7 +351,7 @@ function WatchRow({
             <span className="flex items-center gap-2">
               <span className="truncate">{item.name}</span>
               {showPosition && item.hasPosition ? (
-                <span className="shrink-0 rounded bg-white/10 px-1 text-[10px] text-white/60">持仓</span>
+                <span className="shrink-0 rounded bg-sky-400/15 px-1 text-[10px] text-sky-200/85">持仓</span>
               ) : null}
               {/*
                 日内做T建议。**不是提醒**：它不进 alert_log、不点状态点、不发气泡，
@@ -841,13 +857,27 @@ export function App(): React.JSX.Element {
     注意 `clockOffsetMs` 可能是 0（已校准且刚好对齐），所以判 undefined 而不是判真值。
   */
   /** 当前 tab 这一屏的自选项。顺序沿用全局 sort_order，过滤不重排 */
-  const visibleWatch = useMemo(
-    () =>
-      items.filter((item) =>
-        watchTab === 'ETF' ? item.group === INDUSTRY_ETF_GROUP : item.group !== INDUSTRY_ETF_GROUP
-      ),
-    [items, watchTab]
-  )
+  /*
+    自选那一屏**持仓优先**（2026-08-16）：真金白银的那几只应该一眼看到。
+
+    两条实现约束，缺一条就会出问题：
+
+    1. **段内必须保持用户自己排的顺序**（`Array.sort` 在现代 JS 里是稳定的，
+       所以只按 `hasPosition` 比一次就够）。整个重排会把上移/下移按钮的成果抹掉。
+    2. **上移/下移必须按「段」禁用，不是按整个列表**（见下面 first/last 的算法）。
+       `move()` 交换的是 `items` 里的 `sortOrder`，而显示层每次都会重新把持仓提到前面
+       —— 跨段交换之后显示顺序**一点变化都没有**，表现就是「点了没反应」。
+
+    行业ETF 那一屏不排：那一组不设持仓（`showPosition={false}`），
+    真有历史持仓数据时按它重排只会让一组「观察名单」看起来分了主次。
+  */
+  const visibleWatch = useMemo(() => {
+    const rows = items.filter((item) =>
+      watchTab === 'ETF' ? item.group === INDUSTRY_ETF_GROUP : item.group !== INDUSTRY_ETF_GROUP
+    )
+    if (watchTab === 'ETF') return rows
+    return [...rows].sort((a, b) => Number(b.hasPosition) - Number(a.hasPosition))
+  }, [items, watchTab])
 
   const clockOffMs = status?.clockOffsetMs
   const clockSkewed = clockOffMs !== undefined && Math.abs(clockOffMs) >= CLOCK_WARN_MS
@@ -971,6 +1001,12 @@ export function App(): React.JSX.Element {
           <DailyReportPanel refreshKey={signalKey} />
         </div>
       ) : null}
+      {tab === 'BRIEF' ? (
+        // 滚动同样交给这一层，理由与 REPORT 那一段逐字相同
+        <div className="min-h-0 flex-1 overflow-y-auto p-5">
+          <BriefPanel onError={setError} />
+        </div>
+      ) : null}
       {tab === 'WATCH' ? (
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
           <WatchPoints refreshKey={watchKey} onChanged={refreshWatch} onError={setError} />
@@ -1061,8 +1097,12 @@ export function App(): React.JSX.Element {
                   quote={quoteOf.get(item.code)}
                   position={positionOf.get(item.code)}
                   tHint={tHintOf.get(item.code)}
-                  first={i === 0}
-                  last={i === visibleWatch.length - 1}
+                  // 段边界即禁用边界 —— 理由见 visibleWatch 那段注释的第 2 条
+                  first={i === 0 || visibleWatch[i - 1]?.hasPosition !== item.hasPosition}
+                  last={
+                    i === visibleWatch.length - 1 ||
+                    visibleWatch[i + 1]?.hasPosition !== item.hasPosition
+                  }
                   showPosition={watchTab !== 'ETF'}
                   // 内置组不给删除：删了下次启动又回来，那是一个点了会复活的按钮
                   removable={watchTab !== 'ETF'}

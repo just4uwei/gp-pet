@@ -138,6 +138,23 @@ describe('fetchAnnouncements', () => {
     expect(out).toEqual({ ok: true, rows: [], skipped: 0 })
   })
 
+  it('早于 sinceMs 的条目丢弃 —— 这一层也要兜一道，不能只靠 provider', async () => {
+    const out = await fetchAnnouncements({
+      items: ITEMS,
+      etfGroup: ETF_GROUP,
+      sinceMs: SINCE,
+      now: NOW,
+      provider: 'eastmoney',
+      // provider 忘了截断（或换了个源）时，症状是简报里混进几个月前的旧公告 ——
+      // 每一条看起来都是真的，只是不该出现在这一屏上
+      fetch: async () => [ann(), ann({ id: 'stale', publishedAt: SINCE - 86_400_000 })],
+    })
+    expect(out.ok).toBe(true)
+    if (!out.ok) return
+    expect(out.rows.map((r) => r.id)).toEqual(['AN001'])
+    expect(out.skipped).toBe(1)
+  })
+
   it('同一批里重复的 id 只留一条（翻页边界会重叠）', async () => {
     const out = await fetchAnnouncements({
       items: ITEMS,

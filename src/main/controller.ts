@@ -40,6 +40,7 @@ import type {
   Rect,
   AnnouncementRefreshResult,
   AnnouncementView,
+  DailyBrief,
   ReportNoteView,
   ShadowSummary,
   ShadowTradeView,
@@ -110,6 +111,7 @@ import { shanghaiDayStartMs } from '@shared/time'
 import { buildDailyReport } from './report/build'
 import { buildEnvironment, type EnvironmentTarget } from './report/environment'
 import { fetchAnnouncements } from './engine/announcements'
+import { buildDailyBrief } from './brief/build'
 import { reportFactDigest } from './report/digest'
 import {
   DEFAULT_SHADOW_CAPITAL,
@@ -1225,6 +1227,35 @@ export class AppController {
     const rows = result.rows.map((row) => ({ ...row, provider: providerId }))
     const added = layer.storage.announcements.upsertMany(rows)
     return { ok: true, fetched: rows.length, added, skipped: result.skipped }
+  }
+
+  /**
+   * 盘前简报（docs/11 N3）。**纯读，不发请求** —— 拉取由 `refreshAnnouncements` 单独触发。
+   *
+   * 内置行业 ETF 摘掉，与 `dailyReport()` / `announcements()` 同一条口径。
+   * 日期取「最近一个交易日」，与日报同源 —— 简报答的是「开盘前该看什么」，
+   * 而那个「开盘」指的就是最近这根日线之后的那一次。
+   */
+  dailyBrief(sinceMs: number): DailyBrief | null {
+    const layer = this.data
+    if (!layer) return null
+    const items = layer.watchlist.list().filter((item) => item.group !== INDUSTRY_ETF_GROUP)
+    const dates = items
+      .map((item) => layer.storage.klines.lastDate(item.code))
+      .filter((d): d is TradeDate => d !== null)
+    const date = dates.sort().at(-1) ?? shanghaiTime(Date.now()).date
+
+    return buildDailyBrief({
+      date,
+      at: Date.now(),
+      items: items.map((item) => ({
+        code: item.code,
+        name: item.name,
+        ...(item.industry === undefined ? {} : { industry: item.industry }),
+        hasPosition: item.hasPosition,
+      })),
+      announcements: this.announcements(sinceMs),
+    })
   }
 
   reportNote(): ReportNoteView | null {

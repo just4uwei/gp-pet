@@ -92,6 +92,13 @@ export async function fetchAnnouncements(
       skipped++
       continue
     }
+    // 时间窗口同理：`sinceMs` 是传给 provider 的，但这一层也要自己兜一道。
+    // provider 忘了翻页截断（或换了一个源）时，症状是简报里混进几个月前的旧公告 ——
+    // 而每一条看起来都是真的，只是不该出现在「近三天」这一屏上
+    if (row.publishedAt < sinceMs) {
+      skipped++
+      continue
+    }
     // 同一次返回里出现同一个 id（翻页边界重叠）时只留一条
     if (seen.has(row.id)) continue
     seen.add(row.id)

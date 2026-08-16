@@ -150,8 +150,77 @@ function groupPositions(trades: readonly ReportTrade[]): Position[] {
 
 // ── 历史公告（--announcements，只分层不改交易）───────────────────────────
 
-/** code → 公告日集合（epoch day）。**只存日期，不存标题** —— 这一层只回答「有没有」 */
-type AnnouncementDays = Map<string, Set<number>>
+/**
+ * 公告的方向标签。**由标题关键词判定，没有正文** —— 精度未经核对，见下。
+ *
+ * `NEU` 含两类：程序性公告（股东大会 / 募集资金 / 定期报告 / 关联交易 / 担保…，
+ * 占语料的大多数）与**标题里看不出方向**的（如「2024年度业绩预告」不写预增预减）。
+ */
+type Tone = 'POS' | 'NEG' | 'NEU'
+
+/**
+ * 标题关键词分类表。**这张表在看到任何 alpha 结果之前就定死了**，并且只跑一次
+ * —— 反复调关键词直到某一档好看，等于把这次测量变成一次过拟合搜索
+ * （与「每个候选机制只报一次分位」同一条纪律）。
+ *
+ * 设计取向是**高精度、低召回**：只收方向明确的类别，其余一律 `NEU`。
+ * 宁可让 POS/NEG 两桶小一点，也不要往里掺方向不明的东西 ——
+ * 掺进去的结果是两个桶互相抵消，而那正是这次要排除的解释。
+ *
+ * **四条刻意排除**（都是「看着有方向、其实没有」）：
+ * - `业绩预告`：标题多数不写预增/预减，只有显式写了的才算；
+ * - `异常波动`：它是**价格已经动过**的结果而不是原因，收进来等于用结果解释结果；
+ * - `停牌`：可能是重组（好）也可能是风险（坏）；
+ * - `解除质押`：与 `质押` 相反，必须先排除，否则会被当成利空。
+ */
+const TONE_NEG = [
+  '减持',
+  '冻结',
+  '拍卖',
+  '立案',
+  '处罚',
+  '警示函',
+  '问询函',
+  '关注函',
+  '监管措施',
+  '违规',
+  '业绩预减',
+  '业绩预亏',
+  '退市风险',
+  '其他风险警示',
+  '风险提示',
+] as const
+const TONE_POS = [
+  '增持',
+  '回购',
+  '业绩预增',
+  '扭亏',
+  '中标',
+  '重大合同',
+  '框架协议',
+  '战略合作',
+  '利润分配',
+  '权益分派',
+  '分红',
+] as const
+
+export function toneOf(title: string): Tone {
+  // 质押是利空，但「解除质押」是相反的事 —— 必须先减掉再判
+  const t = title.replace(/解除质押/g, '')
+  if (t.includes('质押')) return 'NEG'
+  for (const k of TONE_NEG) if (t.includes(k)) return 'NEG'
+  for (const k of TONE_POS) if (t.includes(k)) return 'POS'
+  return 'NEU'
+}
+
+/**
+ * code → 公告日 → 当天的合并方向。
+ *
+ * 一天平均 3.23 条公告，方向可能混杂。合并规则：
+ * **有利空记利空 → 否则有利好记利好 → 否则中性**。风险优先是刻意的，
+ * 而且这条规则同样是事前定的，不许事后换。
+ */
+type AnnouncementDays = Map<string, Map<number, Tone>>
 
 /**
  * 载入 `fetch-announcements.mjs` 的产物。
@@ -159,7 +228,7 @@ type AnnouncementDays = Map<string, Set<number>>
  * **读不到就抛错，不静默退化成「都没有公告」** —— 那会让整张表的「公告 无」层
  * 吃下全部建仓，而读表的人完全看不出数据根本没加载。
  */
-function loadAnnouncements(dir: string): AnnouncementDays {
+export function loadAnnouncements(dir: string): AnnouncementDays {
   const files = readdirSync(dir).filter((f) => f.endsWith('.json'))
   if (files.length === 0) throw new Error(`${dir} 里没有公告文件，先跑 pnpm fetch:announcements`)
   const out: AnnouncementDays = new Map()
@@ -167,16 +236,21 @@ function loadAnnouncements(dir: string): AnnouncementDays {
   for (const file of files) {
     const raw = JSON.parse(readFileSync(join(dir, file), 'utf-8')) as {
       code?: string
-      items?: { date?: string }[]
+      items?: { date?: string; title?: string }[]
     }
     if (!raw.code) continue
-    const set = new Set<number>()
+    const byDay = new Map<number, Tone>()
     for (const item of raw.items ?? []) {
       const day = item.date === undefined ? null : toEpochDay(item.date as TradeDate)
-      if (day !== null) set.add(day)
+      if (day === null) continue
+      const tone = toneOf(item.title ?? '')
+      const prev = byDay.get(day)
+      // 合并：NEG > POS > NEU
+      if (prev === 'NEG') continue
+      if (tone === 'NEG' || prev === undefined || (prev === 'NEU' && tone === 'POS')) byDay.set(day, tone)
     }
-    total += set.size
-    out.set(raw.code, set)
+    total += byDay.size
+    out.set(raw.code, byDay)
   }
   process.stderr.write(`公告：${out.size} 只 · 合计 ${total} 个公告日
 `)
@@ -196,18 +270,25 @@ function loadAnnouncements(dir: string): AnnouncementDays {
  * 而表上完全看不出来，读数会全错。null 的建仓**整个退出公告这两层**，
  * 并在日志里报出条数。
  */
-function hasAnnouncement(
+function toneAt(
   days: AnnouncementDays,
   code: string,
   signalDate: TradeDate,
   window: number
-): boolean | null {
-  const set = days.get(code)
-  if (!set) return null
+): Tone | 'NONE' | null {
+  const byDay = days.get(code)
+  if (!byDay) return null
   const end = toEpochDay(signalDate)
   if (end === null) return null
-  for (let d = end - (window - 1); d <= end; d++) if (set.has(d)) return true
-  return false
+  let seen: Tone | null = null
+  for (let d = end - (window - 1); d <= end; d++) {
+    const tone = byDay.get(d)
+    if (tone === undefined) continue
+    // 窗口内跨多天时同样是 NEG > POS > NEU
+    if (tone === 'NEG') return 'NEG'
+    if (seen === null || (seen === 'NEU' && tone === 'POS')) seen = tone
+  }
+  return seen ?? 'NONE'
 }
 
 // ── 分层键 ───────────────────────────────────────────────────────────────
@@ -255,7 +336,18 @@ const ALWAYS_SHOWN = new Set<string>(['ALL', ...REGIMES])
  * 一次建仓同时进多个层。交叉层只对 TREND_UP 展开 ——
  * 它是 §5.21 定位到的负 alpha 集中处，其余状态展开只会把表撑大而没有读数。
  */
-function stratumKeysOf(p: Position, announced: boolean | null): string[] {
+const TONE_LABEL: Record<Tone | 'NONE', string> = {
+  POS: '公告 利好',
+  NEG: '公告 利空',
+  NEU: '公告 中性',
+  NONE: '公告 无',
+}
+
+function stratumKeysOf(
+  p: Position,
+  announced: Tone | 'NONE' | null,
+  freq: { bucket: string; timeHalf: string; codeHalf: string } | null
+): string[] {
   const band = scoreBand(p.entryScore)
   const sig = signalKey(p.entrySignals)
   const keys = [
@@ -273,8 +365,20 @@ function stratumKeysOf(p: Position, announced: boolean | null): string[] {
   // 公告维度（仅 --announcements 时）。与 regime 交叉是这次要看的主判据：
   // 「公告筛出来的池子会不会富集在引擎最差的那个状态上」
   if (announced !== null) {
-    const tag = announced ? '公告 有' : '公告 无'
+    const tag = TONE_LABEL[announced]
     keys.push(tag, `${p.regimeAtEntry} · ${tag}`)
+    // 「有」那一层保留：方向分完之后每桶都很薄，聚合口径仍要能读
+    if (announced !== 'NONE') keys.push('公告 有')
+  }
+  // 股票层面的公告频率（--announce-freq）。四个独立切法是 CLAUDE.md 对
+  // 「砍掉一批」类结论的硬要求：砍掉一批已知负 alpha 的交易必然提升剩余部分的 alpha，
+  // 那是算术不是发现 —— 只有四个切法都同向才分得开「找对机制」与「删掉任何一批差交易」
+  if (freq !== null) {
+    keys.push(
+      `频率 ${freq.bucket}`,
+      `频率 ${freq.bucket} · ${freq.timeHalf}`,
+      `频率 ${freq.bucket} · ${freq.codeHalf}`
+    )
   }
   return keys
 }
@@ -555,6 +659,16 @@ interface Options {
    * 拿成交日去比公告日会把「公告发布后次日才成交」这件事算错一天。
    */
   announceDays: number
+  /**
+   * 按**股票层面**的公告年频率分四桶（Q1 最少 … Q4 最多），并交叉时间/代码前后半。
+   *
+   * ⚠ 与 `--announcements` 的分层**问的不是同一个问题**：那个是「这次建仓前有没有公告」
+   * （时点属性），这个是「这只票爱不爱发公告」（股票属性）。混着读会把两者当成一回事。
+   *
+   * 频率口径是**公告日数 ÷ 该股自己的 K 线年数**，不是除以固定年限 ——
+   * 晚上市的票分子天然小，除固定年限会同时压低它的频率与建仓数，制造出虚假相关。
+   */
+  announceFreq: boolean
   out?: string
   json: boolean
 }
@@ -582,6 +696,8 @@ const USAGE = `用法：
   --announcements <dir>  历史公告目录（fetch-announcements.mjs 的产物）。给了它就多出
                          「公告 有/无」及其与四个 regime 的交叉层。**只分层，不改交易**
   --announce-days <n>    公告窗口（自然日，含信号当天），默认 1
+  --announce-freq        按**股票层面**公告年频率分四桶（控制上市时长），并交叉时间/代码前后半。
+                         与 --announce-days 问的不是同一个问题：那个是时点，这个是股票属性
                          （总体与四个市场状态不受此过滤）
   --out <file>           JSON 落盘
   --json                 只输出 JSON
@@ -597,9 +713,10 @@ function parse(argv: readonly string[]): Options | 'help' {
     warmup: 300,
     minCount: 30,
     announceDays: 1,
+    announceFreq: false,
     json: false,
   }
-  const flags = new Set(['--match-regime', '--shuffle-spans', '--json', '--help', '-h'])
+  const flags = new Set(['--match-regime', '--shuffle-spans', '--announce-freq', '--json', '--help', '-h'])
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i]
     if (key === undefined || key === '--') continue
@@ -639,6 +756,9 @@ function parse(argv: readonly string[]): Options | 'help' {
         break
       case '--announce-days':
         o.announceDays = Number(need())
+        break
+      case '--announce-freq':
+        o.announceFreq = true
         break
       case '--match-regime':
         o.matchRegime = true
@@ -750,9 +870,56 @@ export async function run(argv: readonly string[]): Promise<number> {
      * 拿它直接和随机比，会分不清「点选得差」还是「离场规则差」。
      */
     passive: FillResult | null
-    /** 信号那根 K 线上有没有公告。未开 --announcements 时为 null（该维度不参与分层） */
-    announced: boolean | null
+    /**
+     * 信号那根 K 线上的公告方向。`NONE` = 当天没有公告；
+     * `null` = 这只票没有公告数据（**退出该维度**，不是「没有公告」）。
+     */
+    announced: Tone | 'NONE' | null
+    /** 股票层面的公告频率桶（'Q1'..'Q4'）。未开 --announce-freq 时为 null */
+    freqBucket: string | null
+    /** 时间前/后半（按建仓日在全部建仓里的中位数切）与代码前/后半 —— 稳定性检验用 */
+    timeHalf: string | null
+    codeHalf: string | null
   }
+  /*
+    股票层面的公告年频率（--announce-freq）。
+    **口径是「公告日数 ÷ 该股自己的 K 线年数」**，不是除以固定年限 ——
+    晚上市的票分子天然小，除固定年限会同时压低它的频率与建仓数，制造出虚假正相关。
+  */
+  const freqOf = new Map<string, string>()
+  const timeHalfOf = new Map<string, string>()
+  const codeHalfOf = new Map<string, string>()
+  if (opts.announceFreq) {
+    if (announceDays === null) throw new Error('--announce-freq 需要同时给 --announcements')
+    const rows: { code: string; freq: number }[] = []
+    for (const p of positions) {
+      if (freqOf.has(p.code)) continue
+      const byDay = announceDays.get(p.code)
+      const entry = loaded.get(normalizeCode(p.code))
+      if (!byDay || !entry) continue
+      const years = entry.series.candles.length / 242
+      if (years <= 0) continue
+      freqOf.set(p.code, '')
+      rows.push({ code: p.code, freq: byDay.size / years })
+    }
+    rows.sort((a, b) => a.freq - b.freq)
+    const q = Math.max(1, Math.floor(rows.length / 4))
+    rows.forEach((r, i) => freqOf.set(r.code, `Q${Math.min(4, Math.floor(i / q) + 1)}`))
+    // 代码前/后半：按代码字典序切，与频率无关的一刀
+    const codesSorted = rows.map((r) => r.code).sort()
+    codesSorted.forEach((c, i) =>
+      codeHalfOf.set(c, i < codesSorted.length / 2 ? '代码前半' : '代码后半')
+    )
+    // 时间前/后半：按建仓日的中位数切
+    const dates = positions.map((p) => p.entryDate).sort()
+    const mid = dates[Math.floor(dates.length / 2)] ?? ''
+    for (const p of positions) timeHalfOf.set(`${p.code}@${p.entryDate}`, p.entryDate < mid ? '时间前半' : '时间后半')
+    process.stderr.write(
+      `公告频率分桶：${rows.length} 只 · Q1 ${rows[0]?.freq.toFixed(1)} ~ Q4 ${rows[rows.length - 1]?.freq.toFixed(1)} 公告日/年
+`
+    )
+  }
+
   const tasks: Task[] = []
   const skipped: string[] = []
   /** 没有公告文件、因而退出公告分层的建仓数。必须报出来，见 hasAnnouncement */
@@ -795,7 +962,7 @@ export async function run(argv: readonly string[]): Promise<number> {
     const announced =
       announceDays === null || signalBar === undefined
         ? null
-        : hasAnnouncement(announceDays, p.code, signalBar.date as TradeDate, opts.announceDays)
+        : toneAt(announceDays, p.code, signalBar.date as TradeDate, opts.announceDays)
     if (announceDays !== null && announced === null) missingAnnouncements++
 
     tasks.push({
@@ -807,15 +974,18 @@ export async function run(argv: readonly string[]): Promise<number> {
       real: { deployed: p.deployed, pnl: p.pnl },
       passive: fillTrade(entry.series, entryIdx, span, capital, costs),
       announced,
+      freqBucket: freqOf.get(p.code) ?? null,
+      timeHalf: timeHalfOf.get(`${p.code}@${p.entryDate}`) ?? null,
+      codeHalf: codeHalfOf.get(p.code) ?? null,
     })
   }
 
   if (announceDays !== null) {
     const covered = tasks.filter((t) => t.announced !== null).length
-    const hit = tasks.filter((t) => t.announced === true).length
+    const n = (tone: Tone | 'NONE'): number => tasks.filter((t) => t.announced === tone).length
     process.stderr.write(
-      `公告分层：${covered}/${tasks.length} 次建仓有公告数据` +
-        `（其中信号日有公告 ${hit} 次 = ${((hit / Math.max(1, covered)) * 100).toFixed(1)}%）` +
+      `公告分层：${covered}/${tasks.length} 次建仓有公告数据 · ` +
+        `利好 ${n('POS')} · 利空 ${n('NEG')} · 中性 ${n('NEU')} · 无 ${n('NONE')}` +
         (missingAnnouncements > 0 ? ` · ⚠ ${missingAnnouncements} 次因缺公告文件退出该分层` : '') +
         `
 `
@@ -828,7 +998,13 @@ export async function run(argv: readonly string[]): Promise<number> {
   // 随机组按同一批建仓配对，所以每一层的随机基准都是「这一层里的那些票、那些持有跨度」——
   // 换句话说层与层之间的零点不同，**不同层的分位可以横比，绝对收益不可以**。
   const keysOf = new Map<Position, string[]>()
-  for (const t of tasks) keysOf.set(t.position, stratumKeysOf(t.position, t.announced))
+  for (const t of tasks) {
+    const freq =
+      t.freqBucket === null || t.timeHalf === null || t.codeHalf === null
+        ? null
+        : { bucket: t.freqBucket, timeHalf: t.timeHalf, codeHalf: t.codeHalf }
+    keysOf.set(t.position, stratumKeysOf(t.position, t.announced, freq))
+  }
   const strata: string[] = []
   const seenKey = new Set<string>()
   for (const t of tasks) {
@@ -1060,8 +1236,13 @@ function renderText(p: RandomAuditPayload): string {
     { title: '按 regime 已持续根数（全池）', pick: (l) => l.startsWith('持续 ') },
     { title: '按 regime 已持续根数（TREND_UP）', pick: (l) => l.startsWith('TREND_UP · 持续 ') },
     // 公告分层（仅 --announcements）。放最后：它是一次性的只读验证，不是常规读数
-    { title: '按信号日有无公告（全池）', pick: (l) => l === '公告 有' || l === '公告 无' },
-    { title: '按信号日有无公告 × 市场状态', pick: (l) => /^(TREND_UP|TREND_DOWN|RANGE|TRANSITION) · 公告 /.test(l) },
+    { title: '按信号日公告方向（全池）', pick: (l) => /^公告 (有|无|利好|利空|中性)$/.test(l) },
+    {
+      title: '按信号日公告方向 × 市场状态',
+      pick: (l) => /^(TREND_UP|TREND_DOWN|RANGE|TRANSITION) · 公告 /.test(l),
+    },
+    { title: '按股票公告年频率（四分位）', pick: (l) => /^频率 Q\d$/.test(l) },
+    { title: '按股票公告年频率 × 四个独立切法', pick: (l) => /^频率 Q\d · /.test(l) },
   ]
 
   const W = 30

@@ -206,6 +206,9 @@ export function registerHandlers(controller: AppController): void {
 
   handle('announcement:refresh', (_event, sinceMs) => controller.refreshAnnouncements(sinceMs))
 
+  // 简报事实层（判据在 brief/build.ts）。**纯读**，与 announcement:list 同一条纪律
+  handle('brief:daily', (_event, sinceMs) => controller.dailyBrief(sinceMs))
+
   handle('pet:setHitRegion', (_event, rects) => controller.setHitRects(rects))
 
   handle('pet:setInteractive', (_event, interactive) => controller.setOverlayInteractive(interactive))

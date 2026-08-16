@@ -811,6 +811,63 @@ export interface AnnouncementView {
   url: string
 }
 
+/**
+ * 盘前简报（docs/11 N3/N5）。判据在 `src/main/brief/build.ts`（纯函数，有用例）。
+ *
+ * ## 只列不判
+ *
+ * 每条只有「什么时候 · 什么类型 · 什么标题 · 原文链接」。**不打分、不判利好利空、
+ * 不给买卖方向** —— 只有标题没有正文，拿标题下结论是在没有依据的情况下下结论。
+ * 2026-08-16 的三轮实测另给了一个经验理由（M2 §5.25）：公告方向这个维度
+ * 在 261 只 × 8.6 年上测不出任何东西。
+ *
+ * ## 它不是提醒
+ *
+ * 不进 `alert_log`、不点亮状态点、不弹气泡、不占提醒配额。出口只有面板那一页签。
+ */
+export interface DailyBrief {
+  date: TradeDate
+  /** 生成时刻（墙上时间），由调用方给 */
+  at: number
+  /** 自选股只数（**不含内置行业 ETF**） */
+  watchCount: number
+  /** 只含**有公告**的票；持仓优先，其次按「建议先看」条数 */
+  stocks: BriefStock[]
+  counts: { stocks: number; total: number; spotlight: number }
+  /**
+   * 取数失败的原因。**有它时不许把界面显示成「今天没有公告」** ——
+   * 「没能取到」与「今天没有」是两件事，把前者说成后者等于替一个没查过的范围担保。
+   */
+  fetchError?: string
+  /** 几句**陈述**，每句都能从 counts 逐字推出。不得出现「今日无异常」 */
+  lines: string[]
+}
+
+export interface BriefStock {
+  code: SecCode
+  name: string
+  industry?: string
+  hasPosition: boolean
+  /** 新到旧 */
+  items: BriefItem[]
+}
+
+export interface BriefItem {
+  id: string
+  title: string
+  /** 数据源给的分类。拿不到时 null，**不是「其他」** */
+  category: string | null
+  publishedAt: number
+  noticeDate: TradeDate
+  /** 原文链接。**没有链接的条目根本不会出现在这里** */
+  url: string
+  /**
+   * 命中「建议先看」的类型白名单。**它只影响排序与一个标记，不是评分、不产生方向**，
+   * 也**不用于过滤**（藏起来的那些正是用户可能真正关心的）。
+   */
+  spotlight: boolean
+}
+
 export type AnnouncementRefreshResult =
   | { ok: true; fetched: number; added: number; skipped: number }
   | { ok: false; error: string }
@@ -1086,6 +1143,11 @@ export interface IpcInvokeMap {
    * 「没能取到」与「今天没有公告」是两件事，把前者显示成后者等于替一个没查过的范围担保。
    */
   'announcement:refresh': (sinceMs: number) => AnnouncementRefreshResult
+  /**
+   * 盘前简报（docs/11 N3）。**纯读，不发请求** —— 拉取由 `announcement:refresh` 单独触发，
+   * 打开那一屏不等于每次都去数据源拉一次。
+   */
+  'brief:daily': (sinceMs: number) => DailyBrief | null
   'pet:setHitRegion': (rects: Rect[]) => void
   /**
    * 渲染层完成命中判定后上报：鼠标是否落在悬浮条本体上。
