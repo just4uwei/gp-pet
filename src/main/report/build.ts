@@ -29,6 +29,7 @@ import type {
   DailyReportStock,
   DailyReportTomorrow,
   PositionView,
+  ReportEnvironment,
   SignalRecord,
   WatchItem,
   WatchPointView,
@@ -62,6 +63,13 @@ export interface BuildReportInput {
   stopLossPct: number
   /** 当日零点。判断观察点「明天到期」用，同样不在这里读时钟 */
   dayStart: number
+  /**
+   * 今日环境（基准 + 行业 ETF），由 `report/environment.ts` 先算好传进来。
+   *
+   * **必填而不是可选**：可选会让调用方漏传时静默少一整节，而界面上只是"那块没了"。
+   * 本模块只做透传 —— 它不认识行业 ETF，也不该认识（那一节的判据在 environment.ts）。
+   */
+  environment: ReportEnvironment
 }
 
 /** 方向标签在 `tomorrow.note` 里出现，与面板/悬浮条同一份措辞 */
@@ -91,7 +99,7 @@ function pct(part: number, whole: number): number {
  * **两者不混用**：涨跌幅与振幅必须与 `close` 出自同一份数据，
  * 拿收盘价配快照的昨收会算出一个哪边都不对的数。
  */
-function quoteOf(
+export function quoteOf(
   code: SecCode,
   bars: BuildReportInput['bars'],
   snapshots: BuildReportInput['snapshots']
@@ -154,7 +162,8 @@ export function toStopPct(
 }
 
 export function buildDailyReport(input: BuildReportInput): DailyReport {
-  const { date, at, items, bars, snapshots, signals, positions, watchPoints, alerts, stopLossPct, dayStart } = input
+  const { date, at, items, bars, snapshots, signals, positions, watchPoints, alerts, stopLossPct, dayStart, environment } =
+    input
 
   const positionOf = new Map(positions.map((p) => [p.code, p]))
   const signalsOf = new Map<SecCode, SignalRecord[]>()
@@ -301,6 +310,10 @@ export function buildDailyReport(input: BuildReportInput): DailyReport {
     },
     tomorrow,
     data: { withClose, missing },
+    // 透传。**不要**把 environment 的数字掺进 highlights ——
+    // 那几句答的是「我的票今天怎么样」，环境是另一节，混起来就再也分不清
+    // 「3 只跌破止损」是我的票的事还是大盘的事
+    environment,
     highlights: highlightsOf({ items, withSignal, byDirection, belowStop, delivered, gated: alerts.length - delivered, tomorrow, stage }),
   }
 }

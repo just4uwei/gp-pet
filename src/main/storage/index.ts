@@ -7,6 +7,7 @@
 import type { Database } from './db'
 import { AiExplainRepo } from './repositories/ai-explain'
 import { ReportNoteRepo } from './repositories/report-note'
+import { AnnouncementRepo } from './repositories/announcement'
 import { AlertRepo } from './repositories/alert'
 import { CalendarRepo } from './repositories/calendar'
 import { ProviderHealthRepo } from './repositories/health'
@@ -43,6 +44,7 @@ export interface Storage {
   readonly aiExplains: AiExplainRepo
   /** 收盘日报的 AI 评价：一天一条，同样不进裁剪（见 010_report_note.sql） */
   readonly reportNotes: ReportNoteRepo
+  readonly announcements: AnnouncementRepo
   readonly meta: MetaRepo
   close(): void
 }
@@ -64,6 +66,7 @@ export function createStorage(db: Database): Storage {
     trades: new TradeRepo(db),
     aiExplains: new AiExplainRepo(db),
     reportNotes: new ReportNoteRepo(db),
+    announcements: new AnnouncementRepo(db),
     meta: new MetaRepo(db),
     close: () => db.close(),
   }

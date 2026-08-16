@@ -30,7 +30,8 @@
     "verify:indicators": "node scripts/verify/run.mjs",
     "fixtures:record": "node scripts/record-fixtures.mjs",
     "fetch:history": "node scripts/fetch-history.mjs",
-    "build:universe": "node scripts/build-universe.mjs"
+    "build:universe": "node scripts/build-universe.mjs",
+    "fetch:announcements": "node scripts/fetch-announcements.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

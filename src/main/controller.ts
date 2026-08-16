@@ -38,6 +38,8 @@ import type {
   PositionView,
   ProviderHealth,
   Rect,
+  AnnouncementRefreshResult,
+  AnnouncementView,
   ReportNoteView,
   ShadowSummary,
   ShadowTradeView,
@@ -79,6 +81,7 @@ import { resolveQuiet, type QuietVerdict } from './alerts/dnd'
 import { createNotificationStateProbe, type NotificationStateProbe } from './alerts/notification-state'
 import type { DataLayer } from './data-layer'
 import type { SignalOutcome } from './engine'
+import { BENCHMARK_CODE } from './engine'
 import { log } from './logging'
 import { shanghaiTime, type TickContext } from './scheduler'
 import type { WatchEntry } from './storage/repositories/watchlist'
@@ -105,6 +108,8 @@ import { isReportTarget, reportDateOf } from '@shared/ai-target'
 import { INDUSTRY_ETF_GROUP } from '@shared/industry-etf'
 import { shanghaiDayStartMs } from '@shared/time'
 import { buildDailyReport } from './report/build'
+import { buildEnvironment, type EnvironmentTarget } from './report/environment'
+import { fetchAnnouncements } from './engine/announcements'
 import { reportFactDigest } from './report/digest'
 import {
   DEFAULT_SHADOW_CAPITAL,
@@ -1162,6 +1167,66 @@ export class AppController {
    * 在日线补齐、日报定稿之后可能已经与屏幕上的数字对不上 —— 而它读起来完全正常。
    * 这与「stale 快照必须灰显」是同一条纪律：不假装，也不让用户自己去发现。
    */
+  /**
+   * 已落库的公告（docs/11 N2）。**纯读，一个请求都不发** ——
+   * 与 `report:note` 同一条纪律：打开那一屏不等于去数据源拉一次。
+   *
+   * 内置行业 ETF 不在范围内（它们没有个股公告），与 `dailyReport()` 同一条摘除口径。
+   */
+  announcements(sinceMs: number): AnnouncementView[] {
+    const layer = this.data
+    if (!layer) return []
+    const codes = layer.watchlist
+      .list()
+      .filter((item) => item.group !== INDUSTRY_ETF_GROUP)
+      .map((item) => item.code)
+    return layer.storage.announcements.since(codes, sinceMs).map((row) => ({
+      id: row.id,
+      code: row.code,
+      name: row.name,
+      title: row.title,
+      category: row.category,
+      publishedAt: row.publishedAt,
+      noticeDate: row.noticeDate,
+      url: row.url,
+    }))
+  }
+
+  /**
+   * 去数据源拉一次公告并落库（docs/11 N2）。
+   *
+   * **失败是一等结果**：返回 `ok: false` + 原因，不抛异常。
+   * 「没能取到」与「今天没有公告」是两件事 —— 把前者显示成后者，
+   * 等于替一个从来没查过的范围担保（N2-e）。
+   */
+  async refreshAnnouncements(sinceMs: number): Promise<AnnouncementRefreshResult> {
+    const layer = this.data
+    if (!layer) return { ok: false, error: '数据层尚未就绪，请稍后重试' }
+    if (!layer.registry.supports('announcement')) {
+      return { ok: false, error: '当前没有数据源支持公告' }
+    }
+
+    let providerId = 'unknown'
+    const result = await fetchAnnouncements({
+      items: layer.watchlist.list(),
+      etfGroup: INDUSTRY_ETF_GROUP,
+      sinceMs,
+      now: Date.now(),
+      // 真正用了哪个源要落库留痕：两个源的条目 ID 空间不同，混用时得查得出出处
+      provider: providerId,
+      fetch: async (codes, since) => {
+        const out = await layer.registry.fetchAnnouncements(codes, since)
+        providerId = out.provider
+        return out.value
+      },
+    })
+    if (!result.ok) return result
+
+    const rows = result.rows.map((row) => ({ ...row, provider: providerId }))
+    const added = layer.storage.announcements.upsertMany(rows)
+    return { ok: true, fetched: rows.length, added, skipped: result.skipped }
+  }
+
   reportNote(): ReportNoteView | null {
     const layer = this.data
     if (!layer) return null
@@ -1228,6 +1293,36 @@ export class AppController {
       if (snapshot) snapshots.set(item.code, snapshot)
     }
 
+    /*
+      今日环境（docs/11 N1）：基准指数 + 那 15 只行业 ETF，**独立的一节**。
+
+      这正是上面那段注释里说的「真要在日报里给行业一段，那是独立的一节
+      （与个股分开列），不是把它们混进来」—— `items` 依然不含它们，
+      所以 overview / stocks / tomorrow 的计数一个都没变。
+
+      取数是零新增的：这些标的本来就在自选里（行业ETF 组）或在 auxCodes 里（基准），
+      日线与快照都已经在库。**不含隔夜外盘** —— 原因写在 report/environment.ts 头注释。
+    */
+    const etfItems = layer.watchlist.list().filter((item) => item.group === INDUSTRY_ETF_GROUP)
+    const envTargets: EnvironmentTarget[] = etfItems.map((item) => ({
+      code: item.code,
+      name: item.name,
+      ...(item.industry === undefined ? {} : { industry: item.industry }),
+    }))
+    // 基准不在自选里（它走 auxCodes），名字库里没有，用固定展示名
+    const benchmark: EnvironmentTarget = { code: BENCHMARK_CODE, name: '沪深300' }
+
+    for (const target of [benchmark, ...envTargets]) {
+      const pair = layer.storage.klines.recentThrough(target.code, date, 2)
+      const day = pair.at(-1)
+      if (day && day.date === date) {
+        const prev = pair.length >= 2 ? pair[pair.length - 2] : undefined
+        bars.set(target.code, prev ? { day, prev } : { day })
+      }
+      const snapshot = layer.market.snapshotOf(target.code)
+      if (snapshot) snapshots.set(target.code, snapshot)
+    }
+
     // 日界走北京时间，不是宿主本地时区（shared/time.ts）——
     // 这一处在 2026-08-15 统一日界那轮被漏掉了：UTC−5 上本机 00:00 是北京 13:00，
     // 于是日报里「今天的信号」会从午盘开始算
@@ -1245,6 +1340,7 @@ export class AppController {
       alerts: this.alertHistory({ from: dayStart, limit: 500 }),
       stopLossPct: DEFAULT_PARAMS.risk.stopLossPct,
       dayStart,
+      environment: buildEnvironment({ benchmark, industries: envTargets, bars, snapshots }),
     })
   }
 

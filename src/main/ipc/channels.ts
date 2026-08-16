@@ -55,6 +55,8 @@ export const INVOKE_CHANNELS = [
   'watch:suggest',
   'report:daily',
   'report:note',
+  'announcement:list',
+  'announcement:refresh',
   'app:backupDatabase',
   'app:clearCache',
   'app:chooseDataDir',

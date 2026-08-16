@@ -10,9 +10,9 @@
  */
 
 import type { AdjustMode, SecCode, SecProfile, Snapshot, TradeDate } from '@core/types'
-import { isSTName, splitCode } from '@core/code'
+import { isSTName, parseCode, splitCode } from '@core/code'
 import type { HttpClient } from '../../net/http'
-import type { MinutePoint, MinuteSeries, ProviderCapabilities, QuoteProvider } from '../types'
+import type { Announcement, MinutePoint, MinuteSeries, ProviderCapabilities, QuoteProvider } from '../types'
 import {
   ProviderDataError,
   type RawBar,
@@ -30,6 +30,7 @@ import {
   parseDateTime,
   positive,
   resolveLimits,
+  shanghaiToEpochMs,
   withoutAdjustment,
 } from '../shared'
 
@@ -39,6 +40,18 @@ const KLINE_URL = 'https://push2his.eastmoney.com/api/qt/stock/kline/get'
 const SNAPSHOT_URL = 'https://push2.eastmoney.com/api/qt/ulist.np/get'
 const PROFILE_URL = 'https://push2.eastmoney.com/api/qt/stock/get'
 const TRENDS_URL = 'https://push2his.eastmoney.com/api/qt/stock/trends2/get'
+/** 公告（docs/11 N2）。与行情不同域，UT 也用不上 —— 它不是 push2 那一族 */
+const ANNOUNCE_URL = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+/** 原文详情页。`art_code` + 六位代码就能拼出来，接口本身不给完整 URL */
+const ANNOUNCE_DETAIL = 'https://data.eastmoney.com/notices/detail'
+/** 接口单页上限实测就是 100（要 200 也只给 100） */
+const ANNOUNCE_PAGE_SIZE = 100
+/**
+ * 翻页上限。返回是**全局按发布时刻倒序的扁平流**，活跃日里少数公司会占满整页 ——
+ * 实测请求 40 只、单页 100 条时只覆盖到 32 只。所以必须翻页，但要有上限：
+ * 没有上限的话，`sinceMs` 给早了会把整个历史拖下来。
+ */
+const ANNOUNCE_MAX_PAGES = 10
 
 /**
  * 接口必需的查询参数，不是伪造身份 —— 缺了它多数端点直接 400。
@@ -107,11 +120,128 @@ const CAPABILITIES: ProviderCapabilities = {
   minute: true,
   profile: true,
   calendar: true,
+  // 公告：np-anotice-stock 那条路，见 fetchAnnouncements
+  announcement: true,
 }
 
 export interface EastmoneyOptions {
   http: HttpClient
   now?: () => number
+}
+
+// ─────────────────────────── 公告 ───────────────────────────
+
+/**
+ * `2026-08-14 17:30:24:703` → epoch ms。**毫秒是用冒号分隔的**，不是小数点。
+ *
+ * ⚠ **不要用 `Date.parse` / `new Date(...)`，它不会报错，只会给一个偏掉的时刻。**
+ * V8 对这个格式是宽容的（**不**返回 NaN），但它按**本机时区**解析：
+ * 实测本机 UTC+7 时 `Date.parse('2026-08-14 17:30:24:703')` 给
+ * `2026-08-14T10:30:24Z`，而北京时间 17:30 是 `T09:30:24Z` —— **整整差一小时**。
+ *
+ * 这是本项目最讨厌的那类失真：不抛异常、不报警，只是把「昨晚 17:30 发的公告」
+ * 记成别的时刻，于是盘前简报的时间窗口会漏掉或多算一批。所以走 `shanghaiToEpochMs`。
+ */
+export function parseAnnounceStamp(raw: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(raw.trim())
+  if (!m) return null
+  return shanghaiToEpochMs(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]))
+}
+
+/**
+ * 六位数字 + `ann_type` → 内部代码。
+ *
+ * ⚠ **这里踩过一个真 bug，别改回去**（2026-08-15 实测发现）：
+ * 原先写的是 `splitCode('SH'+digits) ?? splitCode('SZ'+digits) ?? splitCode('BJ'+digits)`，
+ * 而 SH 的代码段表里有 `['000', 'INDEX']` —— 于是 `000157`（中联重科，深市主板）
+ * 被判成 `SH000157`（上证指数段）。后果是**整个深市 000 段**（000001 平安银行、
+ * 000002 万科…）的公告都会带着一个错代码出来，被编排层当成「未点名的票」丢掉，
+ * 用户永远看不到这些票的公告，**而界面上完全看不出来**。实测一次请求丢了 8 条。
+ *
+ * 两道判据，顺序不能换：
+ *   1. **`ann_type` 优先**。实测它是可靠的市场位：`A,SHA` / `A,SZA` / `A,CYB`（创业板）。
+ *      早先注释说它「只是分类标签」是错的，那个判断把我引向了上面那条错路。
+ *   2. 没有 `ann_type` 时退到 `parseCode`，**不要自己拼 SH/SZ/BJ 试** ——
+ *      它已经做对了这件事（`src/core/code.ts`：「指数段排除在推断之外」），
+ *      而公告永远不属于指数。
+ */
+export function resolveAnnounceCode(digits: string, annType: string): SecCode | null {
+  const market = /SHA|SHB|SH\b/.test(annType)
+    ? 'SH'
+    : /SZA|SZB|CYB/.test(annType)
+      ? 'SZ'
+      : /BJA|BSE|BJ\b/.test(annType)
+        ? 'BJ'
+        : null
+  if (market) {
+    const explicit = splitCode(`${market}${digits}` as SecCode)
+    // 显式市场下 000157 仍可能落到 SH 的 INDEX 段上，所以这里也要把指数挡掉
+    if (explicit && explicit.board !== 'INDEX') return explicit.code
+  }
+  const inferred = parseCode(digits)
+  return inferred.ok ? inferred.value.code : null
+}
+
+interface AnnounceRow {
+  art_code?: unknown
+  title?: unknown
+  display_time?: unknown
+  notice_date?: unknown
+  codes?: { stock_code?: unknown; short_name?: unknown; ann_type?: unknown }[]
+  columns?: { column_name?: unknown }[]
+}
+
+/**
+ * 解析公告列表。**跳过而不是抛错**的三种行：缺 `art_code`、缺原文可拼出的代码、
+ * 时刻解析不出来。理由是这三种都只影响那一条，而抛错会让整页作废 ——
+ * 一条脏数据不该让用户今天一条公告都看不到。
+ *
+ * 但 **`url` 拿不到就整条丢弃**（docs/11 N2-d）：能点回原文是防幻觉的结构性保证，
+ * 一条点不开的公告比没有这条更糟。这里的 url 由 `art_code` + 六位代码拼出来，
+ * 所以「拿不到 url」等价于「拿不到这两个之一」。
+ */
+export function parseAnnouncements(body: string): Announcement[] {
+  let payload: { data?: { list?: unknown } | null }
+  try {
+    payload = JSON.parse(body) as { data?: { list?: unknown } | null }
+  } catch {
+    throw new ProviderDataError(ID, `公告返回不是 JSON：${body.slice(0, 80)}`)
+  }
+  const list = payload.data?.list
+  if (!Array.isArray(list)) return []
+
+  const out: Announcement[] = []
+  for (const raw of list as AnnounceRow[]) {
+    const artCode = typeof raw.art_code === 'string' ? raw.art_code : null
+    const title = typeof raw.title === 'string' ? raw.title.trim() : ''
+    const first = raw.codes?.[0]
+    const digits = typeof first?.stock_code === 'string' ? first.stock_code : null
+    if (artCode === null || title === '' || digits === null) continue
+
+    const code = resolveAnnounceCode(digits, typeof first?.ann_type === 'string' ? first.ann_type : '')
+    if (!code) continue
+
+    const publishedAt = typeof raw.display_time === 'string' ? parseAnnounceStamp(raw.display_time) : null
+    if (publishedAt === null) continue
+
+    const noticeRaw = typeof raw.notice_date === 'string' ? raw.notice_date : ''
+    const noticeDate = /^(\d{4}-\d{2}-\d{2})/.exec(noticeRaw)?.[1]
+    if (noticeDate === undefined) continue
+
+    const columnName = raw.columns?.[0]?.column_name
+    out.push({
+      id: artCode,
+      code,
+      name: typeof first?.short_name === 'string' ? first.short_name : '',
+      title,
+      // 拿不到分类给 null，**不填「其他」** —— 猜一个出来，下游的白名单就会命中不存在的类型
+      category: typeof columnName === 'string' && columnName !== '' ? columnName : null,
+      publishedAt,
+      noticeDate: noticeDate as TradeDate,
+      url: `${ANNOUNCE_DETAIL}/${digits}/${artCode}.html`,
+    })
+  }
+  return out
 }
 
 /** `SH600000` → `1.600000`；深市与北交所同属市场号 0 */
@@ -375,6 +505,41 @@ export function createEastmoneyProvider(options: EastmoneyOptions): QuoteProvide
       })
       const { body } = await http.get(`${TRENDS_URL}?${query.toString()}`)
       return parseTrends(body)
+    },
+
+    /**
+     * 个股公告（docs/11 N2）。**批量、翻页、只取到 `sinceMs` 为止。**
+     *
+     * 三条实测（2026-08-15，`scripts/probe-announcements.mjs`）决定了这个写法：
+     *   - `stock_list` 塞到 200 只仍**无混入**（返回里没有未点名的票）⇒ 不分批；
+     *   - 单页上限 100，分页无重叠；
+     *   - 返回按发布时刻**倒序**，且是**跨标的的扁平流** ⇒ 只取第一页会漏票。
+     */
+    async fetchAnnouncements(codes: SecCode[], sinceMs: number): Promise<Announcement[]> {
+      const digits = codes.map((code) => splitCode(code)?.digits).filter((d): d is string => d !== undefined)
+      if (digits.length === 0) return []
+
+      const out: Announcement[] = []
+      for (let page = 1; page <= ANNOUNCE_MAX_PAGES; page++) {
+        const query = new URLSearchParams({
+          page_size: String(ANNOUNCE_PAGE_SIZE),
+          page_index: String(page),
+          ann_type: 'A',
+          client_source: 'web',
+          stock_list: digits.join(','),
+        })
+        const { body } = await http.get(`${ANNOUNCE_URL}?${query.toString()}`)
+        const rows = parseAnnouncements(body)
+        // 空页 = 到底了。**这不是失败** —— registry 那一层刻意不设 emptyIsFailure
+        if (rows.length === 0) break
+
+        out.push(...rows.filter((row) => row.publishedAt >= sinceMs))
+        // 这一页最旧的一条已经早于下界 ⇒ 后面只会更旧，不必再翻
+        const oldest = rows[rows.length - 1]
+        if (oldest && oldest.publishedAt < sinceMs) break
+        if (rows.length < ANNOUNCE_PAGE_SIZE) break
+      }
+      return out
     },
 
     async fetchProfile(code: SecCode): Promise<SecProfile> {

@@ -139,6 +139,8 @@ function input(over: Partial<BuildReportInput> = {}): BuildReportInput {
     alerts: [],
     stopLossPct: 0.08,
     dayStart: DAY_START,
+    // 环境是独立的一节，`buildDailyReport` 只透传。它自己的判据在 environment.test.ts
+    environment: { benchmark: null, industries: [], breadth: { withQuote: 0, up: 0, down: 0, flat: 0 }, missing: [], lines: [] },
     ...over,
   }
 }

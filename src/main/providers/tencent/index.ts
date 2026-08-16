@@ -70,6 +70,8 @@ const CAPABILITIES: ProviderCapabilities = {
   profile: true,
   // 由基准指数日线反推，见 shared.ts calendarFromIndexBars
   calendar: true,
+  // 腾讯的公告在另一套页面里，形状与东财差得远，暂不做第二套解析器
+  announcement: false,
 }
 
 /** 反推交易日历用的基准指数。上证指数历史最长，任何年份都有数据。 */

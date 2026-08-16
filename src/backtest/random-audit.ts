@@ -45,9 +45,10 @@
  * 不是「这套策略整体比随机好不好」。后者要连离场规则一起随机化，是另一个实验。
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { normalizeCode, priceLimits } from '../core/code'
+import { toEpochDay } from '../core/date'
 import { computeIndicators } from '../core/indicators'
 import { classifyRegimes } from '../core/regime'
 import { DEFAULT_PARAMS, type EngineParams } from '../core/params'
@@ -147,6 +148,68 @@ function groupPositions(trades: readonly ReportTrade[]): Position[] {
   return [...map.values()]
 }
 
+// ── 历史公告（--announcements，只分层不改交易）───────────────────────────
+
+/** code → 公告日集合（epoch day）。**只存日期，不存标题** —— 这一层只回答「有没有」 */
+type AnnouncementDays = Map<string, Set<number>>
+
+/**
+ * 载入 `fetch-announcements.mjs` 的产物。
+ *
+ * **读不到就抛错，不静默退化成「都没有公告」** —— 那会让整张表的「公告 无」层
+ * 吃下全部建仓，而读表的人完全看不出数据根本没加载。
+ */
+function loadAnnouncements(dir: string): AnnouncementDays {
+  const files = readdirSync(dir).filter((f) => f.endsWith('.json'))
+  if (files.length === 0) throw new Error(`${dir} 里没有公告文件，先跑 pnpm fetch:announcements`)
+  const out: AnnouncementDays = new Map()
+  let total = 0
+  for (const file of files) {
+    const raw = JSON.parse(readFileSync(join(dir, file), 'utf-8')) as {
+      code?: string
+      items?: { date?: string }[]
+    }
+    if (!raw.code) continue
+    const set = new Set<number>()
+    for (const item of raw.items ?? []) {
+      const day = item.date === undefined ? null : toEpochDay(item.date as TradeDate)
+      if (day !== null) set.add(day)
+    }
+    total += set.size
+    out.set(raw.code, set)
+  }
+  process.stderr.write(`公告：${out.size} 只 · 合计 ${total} 个公告日
+`)
+  return out
+}
+
+/**
+ * 信号那根 K 线的前 `days` 个自然日内有没有公告（含当天）。
+ *
+ * **挂在信号日而不是成交日**：回测在 D 收盘判定、D+1 开盘成交，
+ * 而「公告选股」这套设想是在 D 收盘时已经知道当天的公告。
+ * 用成交日去比会整体错开一天，把真正的当日公告算成「前一天的」。
+ *
+ * ⚠ **这只票根本没抓到公告文件时返回 `null`，不是 `false`。**
+ * 抓取是分批、可中断的（261 只要半小时），把「没抓到」和「确认没有公告」
+ * 混成同一个值，会让一次跑到一半的抓取悄悄把大批建仓塞进「公告 无」那一层 ——
+ * 而表上完全看不出来，读数会全错。null 的建仓**整个退出公告这两层**，
+ * 并在日志里报出条数。
+ */
+function hasAnnouncement(
+  days: AnnouncementDays,
+  code: string,
+  signalDate: TradeDate,
+  window: number
+): boolean | null {
+  const set = days.get(code)
+  if (!set) return null
+  const end = toEpochDay(signalDate)
+  if (end === null) return null
+  for (let d = end - (window - 1); d <= end; d++) if (set.has(d)) return true
+  return false
+}
+
 // ── 分层键 ───────────────────────────────────────────────────────────────
 
 /**
@@ -192,7 +255,7 @@ const ALWAYS_SHOWN = new Set<string>(['ALL', ...REGIMES])
  * 一次建仓同时进多个层。交叉层只对 TREND_UP 展开 ——
  * 它是 §5.21 定位到的负 alpha 集中处，其余状态展开只会把表撑大而没有读数。
  */
-function stratumKeysOf(p: Position): string[] {
+function stratumKeysOf(p: Position, announced: boolean | null): string[] {
   const band = scoreBand(p.entryScore)
   const sig = signalKey(p.entrySignals)
   const keys = [
@@ -206,6 +269,12 @@ function stratumKeysOf(p: Position): string[] {
   if (p.regimeAtEntry === 'TREND_UP') {
     keys.push(`TREND_UP · 得分 ${band}`, `TREND_UP · 信号 ${sig}`)
     if (held !== null) keys.push(`TREND_UP · 持续 ${held}`)
+  }
+  // 公告维度（仅 --announcements 时）。与 regime 交叉是这次要看的主判据：
+  // 「公告筛出来的池子会不会富集在引擎最差的那个状态上」
+  if (announced !== null) {
+    const tag = announced ? '公告 有' : '公告 无'
+    keys.push(tag, `${p.regimeAtEntry} · ${tag}`)
   }
   return keys
 }
@@ -471,6 +540,21 @@ interface Options {
   shuffleSpans: boolean
   warmup: number
   minCount: number
+  /**
+   * 历史公告目录（`scripts/fetch-announcements.mjs` 的产物）。给了它就多出
+   * 「公告 有/无」以及它与四个 regime 的交叉层。
+   *
+   * **这是一次只读的分层，不改变任何一笔交易** —— 两组从同一次模拟里切出来，
+   * 各自配自己的随机基准，所以「公告日建仓」与「非公告日建仓」直接可比。
+   */
+  announcements?: string
+  /**
+   * 公告窗口（自然日，默认 1 = 只看信号那一天）。
+   *
+   * 判据挂在**信号那根 K 线的日期**上，不是成交日 —— 成交在次日开盘，
+   * 拿成交日去比公告日会把「公告发布后次日才成交」这件事算错一天。
+   */
+  announceDays: number
   out?: string
   json: boolean
 }
@@ -495,6 +579,9 @@ const USAGE = `用法：
                          真实组的负 alpha 会被「短跨度天然配着下跌」放大
   --warmup <根>          随机入场日的最早位置，默认 300（= params.data.fullBars）
   --min-count <n>        细分层的最小建仓数，低于它不打印，默认 30
+  --announcements <dir>  历史公告目录（fetch-announcements.mjs 的产物）。给了它就多出
+                         「公告 有/无」及其与四个 regime 的交叉层。**只分层，不改交易**
+  --announce-days <n>    公告窗口（自然日，含信号当天），默认 1
                          （总体与四个市场状态不受此过滤）
   --out <file>           JSON 落盘
   --json                 只输出 JSON
@@ -509,6 +596,7 @@ function parse(argv: readonly string[]): Options | 'help' {
     shuffleSpans: false,
     warmup: 300,
     minCount: 30,
+    announceDays: 1,
     json: false,
   }
   const flags = new Set(['--match-regime', '--shuffle-spans', '--json', '--help', '-h'])
@@ -546,6 +634,12 @@ function parse(argv: readonly string[]): Options | 'help' {
       case '--min-count':
         o.minCount = Number(need())
         break
+      case '--announcements':
+        o.announcements = need()
+        break
+      case '--announce-days':
+        o.announceDays = Number(need())
+        break
       case '--match-regime':
         o.matchRegime = true
         break
@@ -577,6 +671,9 @@ export async function run(argv: readonly string[]): Promise<number> {
   const opts = parsed
   const report = JSON.parse(readFileSync(opts.baseline, 'utf8')) as BaselineReport
   const positions = groupPositions(report.trades)
+  // 只读分层的输入。未给 --announcements 时为 null ⇒ 公告那两层根本不出现，
+  // 而不是「全部落进『公告 无』」（后者会让读表的人以为数据加载了但一条都没命中）
+  const announceDays = opts.announcements === undefined ? null : loadAnnouncements(opts.announcements)
   const capital = report.meta.capitalPerCode
   const costs: CostModel = DEFAULT_COSTS
 
@@ -653,9 +750,13 @@ export async function run(argv: readonly string[]): Promise<number> {
      * 拿它直接和随机比，会分不清「点选得差」还是「离场规则差」。
      */
     passive: FillResult | null
+    /** 信号那根 K 线上有没有公告。未开 --announcements 时为 null（该维度不参与分层） */
+    announced: boolean | null
   }
   const tasks: Task[] = []
   const skipped: string[] = []
+  /** 没有公告文件、因而退出公告分层的建仓数。必须报出来，见 hasAnnouncement */
+  let missingAnnouncements = 0
   for (const p of positions) {
     const code = normalizeCode(p.code)
     const entry = loaded.get(code)
@@ -689,6 +790,14 @@ export async function run(argv: readonly string[]): Promise<number> {
       skipped.push(`${p.code}@${p.entryDate}: 无合格随机入场日`)
       continue
     }
+    // 信号那根 = 成交那根的前一根（次日开盘成交）。第 0 根没有前一根，按「无公告」处理
+    const signalBar = entry.series.candles[entryIdx - 1]
+    const announced =
+      announceDays === null || signalBar === undefined
+        ? null
+        : hasAnnouncement(announceDays, p.code, signalBar.date as TradeDate, opts.announceDays)
+    if (announceDays !== null && announced === null) missingAnnouncements++
+
     tasks.push({
       position: p,
       code,
@@ -697,7 +806,20 @@ export async function run(argv: readonly string[]): Promise<number> {
       pool,
       real: { deployed: p.deployed, pnl: p.pnl },
       passive: fillTrade(entry.series, entryIdx, span, capital, costs),
+      announced,
     })
+  }
+
+  if (announceDays !== null) {
+    const covered = tasks.filter((t) => t.announced !== null).length
+    const hit = tasks.filter((t) => t.announced === true).length
+    process.stderr.write(
+      `公告分层：${covered}/${tasks.length} 次建仓有公告数据` +
+        `（其中信号日有公告 ${hit} 次 = ${((hit / Math.max(1, covered)) * 100).toFixed(1)}%）` +
+        (missingAnnouncements > 0 ? ` · ⚠ ${missingAnnouncements} 次因缺公告文件退出该分层` : '') +
+        `
+`
+    )
   }
 
   // ④ 跑 N 次随机试验
@@ -706,7 +828,7 @@ export async function run(argv: readonly string[]): Promise<number> {
   // 随机组按同一批建仓配对，所以每一层的随机基准都是「这一层里的那些票、那些持有跨度」——
   // 换句话说层与层之间的零点不同，**不同层的分位可以横比，绝对收益不可以**。
   const keysOf = new Map<Position, string[]>()
-  for (const t of tasks) keysOf.set(t.position, stratumKeysOf(t.position))
+  for (const t of tasks) keysOf.set(t.position, stratumKeysOf(t.position, t.announced))
   const strata: string[] = []
   const seenKey = new Set<string>()
   for (const t of tasks) {
@@ -937,6 +1059,9 @@ function renderText(p: RandomAuditPayload): string {
     { title: '按入场子信号组合（TREND_UP）', pick: (l) => l.startsWith('TREND_UP · 信号 ') },
     { title: '按 regime 已持续根数（全池）', pick: (l) => l.startsWith('持续 ') },
     { title: '按 regime 已持续根数（TREND_UP）', pick: (l) => l.startsWith('TREND_UP · 持续 ') },
+    // 公告分层（仅 --announcements）。放最后：它是一次性的只读验证，不是常规读数
+    { title: '按信号日有无公告（全池）', pick: (l) => l === '公告 有' || l === '公告 无' },
+    { title: '按信号日有无公告 × 市场状态', pick: (l) => /^(TREND_UP|TREND_DOWN|RANGE|TRANSITION) · 公告 /.test(l) },
   ]
 
   const W = 30

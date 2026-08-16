@@ -782,6 +782,67 @@ export interface DailyReport {
    * 真正的评价是 AI 那个按钮的事（措辞纪律：不得出现胜率/概率/必涨/抄底）。
    */
   highlights: string[]
+  /**
+   * 今日环境（基准指数 + 行业 ETF）。判据在 `src/main/report/environment.ts`。
+   *
+   * **独立的一节，与 `stocks` 分开** —— `overview` / `stocks` / `tomorrow` 只算用户
+   * 自己的自选股（内置的 15 只行业 ETF 被排除在外），把观察标的混进去会让用户的票
+   * 被埋掉一多半，而且计数再也拆不开。见 `controller.ts` 的 `dailyReport()`。
+   */
+  environment: ReportEnvironment
+}
+
+/**
+ * 一条公告（docs/11 N2）。**只有标题与分类，没有正文** —— 本功能不解析 PDF。
+ * `url` 必填：每条都能点回原文是这个功能唯一的防幻觉结构保证。
+ */
+export interface AnnouncementView {
+  id: string
+  code: SecCode
+  /** 数据源给的简称。展示时优先用 watchlist 里的名字 —— 那个才是用户认得的 */
+  name: string
+  title: string
+  /** 数据源自己的分类。拿不到时 null，**不是「其他」** */
+  category: string | null
+  /** 真实发布时刻 */
+  publishedAt: number
+  /** 归属公告日 */
+  noticeDate: TradeDate
+  url: string
+}
+
+export type AnnouncementRefreshResult =
+  | { ok: true; fetched: number; added: number; skipped: number }
+  | { ok: false; error: string }
+
+/** 环境那一节里的一个标的。行情拿不到时 `quote` 为 null —— 不用 0 占位（约束 4） */
+export interface EnvironmentItem {
+  code: SecCode
+  name: string
+  /** 基准指数没有行业 */
+  industry?: string
+  quote: DailyReportStock['quote']
+}
+
+/**
+ * 今日环境（[docs/11](../../docs/11-盘外消息面简报功能需求.md) N1）。
+ *
+ * **只陈述，不评价** —— `lines` 的每一句都能从下面几个数逐字推出，
+ * 与 `DailyReport.highlights` 同一条纪律。
+ *
+ * **不含隔夜外盘**：`src/core/code.ts` 的 `Market` 只有 SH/SZ/BJ，
+ * 美股港股指数在当前代码空间里表示不了。见 `report/environment.ts` 头注释。
+ */
+export interface ReportEnvironment {
+  /** 沪深300。不在观察范围内时为 null；在范围内但拿不到行情时 `quote` 为 null */
+  benchmark: EnvironmentItem | null
+  /** 行业 ETF，按涨跌幅降序；拿不到行情的排最后 */
+  industries: EnvironmentItem[]
+  /** 涨跌分布。**分母是「有行情的只数」**，不是清单长度 —— 混淆会让缺数看起来像平盘 */
+  breadth: { withQuote: number; up: number; down: number; flat: number }
+  /** 今日没有行情数据的标的，**显式列出**：静默少几行会让「普涨」凭空成立 */
+  missing: SecCode[]
+  lines: string[]
 }
 
 export interface DailyReportStock {
@@ -1009,6 +1070,22 @@ export interface IpcInvokeMap {
    * 打开页签就有东西看，而「要不要花这笔钱」始终是用户按按钮那一下才决定的。
    */
   'report:note': () => ReportNoteView | null
+  /**
+   * 已经落库的公告（docs/11 N2）。**纯读，不发请求** —— 与 `report:note` 同一条纪律。
+   *
+   * `sinceMs` 是**发布时刻**下界，不是公告日：盘前那一屏问的是「昨收盘之后到现在」，
+   * 那是个时刻区间（两者的差别见 012_announcement.sql 头注释）。
+   */
+  'announcement:list': (sinceMs: number) => AnnouncementView[]
+  /**
+   * 去数据源拉一次并落库。**由用户打开那一屏触发，不做定时推送**（docs/11 §3.4）——
+   * 盘前用户的机器可能根本没开，一个「必须开机才生效」的定时任务会静默地时有时无，
+   * 而用户无法分辨是「今天没消息」还是「今天没跑」。
+   *
+   * 失败时返回 `ok: false` + 原因，**不抛异常也不返回空数组** ——
+   * 「没能取到」与「今天没有公告」是两件事，把前者显示成后者等于替一个没查过的范围担保。
+   */
+  'announcement:refresh': (sinceMs: number) => AnnouncementRefreshResult
   'pet:setHitRegion': (rects: Rect[]) => void
   /**
    * 渲染层完成命中判定后上报：鼠标是否落在悬浮条本体上。

@@ -22,6 +22,7 @@ const FULL: ProviderCapabilities = {
   minute: false,
   profile: true,
   calendar: true,
+  announcement: false,
 }
 
 interface FakeSpec {

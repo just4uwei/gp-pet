@@ -17,6 +17,7 @@
 
 import type { AdjustMode, Candle, SecCode, SecProfile, Snapshot, TradeDate } from '@core/types'
 import type {
+  Announcement,
   HealthRecord,
   MinuteSeries,
   ProviderCapabilities,
@@ -145,6 +146,8 @@ export interface ProviderRegistry {
   fetchCalendar(year: number): Promise<RegistryResult<CalendarDay[]>>
   /** 当日分时（用户打开抽屉时才调，见 types.ts fetchMinutes） */
   fetchMinutes(code: SecCode): Promise<RegistryResult<MinuteSeries>>
+  /** 个股公告（docs/11 N2）。一天几次，与行情共用限流器是对的 */
+  fetchAnnouncements(codes: SecCode[], sinceMs: number): Promise<RegistryResult<Announcement[]>>
   /** 当前有没有源能给分时 —— 没有时上层直接走本机留痕，不必白发一轮 */
   supports(capability: Capability): boolean
 
@@ -335,6 +338,23 @@ export function createProviderRegistry(config: RegistryOptions): ProviderRegistr
           return provider.fetchMinutes(code)
         },
         { label: `minute ${code}` }
+      )
+    },
+
+    /**
+     * 公告。**刻意不传 `emptyIsFailure`** —— 与 `fetchMinutes` 同一条理由，
+     * 而且更常发生：绝大多数票绝大多数天**就是没有公告**，返回 0 条是合法结果。
+     * 记成失败会一路降级三个源、跳熔断，把 tick 路径一起拖下水，
+     * 还会污染 docs/08 M1 的「成功率 > 99%」出口指标 —— 换来的只是一份清单没画出来。
+     */
+    fetchAnnouncements(codes, sinceMs) {
+      return run(
+        'announcement',
+        async (provider) => {
+          if (!provider.fetchAnnouncements) throw new Error(`${provider.id} 声明了 announcement 但未实现`)
+          return provider.fetchAnnouncements(codes, sinceMs)
+        },
+        { label: `announcement ${codes.length} 只` }
       )
     },
 

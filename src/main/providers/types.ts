@@ -18,6 +18,8 @@ export interface ProviderCapabilities {
   minute: boolean
   profile: boolean
   calendar: boolean
+  /** 个股公告（docs/11 N2）。与行情无关，只有实现了的源才为 true */
+  announcement: boolean
 }
 
 /**
@@ -65,6 +67,52 @@ export interface QuoteProvider {
    * 一次一只票、上层带 30s 缓存 —— 绝不进 tick 轮询，那份请求预算不给它。
    */
   fetchMinutes?(code: SecCode): Promise<MinuteSeries>
+
+  /**
+   * 个股公告（[docs/11](../../../docs/11-盘外消息面简报功能需求.md) N2）。
+   *
+   * **必须支持批量**：实测 `stock_list` 塞 200 只仍无混入，100 只自选 = 一次请求。
+   * 单只轮询会把「几次/天」变成「100 次/天」，那份预算不给它。
+   *
+   * `sinceMs` 是**发布时刻**下界（含）。实现要自己翻页直到早于它 ——
+   * 接口返回的是全局按发布时刻倒序的扁平流，只取第一页会在活跃日漏掉冷门票的公告
+   * （实测 100 条一页时，请求 40 只只覆盖到 32 只）。
+   */
+  fetchAnnouncements?(codes: SecCode[], sinceMs: number): Promise<Announcement[]>
+}
+
+/**
+ * 一条公告。**只有标题与分类，没有正文** —— 本功能不下载解析 PDF（docs/11 §9）。
+ *
+ * 三条与「防幻觉」直接相关的字段约束：
+ *
+ * 1. **`url` 必填。** 拿不到原文链接的条目在解析处就丢弃（docs/11 N2-d）——
+ *    「每条都能点回原文」是结构性保证，比提示词硬。
+ * 2. **`category` 拿不到时是 null，不是空串、更不是「其他」。** 猜一个分类出来，
+ *    下游的「建议先看」白名单就会命中一个并不存在的类型。
+ * 3. **`publishedAt` 与 `noticeDate` 是两个东西，不许合并。** 实测
+ *    `display_time = 2026-08-14 17:30` 对应 `notice_date = 2026-08-15` ——
+ *    前者是真实发布时刻（切「昨收盘之后」这个窗口用它），后者是归属的公告日（展示用它）。
+ *    只留一个的症状是：盘前简报要么漏掉昨晚 17:30 发的公告，要么把它标成今天发的。
+ */
+export interface Announcement {
+  /**
+   * 数据源给的条目 ID，**去重键**。
+   * 不用「标题 + 日期」拼 —— 同一天同名公告（多份半年度报告附件）是常见的。
+   */
+  id: string
+  code: SecCode
+  /** 数据源给的简称。**不覆盖本地 watchlist 的名字**，只作为落库留痕 */
+  name: string
+  title: string
+  /** 数据源自己的分类，如「业绩快报」「关联交易」。拿不到时 null（见上） */
+  category: string | null
+  /** 真实发布时刻（epoch ms） */
+  publishedAt: number
+  /** 归属的公告日（北京时间 YYYY-MM-DD） */
+  noticeDate: TradeDate
+  /** 原文链接。拿不到的条目不会走到这里 */
+  url: string
 }
 
 export type ProviderStatus = 'OK' | 'DEGRADED' | 'DOWN'

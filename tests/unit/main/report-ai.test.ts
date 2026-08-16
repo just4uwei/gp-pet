@@ -52,6 +52,9 @@ function report(over: Partial<DailyReport> = {}): DailyReport {
     tomorrow: [{ code: 'SH600000' as SecCode, name: '浦发银行', kind: 'POSITION_RISK', note: '持仓未了结' }],
     data: { withClose: 1, missing: ['SZ000001' as SecCode] },
     highlights: ['2 只自选，其中 1 只今日出现信号（卖出 1 条）。'],
+    // 环境是独立的一节（docs/11 N1）。这里给空壳即可 —— 它的判据在 environment.test.ts，
+    // 而**指纹刻意不含它**：环境每分钟都在动，算进去会让「已过期」提示恒亮
+    environment: { benchmark: null, industries: [], breadth: { withQuote: 0, up: 0, down: 0, flat: 0 }, missing: [], lines: [] },
     ...over,
   }
 }

@@ -10,6 +10,7 @@ import { KlineRepo } from './repositories/kline'
 import { META_KEYS, MetaRepo } from './repositories/meta'
 import { ProviderHealthRepo } from './repositories/health'
 import { QuoteTickRepo } from './repositories/quote-tick'
+import { AnnouncementRepo } from './repositories/announcement'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -25,6 +26,13 @@ export interface RetentionPolicy {
   watchDays: number
   /** 当日分时留痕保留多久。只服务面板上那张「今日」走势图，留久了没有用处 */
   quoteTickDays: number
+  /**
+   * 公告保留多久（docs/11 N2）。
+   *
+   * **它能进裁剪，是因为它可以重建** —— 再拉一次就有。这与 `ai_explain` /
+   * `report_note` / 影子账本刻意不进裁剪恰好相反（那三样花过钱或无法重建）。
+   */
+  announcementDays: number
 }
 
 export const DEFAULT_RETENTION: RetentionPolicy = {
@@ -39,6 +47,9 @@ export const DEFAULT_RETENTION: RetentionPolicy = {
   // 面板只画「今日」那张图，7 天纯粹是给「周五收盘后周一才开机」这类情况留的余量。
   // 12 只自选约 3000 行/天，7 天不到 3 MB
   quoteTickDays: 7,
+  // 90 天：盘前简报只看「昨收盘之后」，但用户点进某只票的历史时，
+  // 一个季度的公告是能说明问题的最短跨度（一份季报到下一份）
+  announcementDays: 90,
 }
 
 export interface RetentionReport {
@@ -49,6 +60,7 @@ export interface RetentionReport {
   watchDeleted: number
   healthDeleted: number
   quoteTickDeleted: number
+  announcementDeleted: number
 }
 
 /**
@@ -126,6 +138,7 @@ export function pruneAll(
   const quoteTickDeleted = new QuoteTickRepo(db).prune(now - policy.quoteTickDays * DAY_MS)
 
   const healthDeleted = health.prune(now - policy.healthDays * DAY_MS)
+  const announcementDeleted = new AnnouncementRepo(db).prune(now - policy.announcementDays * DAY_MS)
 
   meta.setNumber(META_KEYS.lastPruneAt, now)
 
@@ -137,6 +150,7 @@ export function pruneAll(
     watchDeleted,
     healthDeleted,
     quoteTickDeleted,
+    announcementDeleted,
   }
 }
 

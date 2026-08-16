@@ -60,6 +60,8 @@ const CAPABILITIES: ProviderCapabilities = {
   // 只有名称与板块，没有行业与上市日
   profile: true,
   calendar: false,
+  // 新浪没有可用的公告接口；备源只兜行情
+  announcement: false,
 }
 
 export interface SinaOptions {

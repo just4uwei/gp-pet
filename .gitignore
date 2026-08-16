@@ -14,6 +14,12 @@ logs/
 reports/
 # 抓下来的历史行情（scripts/fetch-history.mjs 的产物，可重出）
 data/history/
+# 公告源探针的累计样本（scripts/probe-announcements.mjs，docs/11 N0）。
+# 它是**本机这条网络**上的观测，换台机器不通用，所以不进版本控制；
+# 结论归档在 docs/notes/公告源-可达性实测.md
+data/probe/
+# 历史公告（scripts/fetch-announcements.mjs 的产物，可重出）
+data/announcements/
 .vite/
 .eslintcache
 

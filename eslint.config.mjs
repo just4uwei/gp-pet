@@ -44,6 +44,7 @@ export default tseslint.config(
         Buffer: 'readonly',
         TextDecoder: 'readonly',
         URL: 'readonly',
+        URLSearchParams: 'readonly',
         console: 'readonly',
         fetch: 'readonly',
         process: 'readonly',

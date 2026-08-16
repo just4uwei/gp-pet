@@ -201,6 +201,11 @@ export function registerHandlers(controller: AppController): void {
   // 已有的评价。**纯读不发请求** —— 打开页签不等于花钱（与 ai:explain 同一条纪律）
   handle('report:note', () => controller.reportNote())
 
+  // 公告（docs/11 N2）。**list 纯读、refresh 才发请求** —— 打开那一屏不等于每次都去拉
+  handle('announcement:list', (_event, sinceMs) => controller.announcements(sinceMs))
+
+  handle('announcement:refresh', (_event, sinceMs) => controller.refreshAnnouncements(sinceMs))
+
   handle('pet:setHitRegion', (_event, rects) => controller.setHitRects(rects))
 
   handle('pet:setInteractive', (_event, interactive) => controller.setOverlayInteractive(interactive))

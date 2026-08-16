@@ -15,7 +15,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react'
-import type { DailyReport, DailyReportStock, ReportNoteView } from '@shared/ipc-types'
+import type { DailyReport, DailyReportStock, ReportEnvironment, ReportNoteView } from '@shared/ipc-types'
 import { reportTargetId } from '@shared/ai-target'
 import type { TradeDate } from '@core/types'
 import { FOOTER_NOTE } from './disclaimer'
@@ -57,6 +57,56 @@ function signed(value: number): string {
 /** 拿不到就是「—」。**不许用 0 顶替** */
 function num(value: number | null | undefined, digits = 2): string {
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—'
+}
+
+/**
+ * 今日环境（docs/11 N1）。**独立的一节，与「逐只」分开** ——
+ * 上面那几张卡答的是「我自己的票今天怎么样」，这一节答的是「今天大盘与行业怎么样」。
+ * 混在一起会让 15 只观察标的把用户自己的 7 只埋掉（`controller.ts` 的 `dailyReport()`）。
+ *
+ * 这里**只画数**，一句判断都不加：`lines` 由 `report/environment.ts` 拼好，
+ * 每一句都能从同屏的数字里逐字推出。
+ */
+function EnvironmentCard({ env }: { env: ReportEnvironment }): React.JSX.Element {
+  return (
+    <section className="gp-card">
+      <div className="flex items-baseline justify-between px-3 py-2">
+        <h2 className="text-sm text-white/70">今日环境</h2>
+        <span className="text-xs text-white/30">
+          {env.breadth.withQuote}/{env.industries.length} 行业有行情
+        </span>
+      </div>
+
+      <div className="space-y-1 border-t border-white/[0.06] px-3 py-2.5 text-sm text-white/70">
+        {env.lines.map((line) => (
+          <p key={line}>{line}</p>
+        ))}
+      </div>
+
+      {env.industries.length > 0 ? (
+        <ul className="grid grid-cols-2 gap-x-4 border-t border-white/[0.06] px-3 py-2 sm:grid-cols-3">
+          {env.industries.map((row) => (
+            <li key={row.code} className="flex items-baseline justify-between gap-2 py-0.5 text-xs">
+              <span className="truncate text-white/55" title={`${row.name}（${row.code}）`}>
+                {row.industry ?? row.name}
+              </span>
+              <span
+                className={`shrink-0 font-mono ${row.quote ? changeTone(row.quote.changePct) : 'text-white/30'}`}
+                // 拿不到行情与「平盘」必须看得出区别，所以缺数是「—」不是 0.00%
+                title={row.quote ? `收 ${row.quote.close.toFixed(2)}（${row.quote.source === 'CLOSE' ? '收盘线' : '盘中快照'}）` : '今日无行情数据'}
+              >
+                {row.quote ? signed(row.quote.changePct) : '—'}
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      <p className="border-t border-white/[0.06] px-3 py-1.5 text-[11px] leading-snug text-white/30">
+        行业 ETF 是内置的观察名单，不进提醒、不计入上面的自选统计。此处只列行情，不含消息面。
+      </p>
+    </section>
+  )
 }
 
 function StockRow({ stock }: { stock: DailyReportStock }): React.JSX.Element {
@@ -289,34 +339,37 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
       每张卡都会被压到比内容矮，内容溢出到下一张卡上面，看起来就是「重叠错乱」。
     */
     <div className="flex flex-col gap-4">
-      <section className="gp-card">
-        <div className="flex items-center justify-between px-3 py-2">
-          <div className="flex items-baseline gap-2">
-            <h2 className="text-sm text-white/70">收盘日报</h2>
-            <span className="font-mono text-xs text-white/40">{report.date}</span>
-          </div>
-          <span
-            className={`rounded border px-1.5 py-0.5 text-[10px] ${
-              report.stage === 'FINAL'
-                ? 'border-emerald-400/40 bg-emerald-400/10 text-emerald-200'
-                : 'border-amber-400/40 bg-amber-400/10 text-amber-200'
-            }`}
-            title={
-              report.stage === 'FINAL'
-                ? '每只有数据的标的都用上了当日收盘线'
-                : '当日日线尚未入库，部分数字取自盘中最后一次行情，收盘后可能微调'
-            }
-          >
-            {report.stage === 'FINAL' ? '已定稿' : '盘中数据'}
-          </span>
-        </div>
+      {/*
+        **板块按交易日的时间线排**（2026-08-15）：
+        页头 → 今日环境（今天的背景，贯穿全天）→ 逐只（盘中各只发生了什么）
+        → 今日汇总（收盘后的统计）→ 整体评价 → 明日关注（明天）→ 今日提醒（折叠）。
 
-        <div className="space-y-1 border-t border-white/[0.06] px-3 py-2.5 text-sm text-white/70">
-          {report.highlights.map((line) => (
-            <p key={line}>{line}</p>
-          ))}
+        页头**不是卡片**，只是一行：日期与「已定稿 / 盘中数据」是整屏的限定条件，
+        不属于任何一个时段的板块。把它塞进第一张卡会让那张卡看起来比别的卡更重要，
+        而它其实只是个标题。
+      */}
+      <div className="flex items-center justify-between px-1">
+        <div className="flex items-baseline gap-2">
+          <h2 className="text-sm text-white/70">收盘日报</h2>
+          <span className="font-mono text-xs text-white/40">{report.date}</span>
         </div>
-      </section>
+        <span
+          className={`rounded border px-1.5 py-0.5 text-[10px] ${
+            report.stage === 'FINAL'
+              ? 'border-emerald-400/40 bg-emerald-400/10 text-emerald-200'
+              : 'border-amber-400/40 bg-amber-400/10 text-amber-200'
+          }`}
+          title={
+            report.stage === 'FINAL'
+              ? '每只有数据的标的都用上了当日收盘线'
+              : '当日日线尚未入库，部分数字取自盘中最后一次行情，收盘后可能微调'
+          }
+        >
+          {report.stage === 'FINAL' ? '已定稿' : '盘中数据'}
+        </span>
+      </div>
+
+      <EnvironmentCard env={report.environment} />
 
       <section className="gp-card">
         <div className="flex items-center justify-between px-3 py-2">
@@ -331,6 +384,23 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
           ))}
         </ul>
       </section>
+
+      <section className="gp-card">
+        <div className="px-3 py-2">
+          <h2 className="text-sm text-white/70">今日汇总</h2>
+        </div>
+        <div className="space-y-1 border-t border-white/[0.06] px-3 py-2.5 text-sm text-white/70">
+          {report.highlights.map((line) => (
+            <p key={line}>{line}</p>
+          ))}
+        </div>
+      </section>
+
+      {/*
+        AI 评价排在事实之后、明日关注之前：先看今天发生了什么，再看模型怎么评今天，
+        最后才是明天。它评的是**今天**，排到「明日关注」后面会读起来像在评明天。
+      */}
+      <ReportNoteBlock date={report.date} onSaved={load} />
 
       <section className="gp-card">
         <div className="px-3 py-2">
@@ -367,9 +437,6 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
           </ul>
         )}
       </section>
-
-      {/* AI 评价排在事实之后：先看发生了什么，再看别人怎么说 */}
-      <ReportNoteBlock date={report.date} onSaved={load} />
 
       {/*
         今日提醒**默认折叠**（2026-08-14 改）：这一块与概览页的「提醒日志」说的是同一件事，
