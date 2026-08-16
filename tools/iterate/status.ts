@@ -29,6 +29,16 @@
  * 3. **读不到的东西要说「读不到」，不许默认成 0。** `reports/` 是 gitignored 的、
  *    `market.db` 可能不存在。把「没测过」显示成「0 次」是这个项目一直在防的
  *    「用假值冒充」（约束 4 的同一条精神）。
+ * 4. **诊断类任务要分清「工程缺口」与「还没到观察窗口」**（2026-08-16 加）。
+ *    存量为零有两种成因：修复没生效（该查），和**修复之后一场都没开过盘**（查不出东西）。
+ *    只看存量会把后者报成「现在就能做」—— 那次会话里人去查库、翻 git log、
+ *    读 settle.ts，才发现最后一个交易日是上周五。**看板的价值就是免掉这些**，
+ *    报错桶等于把它要省的成本又加回去。判据是 `./session.ts` 的 `sinceFixLanded`，
+ *    分桶只认它（硬事实），交易日历只用来补一句「下一个观察窗口在哪」。
+ *
+ *    ⚠ 这条规则有一个**必须一起满足**的反向要求：它得能重新报警。
+ *    一个只会说「等着」的规则比原来的误报更糟 —— 误报浪费一次排查，
+ *    永久静默让真的复发再也不报。`tests/unit/tools/iterate-session.test.ts` 两条钉着。
  *
  * ## 一个必须解决的问题：关键指标存在会消失的地方
  *
@@ -41,11 +51,15 @@
 import { existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { ENGINE_VERSION } from '@core/params'
+import type { TradeDate } from '@core/types'
 import { countByStatus, paramRows } from '@main/settings/params-view'
+import { createTradingCalendar, parseHolidayTable, type TradingCalendar } from '@main/scheduler/calendar'
+import { dataFreshness, sinceFixLanded, type Freshness } from './session'
 
 const ROOT = process.cwd()
 const REPORTS = join(ROOT, 'reports', 'calib')
 const BOARD = join(ROOT, 'docs', 'iteration', '看板.md')
+const HOLIDAYS = join(ROOT, 'resources', 'data', 'holidays.json')
 
 /** 读不到就是读不到 —— 不许退化成 0（见文件头纪律 3） */
 type Maybe<T> = { known: true; value: T } | { known: false; why: string }
@@ -190,6 +204,67 @@ interface RuntimeSnapshot {
   alerts: number
   alertsWithGate: number
   shadowPoints: number
+  /** 库里最新一行 signal / alert_log 的北京时间日子，null = 一行都没有 */
+  latestSignalDate: TradeDate | null
+  latestAlertDate: TradeDate | null
+  /** 这两张表相对「最后一个已收盘交易日」跟上了没（见 ./session.ts） */
+  signalFreshness: Freshness
+  alertFreshness: Freshness
+}
+
+/** `node:sqlite` 是实验特性，这里只用到 `prepare`，不引它的整套类型 */
+type SqliteDb = { prepare(sql: string): { get(...params: unknown[]): unknown } }
+
+/**
+ * 用**只读**的用户库当交易日历的第一级判据（`scheduler/calendar.ts` 的 `db` 那一级）。
+ *
+ * `upsertMany` 直接抛：`resolve()` 不会调它，而看板**绝不能动用户的库** ——
+ * 悄悄退化成 no-op 的话，哪天有人给日历加了自动回写，这里就变成一次静默的写入。
+ */
+function readOnlyCalendar(db: SqliteDb): TradingCalendar {
+  const raw = existsSync(HOLIDAYS) ? parseHolidayTable(JSON.parse(readFileSync(HOLIDAYS, 'utf8'))) : null
+  return createTradingCalendar({
+    holidays: raw ?? undefined,
+    store: {
+      isOpen(date) {
+        try {
+          const row = db.prepare('SELECT is_open FROM trade_calendar WHERE trade_date = ?').get(date) as
+            | { is_open: number }
+            | undefined
+          if (row !== undefined) return row.is_open === 1
+          /*
+            trade_calendar 每周才刷一次，最近几天常常是空的（实测用户库停在 08-12，
+            而最后一个交易日是 08-14）—— 于是判据掉到 builtin 那一级，
+            2026 不在 `verifiedYears` 里 ⇒ uncertain ⇒ 整个诊断降不了级。
+
+            但库里有更硬的东西：**那天真的落下了日线**。这与应用自己的
+            `markObserved(date, true)` 是同一条依据（「实际观测到行情」），所以按 db 级算。
+
+            ⚠ 反过来不成立，**缺行一律返回 null**：应用没开机那天同样没有日线，
+            把「没数据」读成「休市」正是 calendar.ts 头注释里那条硬规则要防的事
+            —— 判错成休市会让结论彻底反向，而判错成「不知道」只是不下结论。
+          */
+          const seen = db.prepare('SELECT 1 FROM kline_daily WHERE trade_date = ? LIMIT 1').get(date)
+          return seen === undefined ? null : true
+        } catch {
+          return null
+        }
+      },
+      coverageEnd() {
+        try {
+          const row = db.prepare('SELECT MAX(trade_date) AS d FROM trade_calendar').get() as
+            | { d: string | null }
+            | undefined
+          return (row?.d ?? null) as TradeDate | null
+        } catch {
+          return null
+        }
+      },
+      upsertMany() {
+        throw new Error('看板只读用户的库，不写 trade_calendar')
+      },
+    },
+  })
 }
 
 async function runtimeState(): Promise<Maybe<RuntimeSnapshot>> {
@@ -211,6 +286,23 @@ async function runtimeState(): Promise<Maybe<RuntimeSnapshot>> {
         return 0
       }
     }
+    const day = (sql: string): TradeDate | null => {
+      try {
+        const r = db.prepare(sql).get() as Record<string, unknown> | undefined
+        const v = r === undefined ? null : Object.values(r)[0]
+        return typeof v === 'string' && v.length >= 10 ? (v.slice(0, 10) as TradeDate) : null
+      } catch {
+        return null
+      }
+    }
+    const calendar = readOnlyCalendar(db)
+    const now = Date.now()
+    // alert_log 没有 trade_date 列，只有 created_at ——「今天」一律按北京时间切
+    // （CLAUDE.md：不要写 setHours(0,0,0,0)，UTC−5 上会把日界挪到北京 13:00）
+    const latestSignalDate = day('SELECT MAX(trade_date) AS d FROM signal')
+    const latestAlertDate = day(
+      `SELECT date(MAX(created_at) / 1000, 'unixepoch', '+8 hours') AS d FROM alert_log`
+    )
     const snap: RuntimeSnapshot = {
       dbPath,
       signals: one('SELECT COUNT(*) FROM signal'),
@@ -219,6 +311,10 @@ async function runtimeState(): Promise<Maybe<RuntimeSnapshot>> {
       alerts: one('SELECT COUNT(*) FROM alert_log'),
       alertsWithGate: one('SELECT COUNT(*) FROM alert_log WHERE would_block IS NOT NULL'),
       shadowPoints: one('SELECT COUNT(*) FROM shadow_equity'),
+      latestSignalDate,
+      latestAlertDate,
+      signalFreshness: dataFreshness({ now, latest: latestSignalDate, calendar }),
+      alertFreshness: dataFreshness({ now, latest: latestAlertDate, calendar }),
     }
     db.close()
     return known(snap)
@@ -235,6 +331,66 @@ interface Task {
   bucket: Bucket
   title: string
   why: string
+}
+
+/**
+ * 两项真机诊断的「修复落地日」。**DB 里查不到，只能写成常量** —— 它是 git 事实。
+ *
+ * 落地日当天及以前的数据本来就不该有那个东西，报成「现在就能做」是误报；
+ * 严格晚于它的数据仍是零才是复发（判据见 ./session.ts 的 `sinceFixLanded`）。
+ *
+ * ⚠ **这两个日期不会自己更新。** 哪天这两处又改了实现，要连同这里一起改 ——
+ * 忘了改的后果是偏向误报（多查一次），不是漏报，方向是安全的那边。
+ */
+const FIX_LANDED = {
+  /** `engine/settle.ts` 次日盘前补跑，commit 19f542f */
+  settle: '2026-08-14' as TradeDate,
+  /** `011_alert_gate.sql` 加 would_block / suppressed_gate，commit 4836665 */
+  alertGate: '2026-08-15' as TradeDate,
+} as const
+
+/** `sessionGated` 的两份文案。`%LATEST%` / `%LANDED%` / `%NEXT%` 会被替换 */
+interface GatedCopy {
+  notYet: { title: string; why: string }
+  observed: { title: string; why: string }
+}
+
+/**
+ * 把「修复落地之后有没有产生过新数据」翻成一个 Task。
+ *
+ * **分桶只看 `sinceFixLanded`（硬事实），不看交易日历** —— 日历只用来补一句
+ * 「下一个观察窗口在哪」。这个分工是刻意的：日历有 uncertain 的时候，
+ * 分桶不该跟着一起变得不确定（见 ./session.ts 两段头注释）。
+ */
+function sessionGated(input: {
+  latest: TradeDate | null
+  landedOn: TradeDate
+  freshness: Freshness
+  fallback: Task
+  copy: GatedCopy
+}): Task {
+  const state = sinceFixLanded({ latest: input.latest, landedOn: input.landedOn })
+  if (state === 'NO_DATA') return input.fallback
+
+  const f = input.freshness
+  const next =
+    f.kind === 'CAUGHT_UP'
+      ? `下一个交易日（\`${f.session.date}\` 之后那一场）`
+      : f.kind === 'STALE'
+        ? `已经过去 ${f.sessionsBehind} 场（最后一场 \`${f.session.date}\`）`
+        : '下一个交易日'
+  const fill = (s: string): string =>
+    s
+      .replace(/%LATEST%/g, input.latest ?? '?')
+      .replace(/%LANDED%/g, input.landedOn)
+      .replace(/%NEXT%/g, next)
+
+  const copy = state === 'NOT_YET' ? input.copy.notYet : input.copy.observed
+  return {
+    bucket: state === 'NOT_YET' ? '只能靠时间' : '现在就能做',
+    title: fill(copy.title),
+    why: fill(copy.why),
+  }
 }
 
 /**
@@ -272,21 +428,54 @@ function tasks(input: {
       })
     }
     if (r.confirmed === 0 && r.signals > 0) {
-      out.push({
-        bucket: '现在就能做',
-        title: '收盘确认轮：signal 有行但 CONFIRMED 为 0',
-        why:
-          '两种可能，先分清：① 这批数据早于「次日盘前补跑」那次修复（engine/settle.ts），' +
-          '那就只需要再跑一天看它转正；② 修复之后仍然为 0 ⇒ 复发，立刻查 —— ' +
-          '这个症状会让影子运行、指标缓存、carryover 全部为空而界面不报错',
-      })
+      out.push(
+        sessionGated({
+          latest: r.latestSignalDate,
+          landedOn: FIX_LANDED.settle,
+          freshness: r.signalFreshness,
+          fallback: { bucket: '只能靠时间', title: '收盘确认轮还没有可判的数据', why: 'signal 表里读不到日期' },
+          copy: {
+            notYet: {
+              title: '收盘确认轮要等下一个交易日盘前才有结论（CONFIRMED 仍为 0）',
+              why:
+                'engine/settle.ts 设计上**只在次日盘前那一跳**补跑，它 %LANDED% 才落地，' +
+                '而 signal 最新只到 %LATEST% —— 全部数据都不晚于落地日，现在查不出任何东西。' +
+                '观察窗口是 %NEXT% 的盘前，那时应用要开着；**跨过那一场之后仍为 0 才是复发**',
+            },
+            observed: {
+              title: '收盘确认轮：修复已落地且此后有新数据，CONFIRMED 仍为 0 ⇒ 复发',
+              why:
+                'engine/settle.ts %LANDED% 落地，而 signal 最新已到 %LATEST% —— ' +
+                '「数据早于那次修复」这条解释不成立了。立刻查：这个症状会让影子运行、' +
+                '指标缓存、carryover 全部为空而界面不报错',
+            },
+          },
+        })
+      )
     }
     if (r.alerts > 0 && r.alertsWithGate === 0) {
-      out.push({
-        bucket: '现在就能做',
-        title: '闸门量表零数据：alert_log 有行但没有结构化闸门列',
-        why: '011 迁移之后的行才有 would_block。若持续为 0，说明迁移没跑或分发路径没写',
-      })
+      out.push(
+        sessionGated({
+          latest: r.latestAlertDate,
+          landedOn: FIX_LANDED.alertGate,
+          freshness: r.alertFreshness,
+          fallback: { bucket: '只能靠时间', title: '闸门量表还没有可判的数据', why: 'alert_log 里读不到日期' },
+          copy: {
+            notYet: {
+              title: '闸门量表要等下一个交易日才有第一行（would_block 仍为 0）',
+              why:
+                '011 迁移 %LANDED% 落地，只让**此后新写入**的行带 would_block；' +
+                'alert_log 最新只到 %LATEST%，存量行不会被回填，也不该被回填。观察窗口是 %NEXT%',
+            },
+            observed: {
+              title: '闸门量表：011 落地之后写过新行，仍无 would_block ⇒ 分发路径没写',
+              why:
+                '011 %LANDED% 落地，alert_log 最新已到 %LATEST% —— 期间写入的行本该带上这一列。' +
+                '先确认迁移真的跑过（meta.schema_version ≥ 11），再查分发路径',
+            },
+          },
+        })
+      )
     }
     if (r.shadowPoints === 0) {
       out.push({
@@ -468,6 +657,22 @@ function render(input: {
     L.push(
       `| ${r.tradeDays} | ${r.signals} | ${r.confirmed} | ${r.alerts} | ${r.alertsWithGate} | ${r.shadowPoints} |`
     )
+    L.push('')
+    L.push(`数据最新到：signal \`${r.latestSignalDate ?? '—'}\` · alert_log \`${r.latestAlertDate ?? '—'}\``)
+    const f = r.signalFreshness
+    if (f.kind === 'CAUGHT_UP') {
+      L.push(
+        `最后一个**已收盘**交易日是 \`${f.session.date}\`（日历来源 ${f.session.source}）—— ` +
+          '此后一场都没收过盘，**存量诊断这会儿查不出东西**。'
+      )
+    } else if (f.kind === 'STALE') {
+      L.push(
+        `⚠ 最后一个已收盘交易日是 \`${f.session.date}\`，数据落后 **${f.sessionsBehind} 场** —— ` +
+          '「等下一个交易日」这条解释不成立了。'
+      )
+    } else {
+      L.push(`⚠ 判不了「有没有跨过新交易日」：${f.why}`)
+    }
   } else {
     L.push(`⚠ **${runtime.why}**`)
     L.push('')
