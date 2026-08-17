@@ -70,6 +70,7 @@ function codeResult(overrides: Partial<CodeResult> = {}): CodeResult {
     gapSkipped: 0,
     regimeBars: new Map<Regime, number>([['TREND_UP', 8]]),
     openPosition: false,
+    delistedClose: false,
     ...overrides,
   }
 }

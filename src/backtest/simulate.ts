@@ -49,7 +49,35 @@ export interface SimulateOptions {
   lookback: number
   /** 前 N 根只喂数据不判信号。默认取 params.data.fullBars，保证 BBW 分位已预热 */
   warmupBars?: number
+  /**
+   * 退市日（该标的最后一个交易日）。给了它、且喂进来的序列末根已到达该日，
+   * 就在最后一根收盘**强制平仓并记一笔 `trade`**。
+   *
+   * **不给的时候行为与以前逐位相同** —— 旧结论（M2 §5.20 起的全部数字）可原样复现。
+   *
+   * ## 为什么必须记这一笔
+   *
+   * 未平仓的建仓**不产生 `trade` 行**，而建仓级胜率与 `audit:random` 的配对 alpha
+   * **都只读 `trades`**（`groupPositions()` 在 metrics.ts 与 random-audit.ts 各有一份，
+   * 都按 `code@entryDate` 分组）。退市股若只让亏损进净值、不进 `trades`，
+   * 就等于「池子补了、统计口径没补」—— 那正是幸存者偏差的第二重体现，
+   * 而它比第一重更隐蔽：报告上的建仓数、胜率、alpha 全都若无其事。
+   *
+   * ## ⚠ 结算价是最后一个交易日的收盘价，这是个**乐观**假设
+   *
+   * 真实的退市股在整理期常常连续跌停、**根本卖不掉**，之后进老三板近乎归零。
+   * 所以这里算出来的亏损是**下界**，不是真实损失。方向已知且单向，
+   * 报告里必须写明（`report.ts` 的 warnings 有一条钉着）。
+   *
+   * 判据用 `末根.date >= delistedAt` 而不是相等：回测窗口若截在退市日之前
+   * （只跑到 2020，而该票 2024 才退市），末根 < delistedAt，**不该**强制平仓 ——
+   * 那时它只是「窗口到期未平仓」，是另一回事。
+   */
+  delistedAt?: TradeDate
 }
+
+/** 退市强制平仓那一笔的 `exitRule`。归因时要能把它与风控离场分开 */
+export const DELISTED_EXIT_RULE = 'DELISTED'
 
 export const DEFAULT_SIMULATE_OPTIONS: Omit<SimulateOptions, 'params'> = {
   costs: DEFAULT_COSTS,
@@ -120,6 +148,8 @@ export interface CodeResult {
   regimeBars: Map<Regime, number>
   /** 期末仍持仓（未平仓）—— 报告里要单独说明，否则「总收益」里混着浮盈 */
   openPosition: boolean
+  /** 该标的的仓位是被退市强制平仓结束的（见 SimulateOptions.delistedAt 的乐观假设说明） */
+  delistedClose: boolean
 }
 
 interface PendingOrder {
@@ -204,6 +234,7 @@ export function simulateCode(
     gapSkipped: 0,
     regimeBars: new Map(),
     openPosition: false,
+    delistedClose: false,
   }
 
   for (let i = 0; i < candles.length; i++) {
@@ -384,6 +415,50 @@ export function simulateCode(
       barsInRegime: evaluation.regime.heldDays,
       deferred: 0,
     }
+  }
+
+  // ── ⑤ 退市：序列到此为止，这个仓位不可能再有出口 ──────────────────────
+  // 按最后一根收盘价结算并记一笔 trade。不结算的话这笔亏损只进净值、不进 trades，
+  // 而建仓级胜率与配对 alpha 都只读 trades（见 SimulateOptions.delistedAt）
+  const lastBar = candles[candles.length - 1]
+  if (
+    shares > 0 &&
+    options.delistedAt !== undefined &&
+    lastBar !== undefined &&
+    lastBar.date >= options.delistedAt
+  ) {
+    const fillAdj = sellFill(lastBar.closeAdj, costs)
+    const amount = shares * fillAdj
+    const fees = sellFees(amount, costs)
+    cash += amount - fees
+    result.trades.push({
+      code: profile.code,
+      entryDate,
+      exitDate: lastBar.date,
+      entryPrice: entryPriceAdj,
+      exitPrice: fillAdj,
+      entryPriceRaw,
+      exitPriceRaw: sellFill(lastBar.close, costs),
+      shares,
+      // 清仓，所以剩余的建仓费用全部摊到这一笔
+      pnl: (fillAdj - costAdj) * shares - fees - entryCosts,
+      pnlPct: costAdj > 0 ? (fillAdj - costAdj) / costAdj : 0,
+      holdingBars: candles.length - 1 - entryIndex,
+      costs: fees + entryCosts,
+      regimeAtEntry: entryContext?.regime ?? 'TRANSITION',
+      barsInRegimeAtEntry: entryContext?.barsInRegime ?? 0,
+      entryScore: entryContext?.score ?? 0,
+      entrySignals: entryContext?.signals ?? [],
+      exitRule: DELISTED_EXIT_RULE,
+      partial: false,
+    })
+    shares = 0
+    // 净值最后一点是平仓前算的（cash + shares × closeAdj），与结算后的现金差一个
+    // 卖出费用与滑点。不改回来的话净值曲线与 trades 对不上，
+    // 而这两者本该是同一件事的两种记法
+    const lastPoint = result.equity[result.equity.length - 1]
+    if (lastPoint) lastPoint.equity = cash
+    result.delistedClose = true
   }
 
   result.openPosition = shares > 0

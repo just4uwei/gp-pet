@@ -16,6 +16,14 @@ export interface CliOptions {
   /** market.db 路径；与 fixtures 二选一 */
   db?: string
   fixtures?: string
+  /**
+   * 退市清单 JSON（`params/universe-delisted.json` 的形状：`{ delistedAt: { CODE: 'YYYY-MM-DD' } }`）。
+   *
+   * 给了它，名单内的标的会在退市日收盘**强制平仓并记一笔 trade**
+   * （见 `simulate.ts` 的 `SimulateOptions.delistedAt`）。不给则行为与以前逐位相同 ——
+   * 这是刻意的：旧结论要能原样复现，新旧差值才归得清。
+   */
+  delisted?: string
   benchmark: string | null
   params?: string
   grid?: string
@@ -50,6 +58,9 @@ export const USAGE = `用法：
 数据来源（二选一，默认读应用数据库）：
   --db <file>            market.db 路径（默认 %APPDATA%/gp-pet/market.db）
   --fixtures <dir>       从 <dir>/<CODE>.json 读日线（无网络环境下自测用）
+  --delisted <file>      退市清单（params/universe-delisted.json）。名单内的标的在退市日
+                         收盘强制平仓并记一笔 trade —— 不给则未平仓的建仓不进 trades，
+                         而建仓级胜率与配对 alpha 都只读 trades（幸存者偏差的第二重）
 
 区间与标的：
   --codes <list>         逗号分隔的代码，支持 600000 / sh600000 / 000001.SZ
@@ -157,6 +168,9 @@ export function parseArgs(argv: readonly string[]): CliOptions | 'help' {
         break
       case '--fixtures':
         options.fixtures = requireValue(key, next)
+        break
+      case '--delisted':
+        options.delisted = requireValue(key, next)
         break
       case '--benchmark': {
         const value = requireValue(key, next)

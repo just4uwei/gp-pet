@@ -92,6 +92,8 @@ export interface BacktestReport {
     trades: number
     winRate: number | null
     openPosition: boolean
+    /** 仓位是被退市强制平仓结束的（结算价为退市日收盘价，是亏损下界） */
+    delistedClose: boolean
     evaluations: number
     gapSkipped: number
     limitBlocked: number
@@ -236,6 +238,16 @@ export function assembleReport(input: AssembleInput): BacktestReport {
   if (input.results.some((r) => r.openPosition)) {
     warnings.push('期末仍有未平仓标的，总收益中包含浮动盈亏。')
   }
+  const delistedCount = input.results.filter((r) => r.delistedClose).length
+  if (delistedCount > 0) {
+    // 方向已知且单向，所以必须写在报告里而不是只留在代码注释里：
+    // 读的人会拿这个亏损当「退市股的真实代价」，而它是下界不是真值
+    warnings.push(
+      `${delistedCount} 只标的因退市在最后一个交易日强制平仓（exitRule=DELISTED）。` +
+        '结算价用的是该日收盘价，而真实退市股在整理期常常连续跌停卖不掉、之后进老三板近乎归零 —— ' +
+        '所以这里算出的亏损是**下界**，不是真实损失。'
+    )
+  }
   if (!input.benchmarkByDate || input.benchmarkByDate.size === 0) {
     warnings.push('缺少基准指数日线，超额收益与信息比率未计算（不以 0 代替）。')
   }
@@ -255,6 +267,7 @@ export function assembleReport(input: AssembleInput): BacktestReport {
         trades: stats.count,
         winRate: stats.winRate,
         openPosition: result.openPosition,
+        delistedClose: result.delistedClose,
         evaluations: result.evaluations,
         gapSkipped: result.gapSkipped,
         limitBlocked: result.limitBlocked,
@@ -353,7 +366,7 @@ export function renderReport(report: BacktestReport): string {
     lines.push(
       `  ${row.code}  收益 ${pct(row.totalReturn).padStart(8)}  ${String(row.trades).padStart(3)} 笔  胜率 ${pct(
         row.winRate
-      ).padStart(7)}${row.openPosition ? '  （期末持仓）' : ''}`
+      ).padStart(7)}${row.openPosition ? '  （期末持仓）' : ''}${row.delistedClose ? '  （退市平仓）' : ''}`
     )
   }
 

@@ -1,6 +1,6 @@
 {
   "rule": "按代码段分层 + 层内按代码升序等距抽样；不按市值/流动性/ST 筛选（那都是今天的属性，会引入前视偏差）；不含科创板（2019-07 才开市）",
-  "knownBias": "幸存者偏差无法消除：已退市股票在免费接口上取不到日线，必然缺席。方向是绩效被系统性高估。",
+  "knownBias": "本池只含今天仍在交易的股票 ⇒ 自带幸存者偏差，方向是绩效被系统性高估。（2026-08-17 更正：此处原先写「退市股在免费接口上取不到日线，无法消除」—— 那句是错的，腾讯有退市股完整日线，名单来自巨潮。补法见 params/universe-delisted.json 与 scripts/build-delisted.mjs；两个池子刻意分开，「含退市 vs 不含退市」的差值就是幸存者偏差的量化值。）",
   "source": "sina:Market_Center.getHQNodeData?node=hs_a",
   "universeSize": 5542,
   "strata": [

@@ -12,7 +12,13 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_COSTS } from '@backtest/costs'
-import { NEUTRAL_SENTIMENT, assertNoFuture, simulateCode, type SimulateOptions } from '@backtest/simulate'
+import {
+  DELISTED_EXIT_RULE,
+  NEUTRAL_SENTIMENT,
+  assertNoFuture,
+  simulateCode,
+  type SimulateOptions,
+} from '@backtest/simulate'
 import { fallbackProfile, sentimentSeries } from '@backtest/data'
 import { marketSentiment } from '@core/indicators/thresholds'
 import { DEFAULT_PARAMS, withParams } from '@core/params'
@@ -182,5 +188,67 @@ describe('情绪序列与实盘同源', () => {
       expect(value).toBeGreaterThanOrEqual(0)
       expect(value).toBeLessThanOrEqual(1)
     }
+  })
+})
+
+/**
+ * 退市强制平仓（幸存者偏差的第二重）。
+ *
+ * 补这一段的理由不是「多一个功能」：未平仓的建仓**不产生 `trade` 行**，
+ * 而建仓级胜率与 `audit:random` 的配对 alpha **都只读 `trades`**。
+ * 所以退市股若不结算，它的亏损只进净值、不进统计 —— 池子补了、口径没补。
+ *
+ * 第一条用例（不给 `delistedAt` 时逐位相同）比其余几条都重要：
+ * M2 §5.20 起的全部数字都是在没有这个参数的情况下跑出来的，
+ * 它们必须能原样复现，新旧差值才归得清是「补了退市股」而不是「模拟器变了」。
+ */
+describe('退市强制平仓', () => {
+  // 截出一个「末尾仍持仓」的序列：截到第一笔交易的卖出日之前 ——
+  // 那笔买入已经成交、卖出还没发生。引擎只看过去，所以截断不影响此前的判定
+  const firstTrade = run(synthetic).trades[0]
+  const cut = synthetic.findIndex((c) => c.date === firstTrade?.exitDate)
+  const holding = synthetic.slice(0, cut)
+  const lastDate = holding[holding.length - 1]?.date ?? ''
+
+  it('前提：这段序列末尾确实还持着仓 —— 否则下面几条都是空转', () => {
+    expect(cut).toBeGreaterThan(0)
+    expect(run(holding).openPosition).toBe(true)
+  })
+
+  it('不给 delistedAt 时逐位相同 —— 旧结论必须能原样复现', () => {
+    const before = run(holding)
+    expect(before.delistedClose).toBe(false)
+    expect(before.openPosition).toBe(true)
+    // 显式构造一次「没有该字段」的调用，确认不是靠默认值巧合通过
+    const after = simulateCode({ profile, candles: [...holding] }, { ...OPTIONS }, NEUTRAL_SENTIMENT)
+    expect(JSON.stringify(after.trades)).toBe(JSON.stringify(before.trades))
+  })
+
+  it('末根到达退市日：强制平仓、记一笔 DELISTED、不再算未平仓', () => {
+    const base = run(holding)
+    const closed = run(holding, { delistedAt: lastDate })
+    expect(closed.delistedClose).toBe(true)
+    expect(closed.openPosition).toBe(false)
+    expect(closed.trades.length).toBe(base.trades.length + 1)
+
+    const last = closed.trades[closed.trades.length - 1]
+    expect(last?.exitRule).toBe(DELISTED_EXIT_RULE)
+    expect(last?.exitDate).toBe(lastDate)
+    expect(last?.partial).toBe(false)
+    // 建仓上下文要跟着这一笔走，否则它在 regime 归因里会落进错误的桶
+    expect(last?.entryDate).toBe(base.trades[base.trades.length - 1]?.entryDate ?? last?.entryDate)
+  })
+
+  it('退市日晚于末根（窗口截在退市之前）：不平仓，那只是普通的未平仓', () => {
+    const later = run(holding, { delistedAt: '2099-12-31' })
+    expect(later.delistedClose).toBe(false)
+    expect(later.openPosition).toBe(true)
+  })
+
+  it('净值最后一点等于结算后的现金 —— 曲线与 trades 是同一件事的两种记法', () => {
+    const closed = run(holding, { delistedAt: lastDate })
+    const realized = closed.trades.reduce((sum, t) => sum + t.pnl, 0)
+    const lastPoint = closed.equity[closed.equity.length - 1]
+    expect(lastPoint?.equity).toBeCloseTo(OPTIONS.capitalPerCode + realized, 6)
   })
 })

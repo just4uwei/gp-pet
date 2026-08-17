@@ -107,6 +107,33 @@ interface Loaded {
   series: LoadedSeries[]
   benchmark: LoadedSeries | null
   source: DataSource
+  /** `--delisted` 给的退市日表；没给就是空 Map ⇒ 行为与以前逐位相同 */
+  delistedAt: Map<SecCode, TradeDate>
+}
+
+/**
+ * 读 `--delisted` 指向的退市清单（`params/universe-delisted.json` 的形状）。
+ *
+ * **空表和没给是两回事**：没给 `--delisted` 是「这次不管退市」，
+ * 而给了一个解析出来是空的文件几乎总是路径写错或字段名写错 —— 静默当成前者，
+ * 会让一次「以为修了幸存者偏差」的回测悄悄跑成没修的版本，而报告上完全看不出来。
+ * 所以后者直接抛错。
+ */
+function loadDelisted(options: CliOptions): Map<SecCode, TradeDate> {
+  const map = new Map<SecCode, TradeDate>()
+  if (options.delisted === undefined) return map
+  const parsed = JSON.parse(readFileSync(options.delisted, 'utf8')) as {
+    delistedAt?: Record<string, string>
+  }
+  for (const [code, date] of Object.entries(parsed.delistedAt ?? {})) {
+    map.set(normalizeCode(code), date)
+  }
+  if (map.size === 0) {
+    throw new Error(
+      `${options.delisted} 里没有可用的 delistedAt —— 形状应为 { "delistedAt": { "SH600000": "2020-01-01" } }`
+    )
+  }
+  return map
 }
 
 async function loadAll(options: CliOptions, range: { from: TradeDate; to: TradeDate }): Promise<Loaded> {
@@ -131,7 +158,13 @@ async function loadAll(options: CliOptions, range: { from: TradeDate; to: TradeD
     log(options, `[warn] 基准 ${options.benchmark} 无日线，超额收益与信息比率将为空`)
   }
 
-  return { series, benchmark, source }
+  const delistedAt = loadDelisted(options)
+  const covered = series.filter((s) => delistedAt.has(s.profile.code)).length
+  if (delistedAt.size > 0) {
+    log(options, `[backtest] 退市清单 ${delistedAt.size} 只，其中 ${covered} 只在本次标的池内（退市日收盘强制平仓）`)
+  }
+
+  return { series, benchmark, source, delistedAt }
 }
 
 /** 基准日线 → 情绪查表 + 净值查表。两者都按「截至该日期的最后一个有值日」前值填充 */
@@ -167,8 +200,9 @@ function runSimulation(
   range: { from: TradeDate; to: TradeDate }
 ): CodeResult[] {
   const costs = resolveCosts(options)
-  return loaded.series.map((series) =>
-    simulateCode(
+  return loaded.series.map((series) => {
+    const delistedAt = loaded.delistedAt.get(series.profile.code)
+    return simulateCode(
       {
         profile: series.profile,
         candles: series.candles.filter((c) => c.date >= range.from && c.date <= range.to),
@@ -179,10 +213,11 @@ function runSimulation(
         capitalPerCode: options.capital,
         lookback: options.lookback,
         ...(options.warmup === undefined ? {} : { warmupBars: options.warmup }),
+        ...(delistedAt === undefined ? {} : { delistedAt }),
       },
       sentiment
     )
-  )
+  })
 }
 
 /*
@@ -320,6 +355,9 @@ function runSplit(
   const floor = options.warmup ?? params.data.fullBars
   const results = loaded.series.map((series) => {
     const candles = series.candles.filter((c) => c.date <= split.to)
+    // 退市日晚于本段末尾时 simulateCode 自己会跳过（判据是「末根 >= delistedAt」），
+    // 所以这里无条件传：一只 2024 退市的票在训练段（截到 2023）里仍是正常的未平仓
+    const delistedAt = loaded.delistedAt.get(series.profile.code)
     return simulateCode(
       { profile: series.profile, candles },
       {
@@ -332,6 +370,7 @@ function runSplit(
           split,
           floor
         ),
+        ...(delistedAt === undefined ? {} : { delistedAt }),
       },
       views.sentiment
     )
