@@ -26,7 +26,7 @@ import type { AlertPayload } from '@shared/ipc-types'
 import type { InvalidationNotice, SignalOutcome } from '../engine/signals'
 import type { WatchHit } from '../watch/evaluate'
 import { metricLabel } from '../watch/metrics'
-import type { AlertCandidate } from './dispatcher'
+import type { AlertCandidate, AlertTrack } from './dispatcher'
 
 const LEVELS: readonly AlertLevel[] = ['L1', 'L2', 'L3']
 
@@ -65,6 +65,13 @@ export interface BuildOptions {
    * 不新开分发路径，状态点仍只由闸门点亮。
    */
   watchHits?: readonly WatchHit[]
+  /**
+   * 这只标的走哪条轨（2026-08-17 双轨提醒）。缺省全是 `PRIMARY` ⇒ 行为与双轨之前逐位相同。
+   *
+   * 只影响配额与气泡优先级（见 `AlertTrack`），**不影响级别与文案** ——
+   * 观察标的没有持仓，风控那套本来就不跑，所以它自然到不了 L3。
+   */
+  trackOf?: (code: SecCode) => AlertTrack
 }
 
 /** 持仓强制通道：这些裁决绕过组合层得分，不受冷却限制（docs/05 §2.3、§4.2） */
@@ -205,7 +212,7 @@ function watchHitAlert(hit: WatchHit, at: number): PreparedAlert {
 }
 
 export function buildAlerts(outcomes: readonly SignalOutcome[], options: BuildOptions): PreparedAlert[] {
-  const { levelOffset = 0, quotes, at, watchHits = [] } = options
+  const { levelOffset = 0, quotes, at, watchHits = [], trackOf } = options
   const prepared: PreparedAlert[] = []
 
   // 观察点命中排在信号之前：用户亲自设的东西优先于引擎自己发现的
@@ -251,6 +258,7 @@ export function buildAlerts(outcomes: readonly SignalOutcome[], options: BuildOp
       topSubSignalId: forced ? forced.rule : topSubSignalId(evaluation.signal.subSignals, gated.direction),
       ...(forced ? { forced: true } : {}),
       ...(forced?.lossPct === undefined ? {} : { lossPct: forced.lossPct }),
+      ...(trackOf ? { track: trackOf(evaluation.code) } : {}),
     }
 
     prepared.push({

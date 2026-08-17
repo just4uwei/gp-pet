@@ -248,7 +248,8 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
         if (!tracked.has(position.code)) {
           const exitAdj = sellFill(position.lastCloseAdj, costs)
           const amount = exitAdj * position.shares
-          const fees = sellFees(amount, costs)
+          // 板块决定费率：场内基金免印花税与过户费（costs.ts 的 isFundBoard）
+          const fees = sellFees(amount, costs, profileOf(position.code)?.board)
           cash += amount - fees
           repo.insertTrade({
             id: newId(),

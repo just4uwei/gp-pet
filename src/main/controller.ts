@@ -54,7 +54,7 @@ import type {
   WatchPointDraft,
   WatchPointView,
 } from '@shared/ipc-types'
-import type { Candle, Position, SecCode, Snapshot, TradeDate } from '@core/types'
+import type { Board, Candle, Position, SecCode, Snapshot, TradeDate } from '@core/types'
 import { DEFAULT_PARAMS, engineVersionOf, withSensitivity } from '@core/params'
 import { sma } from '@core/indicators/series'
 import { belowStopLine } from '@core/risk'
@@ -126,6 +126,7 @@ import { isQuiet, quietUntil, type QuietPreset } from './util/quiet'
 import { evaluateWatchPoints, type WatchHit } from './watch/evaluate'
 import { isWatchMetric } from './watch/metrics'
 import { applyTrade, isTradeError, replayTrades } from './trades/ledger'
+import { splitCode } from '@core/code'
 import type { TradeRow } from './storage/repositories/trade'
 import type { WatchPointRow } from './storage/repositories/watch'
 import { WindowManager } from './windows/WindowManager'
@@ -260,10 +261,18 @@ export class AppController {
       quiet: () => this.quietVerdict(),
       quotes: () => this.quoteViews(),
       nameOf: (code) => layer.storage.watchlist.get(code)?.profile.name ?? code,
-      // 「行业ETF」分组是观察名单，信号照出、照落库、照进面板，但不进提醒闸门
-      // （理由在 AlertServiceDeps.alertable 的注释里）。**每次现读**，
-      // 用户把某只从 ETF 组移出来的下一轮就该能收到它的提醒
-      alertable: (code) => layer.storage.watchlist.get(code)?.group !== INDUSTRY_ETF_GROUP,
+      /*
+        双轨提醒（2026-08-17，用户拍板）。此前「行业ETF」组**整个不进闸门**，
+        理由是配额共享会让 15 只观察标的挤掉真持仓的提醒（docs/05 §3.2）。
+
+        现在它们进闸门，但走 `OBSERVE` 轨：**自己一份日配额、不占个股任何计数器、
+        且抢不到气泡**（见 `AlertTrack` 与 service.ts 挑气泡那一段）。
+        于是 PRIMARY 的行为逐位不变，每日打扰上限只多 `observeDailyLimit` 条。
+
+        **每次现读**：用户把某只从 ETF 组移出来，下一轮它就该按个股待遇提醒。
+      */
+      trackOf: (code) =>
+        layer.storage.watchlist.get(code)?.group === INDUSTRY_ETF_GROUP ? 'OBSERVE' : 'PRIMARY',
       log,
     })
     this.unread = layer.storage.alerts.unreadCount()
@@ -835,6 +844,17 @@ export class AppController {
    * 录入前试算。**与 `addTrade` 走同一个 `applyTrade`** —— 表单里显示的
    * 「录入后会变成什么样」必须与真的存进去的结果逐位相同，否则用户两个数都不会信。
    */
+  /**
+   * 成交记账要用的板块。**场内基金免印花税与过户费**（`backtest/costs.ts` 的 `isFundBoard`）。
+   *
+   * 从代码段推而不是读 `watchlist.board`：后者是 provider 抓来的画像，可能缺；
+   * 而 `splitCode` 是**纯函数**、与填那一列时用的是同一个判据。
+   * 推不出来时退回 `MAIN`（按股票收满）—— 多收比少收安全，而少收会让成本价偏低。
+   */
+  private boardOf(code: SecCode): Board {
+    return splitCode(code)?.board ?? 'MAIN'
+  }
+
   previewTrade(draft: TradeDraft): TradePreview {
     const empty = { fee: 0, amount: 0, position: null, realized: null }
     const layer = this.data
@@ -843,7 +863,7 @@ export class AppController {
     const current = layer.storage.positions.get(draft.code)
     const outcome = applyTrade(
       current ? { shares: current.shares, cost: current.cost } : null,
-      { side: draft.side, price: draft.price, shares: draft.shares }
+      { side: draft.side, price: draft.price, shares: draft.shares, board: this.boardOf(draft.code) }
     )
     if (isTradeError(outcome)) return { ...empty, error: outcome.error }
     return {
@@ -870,7 +890,7 @@ export class AppController {
     const current = layer.storage.positions.get(code)
     const outcome = applyTrade(
       current ? { shares: current.shares, cost: current.cost } : null,
-      { side: draft.side, price: draft.price, shares: draft.shares }
+      { side: draft.side, price: draft.price, shares: draft.shares, board: this.boardOf(code) }
     )
     if (isTradeError(outcome)) throw new Error(outcome.error)
 
@@ -918,7 +938,7 @@ export class AppController {
     const code = row.code
     layer.storage.db.transaction(() => {
       layer.storage.trades.remove(id)
-      const rebuilt = replayTrades(layer.storage.trades.listByCode(code))
+      const rebuilt = replayTrades(layer.storage.trades.listByCode(code), this.boardOf(code))
       const openedAt = layer.storage.positions.get(code)?.openedAt ?? row.tradedAt
       if (rebuilt === null) layer.storage.positions.clear(code)
       else layer.storage.positions.set(code, rebuilt.shares, rebuilt.cost, openedAt)

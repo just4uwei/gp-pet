@@ -321,13 +321,17 @@ describe('落库失败不能把提醒一起吃掉', () => {
 })
 
 /*
-  观察名单（「行业ETF」分组）不进提醒链路（2026-08-15）。
+  `alertable` 是**通用的排除钩子**：命中的候选在 `buildAlerts()` **之前**就被摘掉。
 
-  这一组的每一条都在防同一类错误：**少发**。少发的提醒用户发现不了 ——
-  他不会知道自己漏了什么，而日志里也不会有那条记录。所以既要钉「ETF 不发」，
-  更要钉「个股照发」与「不留假的拦截记录」。
+  ⚠ **2026-08-17 起「行业ETF」组不再走这个钩子** —— 它改走 `OBSERVE` 轨
+  （独立日配额 + 抢不到气泡，见下面「双轨提醒」那一组）。这几条用例仍然有效，
+  测的是钩子本身：日后若有别的东西需要「完全不进提醒链路」，靠的还是它。
+
+  摘在哪一层是关键：拦在引擎里会连信号一起没了（那正是要观察的东西），
+  拦在闸门后会在 alert_log 里留一堆「被挡」的行 —— 而它们根本没进过闸门，
+  那是在谎报一个不存在的拦截。
 */
-describe('行业ETF 观察名单：不进提醒闸门', () => {
+describe('alertable：完全不进提醒链路的排除钩子', () => {
   const ETF = 'SH512880' as SecCode
   const STOCK = 'SH600000' as SecCode
   /** 真实的判据是「分组是不是 行业ETF」，这里用代码段模拟：SH5128xx 一律当观察名单 */
@@ -389,5 +393,60 @@ describe('行业ETF 观察名单：不进提醒闸门', () => {
     h.service.handle([outcome({ evaluation: evaluation({ code: ETF }) })], { at: T0, debounce: false })
     expect(h.rows).toHaveLength(1)
     expect(h.sink.bubbles).toHaveLength(1)
+  })
+})
+
+/*
+  双轨提醒（2026-08-17，用户拍板）。
+
+  此前「行业ETF」组整个不进闸门，理由是配额共享会让 15 只观察标的挤掉真持仓的提醒。
+  现在它们进闸门但走 OBSERVE 轨。**「不挤占」有两个出口，两个都得堵**：
+  ① 配额（dispatcher 侧，见 alerts.test.ts）② 气泡（这里）——
+  一次只弹一个气泡，而观察标的的得分可能更高。
+*/
+describe('双轨提醒：气泡永远优先给 PRIMARY', () => {
+  function dual(over: { primaryScore: number; observeScore: number }) {
+    const { repo, rows } = fakeRepo()
+    const sink = fakeSink()
+    let counter = 0
+    const service = createAlertService({
+      repo,
+      sink: sink.sink,
+      settings: () => DEFAULT_SETTINGS,
+      quiet: () => ({ quiet: false }),
+      dispatcher: new AlertDispatcher({
+        debounceTicks: 1,
+        startOfDay: (ts) => Math.floor(ts / 86_400_000) * 86_400_000,
+      }),
+      newId: () => `alert-${++counter}`,
+      // SH5128xx 当观察标的（真实判据是 watchlist 的分组）
+      trackOf: (code) => (code.startsWith('SH5128') ? 'OBSERVE' : 'PRIMARY'),
+    })
+    service.handle(
+      [
+        outcome({
+          signalId: 'stock',
+          evaluation: evaluation({ code: 'SH600000' as SecCode, score: over.primaryScore }),
+        }),
+        outcome({
+          signalId: 'etf',
+          evaluation: evaluation({ code: 'SH512800' as SecCode, score: over.observeScore }),
+        }),
+      ],
+      { at: T0, debounce: false }
+    )
+    return { rows, sink }
+  }
+
+  it('观察标的得分更高时也抢不到气泡', () => {
+    const h = dual({ primaryScore: 0.62, observeScore: 0.95 })
+    expect(h.sink.bubbles).toHaveLength(1)
+    expect(h.sink.bubbles[0]?.code).toBe('SH600000')
+  })
+
+  it('两条都进 alert_log —— 观察标的不再是「完全不进链路」', () => {
+    const h = dual({ primaryScore: 0.62, observeScore: 0.95 })
+    expect(h.rows).toHaveLength(2)
+    expect(h.rows.map((r) => r.signalId).sort()).toEqual(['etf', 'stock'])
   })
 })

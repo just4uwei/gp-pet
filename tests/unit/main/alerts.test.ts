@@ -381,3 +381,78 @@ describe('不制造信息黑洞（docs/05 §4 开头）', () => {
     expect(d.dispatch([afterMidnight], earlyAt + 1000, calm)[0]?.level).toBe('L2')
   })
 })
+
+/*
+  双轨提醒的配额（2026-08-17，用户拍板）。
+
+  此前「行业ETF」组整个不进闸门，理由是配额共享会让 15 只观察标的挤掉真持仓的提醒 ——
+  而被挤掉的那条止损用户不会知道自己漏了。所以双轨的实现要求是硬的：
+  **OBSERVE 轨有自己一份日配额，且不碰 PRIMARY 的任何计数器。**
+  这一组的第二条用例是整件事的核心断言 —— 它变红就意味着「不挤占」这条保证破了。
+*/
+describe('双轨提醒：OBSERVE 轨的独立配额', () => {
+  const observe = (i: number): AlertCandidate =>
+    candidate({
+      code: `SH51288${i}` as SecCode,
+      topSubSignalId: `O${i}`,
+      track: 'OBSERVE',
+    })
+
+  it('OBSERVE 轨用满自己的日配额后降为 L1', () => {
+    const d = make({ observeDailyLimit: 2 })
+    for (let i = 0; i < 2; i++) {
+      d.dispatch([observe(i)], T0 + i * MIN, calm)
+      d.dispatch([observe(i)], T0 + i * MIN + 1000, calm)
+    }
+    const third = observe(9)
+    d.dispatch([third], T0 + 10 * MIN, calm)
+    const got = d.dispatch([third], T0 + 11 * MIN, calm)[0]
+    expect(got?.level).toBe('L1')
+    expect(got?.reason).toContain('观察标的今日已达 2 条')
+  })
+
+  it('**OBSERVE 用满配额不影响 PRIMARY** —— 这是双轨存在的全部前提', () => {
+    const d = make({ observeDailyLimit: 1, hourlyLimit: 6 })
+    // 观察轨先把自己那一条用掉，再多来两条（都会被降级）
+    for (const i of [0, 1, 2]) {
+      d.dispatch([observe(i)], T0 + i * MIN, calm)
+      d.dispatch([observe(i)], T0 + i * MIN + 1000, calm)
+    }
+    // 个股这边应当完全不受影响：六条全额发出
+    for (let i = 0; i < 6; i++) {
+      const c = candidate({ code: `SH60000${i}` as SecCode, topSubSignalId: `P${i}` })
+      d.dispatch([c], T0 + (10 + i) * MIN, calm)
+      const got = d.dispatch([c], T0 + (10 + i) * MIN + 1000, calm)[0]
+      expect(got?.level).toBe('L2')
+    }
+  })
+
+  it('反过来也成立：个股用满全局每小时配额，观察轨仍有自己那一份', () => {
+    const d = make({ hourlyLimit: 1, observeDailyLimit: 2 })
+    const stock = candidate({ code: 'SH600001' as SecCode, topSubSignalId: 'P' })
+    d.dispatch([stock], T0, calm)
+    d.dispatch([stock], T0 + MIN, calm)
+    const o = observe(3)
+    d.dispatch([o], T0 + 2 * MIN, calm)
+    expect(d.dispatch([o], T0 + 3 * MIN, calm)[0]?.level).toBe('L2')
+  })
+
+  it('OBSERVE 的配额跨日重置', () => {
+    const d = make({ observeDailyLimit: 1 })
+    const o = observe(4)
+    d.dispatch([o], T0, calm)
+    d.dispatch([o], T0 + MIN, calm)
+    const nextDay = utcStartOfDay(T0) + 86_400_000 + 9 * HOUR
+    const o2 = observe(5)
+    d.dispatch([o2], nextDay, calm)
+    expect(d.dispatch([o2], nextDay + MIN, calm)[0]?.level).toBe('L2')
+  })
+
+  it('不传 track 时一律按 PRIMARY —— 双轨之前的行为逐位不变', () => {
+    const d = make({ observeDailyLimit: 0 })
+    const c = candidate()
+    d.dispatch([c], T0, calm)
+    // observeDailyLimit = 0 若误作用于 PRIMARY，这条会被降成 L1
+    expect(d.dispatch([c], T0 + MIN, calm)[0]?.level).toBe('L2')
+  })
+})

@@ -180,13 +180,13 @@ export function executeOrder(
     }
     const fillAdj = buyFill(ctx.bar.openAdj, ctx.costs)
     const budget = Math.min(ctx.cash, ctx.notionalPerTrade)
-    const shares = lotsAffordable(budget, fillAdj, ctx.costs)
+    const shares = lotsAffordable(budget, fillAdj, ctx.costs, ctx.board)
     if (shares <= 0) {
       // 分清两件事：现金池空了（组合层面的约束）vs 单笔名义金额买不起一手（标的太贵）
       return { kind: 'VOID', reason: ctx.cash < ctx.notionalPerTrade ? 'NO_CASH' : 'NO_LOT' }
     }
     const amount = shares * fillAdj
-    const fees = buyFees(amount, ctx.costs)
+    const fees = buyFees(amount, ctx.costs, ctx.board)
     const fillRaw = buyFill(ctx.bar.open, ctx.costs)
     return {
       kind: 'FILLED_BUY',
@@ -224,7 +224,7 @@ export function executeOrder(
   const qty = quantizeSell(position.shares, fraction)
   const fillAdj = sellFill(ctx.bar.openAdj, ctx.costs)
   const amount = qty * fillAdj
-  const fees = sellFees(amount, ctx.costs)
+  const fees = sellFees(amount, ctx.costs, ctx.board)
   // 部分卖出时买入费用按比例摊到这一笔，剩余留给后续那笔
   const allocatedEntryCosts = position.entryCosts * (qty / position.shares)
   const grossPnl = (fillAdj - position.entryPriceAdj) * qty

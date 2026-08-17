@@ -27,6 +27,7 @@
  * 第二个用例，第一个是影子运行）：口径各写一份，实盘盈亏与影子绩效就再也对不上。
  */
 
+import type { Board } from '@core/types'
 import { DEFAULT_COSTS, buyFees, sellFees, type CostModel } from '../../backtest/costs'
 
 export type TradeSide = 'BUY' | 'SELL'
@@ -42,6 +43,15 @@ export interface TradeInput {
   /** 不复权真实成交价 */
   price: number
   shares: number
+  /**
+   * 板块。**必填**，因为费率靠它区分：场内基金（ETF/LOF）免印花税与过户费。
+   *
+   * ⚠ 刻意不给缺省值。`costs.ts` 的缺省是「按股票收满」（回测偏保守是安全方向），
+   * 但**记账不能靠那个缺省** —— ETF 多扣 0.1% 会让成本价与已实现盈亏系统性偏高，
+   * 而这张账存在的意义就是「实盘盈亏与影子绩效可比」。
+   * 让它必填 = 调用方漏传时**编译不过**，而不是静默算错。
+   */
+  board: Board
 }
 
 export interface TradeApplied {
@@ -80,7 +90,7 @@ export function applyTrade(
   const amount = input.price * shares
 
   if (input.side === 'BUY') {
-    const fee = round2(buyFees(amount, costs))
+    const fee = round2(buyFees(amount, costs, input.board))
     const heldShares = current?.shares ?? 0
     const heldValue = (current?.cost ?? 0) * heldShares
     const nextShares = heldShares + shares
@@ -96,7 +106,7 @@ export function applyTrade(
     return { error: `卖出 ${shares} 股超过持有的 ${current.shares} 股` }
   }
 
-  const fee = round2(sellFees(amount, costs))
+  const fee = round2(sellFees(amount, costs, input.board))
   const realized = round2((input.price - current.cost) * shares - fee)
   const nextShares = current.shares - shares
   return {
@@ -119,6 +129,7 @@ export function applyTrade(
  */
 export function replayTrades(
   trades: readonly { side: TradeSide | 'OPENING'; price: number; shares: number }[],
+  board: Board,
   costs: CostModel = DEFAULT_COSTS
 ): LedgerPosition | null {
   let position: LedgerPosition | null = null
@@ -128,7 +139,11 @@ export function replayTrades(
       position = { shares: Math.trunc(trade.shares), cost: trade.price }
       continue
     }
-    const outcome = applyTrade(position, { side: trade.side, price: trade.price, shares: trade.shares }, costs)
+    const outcome = applyTrade(
+      position,
+      { side: trade.side, price: trade.price, shares: trade.shares, board },
+      costs
+    )
     if (isTradeError(outcome)) continue
     position = outcome.position
   }

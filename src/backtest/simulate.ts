@@ -274,10 +274,10 @@ export function simulateCode(
             pending = null
           } else {
             const fillAdj = buyFill(bar.openAdj, costs)
-            const qty = lotsAffordable(cash, fillAdj, costs)
+            const qty = lotsAffordable(cash, fillAdj, costs, profile.board)
             if (qty > 0) {
               const amount = qty * fillAdj
-              const fees = buyFees(amount, costs)
+              const fees = buyFees(amount, costs, profile.board)
               cash -= amount + fees
               shares = qty
               costAdj = fillAdj
@@ -311,7 +311,7 @@ export function simulateCode(
             const qty = quantizeSell(shares, fraction)
             const fillAdj = sellFill(bar.openAdj, costs)
             const amount = qty * fillAdj
-            const fees = sellFees(amount, costs)
+            const fees = sellFees(amount, costs, profile.board)
             cash += amount - fees
             // 部分卖出时买入费用按比例摊到这一笔，剩余留给后续那笔
             const allocatedEntryCosts = entryCosts * (qty / shares)
@@ -454,7 +454,7 @@ export function simulateCode(
   ) {
     const fillAdj = sellFill(lastBar.closeAdj, costs)
     const amount = shares * fillAdj
-    const fees = sellFees(amount, costs)
+    const fees = sellFees(amount, costs, profile.board)
     cash += amount - fees
     result.trades.push({
       code: profile.code,

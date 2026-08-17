@@ -427,10 +427,10 @@ function fillTrade(
   if (entryLimits !== null && entry.open >= entryLimits.limitUp - 0.001) return null
 
   const fillAdj = buyFill(entry.openAdj, costs)
-  const shares = lotsAffordable(capital, fillAdj, costs)
+  const shares = lotsAffordable(capital, fillAdj, costs, series.profile.board)
   if (shares <= 0) return null
   const deployed = shares * fillAdj
-  const entryFees = buyFees(deployed, costs)
+  const entryFees = buyFees(deployed, costs, series.profile.board)
 
   // 卖出：跌停开盘顺延最多 MAX_DEFER_BARS 根，与 simulate.ts 同
   let exitIdx = entryIdx + span
@@ -447,7 +447,7 @@ function fillTrade(
     if (!limitedDown) {
       const exitAdj = sellFill(bar.openAdj, costs)
       const amount = shares * exitAdj
-      const exitFees = sellFees(amount, costs)
+      const exitFees = sellFees(amount, costs, series.profile.board)
       return { deployed, pnl: (exitAdj - fillAdj) * shares - entryFees - exitFees }
     }
     exitIdx++

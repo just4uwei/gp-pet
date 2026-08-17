@@ -49,6 +49,23 @@ export const CHANNELS_BY_LEVEL: Record<AlertLevel, readonly AlertChannel[]> = {
   L3: ['PET', 'BUBBLE'],
 }
 
+/**
+ * 提醒的**轨道**（2026-08-17，双轨提醒）。
+ *
+ * `PRIMARY` 是用户自己的自选股；`OBSERVE` 是内置「行业ETF」组那 15 只观察标的。
+ *
+ * ## 为什么要分轨，而不是简单地把 ETF 放进闸门
+ *
+ * 频率上限原本是**全局**的（每小时 L2+L3 ≤ 6、每日 L3 ≤ 10）。
+ * 15 只观察标的与 7 只真持仓标的抢同一份配额，等于用行业数据换掉真提醒 ——
+ * 而被挤掉的那条止损用户不会知道自己漏了（这正是 2026-08-15 把它们整个摘掉的理由）。
+ *
+ * 所以双轨的实现是：**`OBSERVE` 有自己的一份日配额，且完全不碰 `PRIMARY` 的任何计数器**。
+ * 后果是 `PRIMARY` 的行为**逐位不变**（M3 正在攒的提醒日志证据不受干扰），
+ * 而每日打扰总量最多增加 `observeDailyLimit` 条。
+ */
+export type AlertTrack = 'PRIMARY' | 'OBSERVE'
+
 export interface AlertCandidate {
   signalId: string
   code: SecCode
@@ -65,6 +82,8 @@ export interface AlertCandidate {
   forced?: boolean
   /** `forced` 时的当前浮亏幅度（负数，如 −0.086）。用于那条 2% 的台阶判定 */
   lossPct?: number
+  /** 轨道。缺省 `PRIMARY` ⇒ 不传时行为与双轨之前逐位相同 */
+  track?: AlertTrack
 }
 
 export interface DispatchContext {
@@ -123,6 +142,15 @@ export interface DispatcherOptions {
   dailyL3Limit?: number
   /** 强制类提醒的复发台阶：跌幅每扩大这么多才再提醒一次（默认 0.02） */
   forcedStepPct?: number
+  /**
+   * `OBSERVE` 轨每日 L2+L3 上限（默认 **2**）。
+   *
+   * ⚠ 这个 2 是个**未标定的猜测值**（与 `alert.bubbleScore` 同一档：
+   * 判据只能来自提醒日志「这几条值不值得被打断」，回测测不到）。
+   * 取 2 的理由是保守：观察标的的信号是配置级的慢事件，
+   * 而每加一条就是每天多一次打扰。
+   */
+  observeDailyLimit?: number
   /** 本地零点。默认按运行环境的本地时区算；注入是为了让单测不受时区影响 */
   startOfDay?: (ts: number) => number
 }
@@ -158,6 +186,7 @@ export class AlertDispatcher {
   private readonly hourlyLimit: number
   private readonly dailyL3Limit: number
   private readonly forcedStepPct: number
+  private readonly observeDailyLimit: number
   private readonly startOfDay: (ts: number) => number
 
   /** 防抖：`code:direction:topSubSignalId` → 连续成立的 tick 数 */
@@ -177,6 +206,8 @@ export class AlertDispatcher {
   private day = -1
   private perCodeToday = new Map<SecCode, number>()
   private l3Today = 0
+  /** `OBSERVE` 轨当日已发出的 L2+L3 条数。**刻意与上面几个计数器分开** */
+  private observeToday = 0
 
   constructor(options: DispatcherOptions = {}) {
     this.debounceTicks = options.debounceTicks ?? 2
@@ -185,6 +216,7 @@ export class AlertDispatcher {
     this.hourlyLimit = options.hourlyLimit ?? 6
     this.dailyL3Limit = options.dailyL3Limit ?? 10
     this.forcedStepPct = options.forcedStepPct ?? 0.02
+    this.observeDailyLimit = options.observeDailyLimit ?? 2
     this.startOfDay = options.startOfDay ?? shanghaiDayStartMs
   }
 
@@ -317,6 +349,15 @@ export class AlertDispatcher {
 
   /** ③ 频率上限（docs/05 §4.3）。返回非空表示要降级 */
   private checkCaps(candidate: AlertCandidate, level: AlertLevel): string | null {
+    /*
+      OBSERVE 轨只看自己那一份日配额，**完全不读也不占** PRIMARY 的计数器。
+      这是双轨的全部要点：观察标的不该把真持仓的提醒挤掉（见 AlertTrack 的注释）。
+    */
+    if (candidate.track === 'OBSERVE') {
+      return this.observeToday >= this.observeDailyLimit
+        ? `频率上限：观察标的今日已达 ${this.observeDailyLimit} 条，降为 L1`
+        : null
+    }
     if ((this.perCodeToday.get(candidate.code) ?? 0) >= this.perCodeDailyLimit) {
       return `频率上限：${candidate.code} 今日 L2+L3 已达 ${this.perCodeDailyLimit} 条，降为 L1`
     }
@@ -333,6 +374,11 @@ export class AlertDispatcher {
   private commit(candidate: AlertCandidate, level: AlertLevel, now: number): void {
     this.lastSent.set(`${candidate.code}:${candidate.direction}`, { level, at: now })
     if (level === 'L1') return
+    if (candidate.track === 'OBSERVE') {
+      // 观察轨只记自己那一份；不进 recentHigh / perCodeToday / l3Today
+      this.observeToday++
+      return
+    }
     /*
       ⚠ 强制类台阶**必须记在这条早退之后**（2026-08-17 修，真机日志掉出来的）。
 
@@ -363,6 +409,7 @@ export class AlertDispatcher {
     this.day = day
     this.perCodeToday.clear()
     this.l3Today = 0
+    this.observeToday = 0
     this.lastForcedLoss.clear()
     // L3 的冷却是 Infinity（当日一次），跨日必须清掉，否则永远发不出第二条
     for (const [key, last] of [...this.lastSent.entries()]) {

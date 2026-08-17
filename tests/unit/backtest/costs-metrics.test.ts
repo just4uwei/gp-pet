@@ -279,3 +279,46 @@ describe('绩效指标', () => {
     })
   })
 })
+
+/*
+  场内基金的费率（2026-08-17）。
+
+  `core/code.ts` 早就认得 ETF 板块，而 costs.ts 此前无条件收印花税 + 过户费 ——
+  后果有两层：回测里 ETF 被多扣 0.1%/卖出（实测 12 只 ETF 池训练窗口带税 +1.63%、
+  免税 +2.14%，**差 0.51pp**），实盘记账里那 15 只行业 ETF 的成本价与已实现盈亏一起偏高。
+*/
+describe('场内基金免印花税与过户费', () => {
+  const amount = 100_000
+
+  it('ETF 卖出只收佣金', () => {
+    const commission = Math.max(DEFAULT_COSTS.minCommission, amount * DEFAULT_COSTS.commissionRate)
+    expect(sellFees(amount, DEFAULT_COSTS, 'ETF')).toBeCloseTo(commission, 10)
+  })
+
+  it('ETF 买入不收过户费', () => {
+    const commission = Math.max(DEFAULT_COSTS.minCommission, amount * DEFAULT_COSTS.commissionRate)
+    expect(buyFees(amount, DEFAULT_COSTS, 'ETF')).toBeCloseTo(commission, 10)
+  })
+
+  it('股票照旧收满 —— 差额恰好是印花税', () => {
+    const stock = sellFees(amount, DEFAULT_COSTS, 'MAIN')
+    const fund = sellFees(amount, DEFAULT_COSTS, 'ETF')
+    expect(stock - fund).toBeCloseTo(
+      amount * DEFAULT_COSTS.stampTaxRate + amount * DEFAULT_COSTS.transferFeeRate,
+      10
+    )
+  })
+
+  it('不传 board 时按股票收满 —— 缺省往「多收」那边掰是刻意的', () => {
+    expect(sellFees(amount, DEFAULT_COSTS)).toBeCloseTo(sellFees(amount, DEFAULT_COSTS, 'MAIN'), 10)
+  })
+
+  it('创业板/科创板/北交所都是股票，不沾这个豁免', () => {
+    for (const board of ['GEM', 'STAR', 'BSE'] as const) {
+      expect(sellFees(amount, DEFAULT_COSTS, board)).toBeCloseTo(
+        sellFees(amount, DEFAULT_COSTS, 'MAIN'),
+        10
+      )
+    }
+  })
+})

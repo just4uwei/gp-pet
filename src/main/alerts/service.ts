@@ -29,7 +29,7 @@ import type { SignalOutcome } from '../engine/signals'
 import type { AlertRepo, AlertRow } from '../storage/repositories/alert'
 import type { WatchHit } from '../watch/evaluate'
 import { buildAlerts, type QuoteView } from './candidates'
-import { AlertDispatcher, type AlertCandidate, type AlertDecision } from './dispatcher'
+import { AlertDispatcher, type AlertCandidate, type AlertDecision, type AlertTrack } from './dispatcher'
 import type { QuietVerdict } from './dnd'
 import { PetStateMachine } from './pet-state'
 
@@ -67,6 +67,14 @@ export interface AlertServiceDeps {
    * 而这些候选**根本没有进过闸门** —— 记一行「被挡」会谎报一个不存在的拦截。
    */
   alertable?: (code: SecCode) => boolean
+  /**
+   * 这只标的走哪条轨（2026-08-17 双轨提醒）。缺省全 `PRIMARY`。
+   *
+   * 内置「行业ETF」组走 `OBSERVE`：**有自己的日配额、不占个股的任何配额**，
+   * 且**抢不到气泡**（见下面挑气泡那一段）。这两条合起来才叫「不挤占」——
+   * 少任何一条，观察标的都能把真持仓的提醒挤掉，而被挤掉的那条止损用户发现不了。
+   */
+  trackOf?: (code: SecCode) => AlertTrack
   dispatcher?: AlertDispatcher
   pet?: PetStateMachine
   newId?: () => string
@@ -103,6 +111,7 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
     quotes,
     nameOf = (code) => code,
     alertable = () => true,
+    trackOf,
     dispatcher = new AlertDispatcher(),
     pet = new PetStateMachine(),
     newId = () => randomUUID(),
@@ -205,6 +214,7 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
         at: ctx.at,
         // 观察点命中与信号走同一套闸门 —— 不新开分发路径（见 candidates.ts 的 watchHitAlert）
         ...(hits === undefined ? {} : { watchHits: hits }),
+        ...(trackOf ? { trackOf } : {}),
       })
 
       if (prepared.length === 0) {
@@ -255,6 +265,7 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
       let delivered = 0
       let bubble: AlertPayload | null = null
       let bubbleScore = -1
+      let bubbleTrack: AlertTrack | null = null
 
       for (const decision of decisions) {
         if (decision.level === null) continue
@@ -266,9 +277,24 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
 
         pet.onAlert(decision.candidate.direction, ctx.at)
 
-        if (decision.channels.includes('BUBBLE') && decision.candidate.score > bubbleScore) {
-          bubbleScore = decision.candidate.score
-          bubble = shown
+        /*
+          挑气泡：**先按轨道，再按得分**（2026-08-17）。
+
+          光给 OBSERVE 一份独立配额还不够 —— 一次只弹一个气泡，
+          而观察标的的得分可能高于本轮那条真持仓提醒，于是它会把气泡抢走。
+          那是同一个「挤占」问题换了个出口，所以 PRIMARY 恒定优先。
+        */
+        if (decision.channels.includes('BUBBLE')) {
+          const track: AlertTrack = decision.candidate.track ?? 'PRIMARY'
+          const better =
+            bubbleTrack === null ||
+            (track === 'PRIMARY' && bubbleTrack === 'OBSERVE') ||
+            (track === bubbleTrack && decision.candidate.score > bubbleScore)
+          if (better) {
+            bubbleScore = decision.candidate.score
+            bubbleTrack = track
+            bubble = shown
+          }
         }
       }
 
