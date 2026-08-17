@@ -97,6 +97,11 @@ export interface BacktestReport {
     evaluations: number
     gapSkipped: number
     limitBlocked: number
+    /**
+     * 被池过滤（`--drop-cap-pct` / `--drop-amount-pct`）挡掉的建仓次数。
+     * **必须进报告**：只看「建仓数变少了」分不清是过滤剔的还是参数变严了。
+     */
+    poolBlocked: number
   }[]
   suppressions: { rule: string; count: number }[]
   /** 离场规则分布（按次数降序）—— 回答「是策略在卖还是风控在卖」 */
@@ -251,6 +256,14 @@ export function assembleReport(input: AssembleInput): BacktestReport {
   if (!input.benchmarkByDate || input.benchmarkByDate.size === 0) {
     warnings.push('缺少基准指数日线，超额收益与信息比率未计算（不以 0 代替）。')
   }
+  const poolBlocked = input.results.reduce((sum, r) => sum + r.poolBlocked, 0)
+  if (poolBlocked > 0) {
+    // 不写这一行就是 silent cap：「建仓数变少了」会被读成参数变严，而不是池被筛过
+    warnings.push(
+      `池过滤（--drop-cap-pct / --drop-amount-pct）挡掉了 ${poolBlocked} 次建仓机会。` +
+        '本次绩效因此建立在**筛过的标的池**上，不可与未过滤的运行直接横向比较。'
+    )
+  }
 
   return {
     meta: { ...input.meta, unvalidatedParams: ENGINE_VERSION.includes('unvalidated') },
@@ -271,6 +284,7 @@ export function assembleReport(input: AssembleInput): BacktestReport {
         evaluations: result.evaluations,
         gapSkipped: result.gapSkipped,
         limitBlocked: result.limitBlocked,
+        poolBlocked: result.poolBlocked,
       }
     }),
     suppressions: [...suppressions.entries()]

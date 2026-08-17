@@ -20,6 +20,9 @@ data/history/
 data/probe/
 # 历史公告（scripts/fetch-announcements.mjs 的产物，可重出）
 data/announcements/
+# 流动性维度（scripts/fetch-liquidity.mjs 的产物，可重出：联网取真值，
+# 或 --from-fixtures 从 data/history 算成交额代理）
+data/liquidity/
 .vite/
 .eslintcache
 

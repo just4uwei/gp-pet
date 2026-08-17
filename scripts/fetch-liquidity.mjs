@@ -43,6 +43,18 @@
  * 4. **不做任何过滤与分位计算。** 这里只落原始三列 + 反推值；
  *    「剔除谁」是回测那一侧的事（预注册见 M2 §5.29），两件事分开才能各自复核。
  *
+ * ## 两条路：联网取真值，或从 fixture 算成交额代理
+ *
+ * `--from-fixtures data/history` **不联网**，用现有腾讯 fixture 算
+ * `amount ≈ 成交量(股) × 不复权收盘价`，`turnoverRate` / `floatShares` / `floatCap` 一律 null。
+ *
+ * **为什么这是永久口径而不是临时凑数**（M2 §5.29 修正一）：东财会因大请求整族限流，
+ * 而「同一支实验先用代理报一次、拿到真值再报一次」违反「每个机制只报一次分位」。
+ * 误差实测（24538 个「股票·日」）：中位 **−0.00%**、绝对误差中位 **0.44%** / p95 **2.51%** ——
+ * 而横截面上不同标的的成交额差几个数量级，对「最小 30%」这个分位排序几乎无影响。
+ *
+ * **市值那一支没有代理**：换手率是反推流通股本的唯一入口，只能联网取。
+ *
  * ## 失败方向
  *
  * 东财是**间歇性**的（undici 成功率约 78%，失败症状 `other side closed`），
@@ -100,6 +112,8 @@ const USAGE = `用法：
   --out <dir>         默认 data/liquidity
   --concurrency <n>   默认 2（东财是间歇性的，压着并发靠重试过）
   --force             已有文件也重抓（默认跳过）
+  --from-fixtures <d> **不联网**：从 <d>/<CODE>.json（腾讯日线 fixture）算成交额代理，
+                      floatCap 一律 null。见下面「两条路」
 `
 
 function fail(message) {
@@ -125,6 +139,7 @@ function parseArgs(argv) {
     out: join('data', 'liquidity'),
     concurrency: 2,
     force: false,
+    fromFixtures: null,
   }
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
@@ -145,6 +160,7 @@ function parseArgs(argv) {
       }
       args.concurrency = parsed
     } else if (flag === '--force') args.force = true
+    else if (flag === '--from-fixtures') args.fromFixtures = next()
     else if (flag === '--help' || flag === '-h') {
       process.stdout.write(USAGE)
       process.exit(0)
@@ -248,7 +264,62 @@ function rowOf(csv) {
   }
 }
 
+/**
+ * 不联网那条路：从腾讯 fixture 算成交额代理。
+ *
+ * `amount ≈ volume(股) × close(不复权)`。**用不复权收盘价**，因为成交额本身是
+ * 不复权口径的（后复权价会把 2018 年的额算成几十倍）。
+ * `turnoverRate` / `floatShares` / `floatCap` 一律 null —— 没有换手率就没有股本，
+ * 编一个出来正是这个项目一直在防的事。
+ */
+function fromFixture(code, args) {
+  const file = join(args.fromFixtures, `${code}.json`)
+  if (!existsSync(file)) throw new Error(`${code} 在 ${args.fromFixtures} 里没有 fixture`)
+  const parsed = JSON.parse(readFileSync(file, 'utf8'))
+  const candles = Array.isArray(parsed.candles) ? parsed.candles : []
+  const rows = []
+  for (const candle of candles) {
+    const date = candle?.date
+    if (!isDate(date) || date < args.from || date > args.to) continue
+    const volume = Number(candle.volume)
+    const close = Number(candle.close)
+    const usable = Number.isFinite(volume) && volume > 0 && Number.isFinite(close) && close > 0
+    rows.push({
+      date,
+      amount: usable ? volume * close : null,
+      turnoverRate: null,
+      avgPrice: usable ? close : null,
+      floatShares: null,
+      floatCap: null,
+    })
+  }
+  if (rows.length === 0) throw new Error(`${code} 的 fixture 在区间内没有可用根`)
+  writeFileSync(
+    join(args.out, `${code}.json`),
+    `${JSON.stringify({
+      code,
+      source: 'fixture-proxy(tencent)',
+      units: {
+        amount: '元（代理 = volume 股 × 不复权收盘价；实测绝对误差中位 0.44% / p95 2.51%）',
+        turnoverRate: 'null —— fixture 没有这一列',
+        floatCap: 'null —— 没有换手率就推不出股本，不许编',
+      },
+      from: rows[0].date,
+      to: rows[rows.length - 1].date,
+      bars: rows.length,
+      capBars: 0,
+      medianFloatCap: null,
+      rows,
+    })}
+`,
+    'utf8'
+  )
+  return { code, bars: rows.length, capBars: 0, median: null }
+}
+
 async function fetchOne(code, args) {
+  if (args.fromFixtures !== null) return fromFixture(code, args)
+
   const klines = await fetchKlines(code, args.from, args.to)
   const rows = klines.map(rowOf).filter((r) => r !== null)
   if (rows.length === 0) throw new Error(`${code} 返回 ${klines.length} 行但一行都解不出来`)
