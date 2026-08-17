@@ -420,8 +420,24 @@ async function main(argv) {
       process.stderr.write(`  ✗ ${code}：${error instanceof Error ? error.message : String(error)}\n`)
       return null
     }
+    // `merge()` 会为数据质量问题抛错（复权价非正、两轨口径不符）。**那不能中断整批** ——
+    // 逐只落盘的全部意义就是「一只出问题，剩下的照抓」，而抛出来的异常会冒泡穿过
+    // `Promise.all` 直接结束 main，后面排队的一只都不会再抓。
+    //
+    // 2026-08-17 补退市股时真踩到：`SH600091`（退市明科）的**后复权**价里有 19 根 ≤ 0，
+    // 一次带走了后面还没抓的 169 只，而输出看起来只是「跑完了，少了一些」。
+    // 后复权是乘性的、本该恒正，所以这个断言**不是误报**（那只的数据确实不可用）——
+    // 错的是处置方式。断言保留，降级成「跳过这一只并计入失败清单」。
+    let result
+    try {
+      result = merge(code, bundle.raw.byDate, bundle.adj.byDate, tradingDays, cutoff)
+    } catch (error) {
+      process.stderr.write(
+        `  ✗ ${code}：${error instanceof Error ? error.message : String(error)}（数据质量断言未过，跳过这一只）\n`
+      )
+      return null
+    }
     ok++
-    const result = merge(code, bundle.raw.byDate, bundle.adj.byDate, tradingDays, cutoff)
     lines.push([code, summarize(result)])
     if (result.candles.length === 0) {
       process.stderr.write(`  ✗ ${code} 没有可用日线，不写盘\n`)

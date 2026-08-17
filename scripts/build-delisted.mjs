@@ -223,7 +223,7 @@ async function probeAll(candidates, names) {
 // ─────────────────────────── 主流程 ───────────────────────────
 
 function parseArgs(argv) {
-  const args = { take: 19, refresh: false }
+  const args = { take: 19, refresh: false, out: OUT }
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
     if (flag === '--take') {
@@ -233,6 +233,13 @@ function parseArgs(argv) {
         process.exit(2)
       }
       args.take = parsed
+    } else if (flag === '--out') {
+      const value = argv[++i]
+      if (!value) {
+        process.stderr.write('--out 缺少取值\n')
+        process.exit(2)
+      }
+      args.out = value
     } else if (flag === '--refresh') args.refresh = true
     else if (flag === '--') continue
     else {
@@ -313,9 +320,9 @@ async function main(argv) {
     )
   })
 
-  mkdirSync(dirname(resolve(OUT)), { recursive: true })
+  mkdirSync(dirname(resolve(args.out)), { recursive: true })
   writeFileSync(
-    OUT,
+    args.out,
     `${JSON.stringify(
       {
         rule:
@@ -346,11 +353,11 @@ async function main(argv) {
   // 不给 --benchmark：默认的 SH000300 同时充当交易日历，`has_gap`（停牌段）靠它标。
   // 给 none 会让每一段停牌都标不出来，而退市股恰恰停牌频繁 —— 缺口段本该跳过成交
   process.stdout.write(
-    `\n共 ${picked.length} 只，已写入 ${OUT}。接着跑：\n` +
-      `  node scripts/fetch-history.mjs --codes ${picked.map((p) => p.code).join(',')} --from ${PROBE_FROM}\n` +
+    `\n共 ${picked.length} 只，已写入 ${args.out}。接着跑：\n` +
+      `  node scripts/fetch-history.mjs --codes <上面那批> --from ${PROBE_FROM}\n` +
       `\n然后做「含退市 vs 不含退市」的对照跑（差值 = 幸存者偏差的量化值）：\n` +
       `  pnpm backtest -- --codes <universe-broad 的 codes> --fixtures data/history --from ${PROBE_FROM} --to <末日> --out reports/pit-A-old.json\n` +
-      `  pnpm backtest -- --codes <两个池子的 codes 合并> --fixtures data/history --from ${PROBE_FROM} --to <末日> --delisted ${OUT} --out reports/pit-B-new.json\n`
+      `  pnpm backtest -- --codes <两个池子的 codes 合并> --fixtures data/history --from ${PROBE_FROM} --to <末日> --delisted ${args.out} --out reports/pit-B-new.json\n`
   )
   return 0
 }
