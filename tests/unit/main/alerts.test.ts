@@ -270,6 +270,45 @@ describe('④ 免打扰：L2/L3 降为 L1（docs/05 §4.4）', () => {
     expect(d.dispatch([after], T0 + 31 * MIN, calm)[0]?.level).toBe('L3')
   })
 
+  /*
+    2026-08-17 真机日志掉出来的漏报，钉死它。
+
+    那天开盘第一轮（09:30:05）屏幕锁定，三只跌破止损线的持仓（浮亏 −7.8%）被降为 L1
+    —— 降级本身是本节的设计。但台阶**照样被记成 −7.8%**，于是解锁之后跌到 −8.4%
+    也再不提醒（要再扩大 2%）：整天 0 条气泡、1580 行「台阶未扩大」。
+    §4.2 那句「既不骚扰又不漏报」当天只剩后半句被打穿。
+
+    判据是「解除之后必须补上」，而不是「降级那一轮要不要发」—— 后者是设计，前者是缺陷。
+  */
+  it('免打扰期间的降级不消耗强制类台阶 —— 解除后同一笔浮亏必须补上那条气泡', () => {
+    const d = make()
+    const forced = (lossPct: number): AlertCandidate =>
+      candidate({ level: 'L3', forced: true, lossPct })
+
+    const locked = d.dispatch([forced(-0.078)], T0, { quiet: true, quietReason: '屏幕已锁定' })[0]
+    expect(locked?.level).toBe('L1')
+    expect(locked?.channels).not.toContain('BUBBLE')
+
+    // 解除免打扰，跌幅只多了 0.6pp（远够不上 2% 的台阶）—— 仍然必须发
+    const after = d.dispatch([forced(-0.084)], T0 + 30 * MIN, calm)[0]
+    expect(after?.level).toBe('L3')
+    expect(after?.channels).toContain('BUBBLE')
+  })
+
+  it('频率上限造成的降级同样不消耗台阶（同一条纪律，另一道闸门）', () => {
+    const d = make({ hourlyLimit: 1 })
+    // 先用掉本小时唯一的额度
+    const other = candidate({ code: 'SZ000001' as SecCode, topSubSignalId: 'X' })
+    d.dispatch([other], T0 - MIN, calm)
+    d.dispatch([other], T0, calm)
+
+    const forced = (lossPct: number): AlertCandidate =>
+      candidate({ level: 'L3', forced: true, lossPct })
+    expect(d.dispatch([forced(-0.078)], T0 + MIN, calm)[0]?.level).toBe('L1')
+    // 一小时后配额释放：同一笔浮亏只多跌 0.6pp，仍然必须发
+    expect(d.dispatch([forced(-0.084)], T0 + HOUR + 2 * MIN, calm)[0]?.level).toBe('L3')
+  })
+
   it('L1 在免打扰下不再降级（已经是最低档），也不报原因', () => {
     const d = make()
     const c = candidate({ level: 'L1' })

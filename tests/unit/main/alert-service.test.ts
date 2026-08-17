@@ -48,6 +48,18 @@ function outcome(overrides: Partial<SignalOutcome> = {}): SignalOutcome {
   return { evaluation: evaluation(), name: '浦发银行', persisted: true, signalId: 'sig-1', ...overrides }
 }
 
+/** 持仓强制类（跌破止损线）。浮亏走 `evidence.profitPct`，是**百分数**不是比率 */
+function forcedOutcome(profitPct: number): SignalOutcome {
+  return outcome({
+    evaluation: evaluation({
+      direction: 'SELL',
+      verdicts: [
+        { rule: 'STOP_LOSS', action: 'FORCE_SELL', evidence: { profitPct } } as unknown as RiskVerdict,
+      ],
+    }),
+  })
+}
+
 /** 内存版 alert_log。只实现 service 用到的那几个方法 */
 function fakeRepo(): { repo: AlertRepo; rows: AlertRow[] } {
   const rows: AlertRow[] = []
@@ -153,6 +165,41 @@ describe('不制造信息黑洞：每一条候选都留一行', () => {
     h.service.handle([outcome({ signalId: 'sig-2' })], { at: T0 + 60_000, debounce: false })
     expect(h.rows).toHaveLength(3)
     expect(h.rows[2]?.repeatCount).toBeUndefined()
+  })
+
+  /*
+    2026-08-17：真机一天落了 1590 行 alert_log，而它们只对应约 6 件事。
+    两个成因各一条用例 —— 修一个不修另一个，日志照样翻不动。
+  */
+  it('抑制文案里的连续量变了不算新事件 —— 一条止损台阶只留一行', () => {
+    // 「强制提醒台阶：跌幅 −8.3% 未比上次（−7.8%）再扩大 2%」里的跌幅每轮都抖，
+    // 旧签名含这句文案 ⇒ 每抖一下就是一行。与 signalSignature 里 reasons[0] 同一形状
+    const h = harness()
+    h.service.handle([forcedOutcome(-7.8)], { at: T0, debounce: false })
+    for (let i = 1; i <= 5; i++) {
+      h.service.handle([forcedOutcome(-7.8 - i * 0.1)], { at: T0 + i * 30_000, debounce: false })
+    }
+    // ① 真发出去那条 ② 被台阶挡住那条（后五轮并进它）
+    expect(h.rows).toHaveLength(2)
+    expect(h.rows[1]?.repeatCount).toBe(5)
+    // 保留的是第一次那句文案（011 的头注释：文案给人读，分组用离散列）
+    expect(h.rows[1]?.suppressedReason).toContain('-7.9%')
+  })
+
+  it('同一只票两条信号交替出现时去重仍然有效 —— 判重键含 signalId', () => {
+    // 跌破止损线的持仓会同时出 SELL 与 REDUCE 两条。旧实现只按 code 记「上一条」，
+    // 两条交替来比 ⇒ 永远匹配不上，去重整块失效
+    const h = harness()
+    const sell = outcome({ signalId: 'sig-sell', evaluation: evaluation({ direction: 'SELL' }) })
+    const buy = outcome({ signalId: 'sig-buy', evaluation: evaluation({ direction: 'BUY' }) })
+    for (let i = 0; i < 4; i++) {
+      h.service.handle([sell, buy], { at: T0 + i * 30_000, debounce: false })
+    }
+    // 两条各发出一次 + 各被冷却挡住一行（后三轮并进去），而不是 8 行
+    expect(h.rows).toHaveLength(4)
+    expect(h.rows.filter((row) => row.suppressedReason !== null).every((row) => row.repeatCount === 3)).toBe(
+      true
+    )
   })
 
   it('重复不把已读的行改回未读 —— 未读数答的是「有几件新事」', () => {

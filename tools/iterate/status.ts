@@ -54,6 +54,7 @@ import { ENGINE_VERSION } from '@core/params'
 import type { TradeDate } from '@core/types'
 import { countByStatus, paramRows } from '@main/settings/params-view'
 import { createTradingCalendar, parseHolidayTable, type TradingCalendar } from '@main/scheduler/calendar'
+import { SHANGHAI_OFFSET_MS } from '@shared/time'
 import { dataFreshness, sinceFixLanded, type Freshness } from './session'
 
 const ROOT = process.cwd()
@@ -66,6 +67,17 @@ type Maybe<T> = { known: true; value: T } | { known: false; why: string }
 
 const unknown = (why: string): Maybe<never> => ({ known: false, why })
 const known = <T>(value: T): Maybe<T> => ({ known: true, value })
+
+/**
+ * `YYYY-MM-DD HH:mm`，**北京时间**。
+ *
+ * 看板上的时刻与日期一律走这里，别用 `toISOString()`：那给的是 UTC，
+ * 而打出来的字看起来像本地钟。两处都踩过 —— 头部「刷新于」在 UTC+7 的机器上
+ * 把北京 15:11 打成 07:11；报告日期按 UTC 切会让北京 00:00–08:00 生成的报告显示成前一天。
+ */
+function shanghaiStamp(epochMs: number): string {
+  return new Date(epochMs + SHANGHAI_OFFSET_MS).toISOString().slice(0, 16).replace('T', ' ')
+}
 
 // ── ① 参数归档状态（唯一有测试钉着的事实来源）─────────────────────────
 
@@ -116,7 +128,7 @@ function latestBaseline(): Maybe<BaselineSnapshot> {
       const wins = [...byEntry.values()].filter((p) => p > 0).length
       return known({
         file: f,
-        at: j.meta?.generatedAt === undefined ? '—' : new Date(j.meta.generatedAt).toISOString().slice(0, 10),
+        at: j.meta?.generatedAt === undefined ? '—' : shanghaiStamp(j.meta.generatedAt).slice(0, 10),
         engineVersion: j.meta?.engineVersion ?? '—',
         codes,
         positions: byEntry.size,
@@ -726,7 +738,9 @@ async function main(): Promise<number> {
   const budget = testBudget()
   const runtime = await runtimeState()
   const taskList = tasks({ params, baseline, alpha, budget, runtime })
-  const at = new Date().toISOString().slice(0, 16).replace('T', ' ')
+  // 一律北京时间：`toISOString()` 给的是 UTC，而看板上那行看起来像本地钟 ——
+  // 2026-08-17 15:11（北京）打成了「07:11」，那正是本项目一直在防的时区混读
+  const at = shanghaiStamp(Date.now())
   const text = render({ params, baseline, alpha, budget, runtime, taskList, at })
 
   process.stdout.write(text)

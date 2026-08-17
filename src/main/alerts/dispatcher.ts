@@ -164,7 +164,12 @@ export class AlertDispatcher {
   private streaks = new Map<string, number>()
   /** 冷却：`code:direction` → { level, at } 最近一次实际发出的提醒 */
   private lastSent = new Map<string, { level: AlertLevel; at: number }>()
-  /** 强制类的台阶：`code` → 上次提醒时的浮亏幅度 */
+  /**
+   * 强制类的台阶：`code` → **上次真的弹过气泡时**的浮亏幅度。
+   *
+   * 「真的弹过」这半句是硬的：被闸门③④降级成 L1 的那条没打扰过任何人，
+   * 不该消耗台阶（见 `commit` 里那段注释）。
+   */
   private lastForcedLoss = new Map<SecCode, number>()
   /** 滑动窗口：最近一小时内实际发出的 L2/L3 时间戳 */
   private recentHigh: number[] = []
@@ -327,10 +332,25 @@ export class AlertDispatcher {
   /** 记账。只有**实际发出**的才计入冷却与配额 —— 被降级成 L1 的不占 L2/L3 的额度 */
   private commit(candidate: AlertCandidate, level: AlertLevel, now: number): void {
     this.lastSent.set(`${candidate.code}:${candidate.direction}`, { level, at: now })
+    if (level === 'L1') return
+    /*
+      ⚠ 强制类台阶**必须记在这条早退之后**（2026-08-17 修，真机日志掉出来的）。
+
+      台阶就是一种额度，与下面三个计数器同一条纪律：被降级成 L1 的那条**没有弹气泡**，
+      不该占用任何额度。原先它记在早退之前，于是：
+        08-17 09:30:05 开盘第一轮，三只跌破止损线的持仓（浮亏 −7.8%）被
+        「免打扰（屏幕已锁定）」降为 L1 —— 降级本身是设计（§4.4，只改状态点不弹气泡），
+        但台阶照样记成 −7.8%。解锁之后跌到 −8.4% 也再不提醒（要再扩大 2%），
+        整天 0 条气泡、1580 行「台阶未扩大」。
+      docs/05 §4.2 那句「既不骚扰又不漏报」被打穿了一半：那天没骚扰过任何人，只漏报。
+      而这正是本项目最贵的错误类别 —— 少发的错误用户自己发现不了。
+
+      代价是免打扰持续期间每轮都会重新造一条候选并落痕（被 006 的判重折成一行），
+      换来的是**免打扰一解除，那条止损气泡立刻补上**。
+    */
     if (candidate.forced === true && candidate.lossPct !== undefined) {
       this.lastForcedLoss.set(candidate.code, candidate.lossPct)
     }
-    if (level === 'L1') return
     this.recentHigh.push(now)
     this.perCodeToday.set(candidate.code, (this.perCodeToday.get(candidate.code) ?? 0) + 1)
     if (level === 'L3') this.l3Today++

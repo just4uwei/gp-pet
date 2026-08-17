@@ -110,7 +110,7 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
   } = deps
 
   /**
-   * 上一条已落库的裁决，按标的记（006_alert_repeat.sql）。
+   * 上一条已落库的裁决，按 **`code:signalId`** 记（006_alert_repeat.sql）。
    *
    * 盘中每 30s 一轮都会对同一个持续中的信号造一次候选、被同键冷却挡一次，
    * 而**被丢弃的裁决照样要留痕**（docs/05 §4「不制造信息黑洞」）。两条加起来的后果是
@@ -120,11 +120,23 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
    * 所以：签名相同 → 把首行的 `repeat_count + 1`（信息一条不少，噪音没了）；
    * 签名不同 → 照常插一行。
    *
+   * ⚠ **键里必须有 `signalId`，只按 `code` 记不够**（2026-08-17 修，真机日志掉出来的）。
+   * 同一只票同一轮里可以有两个候选（跌破止损线的持仓同时出 `SELL` 与 `REDUCE`，
+   * 或者信号 + 同一只票的观察点命中），它们**交替**来对比「上一条」，
+   * 签名永远不等 ⇒ 去重整块失效。08-17 那天 1590 行 alert_log 只对应约 6 件事。
+   *
    * **这是内存态，重启后清空** → 重启后同一个持续状态会多留一行。可以接受，
    * 而且**不要**改成启动时去库里回捞上一条来对齐：那要在每轮 tick 的热路径上
    * 加一次查询，换来的只是省下一行日志。
    */
-  const lastDecision = new Map<SecCode, { signature: string; rowId: string }>()
+  const lastDecision = new Map<string, { signature: string; rowId: string; at: number }>()
+
+  /**
+   * 判重态的保鲜期。超过这么久没再出现的裁决不再合并 —— 重新出现就是新事件
+   * （与 `AlertDispatcher.streaks` 的「消失过就重新计数」同一条纪律）。
+   * 顺带给这张 Map 一个上界：不清理的话长跑一周会攒下每一个历史 signalId。
+   */
+  const DEDUPE_TTL_MS = 60 * 60 * 1000
 
   /**
    * 判重签名。
@@ -132,13 +144,23 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
    * **`signalId` 必须在里面**：新信号就是新事件，哪怕文案一字不差也要新行 ——
    * 否则「早上那条买入」与「下午重新触发的那条买入」会被记成同一件事。
    * 得分不在里面（它每轮都抖，含它等于没有去重，与 signals.ts 的落库签名同一条纪律）。
+   *
+   * ⚠ **用离散的 `blockedBy` 而不是 `reason` 那句文案**（2026-08-17 改）。
+   * 文案里嵌着连续量：「跌幅 −8.3% 未比上次（−7.8%）再扩大 2%」「上次 L2 提醒后还有 87 分钟」
+   * —— 每轮都变一点，于是签名每轮都不同、去重形同虚设。这与 `signalSignature` 里
+   * `reasons[0]` 那个坑**同一个形状**（两天落了 243 行同一条止损），011 迁移加
+   * `suppressed_gate` 这一列正是为此准备的，只是签名当时没换过来。
+   *
+   * 代价是同一道闸门下的不同文案会被折进一行（三条频率上限都是 `CAP`），
+   * 保留的是**第一次**那句 —— 011 的头注释本来就说文案那一列是「给人读的」，
+   * 分组一律用离散列。
    */
   function decisionSignature(decision: AlertDecision): string {
     return [
       decision.candidate.signalId,
       decision.level ?? '-',
       decision.channels.join(','),
-      decision.reason ?? '-',
+      decision.blockedBy ?? '-',
     ].join('|')
   }
 
@@ -149,11 +171,11 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
       // 被丢弃时记**它本来要发的**级别：「本想发 L3，被当日冷却挡了」比一个空值有用
       level: decision.level ?? decision.candidate.level,
       channels: decision.channels,
+      // ⚠ 文案**刻意不进 `decisionSignature`**（2026-08-17 起，见那个函数的注释）：
+      // 它嵌着连续量，进签名等于没有去重。落库照旧、保留第一次那句给人读。
       suppressedReason: decision.reason,
-      // ⚠ 这两列**刻意不进 `decisionSignature`**。
-      // `blockedBy` 由 `reason` 唯一决定（文案变了签名本来就变），加进去是冗余；
-      // 而 `wouldBlock` 会随时间自己变（冷却到期、小时配额滚出窗口），把它算进签名
-      // 会让同一条裁决在结果完全没变的情况下反复落新行 —— 那正是 006 那次去重要解决的问题。
+      // ⚠ `wouldBlock` 同样不进签名：它会随时间自己变（冷却到期、小时配额滚出窗口），
+      // 算进签名会让同一条裁决在结果完全没变的情况下反复落新行 —— 那正是 006 要解决的问题。
       // 代价是被去重的行保留**第一次**的 `wouldBlock`，聚合时按「候选出现次数」读即可。
       suppressedGate: decision.blockedBy,
       wouldBlock: decision.wouldBlock,
@@ -207,17 +229,24 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
       try {
         const fresh: AlertRow[] = []
         for (const decision of decisions) {
-          const code = decision.candidate.code
+          const key = `${decision.candidate.code}:${decision.candidate.signalId}`
           const signature = decisionSignature(decision)
-          const previous = lastDecision.get(code)
+          const previous = lastDecision.get(key)
           // bumpRepeat 返回 false = 那一行已经不在了（被裁剪掉），退回插新行 ——
           // 不能静默丢掉这一轮的裁决，那才是真的信息黑洞
-          if (previous?.signature === signature && repo.bumpRepeat(previous.rowId, ctx.at)) continue
+          if (previous?.signature === signature && repo.bumpRepeat(previous.rowId, ctx.at)) {
+            lastDecision.set(key, { signature, rowId: previous.rowId, at: ctx.at })
+            continue
+          }
           const row = rowOf(decision, ctx.at)
           fresh.push(row)
-          lastDecision.set(code, { signature, rowId: row.id })
+          lastDecision.set(key, { signature, rowId: row.id, at: ctx.at })
         }
         repo.insertMany(fresh)
+        // 过了保鲜期的判重态清掉（见 DEDUPE_TTL_MS）
+        for (const [key, entry] of [...lastDecision.entries()]) {
+          if (ctx.at - entry.at > DEDUPE_TTL_MS) lastDecision.delete(key)
+        }
       } catch (error) {
         // 落库失败不该把提醒也一起吃掉 —— 但必须留痕（docs/02 §7）
         log.warn('[alert] alert_log 写入失败：', error)
