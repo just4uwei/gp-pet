@@ -206,6 +206,74 @@ function testBudget(): Maybe<number> {
   return m?.[1] === undefined ? unknown('docs/07 §3 里没找到「累计触碰次数」那一行') : known(Number(m[1]))
 }
 
+// ── ③b 每个交易日重启过几次（判断那天的提醒日志能不能当判据）─────────
+
+/**
+ * 启动一次会打这一行（`app` 装配完成，`src/main/index.ts`）。
+ * **改了那句文案就要改这里** —— 见 `restartsByDay` 里的自检。
+ */
+const BOOT_MARKER = '窗口与托盘就绪'
+
+/**
+ * 某个交易日重启过几次。`null` = **读不到**，绝不当 0（0 会被读成「那天很干净」，正好反了）。
+ *
+ * ## 为什么看板要管这件事
+ *
+ * `AlertDispatcher` 的冷却、配额、强制类台阶全在内存里（那是刻意的），
+ * 每次重启全部清零 ⇒ 同一条止损会重新发一次。实测 2026-08-13 启动 14 次、
+ * 08-14 二十七次（盘中 12 次），那两天三只票各发了 10–11 条 L3 气泡，
+ * **每一条都能对上一次启动时刻**。把那样的日子计进「自用一周」，
+ * 4.1「今天几条值不值得被打断」必然得出「太吵」——而真实原因是开发期在重启。
+ * 判据与复盘写在 M3 清单 §4.0 / §4.5。
+ *
+ * ## 两条失败方向都朝安全那边掰
+ *
+ * - **文案漂移**：如果整个 logs 目录里一条 `BOOT_MARKER` 都找不到，
+ *   那更可能是那句话改了而不是一周没重启过 ⇒ 全部报 `null`。
+ *   不做这条自检的话，改文案会让所有日子静默变成「干净」。
+ * - **文件名用宿主本地日**（`logging.ts` 的 `getFullYear/getMonth/getDate`），
+ *   而交易日是北京日。UTC+8 与本机 UTC+7 上 09:30–15:00 都落在同一个本地日，
+ *   但宿主偏移 < −1.5h 时北京 09:30 会掉到前一个本地日 ⇒ 那种机器上计数可能偏少。
+ *   `straddlesLocalMidnight()` 会在看板上显式提示，而不是悄悄给一个偏小的数。
+ */
+function restartsByDay(dates: readonly TradeDate[]): Map<TradeDate, number | null> {
+  const out = new Map<TradeDate, number | null>()
+  const appData = process.env.APPDATA
+  const dir = appData === undefined ? null : join(appData, 'gp-pet', 'logs')
+  if (dir === null || !existsSync(dir)) {
+    for (const d of dates) out.set(d, null)
+    return out
+  }
+  const files = readdirSync(dir).filter((f) => f.startsWith('main-') && f.endsWith('.log'))
+  const countIn = (file: string): number | null => {
+    const path = join(dir, file)
+    if (!existsSync(path)) return null
+    return readFileSync(path, 'utf8').split(BOOT_MARKER).length - 1
+  }
+  // 自检：整个目录一条都没有 ⇒ 更可能是文案改了，不是一周没重启过
+  const anyMarker = files.some((f) => (countIn(f) ?? 0) > 0)
+  for (const d of dates) {
+    // 归档件（`main-<日>.old.log`，单日超 maxSize 时产生）要一起数，否则会漏
+    const same = files.filter((f) => f === `main-${d}.log` || f === `main-${d}.old.log`)
+    if (!anyMarker || same.length === 0) {
+      out.set(d, null)
+      continue
+    }
+    out.set(
+      d,
+      same.reduce((sum, f) => sum + (countIn(f) ?? 0), 0)
+    )
+  }
+  return out
+}
+
+/** 宿主时区会不会让北京 09:30–15:00 跨过本地午夜（那时按本地日命名的日志会分家） */
+function straddlesLocalMidnight(): boolean {
+  const offsetHours = -new Date().getTimezoneOffset() / 60
+  // 北京 09:30 = UTC 01:30；北京 15:00 = UTC 07:00
+  return 1.5 + offsetHours < 0 || 7 + offsetHours >= 24
+}
+
 // ── ④ 真机运行数据（market.db，很可能不存在）──────────────────────────
 
 interface RuntimeSnapshot {
@@ -216,6 +284,11 @@ interface RuntimeSnapshot {
   alerts: number
   alertsWithGate: number
   shadowPoints: number
+  /**
+   * 每个有 signal 的交易日重启过几次（`null` = 日志读不到）。
+   * **M3 的「自用一周」只数 0 那一档** —— 理由见 `restartsByDay`。
+   */
+  restarts: { date: TradeDate; count: number | null }[]
   /** 库里最新一行 signal / alert_log 的北京时间日子，null = 一行都没有 */
   latestSignalDate: TradeDate | null
   latestAlertDate: TradeDate | null
@@ -225,7 +298,9 @@ interface RuntimeSnapshot {
 }
 
 /** `node:sqlite` 是实验特性，这里只用到 `prepare`，不引它的整套类型 */
-type SqliteDb = { prepare(sql: string): { get(...params: unknown[]): unknown } }
+type SqliteDb = {
+  prepare(sql: string): { get(...params: unknown[]): unknown; all(...params: unknown[]): unknown[] }
+}
 
 /**
  * 用**只读**的用户库当交易日历的第一级判据（`scheduler/calendar.ts` 的 `db` 那一级）。
@@ -307,6 +382,16 @@ async function runtimeState(): Promise<Maybe<RuntimeSnapshot>> {
         return null
       }
     }
+    const tradeDates = ((): TradeDate[] => {
+      try {
+        return (db.prepare('SELECT DISTINCT trade_date AS d FROM signal ORDER BY 1').all() as {
+          d: string
+        }[]).map((r) => r.d as TradeDate)
+      } catch {
+        return []
+      }
+    })()
+    const restarts = restartsByDay(tradeDates)
     const calendar = readOnlyCalendar(db)
     const now = Date.now()
     // alert_log 没有 trade_date 列，只有 created_at ——「今天」一律按北京时间切
@@ -323,6 +408,7 @@ async function runtimeState(): Promise<Maybe<RuntimeSnapshot>> {
       alerts: one('SELECT COUNT(*) FROM alert_log'),
       alertsWithGate: one('SELECT COUNT(*) FROM alert_log WHERE would_block IS NOT NULL'),
       shadowPoints: one('SELECT COUNT(*) FROM shadow_equity'),
+      restarts: tradeDates.map((date) => ({ date, count: restarts.get(date) ?? null })),
       latestSignalDate,
       latestAlertDate,
       signalFreshness: dataFreshness({ now, latest: latestSignalDate, calendar }),
@@ -332,6 +418,18 @@ async function runtimeState(): Promise<Maybe<RuntimeSnapshot>> {
     return known(snap)
   } catch (err) {
     return unknown(`打不开 market.db：${(err as Error).message}`)
+  }
+}
+
+/**
+ * 干净 / 污染 / 读不到三档。**三档必须分开** ——
+ * 把「日志读不到」并进任何一边都是在编一个事实（见 `restartsByDay`）。
+ */
+function cleanDaysOf(r: RuntimeSnapshot): { clean: number; dirty: number; unknown: number } {
+  return {
+    clean: r.restarts.filter((d) => d.count === 0).length,
+    dirty: r.restarts.filter((d) => d.count !== null && d.count > 0).length,
+    unknown: r.restarts.filter((d) => d.count === null).length,
   }
 }
 
@@ -432,11 +530,23 @@ function tasks(input: {
     const r = rt.value
     if (r.tradeDays === 0) {
       out.push({ bucket: '只能靠时间', title: 'M1 跑满一个交易日', why: 'signal 表里一个交易日都没有' })
-    } else if (r.tradeDays < 5) {
+    } else if (cleanDaysOf(r).clean < 5) {
+      /*
+        **只数「那天没重启过」的交易日**（M3 清单 §4.0）。盘中重启会把冷却/配额/台阶
+        清零、同一条止损重新发一次，那样的日子拿去回答 4.1「几条值不值得被打断」
+        必然得出「太吵」，而真实原因是开发期在重启。
+      */
+      const { clean, dirty, unknown: unclear } = cleanDaysOf(r)
+      const tail = [
+        dirty > 0 ? `${dirty} 天因重启作废` : null,
+        unclear > 0 ? `${unclear} 天日志读不到` : null,
+      ]
+        .filter((s) => s !== null)
+        .join(' · ')
       out.push({
         bucket: '只能靠时间',
-        title: `M3 自用一周（已跑 ${r.tradeDays} 个交易日）`,
-        why: '判据是提醒日志不是「用着感觉还行」',
+        title: `M3 自用一周（干净交易日 ${clean} / 5${tail === '' ? '' : `，${tail}`}）`,
+        why: '判据是提醒日志不是「用着感觉还行」；重启过的那天不算（M3 清单 §4.0）',
       })
     }
     if (r.confirmed === 0 && r.signals > 0) {
@@ -669,6 +779,31 @@ function render(input: {
     L.push(
       `| ${r.tradeDays} | ${r.signals} | ${r.confirmed} | ${r.alerts} | ${r.alertsWithGate} | ${r.shadowPoints} |`
     )
+    L.push('')
+    /*
+      逐日列重启次数。**这不是运维信息，是判据的有效性** ——
+      重启会清空冷却/配额/台阶，那天的提醒日志不能用来答 M3 的出口条件（清单 §4.0）。
+    */
+    const c = cleanDaysOf(r)
+    L.push(
+      `其中**没重启过**的交易日 **${c.clean}** 天` +
+        (c.dirty > 0 ? ` · 重启过 ${c.dirty} 天（提醒日志不可当判据）` : '') +
+        (c.unknown > 0 ? ` · ${c.unknown} 天日志读不到` : '') +
+        '：'
+    )
+    L.push('')
+    L.push(
+      r.restarts
+        .map((d) => `\`${d.date}\` ${d.count === null ? '日志读不到' : d.count === 0 ? '干净' : `启动 ${d.count} 次`}`)
+        .join(' · ')
+    )
+    if (straddlesLocalMidnight()) {
+      L.push('')
+      L.push(
+        '> ⚠ 本机时区会让北京 09:30–15:00 跨过本地午夜，而日志按**本地日**分文件 ——' +
+          '上面的计数可能偏少（把污染日读成干净日）。要用就手工核对相邻两个文件。'
+      )
+    }
     L.push('')
     L.push(`数据最新到：signal \`${r.latestSignalDate ?? '—'}\` · alert_log \`${r.latestAlertDate ?? '—'}\``)
     const f = r.signalFreshness
