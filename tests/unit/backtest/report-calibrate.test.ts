@@ -68,6 +68,7 @@ function codeResult(overrides: Partial<CodeResult> = {}): CodeResult {
     suppressed: new Map([['HARD_LIMIT_UP', 2]]),
     limitBlocked: 1,
     gapSkipped: 0,
+    poolBlocked: 0,
     regimeBars: new Map<Regime, number>([['TREND_UP', 8]]),
     openPosition: false,
     delistedClose: false,

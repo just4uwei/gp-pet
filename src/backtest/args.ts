@@ -24,6 +24,16 @@ export interface CliOptions {
    * 这是刻意的：旧结论要能原样复现，新旧差值才归得清。
    */
   delisted?: string
+  /**
+   * 流动性数据目录（`data/liquidity/<CODE>.json`，`pnpm fetch:liquidity` 产出）。
+   * 只有同时给了 `--drop-cap-pct` 或 `--drop-amount-pct` 才真的剔 ——
+   * 单给目录等于只加载不使用，行为与不给逐位相同。预注册见 M2 §5.29。
+   */
+  liquidity?: string
+  /** 逐日剔除横截面流通市值最小的百分比。0 = 不按市值剔 */
+  dropCapPct: number
+  /** 逐日剔除「过去 N 日均成交额」最小的百分比。0 = 不按流动性剔 */
+  dropAmountPct: number
   benchmark: string | null
   params?: string
   grid?: string
@@ -61,6 +71,12 @@ export const USAGE = `用法：
   --delisted <file>      退市清单（params/universe-delisted.json）。名单内的标的在退市日
                          收盘强制平仓并记一笔 trade —— 不给则未平仓的建仓不进 trades，
                          而建仓级胜率与配对 alpha 都只读 trades（幸存者偏差的第二重）
+
+池过滤（流动性 / 市值，预注册见 M2 §5.29）：
+  --liquidity <dir>      流动性数据目录（data/liquidity/<CODE>.json，pnpm fetch:liquidity 产出）
+  --drop-cap-pct <n>     逐日剔除横截面**流通市值**最小的 n%（默认 0 = 不剔）
+  --drop-amount-pct <n>  逐日剔除**20 日均成交额**最小的 n%（默认 0 = 不剔）
+                         只挡建仓不挡离场；缺数不剔；横截面仅本池之内
 
 区间与标的：
   --codes <list>         逗号分隔的代码，支持 600000 / sh600000 / 000001.SZ
@@ -110,6 +126,15 @@ function positiveNumber(key: string, raw: string): number {
   return value
 }
 
+/** 0..90 的百分比。上界不是洁癖：剔掉 90% 以上就不叫「过滤」了，那是换池子 */
+function percent(key: string, raw: string): number {
+  const value = Number(raw)
+  if (!Number.isFinite(value) || value < 0 || value > 90) {
+    throw new Error(`${key} 必须是 0..90 的百分比，收到 ${raw}`)
+  }
+  return value
+}
+
 function positiveInteger(key: string, raw: string): number {
   const value = Number(raw)
   if (!Number.isInteger(value) || value < 1) throw new Error(`${key} 必须是 ≥ 1 的整数，收到 ${raw}`)
@@ -131,6 +156,8 @@ export function parseArgs(argv: readonly string[]): CliOptions | 'help' {
     capital: 100_000,
     lookback: 320,
     costs: {},
+    dropCapPct: 0,
+    dropAmountPct: 0,
     codeFolds: 4,
     timeSlices: 3,
     touchTest: false,
@@ -171,6 +198,15 @@ export function parseArgs(argv: readonly string[]): CliOptions | 'help' {
         break
       case '--delisted':
         options.delisted = requireValue(key, next)
+        break
+      case '--liquidity':
+        options.liquidity = requireValue(key, next)
+        break
+      case '--drop-cap-pct':
+        options.dropCapPct = percent(key, requireValue(key, next))
+        break
+      case '--drop-amount-pct':
+        options.dropAmountPct = percent(key, requireValue(key, next))
         break
       case '--benchmark': {
         const value = requireValue(key, next)

@@ -42,12 +42,19 @@ import {
 import { DEFAULT_COSTS, type CostModel } from './costs'
 import {
   loadDelistedMap,
+  loadLiquidity,
   openFixtureSource,
   openSqliteSource,
   sentimentSeries,
   type DataSource,
   type LoadedSeries,
 } from './data'
+import {
+  ALLOW_ALL,
+  DEFAULT_AMOUNT_WINDOW,
+  createPoolFilter,
+  type PoolFilter,
+} from './liquidity'
 import { assembleReport, performanceOf, mergeEquity, renderReport, type PerformanceBlock } from './report'
 import { simulateCode, type CodeResult, type SentimentLookup } from './simulate'
 
@@ -116,6 +123,8 @@ interface Loaded {
   source: DataSource
   /** `--delisted` 给的退市日表；没给就是空 Map ⇒ 行为与以前逐位相同 */
   delistedAt: Map<SecCode, TradeDate>
+  /** `--liquidity` + 阈值给的池过滤；没给就是 `ALLOW_ALL` ⇒ 行为与以前逐位相同 */
+  pool: PoolFilter
 }
 
 
@@ -148,7 +157,37 @@ async function loadAll(options: CliOptions, range: { from: TradeDate; to: TradeD
     log(options, `[backtest] 退市清单 ${delistedAt.size} 只，其中 ${covered} 只在本次标的池内（退市日收盘强制平仓）`)
   }
 
-  return { series, benchmark, source, delistedAt }
+  const pool = buildPool(options, series.map((s) => s.profile.code))
+
+  return { series, benchmark, source, delistedAt, pool }
+}
+
+/**
+ * 池过滤（M2 §5.29 预注册）。**两个阈值都是 0 时返回 `ALLOW_ALL`** ——
+ * 于是没给这些参数的旧命令逐位复现，新旧差值才归得清（与 `--delisted` 同一条）。
+ */
+function buildPool(options: CliOptions, codes: readonly SecCode[]): PoolFilter {
+  if (options.dropCapPct <= 0 && options.dropAmountPct <= 0) return ALLOW_ALL
+  if (options.liquidity === undefined) {
+    throw new Error('--drop-cap-pct / --drop-amount-pct 需要同时给 --liquidity <dir>')
+  }
+  const series = loadLiquidity(options.liquidity, codes)
+  const filter = createPoolFilter(series, codes, {
+    dropCapPct: options.dropCapPct,
+    dropAmountPct: options.dropAmountPct,
+    amountWindow: DEFAULT_AMOUNT_WINDOW,
+  })
+  log(options, `[backtest] 池过滤：${filter.describe()}`)
+  const missing = filter.missing()
+  if (missing.length > 0) {
+    // 必须报出来：没数据 ⇒ 不剔，而「没剔」会被读成「合格」
+    log(
+      options,
+      `[warn] ${missing.length} 只没有流动性数据、因此**全程不被剔除**：` +
+        `${missing.slice(0, 8).join(' ')}${missing.length > 8 ? ' …' : ''}`
+    )
+  }
+  return filter
 }
 
 /** 基准日线 → 情绪查表 + 净值查表。两者都按「截至该日期的最后一个有值日」前值填充 */
@@ -198,6 +237,7 @@ function runSimulation(
         lookback: options.lookback,
         ...(options.warmup === undefined ? {} : { warmupBars: options.warmup }),
         ...(delistedAt === undefined ? {} : { delistedAt }),
+        entryAllowed: (date) => loaded.pool.allows(series.profile.code, date),
       },
       sentiment
     )
@@ -355,6 +395,9 @@ function runSplit(
           floor
         ),
         ...(delistedAt === undefined ? {} : { delistedAt }),
+        // 与整池那条路共用同一个池过滤：两条路用不同的池会让「网格结论」与
+        // 「基线数字」建立在不同的标的集合上，而报告上看不出来
+        entryAllowed: (date) => loaded.pool.allows(series.profile.code, date),
       },
       views.sentiment
     )

@@ -16,6 +16,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { isSTName, normalizeCode, splitCode } from '../core/code'
 import type { Candle, SecCode, SecProfile, TradeDate } from '../core/types'
+import type { LiquidityRow, LiquiditySeries } from './liquidity'
 
 export interface LoadedSeries {
   profile: SecProfile
@@ -188,6 +189,28 @@ export function loadDelistedMap(file: string): Map<SecCode, TradeDate> {
     )
   }
   return map
+}
+
+/**
+ * 读流动性目录（`data/liquidity/<CODE>.json`，`pnpm fetch:liquidity` 产出）。
+ *
+ * **读不到的标的直接跳过并由调用方报出来**（`PoolFilter.missing()`）——
+ * 不抛错是刻意的：那 261 只里总会有几只东财没给全，为它们中断整轮回测不划算。
+ * 但「没数据 ⇒ 不剔」这件事必须打印，否则「一只都没剔」会被读成「全都合格」。
+ *
+ * 与 `loadDelistedMap` 同一个位置、同一条理由：判断逻辑不放 cli.ts。
+ */
+export function loadLiquidity(dir: string, codes: readonly SecCode[]): LiquiditySeries[] {
+  const out: LiquiditySeries[] = []
+  for (const code of codes) {
+    const file = join(dir, `${code}.json`)
+    if (!existsSync(file)) continue
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as { rows?: LiquidityRow[] }
+    const rows = parsed.rows ?? []
+    if (rows.length === 0) continue
+    out.push({ code, rows })
+  }
+  return out
 }
 
 /**

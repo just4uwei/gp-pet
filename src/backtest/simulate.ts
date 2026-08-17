@@ -50,6 +50,14 @@ export interface SimulateOptions {
   /** 前 N 根只喂数据不判信号。默认取 params.data.fullBars，保证 BBW 分位已预热 */
   warmupBars?: number
   /**
+   * 这一天允不允许**建仓**（池层面的流动性/市值过滤，见 `liquidity.ts`）。
+   * 不给 = 全允许 ⇒ 行为与以前逐位相同。
+   *
+   * **只挡建仓**：已持有的仓位照常走止损/减仓/移动止损 ——
+   * 挡住卖出会造出永远持有的仓，那是凭空改变风控行为而不是筛标的。
+   */
+  entryAllowed?: (date: TradeDate) => boolean
+  /**
    * 退市日（该标的最后一个交易日）。给了它、且喂进来的序列末根已到达该日，
    * 就在最后一根收盘**强制平仓并记一笔 `trade`**。
    *
@@ -145,6 +153,11 @@ export interface CodeResult {
   limitBlocked: number
   /** 因 hasGap 跳过的根数 */
   gapSkipped: number
+  /**
+   * 因池过滤（`entryAllowed`）被挡掉的**建仓**次数。
+   * **必须报出来**：静默剔除会让「这次剔了什么」事后查不清（no silent caps）。
+   */
+  poolBlocked: number
   regimeBars: Map<Regime, number>
   /** 期末仍持仓（未平仓）—— 报告里要单独说明，否则「总收益」里混着浮盈 */
   openPosition: boolean
@@ -232,6 +245,7 @@ export function simulateCode(
     suppressed: new Map(),
     limitBlocked: 0,
     gapSkipped: 0,
+    poolBlocked: 0,
     regimeBars: new Map(),
     openPosition: false,
     delistedClose: false,
@@ -400,6 +414,17 @@ export function simulateCode(
 
     const order = toOrder(gated.direction, shares > 0)
     if (!order) continue
+    /*
+      池过滤只挡建仓（见 SimulateOptions.entryAllowed）。
+
+      挡在 `actionable++` **之前**：那个数答的是「引擎给出了几次可执行方向」，
+      而这一次确实给出了 —— 但它被池规则否掉了，所以计进 `poolBlocked` 而不是
+      混进 actionable。两个数分开才回答得了「剔掉的是哪一批」。
+    */
+    if (order === 'BUY' && options.entryAllowed?.(bar.date) === false) {
+      result.poolBlocked++
+      continue
+    }
     result.actionable++
 
     const forced = gated.verdicts.find((v) => v.action === 'FORCE_SELL' || v.action === 'FORCE_REDUCE')
