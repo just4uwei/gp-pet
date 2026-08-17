@@ -52,6 +52,8 @@ function harness(options: {
   latestOfDay?: SignalRow | null
   position?: Position | null
   closedAt?: number
+  shadow?: SettleDeps['shadow']
+  now?: number
 } = {}): Harness {
   const candles = options.candles ?? goldenCrossBreakout().candles
   const rows: SignalRow[] = []
@@ -101,6 +103,8 @@ function harness(options: {
     params: SENSITIVE,
     newId: () => `settled-${++counter}`,
     closedAt: options.closedAt ?? closeMsOf('2024-04-09'),
+    ...(options.shadow ? { shadow: options.shadow } : {}),
+    ...(options.now === undefined ? {} : { now: options.now }),
   }
 
   return { deps, rows, cached, stageUpdates, asked }
@@ -227,7 +231,15 @@ describe('settleDay', () => {
   it('不返回 outcomes —— 结构上堵死「顺手接到提醒层」这条路', () => {
     const h = harness()
     const result = settleDay(LAST_DATE as TradeDate, h.deps)
-    expect(Object.keys(result).sort()).toEqual(['date', 'evaluated', 'invalidated', 'persisted'])
+    // `shadowAdvanced` 是个**布尔**（2026-08-17 加）：影子在 settleDay 里就地消费掉 outcomes，
+    // 结果里仍然一条 outcome 都没有 —— 这条用例守的就是这件事，别把它放宽成 objectContaining
+    expect(Object.keys(result).sort()).toEqual([
+      'date',
+      'evaluated',
+      'invalidated',
+      'persisted',
+      'shadowAdvanced',
+    ])
   })
 
   it('单只算不出来不拖垮整轮', () => {
@@ -247,5 +259,59 @@ describe('settleDay', () => {
     }
     expect(settleDay(LAST_DATE as TradeDate, broken).evaluated).toBe(1)
     expect(warn).toHaveBeenCalled()
+  })
+})
+
+
+/*
+  影子运行挂在补跑这条路上（settle.ts 边界 2，2026-08-17）。
+
+  这几条钉的是一个**静默**缺陷的修复：原先 `tick.ts` 每轮都调 `shadow.advance`，
+  于是当天第一跳（实测盘前 09:02）就用空 outcomes 把当天推进掉、写下净值行，
+  主键幂等闸门从此挡住收盘确认轮 ⇒ 第 ⑥ 步「挂明天的委托」永远跑不到 ⇒
+  影子永远不建仓，而净值曲线看不出异常（实测三个交易日：净值 1 行、成交 0 行）。
+*/
+describe('settleDay 喂影子运行', () => {
+  it('给了 shadow 就喂，date 是补跑那天、outcomes 是补跑产出的那批', () => {
+    const advance = vi.fn()
+    const h = harness({ shadow: { advance }, now: 1_800_000_000_000 })
+    const result = settleDay(LAST_DATE as TradeDate, h.deps)
+
+    expect(result.shadowAdvanced).toBe(true)
+    expect(advance).toHaveBeenCalledOnce()
+    const arg = advance.mock.calls[0]?.[0] as { date: string; at: number; outcomes: unknown[] }
+    // 日期是**补跑的那一天**，不是「今天」—— 影子的一根净值对应一个交易日
+    expect(arg.date).toBe(LAST_DATE)
+    // 时刻用「现在」而不是 closedAt：委托要在此刻之后的开盘成交，前向性靠调用方的闸门保证
+    expect(arg.at).toBe(1_800_000_000_000)
+    expect(arg.outcomes.length).toBeGreaterThan(0)
+  })
+
+  it('不给 shadow 就一条都不喂（调用方判「成交机会已过」时就是这样）', () => {
+    const h = harness()
+    expect(settleDay(LAST_DATE as TradeDate, h.deps).shadowAdvanced).toBe(false)
+  })
+
+  it('影子抛错不让整次补跑作废 —— 否则 lastSettledDate 不落，下一轮又要重算全套指标', () => {
+    const h = harness({
+      shadow: {
+        advance: () => {
+          throw new Error('账本炸了')
+        },
+      },
+    })
+    const result = settleDay(LAST_DATE as TradeDate, h.deps)
+    expect(result.shadowAdvanced).toBe(false)
+    // 补跑本身照样完成
+    expect(result.evaluated).toBeGreaterThan(0)
+    expect(h.rows.length).toBeGreaterThan(0)
+  })
+
+  it('`at` 缺省时退回 closedAt —— 不读时钟，与 src/core 同一条纪律', () => {
+    const advance = vi.fn()
+    const closedAt = closeMsOf('2024-04-09')
+    const h = harness({ shadow: { advance }, closedAt })
+    settleDay(LAST_DATE as TradeDate, h.deps)
+    expect((advance.mock.calls[0]?.[0] as { at: number }).at).toBe(closedAt)
   })
 })

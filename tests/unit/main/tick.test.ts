@@ -57,7 +57,8 @@ function outcome(over: Partial<SnapshotOutcome> = {}): SnapshotOutcome {
 }
 
 /** 记录每个依赖被调用了几次 —— 「没发请求」这件事只能靠计数来断言 */
-function harness(over: Partial<TickPipelineDeps> = {}): {
+/** `isOpen` 不是 TickPipelineDeps 的字段，是给日历替身用的开关（休市日那条用例要它） */
+function harness(over: Partial<TickPipelineDeps> & { isOpen?: boolean } = {}): {
   deps: TickPipelineDeps
   meta: Map<string, number | string>
   backfill: ReturnType<typeof vi.fn>
@@ -87,7 +88,12 @@ function harness(over: Partial<TickPipelineDeps> = {}): {
     } as unknown as TickPipelineDeps['market'],
     watchlist: { codes: () => ['SH600000' as SecCode], refreshProfiles },
     calendar: {
-      resolve: (date: TradeDate) => ({ date, isOpen: true, source: 'db' as const, uncertain: false }),
+      resolve: (date: TradeDate) => ({
+        date,
+        isOpen: over.isOpen ?? true,
+        source: 'db' as const,
+        uncertain: false,
+      }),
       refresh: calendarRefresh,
       markObserved,
     },
@@ -304,48 +310,49 @@ describe('createTickPipeline', () => {
 
   // ── M4 挂上来的两件事 ────────────────────────────────────────────
 
-  it('影子运行拿到本轮的评估结果，排在提醒之后', async () => {
-    const order: string[] = []
-    const advance = vi.fn(() => order.push('shadow'))
-    const engine = { run: vi.fn(() => [{ tag: 'outcome' }] as never) }
-    const h = harness({
-      engine,
-      onSignals: () => order.push('alerts'),
-      shadow: { advance },
-    })
-    await createTickPipeline(h.deps).run(ctxOf())
+  /*
+    影子运行**不在 tick 里推进**（2026-08-17 改）。这一组钉的是那个静默缺陷的修复。
 
-    expect(advance).toHaveBeenCalledWith({
-      date: '2026-03-10',
-      at: AT,
-      outcomes: [{ tag: 'outcome' }],
-    })
-    // 提醒先、影子后：模拟账本比提醒次要，不该抢在它前面
-    expect(order).toEqual(['alerts', 'shadow'])
-  })
+    原先每轮都调 `shadow.advance`，看着无害（它自己判幂等），实际是：当天第一跳往往在
+    盘前（实测 09:02），那时 producesSignals 为 false ⇒ outcomes 为空，而 advance 照样
+    写下当天的净值行 ⇒ shadow_equity 主键的幂等闸门从此挡住后面每一轮，**包括收盘确认轮**
+    ⇒ runner 第 ⑥ 步「用今天的 CONFIRMED 挂明天的委托」永远跑不到 ⇒ 影子永远不建仓。
+    实测三个交易日：净值 1 行、成交 **0** 行，而曲线上看不出任何异常。
 
-  it('影子推进抛错不影响提醒与取数 —— 两者重要性差一个量级', async () => {
-    const onSignals = vi.fn()
-    const h = harness({
-      engine: { run: vi.fn(() => [] as never) },
-      onSignals,
-      shadow: {
-        advance: () => {
-          throw new Error('账本炸了')
-        },
-      },
-    })
-    const pipeline = createTickPipeline(h.deps)
-    await expect(pipeline.run(ctxOf())).resolves.toBeUndefined()
-    expect(onSignals).toHaveBeenCalledOnce()
-    expect(h.refreshSnapshots).toHaveBeenCalledOnce()
-  })
+    现在影子挂在 `settle` 那条路上，闸门是「今天是交易日 且 还没到 09:30」。
+  */
+  describe('影子运行的推进时机', () => {
+    it('盘中那一跳补跑时 feedShadow 为 false —— 开盘已过，次日开盘成交不再是前向的', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: false }))
+      const h = harness({ settle })
 
-  it('引擎未接入时影子也不推进（没有评估结果可喂）', async () => {
-    const advance = vi.fn()
-    const h = harness({ shadow: { advance } })
-    await createTickPipeline(h.deps).run(ctxOf())
-    expect(advance).not.toHaveBeenCalled()
+      // ctxOf 默认 minuteOfDay 600（10:00），已过 09:30
+      await createTickPipeline(h.deps).run(ctxOf())
+
+      expect(settle).toHaveBeenCalledWith('2026-03-09', false)
+    })
+
+    it('盘前那一跳 feedShadow 为 true —— 那一刻今天的开盘还没发生', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: true }))
+      const h = harness({ settle })
+
+      await createTickPipeline(h.deps).run(
+        ctxOf({ minuteOfDay: 545, session: 'PRE_OPEN', producesSignals: false })
+      )
+
+      expect(settle).toHaveBeenCalledWith('2026-03-09', true)
+    })
+
+    it('休市日不喂 —— 今天没有开盘可成交', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: false }))
+      const h = harness({ settle, isOpen: false })
+
+      await createTickPipeline(h.deps).run(
+        ctxOf({ minuteOfDay: 545, session: 'PRE_OPEN', isTradingDay: false, needsQuotes: false })
+      )
+
+      if (settle.mock.calls.length > 0) expect(settle).toHaveBeenCalledWith('2026-03-09', false)
+    })
   })
 
   /*
@@ -357,18 +364,18 @@ describe('createTickPipeline', () => {
   */
   describe('补跑收盘确认轮', () => {
     it('盘中那一跳补跑上一个交易日', async () => {
-      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0 }))
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: false }))
       const h = harness({ settle })
 
       await createTickPipeline(h.deps).run(ctxOf())
 
       // 10:00 时「应该已存在的最后一根」是上一个交易日，正是要补跑的那天
-      expect(settle).toHaveBeenCalledWith('2026-03-09')
+      expect(settle).toHaveBeenCalledWith('2026-03-09', false)
       expect(h.meta.get(META_KEYS.lastSettledDate)).toBe('2026-03-09')
     })
 
     it('同一天不重复补跑 —— 它要为每只标的算一遍 320 根的全套指标', async () => {
-      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0 }))
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: false }))
       const h = harness({ settle })
       h.meta.set(META_KEYS.lastSettledDate, '2026-03-09')
 
@@ -378,7 +385,7 @@ describe('createTickPipeline', () => {
     })
 
     it('收盘后那一跳不补跑当天 —— 那是正常的收盘确认轮自己的活', async () => {
-      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0 }))
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: false }))
       const h = harness({ settle })
 
       await createTickPipeline(h.deps).run(ctxOf({ session: 'SETTLE', minuteOfDay: 15 * 60 + 5 }))
@@ -387,7 +394,7 @@ describe('createTickPipeline', () => {
     })
 
     it('补跑排在回补之后 —— 它用的正是刚补进来的那根收盘线', async () => {
-      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0 }))
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: false }))
       const h = harness({ settle })
 
       await createTickPipeline(h.deps).run(ctxOf())

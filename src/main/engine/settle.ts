@@ -31,11 +31,21 @@
  * 1. **不发提醒。** outcomes 直接丢弃，不进 `AlertService`。那天已经过去了，
  *    第二天早上补一条「昨天 14:xx 的买入信号」是纯粹的噪音；
  *    被判 INVALIDATED 的那条同理（撤销一条用户从没收到过的提醒）。
- * 2. **不接影子运行**（刻意不做，见 docs/07 §2.3 的四条前向纪律）。这里的判断很微妙：
+ * 2. **接影子运行，但有一道闸门**（2026-08-17 改；此前刻意不接）。这里的判断很微妙：
  *    D 的 CONFIRMED 信号按影子的成交模型是**次日开盘**成交 —— 若补跑发生在 D+1 盘前，
  *    那一刻 D+1 的开盘还没发生，**仍是前向的**；但用户 D+1 下午才开应用的话，
  *    开盘早过了，同一段代码就变成了回填，而回填出来的绩效不属于任何真实决策。
- *    要接得先有「成交机会是否已过」的闸门，那是一次独立的取舍。
+ *
+ *    闸门因此是「**成交机会还没过**」：调用方（`engine/tick.ts`）只有在
+ *    「今天是交易日 且 还没到 09:30」时才把 `shadow` 传进来，否则这一次补跑不喂影子。
+ *    判据由调用方给，因为只有它知道 `ctx`；本模块不读时钟。
+ *
+ *    **为什么必须接**：不接的后果 2026-08-17 实测到了 —— `tick.ts` 原先每轮都调
+ *    `shadow.advance`，于是当天**第一跳（盘前 09:02）**就用空 outcomes 把当天推进掉、
+ *    写下净值行，`shadow_equity.trade_date` 主键的幂等闸门从此挡住后面每一轮，
+ *    包括收盘确认轮。结果是**第 ⑥ 步（挂明天的委托）永远跑不到**：
+ *    影子组合永远不会建仓，曲线一天一根笔直地画下去，而净值上看不出任何异常。
+ *    实测三个交易日：`shadow_equity` 1 行、`shadow_trade` **0** 行。
  * 3. **新建引擎实例，不复用当日那个。** `persistedSignature` 是按 code 的内存 map，
  *    共用会让补跑把当日流水的去重状态冲掉 —— 症状是补跑之后当天第一条信号重复落一行。
  *
@@ -54,7 +64,7 @@
  * 指标缓存 **0 → 7**，落库行的 `created_at` 是 `2026-08-13T07:00:00Z`（北京时间 15:00）。
  */
 
-import { createSignalEngine, type SignalEngineDeps } from './signals'
+import { createSignalEngine, type SignalEngineDeps, type SignalOutcome } from './signals'
 import type { MarketDataService } from './market-data'
 import { shanghaiToEpochMs } from '../providers/shared'
 import type { SecCode, TradeDate } from '@core/types'
@@ -85,6 +95,13 @@ export interface SettleDeps extends Omit<SignalEngineDeps, 'market'> {
    * 那会让昨天的信号出现在今天的列表里（面板与悬浮条都按 `created_at >= 今天 00:00` 筛）。
    */
   closedAt: number
+  /**
+   * 影子运行推进器。**给了就喂，不给就不喂** —— 「成交机会是否已过」那道闸门
+   * 由调用方判（见头注释边界 2）。本模块不读时钟，也不认识日历。
+   */
+  shadow?: { advance(input: { date: TradeDate; at: number; outcomes: readonly SignalOutcome[] }): unknown }
+  /** 喂影子那一步的墙上时刻。与 `closedAt` 分开：那个是 D 的收盘，这个是「现在」 */
+  now?: number
 }
 
 export interface SettleResult {
@@ -99,6 +116,12 @@ export interface SettleResult {
    * 只有失效才带回一条通知。想数确认数得去查库，别在这里凑一个半对的数。
    */
   invalidated: number
+  /**
+   * 这次补跑有没有喂给影子运行。
+   * **必须报出来**：「补跑了但没喂影子」与「补跑了并喂了」在净值曲线上看不出区别，
+   * 而前者意味着那一天的前向记录永久缺失（见头注释边界 2）。
+   */
+  shadowAdvanced: boolean
 }
 
 /**
@@ -130,9 +153,27 @@ export function settleDay(date: TradeDate, deps: SettleDeps): SettleResult {
     producesSignals: true,
   })
 
+  /*
+    喂影子运行（边界 2）。**outcomes 仍然不返回给调用方** ——
+    影子在这里就地消费掉，免得日后有人顺手把同一份 outcomes 接到 AlertService 上。
+
+    单独 try：模拟账本出错不该让整次补跑作废（否则 `lastSettledDate` 不落，
+    下一轮又要为每只标的重算 320 根指标）。
+  */
+  let shadowAdvanced = false
+  if (deps.shadow) {
+    try {
+      deps.shadow.advance({ date, at: deps.now ?? closedAt, outcomes })
+      shadowAdvanced = true
+    } catch (error) {
+      deps.log?.warn?.(`[settle] ${date} 喂影子运行失败：${String(error)}`)
+    }
+  }
+
   // outcomes 到此为止 —— **不返回给调用方**，免得日后有人顺手接到 AlertService 上（见边界 1）
   return {
     date,
+    shadowAdvanced,
     evaluated: outcomes.length,
     persisted: outcomes.filter((outcome) => outcome.persisted).length,
     invalidated: outcomes.filter((outcome) => outcome.invalidated !== undefined).length,

@@ -362,8 +362,14 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
       15:00 是收盘时刻，按北京时间换算（`shanghaiToEpochMs` 与分时那边共用一个口径 ——
       用 `new Date(...)` 会让非 +08 的机器上算出偏 8 小时的 created_at）。
     */
-    settle: (date) =>
+    settle: (date, feedShadow) =>
       settleDay(date, {
+        /*
+          影子运行挂在补跑这条路上（settle.ts 边界 2，2026-08-17 改）。
+          `feedShadow` 由 tick 判「成交机会还没过」——**给了就喂，不给就不喂**，
+          这一层不再自己判时间。
+        */
+        ...(feedShadow ? { shadow, now: Date.now() } : {}),
         market,
         watchlist: storage.watchlist,
         positions: storage.positions,
@@ -374,7 +380,6 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
         closedAt: closeMsOf(date),
         log,
       }),
-    shadow,
     /*
       分时留痕 + 转发。**始终**挂这个回调（不再是 `...(onQuotes ? …)`）——
       落库是数据层自己的事，不该取决于外面有没有人订阅推送。

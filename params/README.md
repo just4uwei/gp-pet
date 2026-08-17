@@ -55,6 +55,22 @@ JSON 没有注释，网格文件里也**不要**塞 `_comment` / `_label` 之类
 `expandGrid()` 把顶层每个键都当成一个块展开，多出来的键会静默地把网格乘大一圈。
 说明写在本文件里。
 
+⚠ 同一条也适用于 `--params` 文件：多出来的键会被 `withParams` 并进参数集并**污染指纹**
+（指纹进 `ENGINE_VERSION`，于是「这行 signal 是哪套参数产的」会指向一个不存在的参数集）。
+所以下面那四个消融文件里只有一个 `risk` 块，说明写在这张表里。
+
+## 风控消融文件（2026-08-17，M2 §5.30）
+
+四条风控规则各关一次，**用不可达的阈值关，不改代码**（与当年测「冲突裁决」同一手法）。
+目的是定位「96.8% 的离场由风控触发，钱漏在哪一条」，**不是搜参数值**。
+
+| 文件 | 关掉谁 | 手法 | 注意 |
+|---|---|---|---|
+| `ablate-no-drawdown-reduce.json` | ③ 回撤减仓 | `drawdownReducePct = 9.99` ⇒ `fromPeak <= -999%` 永假 | 它是当前最主要的离场机制（1875/3305 笔） |
+| `ablate-no-trailing-stop.json` | ② 移动止损 | `trailingStopPct = 9.99` | 刻意不动 `profitProtectTrigger`（②④ 共用它） |
+| `ablate-no-profit-protect.json` | ④ 盈利保护 | `profitProtectFallback = -9.99` ⇒ `profit < -999%` 永假 | 同上 |
+| `ablate-no-stop-loss.json` | ① 固定止损 | `stopLossPct = 9.99` | ⚠ 它同时放开了 ③ 的 `!belowStop` 守卫 ⇒ 回撤减仓会更常触发，这是**预期**的连带效应，不是 bug |
+
 ## 现有的网格文件
 
 | 文件 | 扫什么 | 备注 |

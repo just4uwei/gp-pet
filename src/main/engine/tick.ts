@@ -19,6 +19,7 @@
 import type { SecCode } from '@core/types'
 import type { TickContext, TradingCalendar } from '../scheduler'
 import { shanghaiTime } from '../scheduler'
+import { SESSION_BOUNDS } from '@core/session'
 import { META_KEYS } from '../storage/repositories/meta'
 import { expectedLastBar, type MarketDataService, type SnapshotOutcome } from './market-data'
 import type { SignalEngine, SignalOutcome } from './signals'
@@ -67,13 +68,29 @@ export interface TickPipelineDeps {
    * **不返回 outcomes 是刻意的**：那天已经过去了，补出来的结论一条都不该进提醒层
    * （settle.ts 的边界 1）。这里只拿一个计数打日志。
    */
-  settle?: (date: string) => { evaluated: number; persisted: number; invalidated: number }
+  settle?: (
+    date: string,
+    /**
+     * 这次补跑要不要喂影子运行 —— 「成交机会还没过」（见下面 `shadow` 那段与
+     * settle.ts 的边界 2）。判据在本模块，因为只有它知道 `ctx`。
+     */
+    feedShadow: boolean
+  ) => { evaluated: number; persisted: number; invalidated: number; shadowAdvanced: boolean }
   /**
-   * 影子运行推进（M4，docs/07 §2.3）。排在提醒**之后**且**单独 try**：
-   * 模拟账本记错了不该连带把提醒吃掉，两者的重要性差一个量级。
-   * 它自己判幂等（一个交易日只推进一次），所以这里每轮都调无妨。
+   * ⚠ **影子运行不在这里推进了**（2026-08-17 改）。它挂在 `settle` 那条路上。
+   *
+   * 原先每轮 tick 都调 `shadow.advance`，看着无害（它自己判幂等），实际是个静默缺陷：
+   * 当天**第一跳往往在盘前**（实测 09:02），那时 `producesSignals` 为 false ⇒ outcomes 为空，
+   * 而 advance 照样写下当天的净值行 ⇒ `shadow_equity.trade_date` 主键的幂等闸门
+   * 从此挡住后面每一轮（`ALREADY_DONE`），**包括收盘确认轮**。
+   * 于是 runner 的第 ⑥ 步「用今天的 CONFIRMED 信号挂明天的委托」永远跑不到：
+   * 影子组合永远不建仓，而净值曲线一天一根笔直画下去，从数字上看不出任何异常。
+   * 实测三个交易日：`shadow_equity` 1 行、`shadow_trade` **0** 行。
+   *
+   * 现在的接线是「**只在补跑那一刻推进，且必须是盘前**」：那时 D 的收盘线刚补进来、
+   * D+1 的开盘还没发生，`orderFrom` 挂的委托按次日开盘成交仍是**前向**的。
+   * 代价是净值曲线比自然日**晚一天**落，且应用某天没开就永久缺那一天 —— 两者都是诚实的。
    */
-  shadow?: { advance(input: { date: string; at: number; outcomes: readonly SignalOutcome[] }): unknown }
   maintenanceIntervalMs?: number
 }
 
@@ -105,7 +122,6 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
     engine,
     onSignals,
     settle,
-    shadow,
     maintenanceIntervalMs = MAINTENANCE_INTERVAL_MS,
   } = deps
 
@@ -184,13 +200,28 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
         晚于当天的 SETTLE 窗口，所以当天那一轮拿不到收盘线（这正是要补跑的原因）。
       */
       if (settle && through && through < ctx.date && meta.get(META_KEYS.lastSettledDate) !== through) {
+        /*
+          「成交机会还没过」这道闸门（settle.ts 的边界 2）。
+
+          影子按次日开盘成交，所以只有在 **今天是交易日 且 还没到 09:30** 时，
+          D 的 CONFIRMED 信号挂出的委托才仍然是前向的。
+          过了开盘（用户下午才开应用）就**不喂** —— 那一刻的「次日开盘」已经过去，
+          同一段代码会从前向模拟退化成回填，而回填出来的绩效不属于任何真实决策。
+
+          注意判据用 `ctx.minuteOfDay < SESSION_BOUNDS.open` 而不是 `ctx.session`：
+          竞价时段（PRE_OPEN / AUCTION）的切分与「开盘了没」不是同一件事，
+          而这里要问的恰恰是后者。
+        */
+        const feedShadow = calendar.resolve(ctx.date).isOpen && ctx.minuteOfDay < SESSION_BOUNDS.open
         try {
-          const result = settle(through)
+          const result = settle(through, feedShadow)
           // 先记账再说：即使一只都没跑成（全部停牌 / 数据仍未到），也不该每轮重试 ——
           // 那会把每一跳都变成一次全量指标重算
           meta.set(META_KEYS.lastSettledDate, through)
           log.info(
-            `[settle] ${through} 收盘确认补跑：评估 ${result.evaluated} 只，新落 ${result.persisted} 行，判失效 ${result.invalidated} 条`
+            `[settle] ${through} 收盘确认补跑：评估 ${result.evaluated} 只，新落 ${result.persisted} 行，判失效 ${result.invalidated} 条` +
+              // 「没喂影子」必须可见：它意味着那一天的前向记录永久缺失
+              (result.shadowAdvanced ? '，已推进影子运行' : `，**未喂影子**（${feedShadow ? '推进失败，见上一条 warn' : '开盘已过或今日休市'}）`)
           )
         } catch (error) {
           // 补跑挂了不该拖垮当轮取数（与引擎失败同一条：行情能看，只是少了这一步）
@@ -228,14 +259,6 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
           log.warn(`[signal] ${ctx.date} ${ctx.session} 引擎异常：${String(error)}`)
         }
 
-        // 影子运行（M4）。单独 try：账本出错不该把上面的提醒一起带走
-        if (shadow) {
-          try {
-            shadow.advance({ date: ctx.date, at: ctx.at, outcomes: lastSignals })
-          } catch (error) {
-            log.warn(`[shadow] ${ctx.date} 推进失败：${String(error)}`)
-          }
-        }
       }
     },
 
