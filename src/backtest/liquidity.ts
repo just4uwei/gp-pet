@@ -64,6 +64,16 @@ export interface PoolFilter {
   blockedBars(): number
   /** 完全没有流动性数据的标的（**必须报出来**，否则「没剔」会被读成「都合格」） */
   missing(): readonly SecCode[]
+  /**
+   * 有文件、但那一档所需的列**一根都没有值**的标的。
+   *
+   * ⚠ **这一项比 `missing()` 更隐蔽，所以必须单独有。** `data/liquidity/` 里可能混着
+   * 两种来源：`--from-fixtures` 的代理文件（`floatCap` 全是 null）与东财真值文件。
+   * 混在一起跑 `--drop-cap-pct` 时，代理那些票因「缺数不剔」被排除在横截面之外 ——
+   * 于是过滤只作用于一部分池子，而报告上**一切正常**。
+   * 半截目录（抓取中途熔断）会制造同样的状态。
+   */
+  noData(): { forCap: readonly SecCode[]; forAmount: readonly SecCode[] }
 }
 
 /** 恒真过滤器：`--liquidity` 没给时用它 ⇒ 行为与以前逐位相同 */
@@ -72,6 +82,7 @@ export const ALLOW_ALL: PoolFilter = {
   describe: () => '未启用（未给 --liquidity）',
   blockedBars: () => 0,
   missing: () => [],
+  noData: () => ({ forCap: [], forAmount: [] }),
 }
 
 /**
@@ -171,11 +182,29 @@ export function createPoolFilter(
   if (spec.dropCapPct > 0) parts.push(`流通市值最小 ${spec.dropCapPct}%`)
   if (spec.dropAmountPct > 0) parts.push(`${spec.amountWindow} 日均成交额最小 ${spec.dropAmountPct}%`)
 
+  /*
+    有文件但那一列全空的标的。判据是「这只票在这一档上一根有值的都没有」——
+    半截目录与代理/真值混装都是这个形状（见 `PoolFilter.noData` 的注释）。
+  */
+  const forCap =
+    spec.dropCapPct > 0
+      ? series
+          .filter((one) => codes.includes(one.code) && one.rows.every((r) => r.floatCap === null))
+          .map((one) => one.code)
+      : []
+  const forAmount =
+    spec.dropAmountPct > 0
+      ? series
+          .filter((one) => codes.includes(one.code) && one.rows.every((r) => r.amount === null))
+          .map((one) => one.code)
+      : []
+
   return {
     allows: (code, date) => !(blocked.get(date)?.has(code) ?? false),
     describe: () =>
       `逐日剔除${parts.join(' 与 ')}（横截面**仅本池 ${codes.length} 只之内**，缺数不剔）`,
     blockedBars: () => blockedBars,
     missing: () => missing,
+    noData: () => ({ forCap, forAmount }),
   }
 }

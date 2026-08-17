@@ -187,6 +187,26 @@ function buildPool(options: CliOptions, codes: readonly SecCode[]): PoolFilter {
         `${missing.slice(0, 8).join(' ')}${missing.length > 8 ? ' …' : ''}`
     )
   }
+  /*
+    有文件但那一列全空 —— 比缺文件更隐蔽（见 `PoolFilter.noData`）。
+    **超过一成就直接抛错**：那说明目录里混着代理与真值、或者抓取中途熔断了，
+    而这种状态会产出一个「看起来干净」的过滤结果 —— 报告上完全看不出来。
+  */
+  const noData = filter.noData()
+  const guard = (label: string, list: readonly SecCode[], flag: string): void => {
+    if (list.length === 0) return
+    const ratio = list.length / codes.length
+    const head = `${list.length}/${codes.length} 只的${label}一根都没有值（${list.slice(0, 6).join(' ')}…）`
+    if (ratio > 0.1) {
+      throw new Error(
+        `${head}。${flag} 只会作用在剩下那部分池子上，而报告上看不出来 —— ` +
+          '先把数据补齐（pnpm fetch:liquidity）或换一个目录，不要在混装/半截目录上跑这一支。'
+      )
+    }
+    log(options, `[warn] ${head}，它们全程不被这一档剔除`)
+  }
+  guard('流通市值', noData.forCap, '--drop-cap-pct')
+  guard('成交额', noData.forAmount, '--drop-amount-pct')
   return filter
 }
 

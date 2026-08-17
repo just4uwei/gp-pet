@@ -166,6 +166,29 @@ describe('createPoolFilter', () => {
     expect(filter.allows(code('SH600003'), '2024-01-02')).toBe(true)
   })
 
+  it('有文件但那一列全空的要单独报出来 —— 比缺文件更隐蔽', () => {
+    /*
+      `data/liquidity/` 可能混着 `--from-fixtures` 的代理文件（floatCap 全 null）
+      与东财真值文件，抓取中途熔断也是同一形状。混装时 `--drop-cap-pct` 只作用于
+      一部分池子，而报告上一切正常 —— 所以 noData() 必须把它们点出来。
+    */
+    const series = pool()
+    series[0] = {
+      code: code('SH600001'),
+      rows: [row('2024-01-02', null, 1e6), row('2024-01-03', null, 1e6)],
+    }
+    const filter = createPoolFilter(series, codes, {
+      dropCapPct: 30,
+      dropAmountPct: 0,
+      amountWindow: 20,
+    })
+    expect(filter.noData().forCap).toEqual([code('SH600001')])
+    // 那一档没开就不报（免得「成交额全空」在只按市值剔的运行里变成噪音）
+    expect(filter.noData().forAmount).toEqual([])
+    // 而 missing() 只答「连文件都没有」，这两个问题不能混成一个
+    expect(filter.missing()).toEqual([])
+  })
+
   it('describe() 要写明横截面只在本池之内 —— 报告不许省这一句', () => {
     const filter = createPoolFilter(pool(), codes, {
       dropCapPct: 30,
