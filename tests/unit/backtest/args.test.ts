@@ -21,6 +21,18 @@ describe('parseArgs', () => {
     expect(options.benchmark).toBe('SH000300')
   })
 
+  it('--delisted：缺省是 undefined（⇒ 不管退市，行为与既有结论一致）', () => {
+    const off = parse('--codes', 'SH600000')
+    expect(off).not.toBe('help')
+    if (off === 'help') return
+    expect(off.delisted).toBeUndefined()
+
+    const on = parse('--codes', 'SH600000', '--delisted', './params/universe-delisted.json')
+    expect(on).not.toBe('help')
+    if (on === 'help') return
+    expect(on.delisted).toBe('./params/universe-delisted.json')
+  })
+
   it('吃掉裸 `--`：pnpm 11 会把分隔符原样传进来', () => {
     const options = parse('--', '--codes', 'SH600000', '--fixtures', './fx')
     expect(options).not.toBe('help')

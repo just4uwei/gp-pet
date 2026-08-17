@@ -40,7 +40,14 @@ import {
   type SplitRun,
 } from './calibrate'
 import { DEFAULT_COSTS, type CostModel } from './costs'
-import { openFixtureSource, openSqliteSource, sentimentSeries, type DataSource, type LoadedSeries } from './data'
+import {
+  loadDelistedMap,
+  openFixtureSource,
+  openSqliteSource,
+  sentimentSeries,
+  type DataSource,
+  type LoadedSeries,
+} from './data'
 import { assembleReport, performanceOf, mergeEquity, renderReport, type PerformanceBlock } from './report'
 import { simulateCode, type CodeResult, type SentimentLookup } from './simulate'
 
@@ -111,30 +118,6 @@ interface Loaded {
   delistedAt: Map<SecCode, TradeDate>
 }
 
-/**
- * 读 `--delisted` 指向的退市清单（`params/universe-delisted.json` 的形状）。
- *
- * **空表和没给是两回事**：没给 `--delisted` 是「这次不管退市」，
- * 而给了一个解析出来是空的文件几乎总是路径写错或字段名写错 —— 静默当成前者，
- * 会让一次「以为修了幸存者偏差」的回测悄悄跑成没修的版本，而报告上完全看不出来。
- * 所以后者直接抛错。
- */
-function loadDelisted(options: CliOptions): Map<SecCode, TradeDate> {
-  const map = new Map<SecCode, TradeDate>()
-  if (options.delisted === undefined) return map
-  const parsed = JSON.parse(readFileSync(options.delisted, 'utf8')) as {
-    delistedAt?: Record<string, string>
-  }
-  for (const [code, date] of Object.entries(parsed.delistedAt ?? {})) {
-    map.set(normalizeCode(code), date)
-  }
-  if (map.size === 0) {
-    throw new Error(
-      `${options.delisted} 里没有可用的 delistedAt —— 形状应为 { "delistedAt": { "SH600000": "2020-01-01" } }`
-    )
-  }
-  return map
-}
 
 async function loadAll(options: CliOptions, range: { from: TradeDate; to: TradeDate }): Promise<Loaded> {
   const source = options.fixtures
@@ -158,7 +141,8 @@ async function loadAll(options: CliOptions, range: { from: TradeDate; to: TradeD
     log(options, `[warn] 基准 ${options.benchmark} 无日线，超额收益与信息比率将为空`)
   }
 
-  const delistedAt = loadDelisted(options)
+  const delistedAt =
+    options.delisted === undefined ? new Map<SecCode, TradeDate>() : loadDelistedMap(options.delisted)
   const covered = series.filter((s) => delistedAt.has(s.profile.code)).length
   if (delistedAt.size > 0) {
     log(options, `[backtest] 退市清单 ${delistedAt.size} 只，其中 ${covered} 只在本次标的池内（退市日收盘强制平仓）`)

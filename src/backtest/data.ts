@@ -14,7 +14,7 @@
 
 import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { isSTName, splitCode } from '../core/code'
+import { isSTName, normalizeCode, splitCode } from '../core/code'
 import type { Candle, SecCode, SecProfile, TradeDate } from '../core/types'
 
 export interface LoadedSeries {
@@ -159,6 +159,35 @@ export function openFixtureSource(
     },
     close: () => {},
   }
+}
+
+/**
+ * 读退市清单 → `code → 退市日`（`params/universe-delisted.json` 的形状）。
+ *
+ * 给 `simulateCode` 的 `delistedAt` 用：名单内的标的在退市日收盘强制平仓并记一笔 `trade`。
+ *
+ * **空表和「没给文件」是两回事。** 没传 `--delisted` 是「这次不管退市」，
+ * 而传了一个解析出来是空的文件，几乎总是路径写错或字段名写错 —— 静默当成前者，
+ * 会让一次「以为修了幸存者偏差」的回测悄悄跑成没修的版本，**而报告上完全看不出来**
+ * （建仓数、胜率、收益全都若无其事）。所以后者直接抛错。
+ *
+ * 住在这里而不是 cli.ts：`cli.ts` 的文件头写着「只接线与打印，判断逻辑都在
+ * simulate/report/calibrate —— 那些有测试，这里没有」，而「空表要抛错」是判断。
+ */
+export function loadDelistedMap(file: string): Map<SecCode, TradeDate> {
+  const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
+    delistedAt?: Record<string, string>
+  }
+  const map = new Map<SecCode, TradeDate>()
+  for (const [code, date] of Object.entries(parsed.delistedAt ?? {})) {
+    map.set(normalizeCode(code), date)
+  }
+  if (map.size === 0) {
+    throw new Error(
+      `${file} 里没有可用的 delistedAt —— 形状应为 { "delistedAt": { "SH600000": "2020-01-01" } }`
+    )
+  }
+  return map
 }
 
 /**

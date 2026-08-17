@@ -8,9 +8,10 @@
  * 用出厂阈值会让多数 fixture 一笔都不成交，那样的「通过」什么都没证明。
  */
 
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterAll, describe, expect, it } from 'vitest'
 import { DEFAULT_COSTS } from '@backtest/costs'
 import {
   DELISTED_EXIT_RULE,
@@ -19,7 +20,7 @@ import {
   simulateCode,
   type SimulateOptions,
 } from '@backtest/simulate'
-import { fallbackProfile, sentimentSeries } from '@backtest/data'
+import { fallbackProfile, loadDelistedMap, sentimentSeries } from '@backtest/data'
 import { marketSentiment } from '@core/indicators/thresholds'
 import { DEFAULT_PARAMS, withParams } from '@core/params'
 import type { Candle } from '@core/types'
@@ -250,5 +251,42 @@ describe('退市强制平仓', () => {
     const realized = closed.trades.reduce((sum, t) => sum + t.pnl, 0)
     const lastPoint = closed.equity[closed.equity.length - 1]
     expect(lastPoint?.equity).toBeCloseTo(OPTIONS.capitalPerCode + realized, 6)
+  })
+})
+
+/** 退市清单的读取。与上一段是同一件事的两半：这里读名单，那里用名单 */
+describe('loadDelistedMap', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gp-delisted-'))
+  afterAll(() => rmSync(dir, { recursive: true, force: true }))
+
+  const write = (name: string, body: unknown): string => {
+    const file = join(dir, name)
+    writeFileSync(file, JSON.stringify(body), 'utf8')
+    return file
+  }
+
+  it('读出 code → 退市日，并把代码归一化到内部形态', () => {
+    const map = loadDelistedMap(
+      write('ok.json', { delistedAt: { '600000': '2020-01-01', SZ000001: '2021-02-03' } })
+    )
+    expect(map.get('SH600000')).toBe('2020-01-01')
+    expect(map.get('SZ000001')).toBe('2021-02-03')
+  })
+
+  it('空表或字段名写错**直接抛错** —— 静默当成「没给」会让一次以为修了幸存者偏差的回测悄悄跑成没修的版本', () => {
+    expect(() => loadDelistedMap(write('empty.json', { delistedAt: {} }))).toThrow(/delistedAt/)
+    // 字段名写错是最容易发生的一种：文件在、JSON 合法、就是一个都读不出来
+    expect(() => loadDelistedMap(write('typo.json', { delisted: { SH600000: '2020-01-01' } }))).toThrow(
+      /delistedAt/
+    )
+  })
+
+  it('仓库里那份真实清单读得出来，且每一项形态正确', () => {
+    const map = loadDelistedMap(join(process.cwd(), 'params/universe-delisted.json'))
+    expect(map.size).toBeGreaterThan(0)
+    for (const [code, date] of map) {
+      expect(code).toMatch(/^(SH|SZ|BJ)\d{6}$/)
+      expect(date).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+    }
   })
 })
