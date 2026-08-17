@@ -20,9 +20,13 @@ data/history/
 data/probe/
 # 历史公告（scripts/fetch-announcements.mjs 的产物，可重出）
 data/announcements/
-# 流动性维度（scripts/fetch-liquidity.mjs 的产物，可重出：联网取真值，
-# 或 --from-fixtures 从 data/history 算成交额代理）
+# 流动性维度（scripts/fetch-liquidity.mjs 的产物，逐日文件都可重出）。
+# ⚠ 真正难重出的那一小块是**逐月流通股本**（东财大请求约 50–60 个就限流），
+# 它压在 params/float-shares.json 里、**进版本控制**，逐日展开是离线的：
+#   node scripts/fetch-liquidity.mjs --from-shares params/float-shares.json --prices data/history --out data/liquidity-em
+# 恢复步骤见 docs/notes/交接-流动性维度.md
 data/liquidity/
+data/liquidity-em/
 .vite/
 .eslintcache
 
