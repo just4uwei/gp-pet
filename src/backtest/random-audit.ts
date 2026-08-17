@@ -597,6 +597,8 @@ export interface RandomAuditPayload {
     trials: number
     seed: number
     matchRegime: boolean
+    /** 随机的是**标的**而不是日期（`--cross-code`）。两种口径的零点不同，读报告前先看这一行 */
+    crossCode: boolean
     warmup: number
     minCount: number
     positionsTotal: number
@@ -642,6 +644,31 @@ interface Options {
    * 打散之后 span 与结果解耦，两组的 span 分布仍然一致，剩下的差异才是入场质量。
    */
   shuffleSpans: boolean
+  /**
+   * **跨票随机**：固定入场日期，随机换一只**别的票**（默认是反过来 —— 固定票、随机换日子）。
+   *
+   * ## 为什么需要它：默认口径有一个测不到的维度
+   *
+   * 默认的随机基准在**同一只票内**抽日子，于是**这只票本身的涨跌在两组之间被抵消掉了**。
+   * 它回答的是「同样这批票，点选得好不好」（择时），**答不了「该不该选这批票」**（选股）。
+   *
+   * 这个盲区是实测撞出来的（[M2 §5.26 ⑥](../../docs/notes/M2-偏差报告.md)）：
+   * 补进 19 只退市股之后**绝对绩效变差**（−0.13pp）而默认口径的配对胜率反而**上升 8pp**，
+   * 两个种子一致。原因就是「选到一只烂票」这件事默认口径根本看不见 ——
+   * 在一只跌到退市的票上随机入场几乎必亏，引擎至少挑得出几个反弹点，于是相对优势反而变大。
+   *
+   * 跨票口径把这个维度换过来：**日期对齐（市场 beta 对齐），变的是选了哪只票**。
+   * 两个口径合起来才拆得开「择时」与「选股」。
+   *
+   * ## 三条实现纪律
+   *
+   * 1. **排除同一只票**，否则那次抽样退化成「真实入场」本身，会把分位往 50% 拽。
+   * 2. **候选是那一天有 K 线的票**（停牌、尚未上市、已退市的当天没有行，自然出局）——
+   *    不需要额外过滤，`date → idx` 查不到就换一只。
+   * 3. **与 `--match-regime` 互斥**：那一档限定「同状态的日子」，而这里日期是固定的，
+   *    两者的零点定义不同，混在一起会产出一个说不清是什么的数。
+   */
+  crossCode: boolean
   warmup: number
   minCount: number
   /**
@@ -691,6 +718,10 @@ const USAGE = `用法：
   --shuffle-spans        每次试验把持仓跨度在建仓之间随机置换（两组用同一置换）。
                          用来剥掉 holdingBars 的内生性 —— 不加这个开关，
                          真实组的负 alpha 会被「短跨度天然配着下跌」放大
+  --cross-code           **跨票随机**：固定入场日期，随机换一只别的票（默认是固定票、换日子）。
+                         默认口径在同一只票内抽样 ⇒ 票本身的涨跌被抵消 ⇒ 测的是「择时」；
+                         这一档日期对齐、变的是标的 ⇒ 测的是「选股」。两个口径合起来才拆得开。
+                         与 --match-regime 互斥（零点定义不同）
   --warmup <根>          随机入场日的最早位置，默认 300（= params.data.fullBars）
   --min-count <n>        细分层的最小建仓数，低于它不打印，默认 30
   --announcements <dir>  历史公告目录（fetch-announcements.mjs 的产物）。给了它就多出
@@ -710,13 +741,22 @@ function parse(argv: readonly string[]): Options | 'help' {
     seed: 1,
     matchRegime: false,
     shuffleSpans: false,
+    crossCode: false,
     warmup: 300,
     minCount: 30,
     announceDays: 1,
     announceFreq: false,
     json: false,
   }
-  const flags = new Set(['--match-regime', '--shuffle-spans', '--announce-freq', '--json', '--help', '-h'])
+  const flags = new Set([
+    '--match-regime',
+    '--shuffle-spans',
+    '--cross-code',
+    '--announce-freq',
+    '--json',
+    '--help',
+    '-h',
+  ])
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i]
     if (key === undefined || key === '--') continue
@@ -766,6 +806,9 @@ function parse(argv: readonly string[]): Options | 'help' {
       case '--shuffle-spans':
         o.shuffleSpans = true
         break
+      case '--cross-code':
+        o.crossCode = true
+        break
       case '--out':
         o.out = need()
         break
@@ -779,6 +822,13 @@ function parse(argv: readonly string[]): Options | 'help' {
   if (!o.baseline) throw new Error('必须用 --baseline 指定真实回测报告')
   if (!o.fixtures && !o.db) throw new Error('必须给 --fixtures 或 --db')
   if (!Number.isInteger(o.trials) || o.trials < 1) throw new Error('--trials 必须是 ≥ 1 的整数')
+  // 互斥而不是「后者覆盖前者」：两档的零点定义不同（一个换日子、一个换标的），
+  // 静默取其一会产出一份看不出是哪种口径的报告，而报告是要写进偏差报告的
+  if (o.crossCode && o.matchRegime) {
+    throw new Error(
+      '--cross-code 与 --match-regime 互斥：前者固定日期换标的，后者固定标的换日期（且限定同状态），零点不是同一个'
+    )
+  }
   return o
 }
 
@@ -802,7 +852,14 @@ export async function run(argv: readonly string[]): Promise<number> {
     : await openSqliteSource(opts.db ?? '', { from: report.meta.from, to: report.meta.to })
 
   // ① 载入所有涉及的标的，并建立「日期 → 下标」索引
-  const codes = [...new Set(positions.map((p) => p.code))].map((c) => normalizeCode(c))
+  //
+  // 默认口径只需要「建过仓的票」（随机在同一只票内换日子）。
+  // **跨票口径必须把整个标的池都载进来**：候选若只有建过仓的那些，
+  // 随机组就只能从「引擎至少看上过一次的票」里挑 —— 那已经被引擎筛过一轮，
+  // 拿它当零点会系统性**低估**选股 alpha。基线报告的 `meta.codes` 才是完整的池。
+  const codes = [
+    ...new Set([...positions.map((p) => p.code), ...(opts.crossCode ? report.meta.codes : [])]),
+  ].map((c) => normalizeCode(c))
   const loaded = new Map<SecCode, { series: LoadedSeries; index: Map<TradeDate, number> }>()
   for (const code of codes) {
     const series = source.load(code)
@@ -992,6 +1049,15 @@ export async function run(argv: readonly string[]): Promise<number> {
     )
   }
 
+  // 跨票模式的候选池。「日期 → 下标」直接用 `loaded` 里已经建好的 `index`，不另造一份 ——
+  // 两份索引迟早会分叉，而分叉之后「随机组抽到的是哪一根」就再也说不清了
+  const crossPool: SecCode[] = opts.crossCode ? [...loaded.keys()] : []
+  if (opts.crossCode) {
+    process.stderr.write(
+      `跨票随机：候选标的 ${crossPool.length} 只（固定入场日期，随机换标的；含从未建仓的票）\n`
+    )
+  }
+
   // ④ 跑 N 次随机试验
   const rng = makeRng(opts.seed)
   // 分层键是**逐建仓**算出来的，一次建仓同时进多个层（总体 / 状态 / 得分档 / 子信号组合 / 交叉）。
@@ -1068,12 +1134,27 @@ export async function run(argv: readonly string[]): Promise<number> {
       const entry = loaded.get(t.code)
       if (!entry) continue
       const span = opts.shuffleSpans ? (perm[i] ?? t.span) : t.span
-      // 一次抽样可能因涨跌停/边界作废，最多重抽 8 次再放弃
+      // 一次抽样可能因涨跌停/边界作废，重抽几次再放弃。
+      // 跨票模式给更多次数：它的候选没有预过滤（`pool` 是预先筛过的），
+      // 抽到当天停牌/未上市/已退市的票要当场换一只
+      const maxAttempts = opts.crossCode ? 16 : 8
       let fill: FillResult | null = null
-      for (let attempt = 0; attempt < 8 && fill === null; attempt++) {
-        const pick = t.pool[Math.floor(rng() * t.pool.length)]
-        if (pick === undefined) break
-        fill = fillTrade(entry.series, pick, span, capital, costs)
+      for (let attempt = 0; attempt < maxAttempts && fill === null; attempt++) {
+        if (opts.crossCode) {
+          const other = crossPool[Math.floor(rng() * crossPool.length)]
+          // 排除同一只票：抽到自己等于把「真实入场」本身当成随机样本，会把分位往 50% 拽
+          if (other === undefined || other === t.code) continue
+          const otherEntry = loaded.get(other)
+          // 那天没有 K 线（停牌 / 尚未上市 / 已退市）⇒ 换一只。
+          // 这就是全部的过滤 —— 不需要额外的上市日/退市日判断，缺行本身已经说明了
+          const otherIdx = otherEntry?.index.get(t.position.entryDate)
+          if (!otherEntry || otherIdx === undefined) continue
+          fill = fillTrade(otherEntry.series, otherIdx, span, capital, costs)
+        } else {
+          const pick = t.pool[Math.floor(rng() * t.pool.length)]
+          if (pick === undefined) break
+          fill = fillTrade(entry.series, pick, span, capital, costs)
+        }
       }
       // 打散模式下真实入场那一侧也要按新 span 重算，否则两组的 span 不是同一批
       const passiveFill = opts.shuffleSpans
@@ -1137,6 +1218,7 @@ export async function run(argv: readonly string[]): Promise<number> {
       trials: opts.trials,
       seed: opts.seed,
       matchRegime: opts.matchRegime,
+      crossCode: opts.crossCode,
       warmup: opts.warmup,
       minCount: opts.minCount,
       positionsTotal: positions.length,
@@ -1217,7 +1299,13 @@ function renderText(p: RandomAuditPayload): string {
     `配对       ${m.positionsPaired}/${m.positionsTotal} 次建仓（跳过 ${m.skipped}）· ` +
       `${m.trials} 次试验 · seed=${m.seed}`
   )
-  lines.push(`抽样口径   ${m.matchRegime ? '同 regime（限定相同市场状态）' : '无条件（任意交易日）'}`)
+  lines.push(
+    `抽样口径   ${
+      m.crossCode
+        ? '**跨票**（固定入场日期，随机换标的）⇒ 测的是「选股」'
+        : `${m.matchRegime ? '同 regime（限定相同市场状态）' : '无条件（任意交易日）'}，同票内换日期 ⇒ 测的是「择时」`
+    }`
+  )
   if (m.regimeSelfCheck) {
     const c = m.regimeSelfCheck
     lines.push(

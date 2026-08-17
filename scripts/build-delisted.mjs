@@ -223,7 +223,7 @@ async function probeAll(candidates, names) {
 // ─────────────────────────── 主流程 ───────────────────────────
 
 function parseArgs(argv) {
-  const args = { take: 19, refresh: false, out: OUT }
+  const args = { take: 19, refresh: false, out: OUT, syncFixtures: null }
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
     if (flag === '--take') {
@@ -240,6 +240,13 @@ function parseArgs(argv) {
         process.exit(2)
       }
       args.out = value
+    } else if (flag === '--sync-fixtures') {
+      const value = argv[++i]
+      if (!value) {
+        process.stderr.write('--sync-fixtures 缺少取值\n')
+        process.exit(2)
+      }
+      args.syncFixtures = value
     } else if (flag === '--refresh') args.refresh = true
     else if (flag === '--') continue
     else {
@@ -319,6 +326,34 @@ async function main(argv) {
         `${chosen.map((c) => `${c.code}(${c.name} ${c.last})`).join(' ')}\n`
     )
   })
+
+  // ── 用 fixture 的实际末根校准退市日 ─────────────────────────────────────
+  //
+  // **必须做，否则强制平仓会静默失效。** 上面探出来的末根用的是**不复权**轨，
+  // 而 `fetch-history.mjs` 会把**后复权**轨尾部的非正值截断（退市整理期那一小段，
+  // 腾讯在那里用了加性处理 ⇒ 股价几毛钱时减成负数）。两者于是差几根到二十几根。
+  //
+  // `simulate.ts` 的判据是「末根 >= delistedAt」：清单里写 2022-05-24、fixture 只到
+  // 2022-04-21 的话，条件恒假 ⇒ **那只票不会被强制平仓，而是变成「期末未平仓」** ——
+  // 报告上只多一行无关痛痒的 warning，那笔亏损照样不进 `trades`。
+  // 这正是本轮要修的幸存者偏差第二重，绕了一圈又漏回去。
+  if (args.syncFixtures !== null) {
+    let adjusted = 0
+    for (const item of picked) {
+      const file = join(args.syncFixtures, `${item.code}.json`)
+      if (!existsSync(file)) continue
+      const fx = JSON.parse(readFileSync(file, 'utf8'))
+      const last = fx.candles?.[fx.candles.length - 1]?.date
+      if (typeof last === 'string' && last !== item.last) {
+        process.stdout.write(`  [sync] ${item.code} 退市日 ${item.last} → ${last}（fixture 末根）\n`)
+        item.last = last
+        adjusted++
+      }
+    }
+    process.stdout.write(
+      `[delisted] 按 ${args.syncFixtures} 的实际末根校准了 ${adjusted} 只的退市日\n`
+    )
+  }
 
   mkdirSync(dirname(resolve(args.out)), { recursive: true })
   writeFileSync(

@@ -94,6 +94,14 @@ const DELAY_MS = 300
  * 于是「少了 165 只标的」在回测里表现为标的数变少、不报错。**每次补数后要点一遍文件数。**
  */
 const MAX_CONCURRENCY = 2
+/**
+ * 尾部非正复权价允许截断的最大占比。超过它就不是「退市整理期那一小段」，而是口径出了问题。
+ *
+ * 10% 的依据：实测三只最坏的分别是 1.8% / 1.4% / 0.3%（SH600091 / SZ000502 / SH600767），
+ * 而真正拉成加性前复权时是**全程**变负（中远海控 714/2088 根 = 34%）。两者相差一个量级，
+ * 10% 落在中间的空档里，不需要精调。
+ */
+const MAX_TRAILING_BAD_RATIO = 0.1
 const TIMEOUT_MS = 20_000
 const RETRIES = 3
 
@@ -281,7 +289,7 @@ const num = (value) => {
  */
 function merge(code, raw, adj, tradingDays, cutoff) {
   const candles = []
-  const dropped = { onlyRaw: 0, onlyQfq: 0, malformed: 0, illogical: 0, provisional: 0 }
+  const dropped = { onlyRaw: 0, onlyQfq: 0, malformed: 0, illogical: 0, provisional: 0, nonPositiveTail: 0 }
   const suspicious = { zeroVolume: 0, jump: 0, volumeMismatch: 0 }
 
   const dates = [...new Set([...raw.keys(), ...adj.keys()])].sort()
@@ -322,19 +330,40 @@ function merge(code, raw, adj, tradingDays, cutoff) {
     })
   }
 
+  // 复权价必须恒正。**但要分两种情况处置，因为它们是两个不同的问题**（2026-08-17 实测）：
+  //
+  //   · **尾部一小段**：腾讯对**退市整理期**那一段用的是加性处理（减累计价差），
+  //     股价跌到几毛钱时就会减成负数。实测 SH600091 最后 19 根、SZ000502 最后 15 根、
+  //     SH600767 最后 4 根，值都是 −0.02 ~ −0.96 这种贴着 0 的小负数，而前面几年完全正常
+  //     （SH600091 的 2018–2021 四年最低收盘 1.075，没有一根非正）。
+  //     ⇒ **截断并告警**。那一段本来就是连续跌停、回测里也成交不了，
+  //     丢掉它比丢掉整只票（连同前面几年可用数据一起丢）偏差小得多 ——
+  //     后者等于让这只退市股完全缺席，那正是幸存者偏差本身。
+  //
+  //   · **中间出现，或尾段占比过大**：那才是「又拉成了加性前复权」的信号（高分红股全程变负，
+  //     实测中远海控 714 根）。⇒ **抛错**，绝不静默通过。
+  //
+  // 判据是位置与占比，不是根数 —— 只看根数分不开这两种。
+  const firstBad = candles.findIndex((c) => c.closeAdj <= 0 || c.lowAdj <= 0)
+  if (firstBad >= 0) {
+    const badCount = candles.length - firstBad
+    const ratio = badCount / candles.length
+    if (ratio > MAX_TRAILING_BAD_RATIO) {
+      throw new Error(
+        `${code}：复权价自第 ${firstBad + 1}/${candles.length} 根起出现非正值，占 ${(ratio * 100).toFixed(1)}%` +
+          `（> ${(MAX_TRAILING_BAD_RATIO * 100).toFixed(0)}%）。后复权不该如此 —— 检查是不是又拉成了加性前复权`
+      )
+    }
+    dropped.nonPositiveTail = badCount
+    candles.length = firstBad
+  }
+
   // docs/07 §4：相邻收盘跳变 > 20% 标记可疑。用**复权**轨判断 ——
-  // 除权跳空在这一轨上已被消除，还跳就是真异动或数据错
+  // 除权跳空在这一轨上已被消除，还跳就是真异动或数据错。
+  // 放在截断之后：否则最后那几根负值会制造一串假的「跳变」
   for (let i = 1; i < candles.length; i++) {
     const prev = candles[i - 1].closeAdj
     if (prev > 0 && Math.abs(candles[i].closeAdj / prev - 1) > 0.2) suspicious.jump++
-  }
-  // 复权价必须恒正。加性前复权在高分红股上会变负（见文件头），后复权不该出现，
-  // 出现就说明口径又回到了 qfq —— 这是一个绝不能静默通过的信号
-  const nonPositive = candles.filter((c) => c.closeAdj <= 0 || c.lowAdj <= 0).length
-  if (nonPositive > 0) {
-    throw new Error(
-      `${code}：复权价出现 ${nonPositive} 根非正值。后复权不该如此 —— 检查是不是又拉成了加性前复权`
-    )
   }
 
   // has_gap：与前一根之间隔着「基准指数开过市、本股没数据」的日子 = 停牌段。
@@ -363,6 +392,9 @@ function summarize(result) {
     )
   }
   if (dropped.provisional > 0) parts.push(`临时K线 ${dropped.provisional}`)
+  // 单独一栏而不是并进 dropTotal：它改变的是**这只票的最后一个交易日**，
+  // 而那个日期正是回测里的退市日。并进总数会让这件事看不见
+  if (dropped.nonPositiveTail > 0) parts.push(`⚠ 截断尾部负复权 ${dropped.nonPositiveTail} 根`)
   if (gaps > 0) parts.push(`停牌段 ${gaps}`)
   const flags = []
   if (suspicious.zeroVolume > 0) flags.push(`零成交 ${suspicious.zeroVolume}`)
