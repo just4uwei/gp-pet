@@ -599,6 +599,14 @@ export interface RandomAuditPayload {
     matchRegime: boolean
     /** 随机的是**标的**而不是日期（`--cross-code`）。两种口径的零点不同，读报告前先看这一行 */
     crossCode: boolean
+    /**
+     * 跨票候选池收窄到「当天也有买入方向信号的票」（`--cross-pool <crosssec.json>`）。
+     *
+     * 它排除的是 §5.27 留下的那个替代解释：跨票随机会抽到当天毫无异动的票，
+     * 于是 74.5% 可能只反映「引擎选了活跃的票」而不是「选了会涨的票」。
+     * null = 不收窄（口径与 §5.27 逐位相同）。
+     */
+    crossPool: string | null
     warmup: number
     minCount: number
     positionsTotal: number
@@ -669,6 +677,7 @@ interface Options {
    *    两者的零点定义不同，混在一起会产出一个说不清是什么的数。
    */
   crossCode: boolean
+  crossPool: string | null
   warmup: number
   minCount: number
   /**
@@ -722,6 +731,10 @@ const USAGE = `用法：
                          默认口径在同一只票内抽样 ⇒ 票本身的涨跌被抵消 ⇒ 测的是「择时」；
                          这一档日期对齐、变的是标的 ⇒ 测的是「选股」。两个口径合起来才拆得开。
                          与 --match-regime 互斥（零点定义不同）
+  --cross-pool <file>    **收窄跨票候选池**到「当天也有买入方向信号的票」
+                         （pnpm audit:crosssec --out 的产物）。只与 --cross-code 同用。
+                         排除「抽到当天毫无异动的票」这个替代解释（M2 §5.27 读法 2）。
+                         同时**只保留当天确有其他候选的建仓** —— 否则两组比的不是同一批
   --warmup <根>          随机入场日的最早位置，默认 300（= params.data.fullBars）
   --min-count <n>        细分层的最小建仓数，低于它不打印，默认 30
   --announcements <dir>  历史公告目录（fetch-announcements.mjs 的产物）。给了它就多出
@@ -742,6 +755,7 @@ function parse(argv: readonly string[]): Options | 'help' {
     matchRegime: false,
     shuffleSpans: false,
     crossCode: false,
+    crossPool: null,
     warmup: 300,
     minCount: 30,
     announceDays: 1,
@@ -806,6 +820,9 @@ function parse(argv: readonly string[]): Options | 'help' {
       case '--shuffle-spans':
         o.shuffleSpans = true
         break
+      case '--cross-pool':
+        o.crossPool = need()
+        break
       case '--cross-code':
         o.crossCode = true
         break
@@ -824,6 +841,9 @@ function parse(argv: readonly string[]): Options | 'help' {
   if (!Number.isInteger(o.trials) || o.trials < 1) throw new Error('--trials 必须是 ≥ 1 的整数')
   // 互斥而不是「后者覆盖前者」：两档的零点定义不同（一个换日子、一个换标的），
   // 静默取其一会产出一份看不出是哪种口径的报告，而报告是要写进偏差报告的
+  if (o.crossPool !== null && !o.crossCode) {
+    throw new Error('--cross-pool 只在 --cross-code 下有意义：它收窄的是「换哪只标的」的候选池')
+  }
   if (o.crossCode && o.matchRegime) {
     throw new Error(
       '--cross-code 与 --match-regime 互斥：前者固定日期换标的，后者固定标的换日期（且限定同状态），零点不是同一个'
@@ -1058,6 +1078,60 @@ export async function run(argv: readonly string[]): Promise<number> {
     )
   }
 
+  /*
+    `--cross-pool`：把跨票候选池按**执行日**收窄到「上一根给出买入方向信号」的票。
+
+    索引按**每只票自己的序列**推执行日（`signalIdx + 1`），不按市场日历 ——
+    停牌会让同一个信号日对应到不同的执行日，用统一日历会把那些票错配进别的一天。
+    这与 `simulate.ts` 的「D 收盘判定、D+1 开盘成交」逐条对齐。
+
+    ⚠ 同时**只保留当天确有其他候选的建仓**（下面 `tasks` 的过滤）：
+    单信号日上随机组抽不出对手，若真实组还留着，两侧比的就不是同一批建仓 ——
+    而「配对」是这个工具全部可信度的来源。
+  */
+  const poolByExecDate = new Map<TradeDate, SecCode[]>()
+  if (opts.crossPool !== null) {
+    const parsedPool: unknown = JSON.parse(readFileSync(opts.crossPool, 'utf8'))
+    const byDate = (parsedPool as { byDate?: Record<string, { signaled?: string[] }> }).byDate
+    if (!byDate) throw new Error(`--cross-pool 文件里没有 byDate：${opts.crossPool}`)
+    let placed = 0
+    for (const [signalDate, entry] of Object.entries(byDate)) {
+      for (const raw of entry.signaled ?? []) {
+        const code = normalizeCode(raw)
+        const series = loaded.get(code)
+        if (!series) continue
+        const idx = series.index.get(signalDate as TradeDate)
+        if (idx === undefined) continue
+        const execDate = series.series.candles[idx + 1]?.date
+        if (execDate === undefined) continue
+        const bucket = poolByExecDate.get(execDate) ?? []
+        bucket.push(code)
+        poolByExecDate.set(execDate, bucket)
+        placed++
+      }
+    }
+    process.stderr.write(
+      `候选池已收窄：${poolByExecDate.size} 个执行日、${placed} 个「当天也有买入信号」的候选`.concat('\n')
+    )
+
+    /*
+      单信号日的建仓要整条摘掉 —— 那天随机组抽不出对手（池里只有自己），
+      若真实组还留着，两侧就不是同一批建仓，而「配对」是这个工具全部可信度的来源。
+      摘掉多少必须报出来：它本身就是一个结论（有多少次建仓当时根本没有横截面选择）。
+    */
+    const before = tasks.length
+    const usable = tasks.filter((t) =>
+      (poolByExecDate.get(t.position.entryDate) ?? []).some((code) => code !== t.code)
+    )
+    tasks.length = 0
+    tasks.push(...usable)
+    process.stderr.write(
+      `单信号日摘除：${before - tasks.length} / ${before} 次建仓当天没有其他候选，余 ${tasks.length} 次进配对`.concat(
+        '\n'
+      )
+    )
+  }
+
   // ④ 跑 N 次随机试验
   const rng = makeRng(opts.seed)
   // 分层键是**逐建仓**算出来的，一次建仓同时进多个层（总体 / 状态 / 得分档 / 子信号组合 / 交叉）。
@@ -1141,7 +1215,11 @@ export async function run(argv: readonly string[]): Promise<number> {
       let fill: FillResult | null = null
       for (let attempt = 0; attempt < maxAttempts && fill === null; attempt++) {
         if (opts.crossCode) {
-          const other = crossPool[Math.floor(rng() * crossPool.length)]
+          // 收窄模式：只从「当天也有买入信号」的那几只里抽（排除自己在下面那行）
+          const pool =
+            opts.crossPool === null ? crossPool : (poolByExecDate.get(t.position.entryDate) ?? [])
+          if (pool.length === 0) break
+          const other = pool[Math.floor(rng() * pool.length)]
           // 排除同一只票：抽到自己等于把「真实入场」本身当成随机样本，会把分位往 50% 拽
           if (other === undefined || other === t.code) continue
           const otherEntry = loaded.get(other)
@@ -1219,6 +1297,7 @@ export async function run(argv: readonly string[]): Promise<number> {
       seed: opts.seed,
       matchRegime: opts.matchRegime,
       crossCode: opts.crossCode,
+      crossPool: opts.crossPool,
       warmup: opts.warmup,
       minCount: opts.minCount,
       positionsTotal: positions.length,
@@ -1306,6 +1385,14 @@ function renderText(p: RandomAuditPayload): string {
         : `${m.matchRegime ? '同 regime（限定相同市场状态）' : '无条件（任意交易日）'}，同票内换日期 ⇒ 测的是「择时」`
     }`
   )
+  /*
+    收窄口径必须打印在报告头上，与「择时/选股」那一行同一个理由（M2 §5.27 的处置）：
+    收窄前后两份报告长得几乎一样，不标注的话事后没有任何办法分辨 ——
+    而它们答的是两个不同的问题（「比随便一只票好吗」vs「比同样有信号的票好吗」）。
+  */
+  if (m.crossPool !== null) {
+    lines.push(`候选池收窄 ${m.crossPool}（只抽「当天也有买入方向信号」的票；单信号日的建仓已摘除）`)
+  }
   if (m.regimeSelfCheck) {
     const c = m.regimeSelfCheck
     lines.push(
