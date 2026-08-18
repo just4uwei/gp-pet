@@ -28,6 +28,19 @@ import type { WatchlistService } from './watchlist'
 /** 日历与基础信息的刷新间隔（docs/03 §1：每周一次足够，节假日安排不会天天变） */
 export const MAINTENANCE_INTERVAL_MS = 7 * 24 * 60 * 60_000
 
+/**
+ * 「喂了影子、但它自己跳过了」的人话。
+ *
+ * 这几行不是装饰：`ALREADY_DONE` 意味着**那个交易日的第 ⑥ 步（挂明天的委托）永远不会跑**，
+ * 而影子不补跑历史 ⇒ 那一天的前向记录永久缺失。日志里只写「未喂影子」答不出「为什么」，
+ * 而那恰恰是 2026-08-18 查「影子一直不动」时唯一想知道的东西。
+ */
+const SHADOW_SKIP_TEXT: Record<string, string> = {
+  ALREADY_DONE: '那天已有净值行（第 ⑥ 步没跑，该交易日永久缺失）',
+  ENGINE_VERSION_CHANGED: '引擎参数已变，影子停止累积',
+  ERROR: '推进失败，见上一条 warn',
+}
+
 /** MetaRepo 结构上就满足它 */
 export interface TickMetaStore {
   getNumber(key: string): number | null
@@ -75,7 +88,14 @@ export interface TickPipelineDeps {
      * settle.ts 的边界 2）。判据在本模块，因为只有它知道 `ctx`。
      */
     feedShadow: boolean
-  ) => { evaluated: number; persisted: number; invalidated: number; shadowAdvanced: boolean }
+  ) => {
+    evaluated: number
+    persisted: number
+    invalidated: number
+    shadowAdvanced: boolean
+    /** 喂了但推进器自己跳过时的理由（`ShadowSkip['kind']` / `ERROR`），见 `SHADOW_SKIP_TEXT` */
+    shadowSkip?: string
+  }
   /**
    * ⚠ **影子运行不在这里推进了**（2026-08-17 改）。它挂在 `settle` 那条路上。
    *
@@ -221,7 +241,16 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
           log.info(
             `[settle] ${through} 收盘确认补跑：评估 ${result.evaluated} 只，新落 ${result.persisted} 行，判失效 ${result.invalidated} 条` +
               // 「没喂影子」必须可见：它意味着那一天的前向记录永久缺失
-              (result.shadowAdvanced ? '，已推进影子运行' : `，**未喂影子**（${feedShadow ? '推进失败，见上一条 warn' : '开盘已过或今日休市'}）`)
+              (result.shadowAdvanced
+                ? '，已推进影子运行'
+                : // 「喂了但被跳过」与「压根没喂」是两件事，别合并成一句
+                  `，**未喂影子**（${
+                    result.shadowSkip === undefined
+                      ? feedShadow
+                        ? '推进失败，见上一条 warn'
+                        : '开盘已过或今日休市'
+                      : (SHADOW_SKIP_TEXT[result.shadowSkip] ?? result.shadowSkip)
+                  }）`)
           )
         } catch (error) {
           // 补跑挂了不该拖垮当轮取数（与引擎失败同一条：行情能看，只是少了这一步）

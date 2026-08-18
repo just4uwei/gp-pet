@@ -273,18 +273,24 @@ describe('settleDay', () => {
 */
 describe('settleDay 喂影子运行', () => {
   it('给了 shadow 就喂，date 是补跑那天、outcomes 是补跑产出的那批', () => {
-    const advance = vi.fn()
+    // 返回一个「真的推进了」的结果对象：`advance` 返回 null 才是跳过，两者不能混（见下面两条）
+    const advance = vi.fn((input: { date: string; at: number; outcomes: readonly unknown[] }) => ({
+      date: input.date,
+      opened: 0,
+      closed: 0,
+      placed: 1,
+    }))
     const h = harness({ shadow: { advance }, now: 1_800_000_000_000 })
     const result = settleDay(LAST_DATE as TradeDate, h.deps)
 
     expect(result.shadowAdvanced).toBe(true)
     expect(advance).toHaveBeenCalledOnce()
-    const arg = advance.mock.calls[0]?.[0] as { date: string; at: number; outcomes: unknown[] }
+    const arg = advance.mock.calls[0]?.[0]
     // 日期是**补跑的那一天**，不是「今天」—— 影子的一根净值对应一个交易日
-    expect(arg.date).toBe(LAST_DATE)
+    expect(arg?.date).toBe(LAST_DATE)
     // 时刻用「现在」而不是 closedAt：委托要在此刻之后的开盘成交，前向性靠调用方的闸门保证
-    expect(arg.at).toBe(1_800_000_000_000)
-    expect(arg.outcomes.length).toBeGreaterThan(0)
+    expect(arg?.at).toBe(1_800_000_000_000)
+    expect(arg?.outcomes.length ?? 0).toBeGreaterThan(0)
   })
 
   it('不给 shadow 就一条都不喂（调用方判「成交机会已过」时就是这样）', () => {
@@ -302,9 +308,35 @@ describe('settleDay 喂影子运行', () => {
     })
     const result = settleDay(LAST_DATE as TradeDate, h.deps)
     expect(result.shadowAdvanced).toBe(false)
+    expect(result.shadowSkip).toBe('ERROR')
     // 补跑本身照样完成
     expect(result.evaluated).toBeGreaterThan(0)
     expect(h.rows.length).toBeGreaterThan(0)
+  })
+
+  /*
+    2026-08-18：影子三天没有任何成交，查出来的根因是**日志说了假话**。
+    修复前 `tick.ts` 留下的 08-17 盘前净值行让 `advance()` 一进去就 `ALREADY_DONE` 返回 null，
+    而这里把「调用没抛错」读成了「已推进」⇒ 日志打「已推进影子运行」，
+    于是「第 ⑥ 步（挂明天的委托）那天根本没跑、那一天永久缺失」完全看不出来。
+    边界 2 要求的可见性只有在这两条用例下成立。
+  */
+  it('推进器返回 null（幂等闸门）时不许报成已推进，并带出跳过原因', () => {
+    const h = harness({
+      shadow: { advance: () => null, lastSkip: () => ({ kind: 'ALREADY_DONE' }) },
+    })
+    const result = settleDay(LAST_DATE as TradeDate, h.deps)
+    expect(result.shadowAdvanced).toBe(false)
+    expect(result.shadowSkip).toBe('ALREADY_DONE')
+    // 补跑本身照样完成：跳过影子不该让 lastSettledDate 之外的任何东西回滚
+    expect(result.evaluated).toBeGreaterThan(0)
+  })
+
+  it('拿不到 lastSkip 也要报一个理由，不许静默变成「已推进」', () => {
+    const h = harness({ shadow: { advance: () => null } })
+    const result = settleDay(LAST_DATE as TradeDate, h.deps)
+    expect(result.shadowAdvanced).toBe(false)
+    expect(result.shadowSkip).toBe('UNKNOWN')
   })
 
   it('`at` 缺省时退回 closedAt —— 不读时钟，与 src/core 同一条纪律', () => {

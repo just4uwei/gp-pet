@@ -17,6 +17,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import type { WatchPointView } from '@shared/ipc-types'
+import { shanghaiMdHhmm } from '@shared/time'
 // 标签表与主进程共用一份（@shared/watch-metrics）—— 两处各抄一张会静默分叉
 import { METRIC_LABELS } from '@shared/watch-metrics'
 
@@ -32,10 +33,8 @@ function dayText(ms: number): string {
   return `还有 ${days} 天`
 }
 
-function timeText(ms: number): string {
-  const d = new Date(ms)
-  return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-}
+/** 北京时间（`shared/time.ts`）。`getHours()` 会按宿主时区偏 —— 理由见 AlertLog 那一处 */
+const timeText = shanghaiMdHhmm
 
 /**
  * 方向结论的显示。**红涨绿跌**（A 股口径，与列表其余地方一致）。

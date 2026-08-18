@@ -36,3 +36,44 @@ export function shanghaiDayStartMs(epochMs: number): number {
   const shifted = epochMs + SHANGHAI_OFFSET_MS
   return Math.floor(shifted / MS_PER_DAY) * MS_PER_DAY - SHANGHAI_OFFSET_MS
 }
+
+/*
+  ## 展示用的时刻格式化（2026-08-18）
+
+  面板上原先有五份手写的格式化，其中三处（提醒日志、信号列表、观察点）用的是
+  `getHours()` —— **宿主本地时区**。在 UTC+8 上恰好对，在本机（UTC+7）上
+  北京 15:00 会显示成 14:00，而页头那个「北京时间 HH:mm:ss」时钟就在同一屏上，
+  两个数对不上而用户没法判断哪个对。日报的「栏目数据时刻」把这件事顶到了台面上：
+  同一条提醒在日报里写 09:03、在提醒日志里写 08:03。
+
+  所以时刻一律走这两个函数：**先加偏移再用 `getUTC*` 读**（与 `IntradayChart`
+  的 x 轴、`App.tsx` 的时钟同一口径）。`getHours()` / `toLocaleTimeString()`
+  在这个项目里一律是错的。
+*/
+
+function pad2(value: number): string {
+  return String(value).padStart(2, '0')
+}
+
+/** `HH:mm`（北京时间）。与宿主时区无关 */
+export function shanghaiHhmm(epochMs: number): string {
+  const at = new Date(epochMs + SHANGHAI_OFFSET_MS)
+  return `${pad2(at.getUTCHours())}:${pad2(at.getUTCMinutes())}`
+}
+
+/** `HH:mm:ss`（北京时间）。秒是必要的：盘中两轮之间只差 30 秒 */
+export function shanghaiHhmmss(epochMs: number): string {
+  return `${shanghaiHhmm(epochMs)}:${pad2(new Date(epochMs + SHANGHAI_OFFSET_MS).getUTCSeconds())}`
+}
+
+/** `YYYY-MM-DD`（北京日）。用来判断一个时刻落在不落在某个交易日里 */
+export function shanghaiDate(epochMs: number): string {
+  const at = new Date(epochMs + SHANGHAI_OFFSET_MS)
+  return `${at.getUTCFullYear()}-${pad2(at.getUTCMonth() + 1)}-${pad2(at.getUTCDate())}`
+}
+
+/** `MM-DD HH:mm`（北京时间）。跨天的时刻用它 —— 只给 `HH:mm` 会让昨晚的东西看起来像刚才的 */
+export function shanghaiMdHhmm(epochMs: number): string {
+  const at = new Date(epochMs + SHANGHAI_OFFSET_MS)
+  return `${pad2(at.getUTCMonth() + 1)}-${pad2(at.getUTCDate())} ${shanghaiHhmm(epochMs)}`
+}

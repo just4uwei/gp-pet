@@ -750,6 +750,29 @@ export interface DailyReport {
   stage: 'PROVISIONAL' | 'FINAL'
   /** 生成时刻（墙上时间），由调用方给 —— 判据本身不读时钟 */
   at: number
+  /**
+   * 每一节的**数据时刻**：这一节的事实里**最新那一条**是几点的。
+   * 一条事实都没有时为 null（不是 0、也不是生成时刻 —— 那会替一节空白的内容担保）。
+   *
+   * ## 为什么是「数据时刻」而不是「重算时刻」（2026-08-18）
+   *
+   * 各节的新鲜度天生不同：行情每 30 秒一跳，提醒可能一整天只有早上那三条。
+   * 全部标成生成时刻等于告诉用户「今日提醒也是刚更新的」——
+   * 那是一个每节相同、且会说谎的数。生成时刻单独在页头给一次（`at`）。
+   *
+   * **不进 `reportFactDigest`**（`report/digest.ts` 是显式白名单）：时刻每轮都变，
+   * 进了指纹就让「这段 AI 评价已过期」恒亮，等于废掉那个功能。
+   */
+  stamps: {
+    /** 基准 + 行业 ETF 的行情时刻取最新 */
+    environment: number | null
+    /** 逐只：行情时刻与当日未静默信号的时刻取最新（这一节两样都在显示） */
+    stocks: number | null
+    /** 今日汇总是上面几节的复述 ⇒ 取它复述的那些事实里最新的一条 */
+    summary: number | null
+    tomorrow: number | null
+    alerts: number | null
+  }
   overview: {
     watchCount: number
     /** 今日出现过**未静默**信号的只数 */
@@ -917,6 +940,15 @@ export interface DailyReportStock {
     low: number | null
     /** `CLOSE` = 当日收盘线；`SNAPSHOT` = 盘中最后一个快照（当日日线还没入库） */
     source: 'CLOSE' | 'SNAPSHOT'
+    /**
+     * 这个价是**什么时候**的：`CLOSE` → 那天北京时间 15:00；`SNAPSHOT` → 快照的
+     * `Snapshot.at`（**最后成交时刻**）。
+     *
+     * ⚠ 快照那一支不是「现在」：停牌与冷门股的最后成交可以合法地落后很久，
+     * 而那恰恰是这个字段要让用户看见的东西。**不许拿它当钟用**
+     * （校时只认 HTTP `Date` 头，见 `scheduler/clock-sync.ts`）。
+     */
+    at: number
   } | null
   signals: {
     total: number
@@ -960,6 +992,11 @@ export interface DailyReportTomorrow {
   kind: 'NEXT_DAY_WATCH' | 'WATCH_POINT' | 'POSITION_RISK'
   /** 复述那条东西自己的说法，不另起一句结论 */
   note: string
+  /**
+   * 被复述的那条东西自己的时刻：信号的 `createdAt` / 观察点的 `createdAt`。
+   * 「这条是几点得出的结论」——「只复述不推导」这条纪律的可核对版本。
+   */
+  at: number
 }
 
 /**

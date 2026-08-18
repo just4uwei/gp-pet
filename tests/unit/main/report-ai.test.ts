@@ -15,6 +15,8 @@ import type { DailyReport, ParamRow } from '@shared/ipc-types'
 import type { SecCode, TradeDate } from '@core/types'
 
 const DATE = '2026-08-14' as TradeDate
+/** DATE 那天的北京 15:00（收盘线的数据时刻） */
+const CLOSE_MS = 1_759_990_000_000
 
 function params(): ParamRow[] {
   return [
@@ -35,7 +37,7 @@ function report(over: Partial<DailyReport> = {}): DailyReport {
         code: 'SH600000' as SecCode,
         name: '浦发银行',
         industry: '银行',
-        quote: { close: 10.5, changePct: -2.1, amplitudePct: 3.4, open: 10.7, high: 10.8, low: 10.4, source: 'CLOSE' },
+        quote: { close: 10.5, changePct: -2.1, amplitudePct: 3.4, open: 10.7, high: 10.8, low: 10.4, source: 'CLOSE', at: CLOSE_MS },
         signals: { total: 2, actionable: 1, last: { direction: 'SELL', level: 'L3', stage: 'CONFIRMED', score: 0.82 }, suppressedReasons: ['已跌停，卖不掉'] },
         position: { shares: 1000, cost: 12, pnlPct: -12.5, toStopPct: -4.5 },
         watch: { hit: 1, expired: 0, active: 2 },
@@ -49,12 +51,14 @@ function report(over: Partial<DailyReport> = {}): DailyReport {
       },
     ],
     alerts: { delivered: 1, gated: 2, reasons: [{ reason: '免打扰时段', count: 2 }] },
-    tomorrow: [{ code: 'SH600000' as SecCode, name: '浦发银行', kind: 'POSITION_RISK', note: '持仓未了结' }],
+    tomorrow: [{ code: 'SH600000' as SecCode, name: '浦发银行', kind: 'POSITION_RISK', note: '持仓未了结', at: 1_759_990_000_000 }],
     data: { withClose: 1, missing: ['SZ000001' as SecCode] },
     highlights: ['2 只自选，其中 1 只今日出现信号（卖出 1 条）。'],
     // 环境是独立的一节（docs/11 N1）。这里给空壳即可 —— 它的判据在 environment.test.ts，
     // 而**指纹刻意不含它**：环境每分钟都在动，算进去会让「已过期」提示恒亮
     environment: { benchmark: null, industries: [], breadth: { withQuote: 0, up: 0, down: 0, flat: 0 }, missing: [], lines: [] },
+    // 每节的数据时刻。**同样刻意不进指纹** —— 见下面那条用例
+    stamps: { environment: null, stocks: CLOSE_MS, summary: CLOSE_MS, tomorrow: CLOSE_MS, alerts: null },
     ...over,
   }
 }
@@ -110,6 +114,29 @@ describe('reportFactDigest', () => {
 
   it('**生成时刻不算进去** —— 算进去的话「已过期」提示会恒亮', () => {
     expect(reportFactDigest(report({ at: 1 }))).toBe(reportFactDigest(report({ at: 2 })))
+  })
+
+  /*
+    2026-08-18 加了「每节数据时刻」（`stamps` / `quote.at` / `tomorrow[].at`）。
+    这一条钉住它们**一个都没进指纹** —— 时刻每 30 秒就变，
+    进了指纹「这段评价已过期」就恒亮，等于把这个功能废掉。
+  */
+  it('**每节的数据时刻不算进去** —— 它每轮都变，算进去「已过期」会恒亮', () => {
+    const moved = report({
+      stamps: { environment: 1, stocks: 2, summary: 3, tomorrow: 4, alerts: 5 },
+      tomorrow: [{ code: 'SH600000' as SecCode, name: '浦发银行', kind: 'POSITION_RISK', note: '持仓未了结', at: 99 }],
+    })
+    expect(reportFactDigest(moved)).toBe(reportFactDigest(report()))
+  })
+
+  it('行情的时刻变了但价格没变 → 指纹不变（换的是「几点的」，不是「多少钱」）', () => {
+    const base = report()
+    const first = base.stocks[0]
+    if (!first?.quote) throw new Error('用例数据变了')
+    const later = report({
+      stocks: [{ ...first, quote: { ...first.quote, at: first.quote.at + 60_000 } }, ...base.stocks.slice(1)],
+    })
+    expect(reportFactDigest(later)).toBe(reportFactDigest(base))
   })
 
   it('highlights 是派生量，也不算进去', () => {

@@ -35,11 +35,18 @@ import type {
   WatchPointView,
 } from '@shared/ipc-types'
 import type { Candle, GatedDirection, SecCode, Snapshot, TradeDate } from '@core/types'
+import { SESSION_BOUNDS } from '@core/session'
 
 export interface BuildReportInput {
   date: TradeDate
   /** 生成时刻（墙上时间）。本模块不读时钟 */
   at: number
+  /**
+   * `date` 那天**北京时间 15:00** 的 epoch ms。收盘线的「数据时刻」用它。
+   *
+   * 由调用方给（`engine/settle.ts` 的 `closeMsOf`）—— 本模块不读时钟、也不做时区换算。
+   */
+  closeMs: number
   items: readonly WatchItem[]
   /**
    * 当日收盘线：code → [前一根, 当日那根]。**当日那根缺席时整条不给**
@@ -117,15 +124,47 @@ export function reportableItems<T extends { group: string; hasPosition: boolean 
 }
 
 /**
+ * 日报该报**哪一天**（2026-08-18）。
+ *
+ * 改动之前这个判据是「库里最后一根日线的日期」，而当日日线 15:05–15:30 才发布、
+ * 应用 15:10 之后不再取数 ⇒ 今天的那根要到**次日盘前**才入库 ⇒ **整个今天
+ * （含盘中）日报都停在昨天，还打着「已定稿」**；而同一屏的信号 / 提醒统计按
+ * 「今天北京 00:00」切 —— 一份报告里混着「昨天的价 + 今天的信号」，界面上看不出来。
+ *
+ * 所以判据改成「当前交易日」：**开盘之后就是今天**，今天的收盘线还没入库不要紧，
+ * 那正是 `stage = PROVISIONAL` 在说的事。
+ *
+ * 阈值取 `SESSION_BOUNDS.open`（09:30）而不是 09:00：开盘前今天一个数都没有，
+ * 那时给昨天的定稿版比给一屏「—」有用。休市日同理退回最后一天有数据的那天。
+ *
+ * 名字不叫 `reportDateOf` —— 那个名字被 `@shared/ai-target` 占着（解析 `report:<date>`）。
+ */
+export function reportSubjectDate(input: {
+  /** 北京日，由调用方给（本模块不读时钟） */
+  today: TradeDate
+  /** 今天是不是交易日，由调用方问日历 */
+  todayIsOpen: boolean
+  minuteOfDay: number
+  /** 库里已有收盘线的最后一天；一根都没有时 null */
+  lastDataDate: TradeDate | null
+}): TradeDate {
+  if (input.todayIsOpen && input.minuteOfDay >= SESSION_BOUNDS.open) return input.today
+  return input.lastDataDate ?? input.today
+}
+
+/**
  * 一只票的行情。优先当日收盘线，其次盘中快照，都没有则 null。
  *
  * **两者不混用**：涨跌幅与振幅必须与 `close` 出自同一份数据，
  * 拿收盘价配快照的昨收会算出一个哪边都不对的数。
+ *
+ * `closeMs` 是那一天的北京 15:00，只用来给收盘线那一支盖时刻。
  */
 export function quoteOf(
   code: SecCode,
   bars: BuildReportInput['bars'],
-  snapshots: BuildReportInput['snapshots']
+  snapshots: BuildReportInput['snapshots'],
+  closeMs: number
 ): DailyReportStock['quote'] {
   const bar = bars.get(code)
   if (bar) {
@@ -140,6 +179,8 @@ export function quoteOf(
       high: bar.day.high,
       low: bar.day.low,
       source: 'CLOSE',
+      // 收盘线的时刻就是那天的收盘 —— 它是哪一分钟被抓进库的与这个数无关
+      at: closeMs,
     }
   }
 
@@ -157,6 +198,12 @@ export function quoteOf(
       high: snapshot.high > 0 ? snapshot.high : null,
       low: snapshot.low > 0 ? snapshot.low : null,
       source: 'SNAPSHOT',
+      /*
+        `Snapshot.at` 是**最后成交时刻**，不是「现在」——停牌与冷门股会合法地落后很久。
+        作为「这个价是什么时候的」它正合适（那种落后恰恰要让用户看见），
+        但**不许拿它当钟用**：`clock-sync.ts` 的头注释记着同一条（校时只认 HTTP Date 头）。
+      */
+      at: snapshot.at,
     }
   }
 
@@ -185,7 +232,7 @@ export function toStopPct(
 }
 
 export function buildDailyReport(input: BuildReportInput): DailyReport {
-  const { date, at, items, bars, snapshots, signals, positions, watchPoints, alerts, stopLossPct, dayStart, environment } =
+  const { date, at, closeMs, items, bars, snapshots, signals, positions, watchPoints, alerts, stopLossPct, dayStart, environment } =
     input
 
   const positionOf = new Map(positions.map((p) => [p.code, p]))
@@ -209,9 +256,18 @@ export function buildDailyReport(input: BuildReportInput): DailyReport {
   let withClose = 0
   let withSignal = 0
   let belowStop = 0
+  /*
+    「逐只」那一节里信号侧的最新时刻。
+
+    单独累一个数是必须的：`DailyReportStock.signals` 只留了**最后一条的方向**，
+    没留时刻（那一节要的是结论不是时刻）；而 `signals` 入参覆盖的是**全部自选**，
+    含被 `reportableItems` 摘掉的那些没持仓的行业 ETF —— 拿它去算这一节的时刻，
+    会把一条屏幕上根本不存在的 ETF 信号当成「这一节刚更新过」。
+  */
+  let lastSignalAt: number | null = null
 
   for (const item of items) {
-    const quote = quoteOf(item.code, bars, snapshots)
+    const quote = quoteOf(item.code, bars, snapshots, closeMs)
     if (quote === null) missing.push(item.code)
     if (quote?.source === 'CLOSE') withClose++
 
@@ -221,7 +277,10 @@ export function buildDailyReport(input: BuildReportInput): DailyReport {
     // 「当日最后一条未静默」—— 与悬浮条 tag 同一口径（收盘失效那条不该被上午的盖住）
     const last = visible[visible.length - 1] ?? null
     if (visible.length > 0) withSignal++
-    for (const row of visible) directionTally.set(row.direction, (directionTally.get(row.direction) ?? 0) + 1)
+    for (const row of visible) {
+      directionTally.set(row.direction, (directionTally.get(row.direction) ?? 0) + 1)
+      if (lastSignalAt === null || row.createdAt > lastSignalAt) lastSignalAt = row.createdAt
+    }
 
     const suppressedReasons = [
       ...new Set(rows.map((row) => row.suppressedReason).filter((r): r is string => r !== undefined)),
@@ -271,6 +330,8 @@ export function buildDailyReport(input: BuildReportInput): DailyReport {
         name: item.name,
         kind: 'NEXT_DAY_WATCH',
         note: `今日收盘给出「${DIRECTION_LABEL.NEXT_DAY_WATCH}」，置信 ${Math.round(last.score * 100)}%`,
+        // 时刻也是「复述」的一部分：被复述的那条信号自己是几点得出的
+        at: last.createdAt,
       })
     }
     for (const point of pointsOf.get(item.code) ?? []) {
@@ -280,6 +341,9 @@ export function buildDailyReport(input: BuildReportInput): DailyReport {
         name: item.name,
         kind: 'WATCH_POINT',
         note: `仍在盯：${point.metric} ${point.op === 'LTE' ? '跌破' : '升破'} ${point.threshold}`,
+        // 观察点的时刻用**建立时刻**：它是「用户什么时候让我盯的」。
+        // 不用 expiresAt（那是未来）、也不用 hitAt（ACTIVE 的还没命中）
+        at: point.createdAt,
       })
     }
     // 未了结的持仓风控：**复述当日那条信号自己的方向**，不另起一个结论
@@ -289,6 +353,7 @@ export function buildDailyReport(input: BuildReportInput): DailyReport {
         name: item.name,
         kind: 'POSITION_RISK',
         note: `持仓未了结：今日最后一条为「${DIRECTION_LABEL[last.direction]}」`,
+        at: last.createdAt,
       })
     }
   }
@@ -338,6 +403,58 @@ export function buildDailyReport(input: BuildReportInput): DailyReport {
     // 「3 只跌破止损」是我的票的事还是大盘的事
     environment,
     highlights: highlightsOf({ items, withSignal, byDirection, belowStop, delivered, gated: alerts.length - delivered, tomorrow, stage }),
+    stamps: stampsOf({ stocks, environment, lastSignalAt, tomorrow, alerts }),
+  }
+}
+
+/** 一串时刻里最新的那个。全是 null / 空 → null（**绝不退化成 0 或「现在」**） */
+function newestOf(values: readonly (number | null | undefined)[]): number | null {
+  let best: number | null = null
+  for (const value of values) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) continue
+    if (best === null || value > best) best = value
+  }
+  return best
+}
+
+/**
+ * 每一节的「数据时刻」（2026-08-18）。
+ *
+ * 口径是**数据时刻**不是重算时刻：这一节的事实里最新那一条是几点的。
+ * 理由写在 `DailyReport.stamps` 的类型注释里 —— 全部标成生成时刻等于告诉用户
+ * 「今日提醒也是刚更新的」，而它可能从早上 09:03 起就没变过。
+ *
+ * 三条边界：
+ * 1. **取最新（max）而不是最旧。** 停牌股的快照可以是几天前的，
+ *    拿它当整节的时刻会让一屏刚刷出来的数字显示成「三天前」。
+ *    单只有多旧由那一行自己的 `quote.at` 回答。
+ * 2. **一条事实都没有就是 null。** 用 0 或生成时刻顶替，等于替一节空白内容担保。
+ * 3. **`summary` 是派生节**，取它复述的那几节里最新的一条 —— 它自己没有独立事实。
+ */
+export function stampsOf(input: {
+  stocks: readonly DailyReportStock[]
+  environment: ReportEnvironment
+  /** 「逐只」那一节里当日未静默信号的最新时刻（`stocks` 里不带时刻，见 buildDailyReport） */
+  lastSignalAt: number | null
+  tomorrow: readonly DailyReportTomorrow[]
+  alerts: readonly AlertRecord[]
+}): DailyReport['stamps'] {
+  const { stocks, environment, lastSignalAt, tomorrow, alerts } = input
+
+  const quotesAt = newestOf(stocks.map((stock) => stock.quote?.at))
+  const stampStocks = newestOf([quotesAt, lastSignalAt])
+  const stampTomorrow = newestOf(tomorrow.map((row) => row.at))
+  const stampAlerts = newestOf(alerts.map((row) => row.createdAt))
+
+  return {
+    environment: newestOf([
+      environment.benchmark?.quote?.at,
+      ...environment.industries.map((row) => row.quote?.at),
+    ]),
+    stocks: stampStocks,
+    summary: newestOf([stampStocks, stampTomorrow, stampAlerts]),
+    tomorrow: stampTomorrow,
+    alerts: stampAlerts,
   }
 }
 
@@ -382,7 +499,10 @@ export function highlightsOf(input: {
   }
 
   if (stage === 'PROVISIONAL') {
-    lines.push('当日日线尚未入库，数字取自盘中最后一次行情，收盘后可能微调。')
+    // 「收盘后可能微调」这句原先在收盘之后读起来自相矛盾（2026-08-18 改）：
+    // 新口径下这份报告从开盘那一刻起就是今天的，而当日日线要到次日盘前才入库，
+    // 于是这一句在 16:00 也会出现
+    lines.push('当日日线尚未入库，数字取自盘中最后一次行情，次日盘前定稿后可能微调。')
   }
 
   return lines

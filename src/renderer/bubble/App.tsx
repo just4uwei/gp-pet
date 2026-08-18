@@ -20,6 +20,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import type { AlertPayload } from '@shared/ipc-types'
+import { shanghaiHhmm } from '@shared/time'
 import type { GatedDirection } from '@core/types'
 
 /** 与主进程 BubbleWindow.AUTO_HIDE_MS 一致；改一处要改两处，所以两边都写了注释 */
@@ -41,10 +42,11 @@ const DIRECTION_CLASS: Record<GatedDirection, string> = {
   NONE: 'badge--watch',
 }
 
-function timeOf(ms: number): string {
-  const at = new Date(ms)
-  return `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
-}
+/**
+ * 北京时间（`shared/time.ts`）。同一条提醒在气泡、提醒日志、日报三处必须是同一个时刻 ——
+ * `getHours()` 会按宿主时区偏（本机 UTC+7 上少一小时）。
+ */
+const timeOf = shanghaiHhmm
 
 function signed(value: number): string {
   return `${value > 0 ? '+' : ''}${value.toFixed(2)}%`

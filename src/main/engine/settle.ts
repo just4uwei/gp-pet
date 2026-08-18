@@ -98,8 +98,16 @@ export interface SettleDeps extends Omit<SignalEngineDeps, 'market'> {
   /**
    * 影子运行推进器。**给了就喂，不给就不喂** —— 「成交机会是否已过」那道闸门
    * 由调用方判（见头注释边界 2）。本模块不读时钟，也不认识日历。
+   *
+   * `advance` 返回 **null = 本轮什么都没做**（幂等闸门 / 引擎版本闸门）。类型写成
+   * `object | null` 而不是 `unknown` 是刻意的：`unknown` 会让「跳过」在这里读不出来，
+   * 而那正是 2026-08-18 那个静默缺陷的形状（见下面 `shadowAdvanced` 那段）。
    */
-  shadow?: { advance(input: { date: TradeDate; at: number; outcomes: readonly SignalOutcome[] }): unknown }
+  shadow?: {
+    advance(input: { date: TradeDate; at: number; outcomes: readonly SignalOutcome[] }): object | null
+    /** 跳过的理由。拿得到就报出来 —— 「哪一天永久缺了」必须答得出具体原因 */
+    lastSkip?(): { kind: string } | null
+  }
   /** 喂影子那一步的墙上时刻。与 `closedAt` 分开：那个是 D 的收盘，这个是「现在」 */
   now?: number
 }
@@ -117,11 +125,16 @@ export interface SettleResult {
    */
   invalidated: number
   /**
-   * 这次补跑有没有喂给影子运行。
+   * 这次补跑有没有喂给影子运行**并且真的推进了**。
    * **必须报出来**：「补跑了但没喂影子」与「补跑了并喂了」在净值曲线上看不出区别，
    * 而前者意味着那一天的前向记录永久缺失（见头注释边界 2）。
    */
   shadowAdvanced: boolean
+  /**
+   * 喂了、但推进器自己跳过了的理由（`ShadowSkip['kind']`，或抛错时的 `ERROR`）。
+   * 推进成功时**不出现**这个键。
+   */
+  shadowSkip?: string
 }
 
 /**
@@ -161,11 +174,24 @@ export function settleDay(date: TradeDate, deps: SettleDeps): SettleResult {
     下一轮又要为每只标的重算 320 根指标）。
   */
   let shadowAdvanced = false
+  let shadowSkip: string | undefined
   if (deps.shadow) {
     try {
-      deps.shadow.advance({ date, at: deps.now ?? closedAt, outcomes })
-      shadowAdvanced = true
+      /*
+        `advance` 返回 null = 它自己跳过了（`ALREADY_DONE` / `ENGINE_VERSION_CHANGED`）。
+        **「喂了」不等于「推进了」** —— 把两者读成一件事会让日志替一次没发生的推进担保。
+
+        2026-08-18 实测到过这个形状：08-17 盘前那条修复前的代码留下的净值行，
+        让第二天补跑一进 advance 就 `ALREADY_DONE` 返回 null，
+        而这里照样报 `shadowAdvanced: true`、日志照样打「已推进影子运行」——
+        于是「第 ⑥ 步（挂明天的委托）那天根本没跑、那一天永久缺失」这件事
+        在日志上完全看不出来，而那正是边界 2 要求可见的东西。
+      */
+      const advanced = deps.shadow.advance({ date, at: deps.now ?? closedAt, outcomes })
+      shadowAdvanced = advanced !== null
+      if (!shadowAdvanced) shadowSkip = deps.shadow.lastSkip?.()?.kind ?? 'UNKNOWN'
     } catch (error) {
+      shadowSkip = 'ERROR'
       deps.log?.warn?.(`[settle] ${date} 喂影子运行失败：${String(error)}`)
     }
   }
@@ -174,6 +200,8 @@ export function settleDay(date: TradeDate, deps: SettleDeps): SettleResult {
   return {
     date,
     shadowAdvanced,
+    // 条件展开：推进成功时不该多出一个恒为 undefined 的键
+    ...(shadowSkip === undefined ? {} : { shadowSkip }),
     evaluated: outcomes.length,
     persisted: outcomes.filter((outcome) => outcome.persisted).length,
     invalidated: outcomes.filter((outcome) => outcome.invalidated !== undefined).length,

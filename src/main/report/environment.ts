@@ -54,16 +54,19 @@ export interface BuildEnvironmentInput {
   /** 与 `buildDailyReport` **同一份** bars / snapshots，口径必须一致 */
   bars: BuildReportInput['bars']
   snapshots: BuildReportInput['snapshots']
+  /** 那一天的北京 15:00，收盘线的「数据时刻」用它。与 `buildDailyReport` 同一个值 */
+  closeMs: number
 }
 
 function itemOf(
   target: EnvironmentTarget,
   bars: BuildEnvironmentInput['bars'],
-  snapshots: BuildEnvironmentInput['snapshots']
+  snapshots: BuildEnvironmentInput['snapshots'],
+  closeMs: number
 ): EnvironmentItem {
   // 复用 build.ts 的 quoteOf：收盘线优先、快照兜底、**两者不混用**。
   // 各写一份的症状是日报上半屏与下半屏的涨跌幅对不上，而用户没法判断哪个对。
-  const quote = quoteOf(target.code, bars, snapshots)
+  const quote = quoteOf(target.code, bars, snapshots, closeMs)
   return {
     code: target.code,
     name: target.name,
@@ -90,10 +93,10 @@ function fmtPct(value: number): string {
 }
 
 export function buildEnvironment(input: BuildEnvironmentInput): ReportEnvironment {
-  const { benchmark, industries, bars, snapshots } = input
+  const { benchmark, industries, bars, snapshots, closeMs } = input
 
-  const benchmarkItem = benchmark ? itemOf(benchmark, bars, snapshots) : null
-  const industryItems = industries.map((t) => itemOf(t, bars, snapshots)).sort(byChangeDesc)
+  const benchmarkItem = benchmark ? itemOf(benchmark, bars, snapshots, closeMs) : null
+  const industryItems = industries.map((t) => itemOf(t, bars, snapshots, closeMs)).sort(byChangeDesc)
 
   const priced = industryItems.filter((i) => i.quote !== null)
   const breadth = {
@@ -179,7 +182,9 @@ export function linesOf(input: {
     lines.push(`另有 ${missingIndustries} 只今日无行情数据，未计入上面的统计。`)
   }
 
-  if (anySnapshot) lines.push('部分数字取自盘中最后一次行情，收盘后可能微调。')
+  // 与 build.ts 的 highlightsOf 同一句、同一条理由（2026-08-18 改口径）：
+  // 新日期口径下这一句在收盘之后也会出现，「收盘后可能微调」那时是自相矛盾的
+  if (anySnapshot) lines.push('部分数字取自盘中最后一次行情，次日盘前定稿后可能微调。')
 
   return lines.length > 0 ? lines : ['今日环境数据暂缺。']
 }

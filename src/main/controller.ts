@@ -109,7 +109,8 @@ import { paramRows } from './settings/params-view'
 import { isReportTarget, reportDateOf } from '@shared/ai-target'
 import { INDUSTRY_ETF_GROUP } from '@shared/industry-etf'
 import { shanghaiDayStartMs } from '@shared/time'
-import { buildDailyReport, reportableItems } from './report/build'
+import { buildDailyReport, reportSubjectDate, reportableItems } from './report/build'
+import { closeMsOf } from './engine/settle'
 import { buildEnvironment, type EnvironmentTarget } from './report/environment'
 import { fetchAnnouncements } from './engine/announcements'
 import { buildDailyBrief } from './brief/build'
@@ -1335,8 +1336,29 @@ export class AppController {
     const dates = items
       .map((item) => layer.storage.klines.lastDate(item.code))
       .filter((d): d is TradeDate => d !== null)
-    // 一根日线都没有时退到本机日期 —— 那时报告里全是「—」，而那正是实情
-    const date = dates.sort().at(-1) ?? shanghaiTime(Date.now()).date
+
+    /*
+      **报的是「当前交易日」，不是「库里最后一根日线的日期」**（2026-08-18 改）。
+
+      旧口径的症状：当日日线 15:05–15:30 才发布、应用 15:10 之后不再取数 ⇒ 今天那根
+      要到次日盘前才入库 ⇒ 整个今天（**含盘中**）日报都停在昨天，`stage` 还算出 `FINAL`
+      打「已定稿」；而下面的信号 / 提醒 / 观察点统计按 `dayStart`（今天北京 00:00）切 ——
+      **一份报告里混着「昨天的价 + 今天的信号」，而界面上完全看不出来**。
+
+      判据下沉到 `report/build.ts` 的 `reportSubjectDate`（纯函数 + 用例）。
+      这一层只负责把它要的三样东西凑齐：北京日 / 今天开不开市 / 库里最后一天。
+    */
+    const now = Date.now()
+    const { date: today, minuteOfDay } = shanghaiTime(now)
+    const date = reportSubjectDate({
+      today,
+      todayIsOpen: layer.calendar.resolve(today).isOpen,
+      minuteOfDay,
+      lastDataDate: dates.sort().at(-1) ?? null,
+    })
+    // 收盘线的「数据时刻」= 那天的北京 15:00。复用补跑那边的同一个函数，
+    // 别在这里手写时区换算（`Date.parse('...T15:00')` 会按本机时区解析）
+    const closeMs = closeMsOf(date)
 
     const bars = new Map<SecCode, { day: Candle; prev?: Candle }>()
     for (const item of items) {
@@ -1393,10 +1415,11 @@ export class AppController {
     // 日界走北京时间，不是宿主本地时区（shared/time.ts）——
     // 这一处在 2026-08-15 统一日界那轮被漏掉了：UTC−5 上本机 00:00 是北京 13:00，
     // 于是日报里「今天的信号」会从午盘开始算
-    const dayStart = shanghaiDayStartMs(Date.now())
+    const dayStart = shanghaiDayStartMs(now)
     return buildDailyReport({
       date,
-      at: Date.now(),
+      at: now,
+      closeMs,
       items,
       bars,
       snapshots,
@@ -1407,7 +1430,7 @@ export class AppController {
       alerts: this.alertHistory({ from: dayStart, limit: 500 }),
       stopLossPct: DEFAULT_PARAMS.risk.stopLossPct,
       dayStart,
-      environment: buildEnvironment({ benchmark, industries: envTargets, bars, snapshots }),
+      environment: buildEnvironment({ benchmark, industries: envTargets, bars, snapshots, closeMs }),
     })
   }
 

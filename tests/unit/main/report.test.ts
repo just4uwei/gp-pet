@@ -14,7 +14,9 @@ import { describe, expect, it } from 'vitest'
 import {
   buildDailyReport,
   highlightsOf,
+  reportSubjectDate,
   reportableItems,
+  stampsOf,
   toStopPct,
   type BuildReportInput,
 } from '@main/report/build'
@@ -31,6 +33,8 @@ import type { Candle, GatedDirection, SecCode, Snapshot, TradeDate } from '@core
 const DATE = '2026-08-14' as TradeDate
 const AT = 1_760_000_000_000
 const DAY_START = 1_759_900_000_000
+/** DATE 那天的北京 15:00。真实值由 `closeMsOf` 算，这里只需要一个可辨认的常量 */
+const CLOSE_MS = 1_759_990_000_000
 
 function item(code: string, name = `票-${code}`, industry?: string): WatchItem {
   return {
@@ -137,6 +141,7 @@ function input(over: Partial<BuildReportInput> = {}): BuildReportInput {
   return {
     date: DATE,
     at: AT,
+    closeMs: CLOSE_MS,
     items: [item('SH600000')],
     bars: new Map(),
     snapshots: new Map(),
@@ -418,5 +423,126 @@ describe('reportableItems', () => {
     const held: WatchItem = { ...item('SZ000001'), hasPosition: true }
     const kept = reportableItems([item('SH600000'), held], INDUSTRY_ETF_GROUP)
     expect(kept).toHaveLength(2)
+  })
+})
+
+/*
+  日报该报哪一天（`reportSubjectDate`，2026-08-18）。
+
+  这一条钉的是一个**混口径**的错：旧判据是「库里最后一根日线的日期」，
+  而当日日线要到次日盘前才入库 ⇒ 整个今天（含盘中）日报都停在昨天、还打「已定稿」，
+  而同屏的信号 / 提醒统计按今天的日界切 —— 一份报告里「昨天的价 + 今天的信号」，
+  界面上完全看不出来。
+*/
+describe('reportSubjectDate：报的是当前交易日', () => {
+  const TODAY = '2026-08-18' as TradeDate
+  const YESTERDAY = '2026-08-17' as TradeDate
+
+  it('交易日开盘之后 → 今天（今天的收盘线还没入库不要紧，那是 stage 在说的事）', () => {
+    for (const minuteOfDay of [9 * 60 + 30, 11 * 60, 15 * 60, 22 * 60]) {
+      expect(
+        reportSubjectDate({ today: TODAY, todayIsOpen: true, minuteOfDay, lastDataDate: YESTERDAY })
+      ).toBe(TODAY)
+    }
+  })
+
+  it('开盘前 → 库里最后一天：那时今天一个数都没有，给昨天的定稿版比给一屏「—」有用', () => {
+    for (const minuteOfDay of [0, 9 * 60, 9 * 60 + 29]) {
+      expect(
+        reportSubjectDate({ today: TODAY, todayIsOpen: true, minuteOfDay, lastDataDate: YESTERDAY })
+      ).toBe(YESTERDAY)
+    }
+  })
+
+  it('休市日（周末 / 节假日）→ 库里最后一天，钟点再晚也一样', () => {
+    expect(
+      reportSubjectDate({ today: TODAY, todayIsOpen: false, minuteOfDay: 20 * 60, lastDataDate: YESTERDAY })
+    ).toBe(YESTERDAY)
+  })
+
+  it('一根日线都没有 → 退到今天（报告里全是「—」，而那正是实情）', () => {
+    expect(
+      reportSubjectDate({ today: TODAY, todayIsOpen: false, minuteOfDay: 20 * 60, lastDataDate: null })
+    ).toBe(TODAY)
+  })
+})
+
+/*
+  每一节的「数据时刻」（`stampsOf`，2026-08-18）。
+
+  口径是**数据时刻**不是重算时刻：全标成生成时刻等于每节都说「刚更新过」，
+  而「今日提醒」那一节可能从早上 09:03 起就没变过 —— 那是一个每节相同、且会说谎的数。
+*/
+describe('stamps：每节标自己的数据时刻', () => {
+  const bars = new Map([['SH600000' as SecCode, { day: candle(DATE, 11), prev: candle('2026-08-13', 10) }]])
+
+  it('收盘线那一支的时刻是**那天的收盘**，不是抓取时刻', () => {
+    const quote = buildDailyReport(input({ bars })).stocks[0]?.quote
+    expect(quote?.source).toBe('CLOSE')
+    expect(quote?.at).toBe(CLOSE_MS)
+  })
+
+  it('快照那一支用 `Snapshot.at`（最后成交时刻），不是「现在」', () => {
+    const at = AT - 3_600_000
+    const snapshots = new Map([['SH600000' as SecCode, snapshot('SH600000', { at })]])
+    expect(buildDailyReport(input({ snapshots })).stocks[0]?.quote?.at).toBe(at)
+  })
+
+  it('逐只那一节取「行情与信号里最新的一条」', () => {
+    const signals = [signal('SH600000', { createdAt: CLOSE_MS + 60_000 })]
+    const report = buildDailyReport(input({ bars, signals }))
+    // 信号比收盘线新 → 取信号
+    expect(report.stamps.stocks).toBe(CLOSE_MS + 60_000)
+  })
+
+  it('停牌股那个很旧的快照不把整节拉旧 —— 取最新（单只有多旧由那一行自己回答）', () => {
+    const stale = AT - 5 * 86_400_000
+    const report = buildDailyReport(
+      input({
+        items: [item('SH600000'), item('SZ000001')],
+        bars,
+        snapshots: new Map([['SZ000001' as SecCode, snapshot('SZ000001', { at: stale })]]),
+      })
+    )
+    expect(report.stamps.stocks).toBe(CLOSE_MS)
+    // 那一行自己仍然带着真实的旧时刻
+    expect(report.stocks[1]?.quote?.at).toBe(stale)
+  })
+
+  it('一条事实都没有的那节是 null —— 不许退回 0 或生成时刻（那等于替空白内容担保）', () => {
+    const report = buildDailyReport(input())
+    expect(report.stamps.alerts).toBeNull()
+    expect(report.stamps.tomorrow).toBeNull()
+    expect(report.stamps.environment).toBeNull()
+    expect(report.stamps.stocks).toBeNull()
+  })
+
+  it('提醒那一节取当日最后一条提醒的时刻', () => {
+    const report = buildDailyReport(input({ alerts: [alert({ createdAt: 5_000 }), alert({ createdAt: 9_000 })] }))
+    expect(report.stamps.alerts).toBe(9_000)
+  })
+
+  it('「明日关注」每一项都带着被复述那条东西自己的时刻', () => {
+    const signals = [signal('SH600000', { direction: 'NEXT_DAY_WATCH', createdAt: 7_777 })]
+    const points = [point('SH600000', { createdAt: 8_888 })]
+    const report = buildDailyReport(input({ signals, watchPoints: points }))
+    const watch = report.tomorrow.find((row) => row.kind === 'NEXT_DAY_WATCH')
+    const pointRow = report.tomorrow.find((row) => row.kind === 'WATCH_POINT')
+    expect(watch?.at).toBe(7_777)
+    expect(pointRow?.at).toBe(8_888)
+    expect(report.stamps.tomorrow).toBe(8_888)
+  })
+
+  it('今日汇总是派生节：取它复述的那几节里最新的一条', () => {
+    const stamps = stampsOf({
+      stocks: [],
+      environment: { benchmark: null, industries: [], breadth: { withQuote: 0, up: 0, down: 0, flat: 0 }, missing: [], lines: [] },
+      lastSignalAt: 100,
+      tomorrow: [{ code: 'SH600000' as SecCode, name: '票', kind: 'NEXT_DAY_WATCH', note: '', at: 300 }],
+      alerts: [alert({ createdAt: 200 })],
+    })
+    expect(stamps.summary).toBe(300)
+    // 环境那一节与它无关，仍然是 null
+    expect(stamps.environment).toBeNull()
   })
 })

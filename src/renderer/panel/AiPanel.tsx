@@ -40,6 +40,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { GatedDirection, SecCode } from '@core/types'
 import type { AiExplainRecord, SignalRecord } from '@shared/ipc-types'
+import { shanghaiMdHhmm } from '@shared/time'
 import { AiExplain, visibleAiText } from './AiExplain'
 
 const DIRECTION_LABEL: Record<GatedDirection, string> = {
@@ -50,11 +51,8 @@ const DIRECTION_LABEL: Record<GatedDirection, string> = {
   NONE: '观察',
 }
 
-function stamp(ms: number): string {
-  const at = new Date(ms)
-  const pad = (n: number): string => String(n).padStart(2, '0')
-  return `${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}`
-}
+/** 北京时间（`shared/time.ts`）。`getHours()` 会按宿主时区偏 —— 理由见 AlertLog 那一处 */
+const stamp = shanghaiMdHhmm
 
 export function AiPanel({
   code,

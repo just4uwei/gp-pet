@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { SHANGHAI_OFFSET_MS, shanghaiDayStartMs } from '@shared/time'
+import {
+  SHANGHAI_OFFSET_MS,
+  shanghaiDate,
+  shanghaiDayStartMs,
+  shanghaiHhmm,
+  shanghaiHhmmss,
+  shanghaiMdHhmm,
+} from '@shared/time'
 
 /** 北京时间 2026-08-15 00:00:00 = UTC 2026-08-14 16:00:00 */
 const AUG15_START = Date.UTC(2026, 7, 14, 16, 0, 0)
@@ -44,5 +51,40 @@ describe('shanghaiDayStartMs', () => {
     const start = shanghaiDayStartMs(at)
     expect(start).toBeLessThanOrEqual(at)
     expect(at - start).toBeLessThan(86_400_000)
+  })
+})
+
+/*
+  展示用的格式化（2026-08-18）。
+
+  这几条钉的是**同一个宿主时区的坑**：面板上六处原先用 `getHours()`，
+  在本机（UTC+7）上会把北京 15:00 写成 14:00 —— 而页头那个「北京时间」时钟就在同一屏，
+  日报的「今日提醒 09:03」也会与提醒日志的「08:03」对不上。
+  所以断言的方式是「换任何一个宿主时区，结果都不变」的那种：只喂 epoch，只比字符串。
+*/
+describe('展示用格式化：一律北京时间', () => {
+  /** 北京 2026-08-18 15:00:07 */
+  const CLOSE = Date.UTC(2026, 7, 18, 7, 0, 7)
+
+  it('shanghaiHhmm / shanghaiHhmmss 按北京时间读，不受宿主时区影响', () => {
+    expect(shanghaiHhmm(CLOSE)).toBe('15:00')
+    expect(shanghaiHhmmss(CLOSE)).toBe('15:00:07')
+  })
+
+  it('秒必须有：盘中两轮之间只差 30 秒，只给分钟看不出这一屏动没动', () => {
+    expect(shanghaiHhmmss(CLOSE + 30_000)).toBe('15:00:37')
+    expect(shanghaiHhmm(CLOSE + 30_000)).toBe(shanghaiHhmm(CLOSE))
+  })
+
+  it('shanghaiMdHhmm 带月日 —— 只给 HH:mm 会让昨晚的东西看起来像刚才的', () => {
+    expect(shanghaiMdHhmm(CLOSE)).toBe('08-18 15:00')
+    // 北京 2026-01-02 09:05（个位月与个位日都要补零）
+    expect(shanghaiMdHhmm(Date.UTC(2026, 0, 2, 1, 5, 0))).toBe('01-02 09:05')
+  })
+
+  it('shanghaiDate 给的是北京日：北京 00:30 那一刻仍算前一个 UTC 日的次日', () => {
+    // 北京 2026-08-19 00:30 = UTC 2026-08-18 16:30
+    expect(shanghaiDate(Date.UTC(2026, 7, 18, 16, 30, 0))).toBe('2026-08-19')
+    expect(shanghaiDate(CLOSE)).toBe('2026-08-18')
   })
 })

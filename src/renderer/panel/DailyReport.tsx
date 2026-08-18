@@ -12,11 +12,20 @@
  *
  * 与「观察点」「影子运行」同一形态：**不订阅推送**，切进来时拉一次。
  * 日报是「一天结束后看一眼」的东西，让它每 30 秒跳一次数字既没必要也让人分心。
+ * 代价是这一屏会静止（收盘后引擎不再推 `push:engineStatus`，连那次重取也没了）——
+ * 所以页头必须给出**生成时刻**与一个**刷新**按钮：静止是可以的，静止而看不出来不行。
+ *
+ * ## 每个栏目标题后面那个时刻是「数据时刻」，不是「重算时刻」（2026-08-18）
+ *
+ * 各节的新鲜度天生不同：行情每 30 秒一跳，而「今日提醒」可能从早上 09:03 起就没变过。
+ * 全标成生成时刻等于每节都说「刚更新」，那是一个会说谎的数。判据在
+ * `report/build.ts` 的 `stampsOf()`（纯函数 + 用例），这里只负责画。
  */
 
 import { useCallback, useEffect, useState } from 'react'
 import type { DailyReport, DailyReportStock, ReportEnvironment, ReportNoteView } from '@shared/ipc-types'
 import { reportTargetId } from '@shared/ai-target'
+import { shanghaiDate, shanghaiHhmmss, shanghaiMdHhmm } from '@shared/time'
 import type { TradeDate } from '@core/types'
 import { FOOTER_NOTE } from './disclaimer'
 import { useAiStream } from './useAiStream'
@@ -60,6 +69,43 @@ function num(value: number | null | undefined, digits = 2): string {
 }
 
 /**
+ * 时刻一律按**北京时间**格式化（`shared/time.ts`）。
+ * 用 `toLocaleTimeString` / `getHours()` 会按宿主时区二次偏移 —— 本机 UTC+7 上
+ * 北京 15:00 会写成 14:00，而页头那个「北京时间」时钟就在同一屏上。
+ *
+ * 落在报告那一天之外的时刻带上日期：只给 `HH:mm` 会让昨晚的东西看起来像刚才的。
+ */
+function stampText(at: number, reportDate: string): string {
+  return shanghaiDate(at) === reportDate ? shanghaiHhmmss(at) : shanghaiMdHhmm(at)
+}
+
+/**
+ * 栏目标题后的数据时刻。
+ *
+ * `at` 为 null = 这一节还没有任何事实 → 说「暂无」。**不许退回生成时刻或 0**：
+ * 那等于替一节空白内容担保「刚更新过」。
+ */
+function SectionTime({
+  at,
+  reportDate,
+  what,
+}: {
+  at: number | null
+  reportDate: string
+  /** 这个时刻是「什么」的时刻 —— 写进 tooltip，别让用户猜 */
+  what: string
+}): React.JSX.Element {
+  return (
+    <span
+      className="shrink-0 font-mono text-[11px] tabular-nums text-white/30"
+      title={at === null ? `这一节暂无数据（${what}）` : `${what}：${stampText(at, reportDate)}（北京时间）`}
+    >
+      {at === null ? '暂无' : stampText(at, reportDate)}
+    </span>
+  )
+}
+
+/**
  * 今日环境（docs/11 N1）。**独立的一节，与「逐只」分开** ——
  * 上面那几张卡答的是「我自己的票今天怎么样」，这一节答的是「今天大盘与行业怎么样」。
  * 混在一起会让 15 只观察标的把用户自己的 7 只埋掉（`controller.ts` 的 `dailyReport()`）。
@@ -67,11 +113,22 @@ function num(value: number | null | undefined, digits = 2): string {
  * 这里**只画数**，一句判断都不加：`lines` 由 `report/environment.ts` 拼好，
  * 每一句都能从同屏的数字里逐字推出。
  */
-function EnvironmentCard({ env }: { env: ReportEnvironment }): React.JSX.Element {
+function EnvironmentCard({
+  env,
+  at,
+  reportDate,
+}: {
+  env: ReportEnvironment
+  at: number | null
+  reportDate: string
+}): React.JSX.Element {
   return (
     <section className="gp-card">
-      <div className="flex items-baseline justify-between px-3 py-2">
-        <h2 className="text-sm text-white/70">今日环境</h2>
+      <div className="flex items-baseline justify-between gap-2 px-3 py-2">
+        <h2 className="flex items-baseline gap-2 text-sm text-white/70">
+          今日环境
+          <SectionTime at={at} reportDate={reportDate} what="这一节里最新的一条行情" />
+        </h2>
         <span className="text-xs text-white/30">
           {env.breadth.withQuote}/{env.industries.length} 行业有行情
         </span>
@@ -109,7 +166,7 @@ function EnvironmentCard({ env }: { env: ReportEnvironment }): React.JSX.Element
   )
 }
 
-function StockRow({ stock }: { stock: DailyReportStock }): React.JSX.Element {
+function StockRow({ stock, reportDate }: { stock: DailyReportStock; reportDate: string }): React.JSX.Element {
   const quote = stock.quote
   const last = stock.signals.last
   return (
@@ -118,9 +175,16 @@ function StockRow({ stock }: { stock: DailyReportStock }): React.JSX.Element {
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-2">
             <span className="truncate">{stock.name}</span>
-            {/* 快照来源要逐只标注：同一份日报里可能一部分定稿、一部分还没有 */}
+            {/*
+              快照来源要逐只标注：同一份日报里可能一部分定稿、一部分还没有。
+              时刻也逐只给（tooltip）—— 停牌股的「最后成交」可以是几天前的，
+              而整节那个时刻取的是最新值，看不出某一行有多旧。
+            */}
             {quote?.source === 'SNAPSHOT' ? (
-              <span className="shrink-0 rounded bg-white/10 px-1 text-[10px] text-white/50" title="当日日线尚未入库，这一行取自盘中最后一次行情">
+              <span
+                className="shrink-0 rounded bg-white/10 px-1 text-[10px] text-white/50"
+                title={`当日日线尚未入库，这一行取自盘中最后一次行情（最后成交 ${stampText(quote.at, reportDate)}）`}
+              >
                 盘中
               </span>
             ) : null}
@@ -226,7 +290,16 @@ function ReportNoteBlock({
     <section className="gp-card">
       <div className="flex items-center justify-between gap-2 px-3 py-2">
         <div>
-          <h2 className="text-sm text-white/70">整体评价（AI）</h2>
+          <h2 className="flex items-baseline gap-2 text-sm text-white/70">
+            整体评价（AI）
+            {/*
+              这一节的「数据时刻」就是那段话的生成时刻（脚注里也有一份，那份还带模型名）。
+              流式跑着的时候不显示 —— 那时它还没有落库时刻，写一个「刚才」是编的
+            */}
+            {stream.phase === 'idle' && stored ? (
+              <SectionTime at={stored.createdAt} reportDate={date} what="这段评价的生成时刻" />
+            ) : null}
+          </h2>
           <p className="mt-0.5 text-[11px] leading-snug text-white/35">
             由你在设置里配置的模型生成。它只做跨标的的横向观察，不改任何结论、也不给单只票的买卖建议。
           </p>
@@ -288,7 +361,8 @@ function ReportNoteBlock({
         {showing !== '' && stream.error === null ? (
           <p className="mt-2 border-t border-white/[0.06] pt-1.5 text-[10px] leading-snug text-white/30">
             以上由模型根据本地已算出的日报生成
-            {stream.phase === 'idle' && stored ? `（${stored.model}，${new Date(stored.createdAt).toLocaleString('zh-CN')}）` : ''}
+            {/* 时刻按北京时间，与这一屏其余时刻同一口径（`toLocaleString` 会按宿主时区偏） */}
+            {stream.phase === 'idle' && stored ? `（${stored.model}，${shanghaiMdHhmm(stored.createdAt)}）` : ''}
             ，不是本软件的结论，也未经任何回测验证。
           </p>
         ) : null}
@@ -329,6 +403,17 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
     return <p className="px-3 py-10 text-center text-sm text-white/35">数据层尚未就绪。</p>
   }
 
+  /*
+    页头那个「数据截至」= 各节数据时刻的**最大值**。
+
+    在这里现算而不是让主进程多给一个字段：它是 `stamps` 的纯派生量，
+    多一个字段就多一个会与那五个数不一致的地方。
+  */
+  const newestStamp = Object.values(report.stamps).reduce<number | null>(
+    (best, at) => (at !== null && (best === null || at > best) ? at : best),
+    null
+  )
+
   return (
     /*
       **高度自适应，不要 `flex-1` / `overflow-y-auto`**：滚动是外层那一层的事
@@ -348,46 +433,83 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
         不属于任何一个时段的板块。把它塞进第一张卡会让那张卡看起来比别的卡更重要，
         而它其实只是个标题。
       */}
-      <div className="flex items-center justify-between px-1">
+      <div className="flex items-center justify-between gap-3 px-1">
         <div className="flex items-baseline gap-2">
           <h2 className="text-sm text-white/70">收盘日报</h2>
           <span className="font-mono text-xs text-white/40">{report.date}</span>
+          <span
+            className={`rounded border px-1.5 py-0.5 text-[10px] ${
+              report.stage === 'FINAL'
+                ? 'border-emerald-400/40 bg-emerald-400/10 text-emerald-200'
+                : 'border-amber-400/40 bg-amber-400/10 text-amber-200'
+            }`}
+            title={
+              report.stage === 'FINAL'
+                ? '每只有数据的标的都用上了当日收盘线'
+                : '当日日线尚未入库（数据源 15:05–15:30 才发布），部分数字取自盘中最后一次行情，次日盘前定稿'
+            }
+          >
+            {/*
+              未定稿态的文案刻意不叫「盘中数据」（2026-08-18 改）：日期改成当前交易日之后，
+              这个 badge 在 16:00 也会出现，那时「盘中」是错的。具体几点的数由旁边的时刻回答。
+            */}
+            {report.stage === 'FINAL' ? '已定稿' : '未定稿'}
+          </span>
         </div>
-        <span
-          className={`rounded border px-1.5 py-0.5 text-[10px] ${
-            report.stage === 'FINAL'
-              ? 'border-emerald-400/40 bg-emerald-400/10 text-emerald-200'
-              : 'border-amber-400/40 bg-amber-400/10 text-amber-200'
-          }`}
-          title={
-            report.stage === 'FINAL'
-              ? '每只有数据的标的都用上了当日收盘线'
-              : '当日日线尚未入库，部分数字取自盘中最后一次行情，收盘后可能微调'
-          }
-        >
-          {report.stage === 'FINAL' ? '已定稿' : '盘中数据'}
-        </span>
+        <div className="flex shrink-0 items-baseline gap-2 text-[11px] text-white/35">
+          {/*
+            两个时刻分开给，别合成一个：
+            「数据截至」= 这份报告里最新的一条事实是几点的（各节取最大）；
+            「生成」= 这一屏是几点算出来的。收盘后引擎停止推送 ⇒ 这一屏会静止，
+            那时两个数会一起停住，而点「刷新」只会让后一个前进 —— 那个区别正是要让人看见的。
+          */}
+          <span className="font-mono tabular-nums" title="这份报告里最新的一条事实的时刻（北京时间）">
+            数据截至 {newestStamp === null ? '—' : stampText(newestStamp, report.date)}
+          </span>
+          <span className="font-mono tabular-nums text-white/25" title="这一屏是什么时候算出来的（北京时间）">
+            生成 {stampText(report.at, report.date)}
+          </span>
+          <button
+            className="gp-btn text-[11px]"
+            onClick={load}
+            disabled={loading}
+            title="重新汇总一次。收盘后引擎不再推送，这一屏不会自己更新"
+          >
+            {loading ? '刷新中…' : '刷新'}
+          </button>
+        </div>
       </div>
 
-      <EnvironmentCard env={report.environment} />
+      <EnvironmentCard env={report.environment} at={report.stamps.environment} reportDate={report.date} />
 
       <section className="gp-card">
-        <div className="flex items-center justify-between px-3 py-2">
-          <h2 className="text-sm text-white/70">逐只</h2>
+        <div className="flex items-center justify-between gap-2 px-3 py-2">
+          <h2 className="flex items-baseline gap-2 text-sm text-white/70">
+            逐只
+            <SectionTime
+              at={report.stamps.stocks}
+              reportDate={report.date}
+              what="这一节里最新的一条行情或信号"
+            />
+          </h2>
           <span className="text-xs text-white/30">
             {report.data.withClose}/{report.overview.watchCount} 已有收盘线
           </span>
         </div>
         <ul className="border-t border-white/[0.06]">
           {report.stocks.map((stock) => (
-            <StockRow key={stock.code} stock={stock} />
+            <StockRow key={stock.code} stock={stock} reportDate={report.date} />
           ))}
         </ul>
       </section>
 
       <section className="gp-card">
         <div className="px-3 py-2">
-          <h2 className="text-sm text-white/70">今日汇总</h2>
+          <h2 className="flex items-baseline gap-2 text-sm text-white/70">
+            今日汇总
+            {/* 它是上面几节的复述 ⇒ 时刻取它复述的那些事实里最新的一条（stampsOf 的边界 3） */}
+            <SectionTime at={report.stamps.summary} reportDate={report.date} what="被复述的那些事实里最新的一条" />
+          </h2>
         </div>
         <div className="space-y-1 border-t border-white/[0.06] px-3 py-2.5 text-sm text-white/70">
           {report.highlights.map((line) => (
@@ -404,7 +526,10 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
 
       <section className="gp-card">
         <div className="px-3 py-2">
-          <h2 className="text-sm text-white/70">明日关注</h2>
+          <h2 className="flex items-baseline gap-2 text-sm text-white/70">
+            明日关注
+            <SectionTime at={report.stamps.tomorrow} reportDate={report.date} what="被复述的那些结论里最新的一条" />
+          </h2>
           {/*
             这一句不是客套：它是「日报只复述不推导」这条纪律对用户的交代 ——
             让他知道这里不会冒出一个别处没有的结论
@@ -432,6 +557,13 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
                   <span className="ml-2 font-mono text-xs text-white/35">{row.code}</span>
                 </span>
                 <span className="text-xs text-white/50">{row.note}</span>
+                {/* 被复述的那条东西自己是几点得出的 —— 「只复述不推导」的可核对版本 */}
+                <span
+                  className="shrink-0 font-mono text-[11px] tabular-nums text-white/25"
+                  title="被复述的那条信号 / 观察点自己的时刻（北京时间）"
+                >
+                  {stampText(row.at, report.date)}
+                </span>
               </li>
             ))}
           </ul>
@@ -452,7 +584,11 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
           onClick={() => setAlertsOpen((open) => !open)}
         >
           <span className="inline-block w-2 text-xs text-white/35">{alertsOpen ? '▾' : '▸'}</span>
-          <h2 className="text-sm text-white/70">今日提醒</h2>
+          <h2 className="flex items-baseline gap-2 text-sm text-white/70">
+            今日提醒
+            {/* 这一节可能从早上 09:03 起就没变过 —— 那正是「数据时刻」要说的事 */}
+            <SectionTime at={report.stamps.alerts} reportDate={report.date} what="今日最后一条提醒的时刻" />
+          </h2>
           <span className="ml-auto text-xs text-white/45">
             发出 {report.alerts.delivered} 条 · 挡下或降级 {report.alerts.gated} 条
           </span>

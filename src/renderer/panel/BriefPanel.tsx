@@ -26,16 +26,17 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import type { BriefItem, BriefStock, DailyBrief } from '@shared/ipc-types'
+import { shanghaiMdHhmm } from '@shared/time'
 import { FOOTER_NOTE } from './disclaimer'
 
 /** 默认回看窗口：3 天。周五收盘后到周一开盘之间隔着两个自然日，短于它会漏掉整个周末 */
 const LOOKBACK_DAYS = 3
 
-function timeText(ms: number): string {
-  const d = new Date(ms)
-  const p = (n: number): string => String(n).padStart(2, '0')
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
-}
+/**
+ * 北京时间（`shared/time.ts`）。公告的 `display_time` 本来就是北京时刻，
+ * 用 `getHours()` 读会在非 +08 的机器上整体偏掉 —— 而「昨收盘之后」这个窗口正是按它切的。
+ */
+const timeText = shanghaiMdHhmm
 
 function ItemRow({ item }: { item: BriefItem }): React.JSX.Element {
   return (

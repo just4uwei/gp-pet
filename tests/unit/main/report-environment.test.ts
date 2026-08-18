@@ -14,7 +14,12 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { buildEnvironment, type EnvironmentTarget } from '@main/report/environment'
+import {
+  buildEnvironment,
+  type BuildEnvironmentInput,
+  type EnvironmentTarget,
+} from '@main/report/environment'
+import type { ReportEnvironment } from '@shared/ipc-types'
 import { FORBIDDEN_WORDS } from '@main/ai/prompt'
 import type { Candle, SecCode, Snapshot } from '@core/types'
 
@@ -70,9 +75,17 @@ function barsOf(spec: Record<string, number>): Map<SecCode, { day: Candle; prev?
 
 const BENCH = target('SH000300', '沪深300')
 
+/** DATE 那天的北京 15:00。收盘线的「数据时刻」用它 —— 下面多数用例不关心它的值 */
+const CLOSE_MS = 1_759_990_000_000
+
+/** 统一补上 `closeMs`，免得每个用例都写一遍一个它并不关心的数 */
+function buildEnv(input: Omit<BuildEnvironmentInput, 'closeMs'>): ReportEnvironment {
+  return buildEnvironment({ ...input, closeMs: CLOSE_MS })
+}
+
 describe('buildEnvironment', () => {
   it('breadth 的分母是「有行情的只数」，不是清单长度 —— 缺数不能被读成平盘', () => {
-    const env = buildEnvironment({
+    const env = buildEnv({
       benchmark: BENCH,
       industries: [target('SH512800', '银行ETF', '银行'), target('SH512880', '证券ETF', '证券'), target('SH512980', '传媒ETF', '传媒')],
       bars: barsOf({ SH512800: 1.5, SH512880: -2 }),
@@ -85,7 +98,7 @@ describe('buildEnvironment', () => {
   })
 
   it('缺失必须显式列出并出现在陈述里 —— 静默少几行会让「普涨」凭空成立', () => {
-    const env = buildEnvironment({
+    const env = buildEnv({
       benchmark: BENCH,
       industries: [target('SH512800', '银行ETF'), target('SH512880', '证券ETF')],
       bars: barsOf({ SH512800: 1.5 }),
@@ -100,7 +113,7 @@ describe('buildEnvironment', () => {
   })
 
   it('一只行业都没取到时说清楚为什么，而不是留一片「—」（真机现状：ETF 刚加进自选，还没跑过交易日）', () => {
-    const env = buildEnvironment({
+    const env = buildEnv({
       benchmark: BENCH,
       industries: [target('SH512800', '银行ETF'), target('SH512880', '证券ETF')],
       bars: barsOf({ SH000300: -1.2 }),
@@ -115,7 +128,7 @@ describe('buildEnvironment', () => {
   })
 
   it('拿不到行情时 quote 是 null，不是 0（约束 4）', () => {
-    const env = buildEnvironment({
+    const env = buildEnv({
       benchmark: BENCH,
       industries: [target('SH512800', '银行ETF')],
       bars: new Map(),
@@ -128,7 +141,7 @@ describe('buildEnvironment', () => {
   })
 
   it('按涨跌幅降序，拿不到行情的排最后', () => {
-    const env = buildEnvironment({
+    const env = buildEnv({
       benchmark: undefined,
       industries: [
         target('SH512800', '银行ETF'),
@@ -145,7 +158,7 @@ describe('buildEnvironment', () => {
   })
 
   it('收盘线优先于快照，两者不混用', () => {
-    const env = buildEnvironment({
+    const env = buildEnv({
       benchmark: undefined,
       industries: [target('SH512800', '银行ETF'), target('SH512880', '证券ETF')],
       // 银行有收盘线（+1%），证券只有快照（110/100 = +10%）
@@ -164,7 +177,7 @@ describe('buildEnvironment', () => {
   })
 
   it('只有一只有行情时不说「最高/最低」—— 那是句废话', () => {
-    const env = buildEnvironment({
+    const env = buildEnv({
       benchmark: undefined,
       industries: [target('SH512800', '银行ETF'), target('SH512880', '证券ETF')],
       bars: barsOf({ SH512800: 1 }),
@@ -174,7 +187,7 @@ describe('buildEnvironment', () => {
   })
 
   it('两只以上时报出两端，且百分号与符号是显式的', () => {
-    const env = buildEnvironment({
+    const env = buildEnv({
       benchmark: BENCH,
       industries: [target('SH512800', '银行ETF'), target('SH512880', '证券ETF')],
       bars: barsOf({ SH000300: -1.2, SH512800: 1.5, SH512880: -2.34 }),
@@ -188,7 +201,7 @@ describe('buildEnvironment', () => {
   })
 
   it('lines 是陈述不是评价：不出现禁用词，也不出现「环境不好」这类判断', () => {
-    const env = buildEnvironment({
+    const env = buildEnv({
       benchmark: BENCH,
       industries: [target('SH512800', '银行ETF'), target('SH512880', '证券ETF')],
       bars: barsOf({ SH000300: -3, SH512800: -2, SH512880: -4 }),
@@ -203,15 +216,30 @@ describe('buildEnvironment', () => {
   })
 
   it('一只都没有时给一句实话，而不是空数组', () => {
-    const env = buildEnvironment({ benchmark: undefined, industries: [], bars: new Map(), snapshots: new Map() })
+    const env = buildEnv({ benchmark: undefined, industries: [], bars: new Map(), snapshots: new Map() })
     expect(env.lines).toEqual(['今日环境数据暂缺。'])
     expect(env.breadth.withQuote).toBe(0)
     expect(env.missing).toEqual([])
   })
 
+  /*
+    行情的「数据时刻」（2026-08-18）。日报页头与各栏目标题上的时刻从这里来 ——
+    环境那一节的时刻取的是它自己这些标的里最新的一条。
+  */
+  it('收盘线的时刻是那天的收盘（closeMs），快照的是最后成交时刻', () => {
+    const env = buildEnv({
+      benchmark: undefined,
+      industries: [target('SH512800', '银行ETF'), target('SH512880', '证券ETF')],
+      bars: barsOf({ SH512800: 1 }),
+      snapshots: new Map([['SH512880' as SecCode, snapshot('SH512880', 110, 100)]]),
+    })
+    expect(env.industries.find((i) => i.code === 'SH512800')?.quote?.at).toBe(CLOSE_MS)
+    expect(env.industries.find((i) => i.code === 'SH512880')?.quote?.at).toBe(AT)
+  })
+
   it('并列涨跌幅时按代码定序 —— 顺序抖动的列表读起来像在闪', () => {
     const build = (): string[] =>
-      buildEnvironment({
+      buildEnv({
         benchmark: undefined,
         industries: [target('SZ159755', '电池ETF'), target('SH512800', '银行ETF')],
         bars: barsOf({ SH512800: 1, SZ159755: 1 }),

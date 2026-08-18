@@ -23,6 +23,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { AlertLevel, GatedDirection } from '@core/types'
 import type { AlertRecord } from '@shared/ipc-types'
+import { shanghaiHhmm } from '@shared/time'
 
 const DIRECTION_LABEL: Record<GatedDirection, string> = {
   BUY: '买入',
@@ -55,10 +56,12 @@ const LEVEL_LABEL: Record<AlertLevel, string> = {
   L3: '气泡 · 当日一次',
 }
 
-function timeOf(ms: number): string {
-  const at = new Date(ms)
-  return `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
-}
+/*
+  时刻按**北京时间**（`shared/time.ts`），不是宿主本地时区。
+  原先这里用 `getHours()`：UTC+8 上恰好对，本机（UTC+7）上北京 09:03 那条会写成 08:03 ——
+  而日报「今日提醒」那一节标的是同一条提醒的北京时刻，两屏对不上而用户没法判断哪个对。
+*/
+const timeOf = shanghaiHhmm
 
 /** 当天 00:00。与「今日信号」同一口径 */
 function startOfToday(): number {

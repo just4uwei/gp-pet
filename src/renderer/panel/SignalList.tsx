@@ -48,6 +48,7 @@ import type { SignalEvidence, SignalRecord, WatchPointView } from '@shared/ipc-t
 import { WATCH_MARK_LABEL, type WatchMark } from '@shared/watch-mark'
 import { pinnedSignal, type SignalGroup } from '@shared/signal-group'
 import { metricLabel } from '@shared/watch-metrics'
+import { shanghaiHhmm } from '@shared/time'
 
 const DIRECTION_LABEL: Record<GatedDirection, string> = {
   BUY: '买入',
@@ -122,10 +123,8 @@ const SUB_SIGNAL_LABEL: Record<string, string> = {
   M3_FALSE_BREAKOUT: '周线无趋势，突破存疑',
 }
 
-function timeOf(ms: number): string {
-  const date = new Date(ms)
-  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
-}
+/** 北京时间（`shared/time.ts`）。`getHours()` 会按宿主时区偏 —— 理由见 AlertLog 那一处 */
+const timeOf = shanghaiHhmm
 
 function numberText(value: number | null | undefined, digits = 2): string {
   return value === null || value === undefined || !Number.isFinite(value) ? '—' : value.toFixed(digits)
