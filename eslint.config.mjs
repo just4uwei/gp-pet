@@ -40,6 +40,9 @@ export default tseslint.config(
     files: ['tools/**/*.mjs', 'scripts/**/*.mjs'],
     languageOptions: {
       globals: {
+        // `page.evaluate()` 的回调在**浏览器里**执行（fetch-page.mjs --render），
+        // 所以 document 在那些回调里是合法的。只有调研脚本会用到它
+        document: 'readonly',
         AbortSignal: 'readonly',
         Buffer: 'readonly',
         TextDecoder: 'readonly',

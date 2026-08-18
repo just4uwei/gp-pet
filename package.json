@@ -33,7 +33,8 @@
     "fetch:history": "node scripts/fetch-history.mjs",
     "build:universe": "node scripts/build-universe.mjs",
     "fetch:announcements": "node scripts/fetch-announcements.mjs",
-    "fetch:liquidity": "node scripts/fetch-liquidity.mjs"
+    "fetch:liquidity": "node scripts/fetch-liquidity.mjs",
+    "fetch:page": "node scripts/fetch-page.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

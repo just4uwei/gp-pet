@@ -256,6 +256,7 @@ pnpm typecheck        # 三个 tsconfig（node / web / e2e）分别校验
 pnpm lint
 pnpm verify:indicators           # 重出指标黄金用例；加 -- --check 只校验不重写
 pnpm fetch:history -- --codes SH600000,SZ000001 --from 2018-01-01   # 拉真实日线 → data/history/
+pnpm fetch:page -- <url> [--render] [--state <file>] [--links]      # 调研取页（WebFetch 在本机永久不可用，见下）
 pnpm backtest -- --codes SH600000 --fixtures ./data/history --from 2020-01-01 --to 2026-06-30
 pnpm backtest -- --codes ... --fixtures ./data/history --grid params/grid.json   # 参数标定
 pnpm audit:regime -- --codes ... --fixtures ./data/history --to 2026-08-11       # Regime 判定的成因分解
@@ -314,6 +315,14 @@ src/backtest 回测 CLI，复用 src/core
 
 ## 容易踩的坑
 
+- **内置的 WebFetch 工具在这台机器上永久不可用，别再拿它当「站点访问不了」的证据。**
+  它抓之前要做一次域名安全校验，而校验要摸 `claude.ai` —— 实测 `curl https://claude.ai` **000**
+  ⇒ 它对**所有**域名都失败，包括同一时刻 curl 能 200 的站点
+  （`www.joinquant.com` 200 · `raw.githubusercontent.com` 200 · 而 `api.github.com` 确实 000）。
+  调研取页一律走 `pnpm fetch:page`（静态页用 fetch，SPA 加 `--render` 用**系统已装的 Edge/Chrome**，
+  不下载 Playwright 的 Chromium）。**它不是 provider**：不进应用、不进降级链、不占
+  docs/03 §2.4 那份轮询预算。需要登录的站点由**人在有界面窗口里登录**，
+  会话（`storageState`）放在**仓库之外**（`%LOCALAPPDATA%`）—— 它含 cookie，进仓库等于提交凭据。
 - **复权**：指标用前复权（`*Adj` 字段），展示与持仓成本用不复权。混用会伪造出金叉死叉。
 - **回测数据里的 `*Adj` 是后复权，不是前复权。** 腾讯的前复权是加性的（减价差），高分红股上会
   变成**负数** —— 实测中远海控（SH601919）2018–2026 有 714 根前复权收盘价 ≤ 0，最低 -5.145，
@@ -418,6 +427,16 @@ src/backtest 回测 CLI，复用 src/core
   写回门槛是 `|Δ|/标准误 ≥ 2` 且 ≥ 2/3 的折为正。项目一直口头在用的「±1pp 噪音带」
   「正负交替 = 噪音」就是这个数的手算版本，现在别再手算了。
   单折绩效**不可**与整池绩效横向比较，也不可单独引用（窗口短、标的少、回撤分母小）。
+- **那个 `|Δ|/标准误` 没有做相关性调整 ⇒ 它是个「上界」，报告里也没标注**（2026-08-18 盘点）。
+  `stdev(Δ)/√n` 的 `√n` 收敛只在折相互独立时成立，而 12 折是**从同一次模拟里切出来的**：
+  同一时间片里的不同标的子集共享市场 beta，时间片本身连续且持仓跨片重叠 ⇒ **t 偏乐观**。
+  同一个病还落在 Sharpe（`×√243` 的 iid 假设）与 `audit:random` 的**择时**口径
+  （逐次独立抽日，破坏了真实建仓的时间聚集 ⇒ 零分布方差偏小 ⇒ 分位偏向显著）；
+  **跨票口径固定日期，歪打正着地躲过了**（所以 §5.35 的 55.0% 比 §5.21 那批择时分位更可信）。
+  **它不改变迄今任何一条结论**（没有一条是靠刚过线立住的），咬的是未来那个 `t = 2.1` 的候选 ——
+  所以**必须在第一个候选逼近门槛之前修**，否则就是看过数据再改判据。
+  落点与修法见 [迭代计划 §4.6](./docs/notes/下一阶段取舍与迭代计划.md)。
+  **在修好之前，所有 t 与择时分位一律按「未调整上界」读。**
 - **`--grid` 默认不再跑测试集**，要读得显式加 `--touch-test`，并去 docs/07 §3 ④ 的计数里记一笔。
   以前每次调用都自动烧一次测试窗口，历史上 5 次里几乎每一次的优胜者最后都没被采用。
 - **`adx.maxThreshold` 在出厂配置下是算术上的死参数，不要标定它的上侧。**
