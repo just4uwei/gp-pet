@@ -41,10 +41,18 @@ const DIRECTION_TONE: Record<GatedDirection, string> = {
   NONE: 'border-white/15 bg-white/5 text-white/50',
 }
 
+/**
+ * 级别标签。原先写作「表情 + 角标」/「系统通知」，那三样（桌宠表情、托盘角标、
+ * 系统通知）都在 2026-08-13 删掉了 —— 提醒的可见出口只剩气泡。
+ * 这一行显示在「已提醒 · X」后面，写一个不存在的渠道等于让用户去找一个不会出现的弹窗。
+ *
+ * L2 与 L3 渠道相同，区别是冷却窗口（两小时 / 当日一次），标签照着这个区别写。
+ * **级别本身不许合并**（见 dispatcher.ts 的 CHANNELS_BY_LEVEL）。
+ */
 const LEVEL_LABEL: Record<AlertLevel, string> = {
-  L1: '静默（表情 + 角标）',
+  L1: '静默（仅状态点）',
   L2: '气泡',
-  L3: '系统通知',
+  L3: '气泡 · 当日一次',
 }
 
 function timeOf(ms: number): string {

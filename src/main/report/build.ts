@@ -94,6 +94,29 @@ function pct(part: number, whole: number): number {
 }
 
 /**
+ * 日报的 `overview` / `stocks` / `tomorrow` 三节要算哪些标的（2026-08-15 定，08-18 补例外）。
+ *
+ * 内置的「行业ETF」组默认摘掉：日报答的是「我这些票今天怎么样」，
+ * 15 只观察标的混进 7 只真持仓里，用户自己的票会被埋掉一多半，
+ * 而 `highlights` / `tomorrow` 的计数也会被它们顶满。
+ *
+ * **但有持仓的不摘**：行业 ETF 现在可以真的建仓，而持仓就是「我这些票」——
+ * 一只压着真金白银的 ETF 不出现在日报里，那是漏，不是克制。
+ * 而这种漏在界面上看不出来（少一行不会报错），所以判据下沉到这里、由用例钉住。
+ *
+ * 行业动向仍由独立的「今日环境」那一节回答（`report/environment.ts`），
+ * 它列全部 15 只，**含已被这里收走的那几只持仓 ETF** —— 两节答的是两个问题。
+ *
+ * @param etfGroup `INDUSTRY_ETF_GROUP`，由调用方传（本模块不 import `@shared/industry-etf`）
+ */
+export function reportableItems<T extends { group: string; hasPosition: boolean }>(
+  items: readonly T[],
+  etfGroup: string
+): T[] {
+  return items.filter((item) => item.group !== etfGroup || item.hasPosition)
+}
+
+/**
  * 一只票的行情。优先当日收盘线，其次盘中快照，都没有则 null。
  *
  * **两者不混用**：涨跌幅与振幅必须与 `close` 出自同一份数据，

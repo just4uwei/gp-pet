@@ -176,7 +176,7 @@ export interface SignalEvidence {
  */
 export type PetState = 'SLEEPY' | 'IDLE' | 'WATCHING' | 'EXCITED' | 'ALERT' | 'OFFLINE'
 
-/** 气泡与系统通知的展示载荷。四段结构见 docs/05 §5 */
+/** 气泡的展示载荷（系统通知已于 2026-08-13 移除）。四段结构见 docs/05 §5 */
 export interface AlertPayload {
   signalId: string
   level: AlertLevel

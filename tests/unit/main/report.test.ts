@@ -11,7 +11,14 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { buildDailyReport, highlightsOf, toStopPct, type BuildReportInput } from '@main/report/build'
+import {
+  buildDailyReport,
+  highlightsOf,
+  reportableItems,
+  toStopPct,
+  type BuildReportInput,
+} from '@main/report/build'
+import { INDUSTRY_ETF_GROUP } from '@shared/industry-etf'
 import type {
   AlertRecord,
   PositionView,
@@ -379,5 +386,37 @@ describe('highlights：是陈述，不是评价', () => {
 
   it('没有自选时只说这一件事', () => {
     expect(highlightsOf({ ...base, items: [] })).toEqual(['还没有自选股。'])
+  })
+})
+
+/**
+ * 日报要算哪些标的（`reportableItems`）。
+ *
+ * 这一条钉的是一个**看不出来的漏**：持仓中的行业 ETF 若被整组摘掉，
+ * 日报上只是少一行，不报错、不留痕，而那一行对应的是真金白银。
+ */
+describe('reportableItems', () => {
+  const etf = (code: string, hasPosition: boolean): WatchItem => ({
+    code: code as SecCode,
+    name: `ETF-${code}`,
+    group: INDUSTRY_ETF_GROUP,
+    sortOrder: 0,
+    hasPosition,
+  })
+
+  it('无持仓的行业ETF 摘掉 —— 15 只观察标的会把自己的票埋掉一多半', () => {
+    const kept = reportableItems([item('SH600000'), etf('SH512800', false)], INDUSTRY_ETF_GROUP)
+    expect(kept.map((r) => r.code)).toEqual(['SH600000'])
+  })
+
+  it('**有持仓的行业ETF 留下** —— 持仓就是「我这些票」', () => {
+    const kept = reportableItems([item('SH600000'), etf('SH512800', true)], INDUSTRY_ETF_GROUP)
+    expect(kept.map((r) => r.code)).toEqual(['SH600000', 'SH512800'])
+  })
+
+  it('自选组一个都不摘，有没有持仓都一样', () => {
+    const held: WatchItem = { ...item('SZ000001'), hasPosition: true }
+    const kept = reportableItems([item('SH600000'), held], INDUSTRY_ETF_GROUP)
+    expect(kept).toHaveLength(2)
   })
 })

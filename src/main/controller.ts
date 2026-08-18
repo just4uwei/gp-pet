@@ -79,6 +79,7 @@ import { electronAutoLaunchDeps, syncAutoLaunch } from './auto-launch'
 import { createAlertService, type AlertService, type AlertSink } from './alerts/service'
 import type { QuoteView } from './alerts/candidates'
 import { resolveQuiet, type QuietVerdict } from './alerts/dnd'
+import { alertTrackOf } from './alerts/track'
 import { createNotificationStateProbe, type NotificationStateProbe } from './alerts/notification-state'
 import type { DataLayer } from './data-layer'
 import type { SignalOutcome } from './engine'
@@ -108,7 +109,7 @@ import { paramRows } from './settings/params-view'
 import { isReportTarget, reportDateOf } from '@shared/ai-target'
 import { INDUSTRY_ETF_GROUP } from '@shared/industry-etf'
 import { shanghaiDayStartMs } from '@shared/time'
-import { buildDailyReport } from './report/build'
+import { buildDailyReport, reportableItems } from './report/build'
 import { buildEnvironment, type EnvironmentTarget } from './report/environment'
 import { fetchAnnouncements } from './engine/announcements'
 import { buildDailyBrief } from './brief/build'
@@ -267,12 +268,19 @@ export class AppController {
 
         现在它们进闸门，但走 `OBSERVE` 轨：**自己一份日配额、不占个股任何计数器、
         且抢不到气泡**（见 `AlertTrack` 与 service.ts 挑气泡那一段）。
-        于是 PRIMARY 的行为逐位不变，每日打扰上限只多 `observeDailyLimit` 条。
 
-        **每次现读**：用户把某只从 ETF 组移出来，下一轮它就该按个股待遇提醒。
+        **2026-08-18 补一条：有持仓就翻回 PRIMARY。** 行业 ETF 现在可以真的建仓，
+        而 OBSERVE 轨那两条性质（2 条日配额、抢不到气泡）会让持仓的止损一声不响 ——
+        判据与理由在 `alerts/track.ts`。
+
+        **每次现读**（分组与持仓都是）：用户刚录完一笔成交，下一轮它就该按个股待遇提醒。
       */
       trackOf: (code) =>
-        layer.storage.watchlist.get(code)?.group === INDUSTRY_ETF_GROUP ? 'OBSERVE' : 'PRIMARY',
+        alertTrackOf(
+          layer.storage.watchlist.get(code)?.group ?? '',
+          layer.storage.positions.get(code) !== null,
+          INDUSTRY_ETF_GROUP
+        ),
       log,
     })
     this.unread = layer.storage.alerts.unreadCount()
@@ -1311,16 +1319,19 @@ export class AppController {
     if (!layer) return null
 
     /*
-      日报**不含内置的「行业ETF」组**（2026-08-15）。
+      日报**不含内置的「行业ETF」组** —— 但**有持仓的除外**（2026-08-15 定，08-18 补例外）。
 
-      那 15 只是行业观察名单：不设持仓、不发提醒。日报答的是「我这些票今天怎么样」，
-      把 15 只观察标的混进 7 只真持仓里，用户自己的票会被埋掉一多半，
-      而 `highlights` / `tomorrow` 的计数也会被它们顶满。
+      那 15 只原本是纯观察名单。日报答的是「我这些票今天怎么样」，把 15 只观察标的
+      混进 7 只真持仓里，用户自己的票会被埋掉一多半，而 `highlights` / `tomorrow`
+      的计数也会被它们顶满。
 
-      **代价说清楚**：日报里因此看不到行业动向。要看行业得去概览页那一屏。
-      真要在日报里给行业一段，那是独立的一节（与个股分开列），不是把它们混进来。
+      行业 ETF 现在可以真的建仓，而**持仓就是「我这些票」**：一只压着真金白银的 ETF
+      不出现在日报里，那是漏，不是克制。判据因此是持仓而不是分组。
+
+      **代价说清楚**：没持仓的行业动向仍不在这几节里，它在下面那个独立的「今日环境」节。
+      判据下沉在 `report/build.ts` 的 `reportableItems`（有用例）。
     */
-    const items = layer.watchlist.list().filter((item) => item.group !== INDUSTRY_ETF_GROUP)
+    const items = reportableItems(layer.watchlist.list(), INDUSTRY_ETF_GROUP)
     const dates = items
       .map((item) => layer.storage.klines.lastDate(item.code))
       .filter((d): d is TradeDate => d !== null)
@@ -1348,8 +1359,13 @@ export class AppController {
       今日环境（docs/11 N1）：基准指数 + 那 15 只行业 ETF，**独立的一节**。
 
       这正是上面那段注释里说的「真要在日报里给行业一段，那是独立的一节
-      （与个股分开列），不是把它们混进来」—— `items` 依然不含它们，
-      所以 overview / stocks / tomorrow 的计数一个都没变。
+      （与个股分开列），不是把它们混进来」—— `items` 依然不含**没持仓的**它们，
+      所以 overview / stocks / tomorrow 的计数不会被 15 只观察标的顶满。
+
+      **这一节列全部 15 只，含已经被 `items` 收走的那几只持仓 ETF**（2026-08-18）。
+      重复是刻意的：这一节答的是「今天各行业怎么走」，缺了你恰好持有的那个行业，
+      这张行业全景就是残的 —— 而上面那几节答的是「我的票今天怎么样」，
+      两个问题的答案本来就可以指向同一只标的。
 
       取数是零新增的：这些标的本来就在自选里（行业ETF 组）或在 auxCodes 里（基准），
       日线与快照都已经在库。**不含隔夜外盘** —— 原因写在 report/environment.ts 头注释。

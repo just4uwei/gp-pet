@@ -27,11 +27,10 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { hitTest } from '@shared/hit-test'
-import { applyOrder, buildTicker, orderFingerprint, type TickerEntry } from '@shared/ticker'
+import { applyOrder, buildTicker, orderFingerprint, visibleTicker, type TickerEntry } from '@shared/ticker'
 import { WATCH_MARK_LABEL } from '@shared/watch-mark'
 import { T_HINT_LABEL, T_HINT_TITLE } from '@shared/intraday-t'
 import { shanghaiDayStartMs } from '@shared/time'
-import { INDUSTRY_ETF_GROUP } from '@shared/industry-etf'
 import type { GatedDirection, SecCode } from '@core/types'
 import type {
   EngineStatus,
@@ -136,7 +135,7 @@ function changeClass(value: number): string {
  * Windows 的「显示动画」关掉（设置 → 辅助功能 → 视觉效果，**远程桌面会话里默认就是关的**）
  * 会让 Chromium 报 `prefers-reduced-motion: reduce`。这在本项目里不是小事：
  * 跑马灯一旦不滚，用户**永远只看得到第一只**，而且它还被右边框裁掉一半 ——
- * 「滚动显示全部自选」这个功能在那台机器上等于不存在（2026-08-13 在打包版上实测到）。
+ * 「轮流显示」这个功能在那台机器上等于不存在（2026-08-13 在打包版上实测到）。
  * 所以这里不是「关掉动画就完了」，而是换一种不连续运动的表达：**一次显示一只，定时换**。
  */
 function usePrefersReducedMotion(): boolean {
@@ -433,19 +432,24 @@ export function App(): React.JSX.Element {
   // ── 绘制 ─────────────────────────────────────────────────────────
   const actionable = useMemo(() => signals.filter((s) => s.suppressedReason === undefined), [signals])
   /*
-    跑马灯**不含「行业ETF」分组**（2026-08-15）。
+    跑马灯**只跑「有持仓的 + 今天出了未静默信号的」**（2026-08-18 用户拍板）。
 
     悬浮条是常驻的、被动进入视野的那一面 —— 它的注意力预算最紧（300px，一次只看得见
-    一两条）。行业 ETF 是观察名单：不发提醒、不设持仓，用户要看它是**主动**去开面板看，
-    而不是让它把 7 只真持仓标的的露出频次摊薄到三分之一。
+    一两条）。把全部自选轮一遍，等于让 20 只今天什么都没发生的票，把真持仓标的
+    的露出频次摊薄一个量级。
 
-    这是个取舍不是铁律：想让它们也跑，把这一行 filter 去掉即可（`bar` 与面板共用
-    同一份 `watchlist:list`，别的都不用改）。
+    判据在 `@shared/ticker` 的 `visibleTicker`（纯函数，有用例）。**收窄必须作用在
+    `buildTicker` 的产物上**：它的主集合是 `items ∪ quotes ∪ 今日有信号的`，
+    而 `push:quoteTick` 推的是全部自选 —— 此前那行「过滤掉行业ETF 分组」只滤了
+    `items`，于是从来没有生效过，而界面上完全看不出来。
   */
-  const barItems = useMemo(() => items.filter((item) => item.group !== INDUSTRY_ETF_GROUP), [items])
+  const held = useMemo(
+    () => new Set(items.filter((item) => item.hasPosition).map((item) => item.code)),
+    [items]
+  )
   const fresh = useMemo(
-    () => buildTicker(barItems, quotes, signals, hits, tHints),
-    [barItems, quotes, signals, hits, tHints]
+    () => visibleTicker(buildTicker(items, quotes, signals, hits, tHints), held),
+    [items, quotes, signals, hits, tHints, held]
   )
 
   /**
@@ -552,8 +556,16 @@ export function App(): React.JSX.Element {
           )}
         </div>
       ) : (
+        /*
+          三档空态，第三档是 2026-08-18 收窄跑马灯范围后新加的必需品：
+          有自选、也拿到了报价，但既没有持仓也没有今日信号 —— 那是**常态**，
+          不是故障。显示成「等待行情…」等于报一个不存在的问题，
+          而用户会去查网络（"读不到就说读不到" 的反面：读到了就别说没读到）。
+        */
         // 还没有报价时不显示任何数字（docs/03：没有报价 ≠ 报价为 0）
-        <span className="empty">{status?.watchCount === 0 ? '未添加自选' : '等待行情…'}</span>
+        <span className="empty">
+          {status?.watchCount === 0 ? '未添加自选' : quotes.length === 0 ? '等待行情…' : '无持仓 · 今日无信号'}
+        </span>
       )}
 
       {actionable.length > 0 ? (

@@ -69,11 +69,12 @@ test.describe('首次启动引导', () => {
     app = await launch(userData)
     const panel = await openPanel(app)
 
-    // ① 引导挡在前面：免责声明可见，而主界面的「自选股」卡片不存在（不是隐藏，是没渲染）
-    // 用那个 tab 按钮当主界面的标记：卡片头 2026-08-15 从 h2 改成了两个 tab（自选股 / 行业ETF）
+    // ① 引导挡在前面：免责声明可见，而主界面的自选卡片不存在（不是隐藏，是没渲染）
+    // 用那个 tab 按钮当主界面的标记：卡片头 2026-08-15 从 h2 改成了两个 tab
+    // （2026-08-18 起是「个股 / ETF」，标签里还跟着只数，所以按前缀匹配而不是 exact）
     await expect(panel.getByRole('heading', { name: '免责声明' })).toBeVisible()
     await expect(panel.getByText('不构成任何投资建议')).toBeVisible()
-    await expect(panel.getByRole('button', { name: '自选股', exact: true })).toHaveCount(0)
+    await expect(panel.getByRole('button', { name: /^个股/ })).toHaveCount(0)
 
     // ② 读到底才亮按钮
     const accept = panel.getByRole('button', { name: /我已阅读并理解/ })
@@ -86,7 +87,7 @@ test.describe('首次启动引导', () => {
     await accept.click()
 
     // ③ 确认后进主界面
-    await expect(panel.getByRole('button', { name: '自选股', exact: true })).toBeVisible()
+    await expect(panel.getByRole('button', { name: /^个股/ })).toBeVisible()
 
     // ④ 真的落盘了 —— 时刻而不是布尔值
     const settings = JSON.parse(readFileSync(join(userData, 'settings.json'), 'utf8')) as {
@@ -99,7 +100,7 @@ test.describe('首次启动引导', () => {
     await app.close()
     app = await launch(userData)
     const again = await openPanel(app)
-    await expect(again.getByRole('button', { name: '自选股', exact: true })).toBeVisible()
+    await expect(again.getByRole('button', { name: /^个股/ })).toBeVisible()
     await expect(again.getByRole('heading', { name: '免责声明' })).toHaveCount(0)
   })
 })
@@ -139,32 +140,34 @@ test.describe('面板五屏', () => {
   })
 
   /*
-    自选卡片的两个 tab（2026-08-15）。三条一起钉：
+    自选卡片的两个 tab（2026-08-15 加，2026-08-18 换判据：按板块分「个股 / ETF」）。四条一起钉：
 
-    ① 行业 ETF 是**内置**的 —— 空库首启就该有 15 只，不需要用户做任何事。
+    ① 内置的 15 只行业 ETF 空库首启就该在 —— 不需要用户做任何事。
        这一条同时验了 data-layer 的播种真的跑了（单测测不到装配路径）。
-    ② 那一屏必须把**边界**说出来（不发提醒、不设持仓）：它与自选股的差别全在这，
-       只画一个列表的话用户会以为它就是第二个自选列表。
-    ③ 不给添加框、不给移除按钮 —— 内置组的构成不归用户管，
-       给了就是一个「删了下次启动会复活」的按钮。
+    ② 那一屏必须把**两档待遇**说出来：无持仓走观察轨、有持仓按个股待遇。
+       同一屏里两种不同的提醒行为，不写出来的话用户会按其中一种去理解另一种。
+    ③ **不给移除按钮** —— 内置组的构成不归用户管，给了就是一个「删了下次启动会复活」的按钮。
+    ④ **给持仓入口**（2026-08-18 起）。这一条是反过来钉的：它曾经不给，
+       而放开它连带了提醒轨与日报两处行为改动 —— 界面上少了这个按钮，那两处就白改了。
+
+    添加框现在在 tab 那一行、两屏共用，所以**不再断言 ETF 屏没有添加框**。
   */
-  test('行业ETF 是内置的一屏：首启即有、说清边界、不给增删', async () => {
+  test('ETF 屏：内置 15 只首启即有、说清两档待遇、不给移除但给持仓入口', async () => {
     const panel = await openPanel(app as ElectronApplication)
-    await expect(panel.getByRole('button', { name: '自选股', exact: true })).toBeVisible()
+    await expect(panel.getByRole('button', { name: /^个股/ })).toBeVisible()
 
-    await panel.getByRole('button', { name: '行业ETF', exact: true }).click()
+    await panel.getByRole('button', { name: /^ETF/ }).click()
 
-    await expect(panel.getByText(/不发提醒、不设持仓/)).toBeVisible()
-    await expect(panel.getByText(/内置 \d+ 只行业 ETF/)).toBeVisible()
+    await expect(panel.getByText(/无持仓时走观察轨/)).toBeVisible()
+    await expect(panel.getByText(/有持仓后按个股待遇提醒/)).toBeVisible()
+    await expect(panel.getByText(/含内置 \d+ 只行业 ETF/)).toBeVisible()
     // 空库首启就该有内容 —— 播种没跑的话这里是「暂时为空」
     await expect(panel.getByText('内置行业 ETF 暂时为空，重启应用会自动补齐。')).toHaveCount(0)
     await expect(panel.getByText('证券ETF', { exact: false }).first()).toBeVisible()
 
-    // 没有添加框、没有移除按钮
-    await expect(panel.getByPlaceholder(/添加/)).toHaveCount(0)
+    // 内置组不给移除；持仓入口则每一行都有
     await expect(panel.getByTitle('移除')).toHaveCount(0)
-    // 也没有持仓入口
-    await expect(panel.getByTitle('持仓与成交录入')).toHaveCount(0)
+    expect(await panel.getByTitle('持仓与成交录入').count()).toBeGreaterThan(0)
   })
 
   test('影子运行页在还没有交易日时说「尚未开始」，不显示一屏 0', async () => {
@@ -251,8 +254,8 @@ test.describe('面板五屏', () => {
     const panel = await openPanel(app as ElectronApplication)
     await panel.getByRole('button', { name: '日报' }).click()
 
-    // 精确匹配：概览页是**常驻挂载**的（只切 display），它那句
-    // 「还没有自选股，先在上面添加一只。」同时在 DOM 里，模糊匹配会撞上两个
+    // 精确匹配：概览页是**常驻挂载**的（只切 display），它那句空态同时在 DOM 里。
+    // （2026-08-18 起概览那句是「还没有个股…」，不再与这句撞车，但精确匹配照旧留着）
     await expect(panel.getByText('还没有自选股。', { exact: true })).toBeVisible()
     await expect(panel.getByText(/这里不产生新的判断/)).toBeVisible()
     await expect(panel.getByText(/没有需要明天跟进的事项/)).toBeVisible()

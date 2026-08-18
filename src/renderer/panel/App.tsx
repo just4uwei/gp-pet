@@ -22,7 +22,7 @@
  * 这时改由中间那层容器整体滚动。
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AppSettings,
   EngineStatus,
@@ -40,6 +40,7 @@ import { watchMarkOf } from '@shared/watch-mark'
 import { T_HINT_LABEL, T_HINT_TITLE } from '@shared/intraday-t'
 import { SHANGHAI_OFFSET_MS, shanghaiDayStartMs } from '@shared/time'
 import { INDUSTRY_ETF_GROUP, INDUSTRY_ETFS } from '@shared/industry-etf'
+import { splitWatchItems, watchTabOf, type WatchTab } from '@shared/watch-split'
 import type { SecCode } from '@core/types'
 import { AlertLog } from './AlertLog'
 import { BrandMark } from './BrandMark'
@@ -109,18 +110,20 @@ const HEALTH_TONE: Record<ProviderHealth['status'], string> = {
 const CLOCK_WARN_MS = 60_000
 
 /**
- * 自选卡片里的两个 tab（2026-08-15）。
+ * 自选卡片里的两个 tab。
  *
- * 分的是 `WatchItem.group`，不是 `board` —— 「它怎么进来的」而不是「它是什么」。
- * 用 board 分的话，用户自己挑着买的黄金ETF 会被拽进「行业ETF」那一屏，
- * 而那一屏的语义是「不发提醒、不设持仓的观察名单」，与他的持仓标的正好相反。
+ * **2026-08-18 起分的是 `board`（代码段推的），不再是 `WatchItem.group`。**
+ * 按分组分的时候，用户自己加的黄金ETF 留在个股屏、内置的 15 只行业 ETF 在另一屏 ——
+ * 同一类品种分居两处。改按「它是什么」之后两屏的语义才是干净的：
+ * 左边是股票，右边是场内基金，内置与手动加的混在一起（用是否可移除区分）。
+ *
+ * 判据在 `@shared/watch-split`（纯函数，有用例）—— 渲染层没有测试，
+ * 这种「谁进哪一屏」的判据不该埋在 JSX 里靠肉眼验收。
  */
 const WATCH_TABS = [
-  { id: 'STOCK', label: '自选股' },
-  { id: 'ETF', label: '行业ETF' },
+  { id: 'STOCK', label: '个股' },
+  { id: 'ETF', label: 'ETF' },
 ] as const
-
-type WatchTab = (typeof WATCH_TABS)[number]['id']
 
 /**
  * Electron 会把主进程抛出的 Error 包成 "Error invoking remote method 'x': Error: 真正的原因"。
@@ -232,13 +235,17 @@ function StatusBar({
   )
 }
 
-function AddForm({
-  onAdd,
-  placeholder,
-}: {
-  onAdd: (code: string) => Promise<void>
-  placeholder: string
-}): React.JSX.Element {
+/**
+ * 添加自选。**两屏共用一个**（2026-08-18）：它坐在 tab 那一行的右半边，
+ * 而不是像以前那样只挂在个股屏。
+ *
+ * 分屏判据已经是「代码是什么」而不是「你在哪一屏加的」，所以让用户先切对屏再输入
+ * 是一个纯粹多余的步骤 —— 输 `159915` 就该进 ETF 屏，与他当时看着哪一屏无关。
+ * 加完由上层切屏并滚过去（`pendingFocus`），用户不用自己去找它落在哪。
+ *
+ * 错误绝对定位在输入框下方：它挂在 `gp-card-head` 里，占高度会把整张卡的表头撑开一跳。
+ */
+function AddForm({ onAdd }: { onAdd: (code: string) => Promise<void> }): React.JSX.Element {
   const [value, setValue] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -260,19 +267,22 @@ function AddForm({
   }
 
   return (
-    <form className="shrink-0 border-b border-white/10 px-3 py-2.5" onSubmit={(e) => void submit(e)}>
-      <div className="flex gap-2">
-        <input
-          className="min-w-0 flex-1 rounded border border-white/15 bg-black/25 px-2.5 py-1.5 text-sm outline-none placeholder:text-white/25 focus:border-white/35"
-          placeholder={placeholder}
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-        />
-        <button className="gp-btn shrink-0" type="submit" disabled={busy || value.trim() === ''}>
-          {busy ? '添加中…' : '添加'}
-        </button>
-      </div>
-      {error ? <p className="mt-2 text-xs text-rose-300">{error}</p> : null}
+    <form className="relative ml-auto flex min-w-0 flex-1 gap-1.5" onSubmit={(e) => void submit(e)}>
+      <input
+        className="min-w-0 flex-1 rounded border border-white/15 bg-black/25 px-2 py-1 text-xs outline-none placeholder:text-white/25 focus:border-white/35"
+        placeholder="添加：600000 / 159915"
+        title="股票与场内基金都从这里加，加完会自动切到它所属的那一屏"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+      />
+      <button className="gp-btn shrink-0" type="submit" disabled={busy || value.trim() === ''}>
+        {busy ? '添加中…' : '添加'}
+      </button>
+      {error ? (
+        <p className="absolute right-0 top-full z-10 mt-1 max-w-full rounded border border-rose-400/30 bg-[var(--gp-surface)] px-2 py-1 text-xs text-rose-300 shadow-lg">
+          {error}
+        </p>
+      ) : null}
     </form>
   )
 }
@@ -284,8 +294,9 @@ function WatchRow({
   tHint,
   first,
   last,
-  showPosition = true,
   removable = true,
+  highlight = false,
+  innerRef,
   onRemove,
   onMove,
   onOpen,
@@ -302,16 +313,12 @@ function WatchRow({
   tHint: IntradayTHint | undefined
   first: boolean
   last: boolean
-  /**
-   * 显示持仓相关的东西（「仓」按钮、持仓标签、浮盈亏那一行）。
-   *
-   * 「行业ETF」分组传 false：那 15 只是**观察名单**，不设持仓（2026-08-15 的取舍）。
-   * 留着入口会让人以为该在这儿记仓位，而一旦真记了，止损/回撤减仓那套持仓强制类风控
-   * 就会对一只观察标的生效 —— 那与「不进提醒闸门」是自相矛盾的两个决定。
-   */
-  showPosition?: boolean
   /** 显示移除按钮。内置的「行业ETF」组传 false —— 删了下次启动会被补回来 */
   removable?: boolean
+  /** 刚添加进来的那一行：上层要滚到它，并短暂高亮让人看见它落在哪 */
+  highlight?: boolean
+  /** 上层用来 `scrollIntoView` 的把手。只给 `highlight` 那一行装 */
+  innerRef?: (el: HTMLLIElement | null) => void
   onRemove: (code: SecCode) => void
   onMove: (code: SecCode, delta: number) => void
   /** 打开详情抽屉。`tab` 决定落在哪一页 */
@@ -335,11 +342,17 @@ function WatchRow({
 
       色系选 sky：与「公告」页的持仓标记同一个色，且避开 rose/emerald（涨跌）、
       teal（行业ETF 观察名单）、violet（做T建议）—— 那三个都已经有确定含义。
+
+      ⚠ 底色**三选一，写成互斥的三元**而不是叠两个 `bg-sky-400/*` 类：
+      同为工具类时谁生效取决于**样式表里的先后**，不是 className 里的先后 ——
+      叠着写的话「刚添加的高亮」会不会盖住持仓底色，取决于 Tailwind 这次怎么排，
+      而那是一个每次构建都可能翻转、且只在持仓行上出现的差异。
     */
     <li
-      className={`border-b border-l-2 border-b-white/[0.06] last:border-b-0 hover:bg-white/[0.02] ${
-        showPosition && item.hasPosition ? 'border-l-sky-400/60 bg-sky-400/[0.03]' : 'border-l-transparent'
-      }`}
+      ref={innerRef}
+      className={`border-b border-l-2 border-b-white/[0.06] transition-colors last:border-b-0 hover:bg-white/[0.02] ${
+        item.hasPosition ? 'border-l-sky-400/60' : 'border-l-transparent'
+      } ${highlight ? 'bg-sky-400/15' : item.hasPosition ? 'bg-sky-400/[0.03]' : ''}`}
     >
       <div className="flex items-center gap-3 px-3 py-2 text-sm">
         {/*
@@ -350,7 +363,7 @@ function WatchRow({
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-2">
               <span className="truncate">{item.name}</span>
-              {showPosition && item.hasPosition ? (
+              {item.hasPosition ? (
                 <span className="shrink-0 rounded bg-sky-400/15 px-1 text-[10px] text-sky-200/85">持仓</span>
               ) : null}
               {/*
@@ -384,15 +397,19 @@ function WatchRow({
         </button>
 
         <div className="flex shrink-0 justify-end gap-0.5 text-xs text-white/40">
-          {showPosition ? (
-            <button
-              className="px-1 hover:text-white/80"
-              title="持仓与成交录入"
-              onClick={() => onOpen(item.code, 'POSITION')}
-            >
-              仓
-            </button>
-          ) : null}
+          {/*
+            「仓」以前对「行业ETF」组不显示（2026-08-15 的取舍：那 15 只是观察名单）。
+            2026-08-18 用户要在行业 ETF 上真的建仓，那条限制去掉了 ——
+            连带的是提醒轨：有持仓即翻回 PRIMARY（`main/alerts/track.ts`），
+            否则止损会留在只有 2 条日配额、且抢不到气泡的 OBSERVE 轨上。
+          */}
+          <button
+            className="px-1 hover:text-white/80"
+            title="持仓与成交录入"
+            onClick={() => onOpen(item.code, 'POSITION')}
+          >
+            仓
+          </button>
           <button
             className="px-1 hover:text-white/80 disabled:opacity-25"
             disabled={first}
@@ -418,7 +435,7 @@ function WatchRow({
       </div>
 
       {/* 有持仓时把浮盈亏摆在行里：那是用户最常想看的一个数，不该要点进抽屉才知道 */}
-      {showPosition && position ? (
+      {position ? (
         <div className="flex items-baseline gap-2 px-3 pb-1.5 text-[10px] text-white/35">
           <span>{position.shares} 股</span>
           <span>成本 {position.cost.toFixed(3)}</span>
@@ -474,6 +491,14 @@ export function App(): React.JSX.Element {
   const [tab, setTab] = useState<Tab>('OVERVIEW')
   const [items, setItems] = useState<WatchItem[]>([])
   const [watchTab, setWatchTab] = useState<WatchTab>('STOCK')
+  /**
+   * 刚添加进来的那一只：切到它所属的那一屏、滚过去、短暂高亮，然后清空。
+   *
+   * 加完不定位的话，一只 ETF 会落在另一屏的某个位置上，用户看到的是「点了添加，
+   * 什么都没发生」—— 而列表可能有二十来行，他并不知道该去哪一屏找。
+   * **重复添加（幂等）也照样定位**：那正是他想确认的事（「我是不是已经加过了」）。
+   */
+  const [pendingFocus, setPendingFocus] = useState<SecCode | null>(null)
   const [quotes, setQuotes] = useState<QuoteTick[]>([])
   const [status, setStatus] = useState<EngineStatus | null>(null)
   const [health, setHealth] = useState<ProviderHealth[]>([])
@@ -652,13 +677,22 @@ export function App(): React.JSX.Element {
   )
 
   /**
-   * 「行业ETF」分组的标的。信号列表拿它决定要不要把那条结论画成中性色。
+   * 走 `OBSERVE` 轨的标的。信号列表拿它决定要不要把那条结论画成中性色。
+   *
+   * **判据必须与主进程的 `alertTrackOf` 一致**（2026-08-18）：
+   * 中性色表达的是「这条不会像个股那样提醒你」，而有持仓的行业 ETF 已经翻回 PRIMARY，
+   * 它的结论是可执行的 —— 继续画成观察色就是在说一句与实际行为相反的话。
    *
    * 与 `openDrawer` 同一条理由，**必须定义在 renderSignalRow 之前**（`const` 有 TDZ，
    * 而它进了那个回调的 deps 数组 —— 顺序反过来是启动即崩）。
    */
-  const etfCodes = useMemo(
-    () => new Set(items.filter((item) => item.group === INDUSTRY_ETF_GROUP).map((item) => item.code)),
+  const observeCodes = useMemo(
+    () =>
+      new Set(
+        items
+          .filter((item) => item.group === INDUSTRY_ETF_GROUP && !item.hasPosition)
+          .map((item) => item.code)
+      ),
     [items]
   )
 
@@ -669,8 +703,8 @@ export function App(): React.JSX.Element {
         record={record}
         // 用户自己设的条件把这条结论否掉了 / 确认了。与悬浮条共用同一份判据
         mark={watchMarkOf(record.id, watchHits)}
-        // 行业 ETF 的结论不进提醒、不参与持仓风控，颜色必须与可执行的买卖分开
-        observational={etfCodes.has(record.code)}
+        // 走观察轨的结论（无持仓的行业 ETF）颜色必须与可执行的买卖分开
+        observational={observeCodes.has(record.code)}
         expanded={signalEvidence.expandedId === record.id}
         evidence={signalEvidence.evidence[record.id] ?? null}
         aiReady={aiReady}
@@ -678,7 +712,7 @@ export function App(): React.JSX.Element {
         onToggle={signalEvidence.toggle}
       />
     ),
-    [signalEvidence, aiReady, openDrawer, watchHits, etfCodes]
+    [signalEvidence, aiReady, openDrawer, watchHits, observeCodes]
   )
 
   /**
@@ -780,10 +814,18 @@ export function App(): React.JSX.Element {
     void window.gp.invoke('app:engineStatus').then(setStatus)
   }, [])
 
+  /**
+   * 添加一只。**以主进程回写的那一行为准**来决定切到哪一屏 ——
+   * 用户输的是 `159915` / `sz159915` / `159915.SZ` 里的任意一种，
+   * 规范化只在主进程做一次（`engine/watchlist.ts` 的头注释），
+   * 在这里照着输入串猜代码等于把那件事抄第二遍。
+   */
   const add = useCallback(
     async (code: string, group?: string): Promise<void> => {
-      await window.gp.invoke('watchlist:add', code, group)
+      const item = await window.gp.invoke('watchlist:add', code, group)
       await reload()
+      setWatchTab(watchTabOf(item.code))
+      setPendingFocus(item.code)
     },
     [reload]
   )
@@ -856,28 +898,33 @@ export function App(): React.JSX.Element {
     而一条常亮的提示条会让用户学会无视所有横幅。
     注意 `clockOffsetMs` 可能是 0（已校准且刚好对齐），所以判 undefined 而不是判真值。
   */
-  /** 当前 tab 这一屏的自选项。顺序沿用全局 sort_order，过滤不重排 */
   /*
-    自选那一屏**持仓优先**（2026-08-16）：真金白银的那几只应该一眼看到。
+    两屏的内容与顺序。判据全在 `@shared/watch-split`（纯函数，有用例）——
+    分屏按代码段推出的板块，段内**持仓优先且保持用户自己排的顺序**。
 
-    两条实现约束，缺一条就会出问题：
-
-    1. **段内必须保持用户自己排的顺序**（`Array.sort` 在现代 JS 里是稳定的，
-       所以只按 `hasPosition` 比一次就够）。整个重排会把上移/下移按钮的成果抹掉。
-    2. **上移/下移必须按「段」禁用，不是按整个列表**（见下面 first/last 的算法）。
-       `move()` 交换的是 `items` 里的 `sortOrder`，而显示层每次都会重新把持仓提到前面
-       —— 跨段交换之后显示顺序**一点变化都没有**，表现就是「点了没反应」。
-
-    行业ETF 那一屏不排：那一组不设持仓（`showPosition={false}`），
-    真有历史持仓数据时按它重排只会让一组「观察名单」看起来分了主次。
+    **ETF 那一屏 2026-08-18 起也排**：它不再是「不设持仓的观察名单」，
+    有持仓的同样该一眼看到。两屏因此逐字同规则，`first`/`last` 的段边界算法也共用。
   */
-  const visibleWatch = useMemo(() => {
-    const rows = items.filter((item) =>
-      watchTab === 'ETF' ? item.group === INDUSTRY_ETF_GROUP : item.group !== INDUSTRY_ETF_GROUP
-    )
-    if (watchTab === 'ETF') return rows
-    return [...rows].sort((a, b) => Number(b.hasPosition) - Number(a.hasPosition))
-  }, [items, watchTab])
+  const split = useMemo(() => splitWatchItems(items), [items])
+  const visibleWatch = watchTab === 'ETF' ? split.etf : split.stock
+
+  /*
+    刚添加的那一行：滚到它并短暂高亮。
+
+    **超时一定要挂**（而不是只在 `el` 存在时挂）：拿不到那一行的可能性是真的
+    （列表还没 reload 回来、或者主进程回写的代码不在任何一屏），
+    只在成功路径上清 `pendingFocus` 会让一行永久高亮着，而那是个假的「刚加进来」。
+
+    `block: 'nearest'` 而不是 `'center'`：目标已经在视野里时它一个像素都不动，
+    否则每加一只都会把列表整个甩一下。
+  */
+  const focusRef = useRef<HTMLLIElement | null>(null)
+  useEffect(() => {
+    if (pendingFocus === null) return
+    focusRef.current?.scrollIntoView({ block: 'nearest' })
+    const timer = window.setTimeout(() => setPendingFocus(null), 1800)
+    return () => window.clearTimeout(timer)
+  }, [pendingFocus, visibleWatch])
 
   const clockOffMs = status?.clockOffsetMs
   const clockSkewed = clockOffMs !== undefined && Math.abs(clockOffMs) >= CLOCK_WARN_MS
@@ -1041,14 +1088,14 @@ export function App(): React.JSX.Element {
         }`}
       >
         {/*
-          两个 tab 分的是**分组**（`WatchItem.group`），不是「是不是 ETF」。
-          `watchlist` 的主键是 code，一只标的只属于一个分组 —— 所以
-          手动加进「自选股」的 ETF（比如黄金ETF）就留在自选股这一屏，
-          不会被这里的 tab 拽走。两屏都可能有 ETF，那是对的。
+          两个 tab 分的是**板块**（代码段推的），不是分组：左边股票，右边场内基金。
+          内置的 15 只行业 ETF 与用户自己加的 ETF 因此混在同一屏 ——
+          区别只在「能不能移除」（内置的删了下次启动会被补回来）。
         */}
         <section className="gp-card max-h-full">
+          {/* 添加框与 tab 同一行（2026-08-18）：两屏共用一个，加完自动切屏 */}
           <div className="gp-card-head">
-            <div className="flex items-center gap-1">
+            <div className="flex shrink-0 items-center gap-1">
               {WATCH_TABS.map((t) => (
                 <button
                   key={t.id}
@@ -1058,25 +1105,28 @@ export function App(): React.JSX.Element {
                   onClick={() => setWatchTab(t.id)}
                 >
                   {t.label}
+                  {/* 只数挪进标签里，把表头右侧腾给添加框 */}
+                  <span className="ml-1 text-xs text-white/30">
+                    {(t.id === 'ETF' ? split.etf : split.stock).length}
+                  </span>
                 </button>
               ))}
             </div>
-            <span className="text-xs text-white/30">{visibleWatch.length} 只</span>
+            <AddForm onAdd={(code) => add(code)} />
           </div>
 
           {/*
-            行业ETF 那一屏**不给添加框**：这一组是内置的（`INDUSTRY_ETFS`，每次启动补齐）。
-            给了输入框就等于说「这是你的列表」，而它不是 —— 用户加进去的那只在
-            下次启动时仍在，但整组的构成不归他管，两种预期混在一起只会让人困惑。
+            ETF 屏的一行短注。**必须说清两档待遇**：无持仓的走观察轨
+            （独立配额、抢不到气泡），有持仓的按个股待遇提醒 —— 这是同一屏里
+            两种不同的行为，不写出来的话用户会按其中一种去理解另一种。
           */}
           {watchTab === 'ETF' ? (
             <p className="shrink-0 border-b border-white/10 px-3 py-2 text-xs leading-relaxed text-white/35">
-              内置 {INDUSTRY_ETFS.length} 只行业 ETF，每个行业一只。看的是<span className="text-white/55">行业整体动向</span>
-              ，结论只针对行业指数本身 —— <span className="text-white/55">不发提醒、不设持仓</span>。
+              含内置 {INDUSTRY_ETFS.length} 只行业 ETF（每个行业一只，不可移除）。
+              <span className="text-white/55">无持仓时走观察轨</span>：结论照常算、照常进今日信号，
+              但提醒配额独立且不抢气泡；<span className="text-white/55">有持仓后按个股待遇提醒</span>。
             </p>
-          ) : (
-            <AddForm onAdd={(code) => add(code)} placeholder="添加自选：600000 / sh600000 / 000001.SZ" />
-          )}
+          ) : null}
 
           {visibleWatch.length === 0 ? (
             watchTab === 'ETF' ? (
@@ -1086,7 +1136,7 @@ export function App(): React.JSX.Element {
                 内置行业 ETF 暂时为空，重启应用会自动补齐。
               </p>
             ) : (
-              <p className="px-3 py-10 text-center text-sm text-white/35">还没有自选股，先在上面添加一只。</p>
+              <p className="px-3 py-10 text-center text-sm text-white/35">还没有个股，先在上面添加一只。</p>
             )
           ) : (
             <ul className="min-h-0 flex-1 overflow-y-auto">
@@ -1097,15 +1147,17 @@ export function App(): React.JSX.Element {
                   quote={quoteOf.get(item.code)}
                   position={positionOf.get(item.code)}
                   tHint={tHintOf.get(item.code)}
-                  // 段边界即禁用边界 —— 理由见 visibleWatch 那段注释的第 2 条
+                  // 段边界即禁用边界 —— 理由见 splitWatchItems 头注释的第 2 条
                   first={i === 0 || visibleWatch[i - 1]?.hasPosition !== item.hasPosition}
                   last={
                     i === visibleWatch.length - 1 ||
                     visibleWatch[i + 1]?.hasPosition !== item.hasPosition
                   }
-                  showPosition={watchTab !== 'ETF'}
-                  // 内置组不给删除：删了下次启动又回来，那是一个点了会复活的按钮
-                  removable={watchTab !== 'ETF'}
+                  // 内置组不给删除：删了下次启动又回来，那是一个点了会复活的按钮。
+                  // **按项判断而不是按屏** —— 同一屏里用户自己加的 ETF 照常可删
+                  removable={item.group !== INDUSTRY_ETF_GROUP}
+                  highlight={pendingFocus === item.code}
+                  {...(pendingFocus === item.code ? { innerRef: (el) => (focusRef.current = el) } : {})}
                   onRemove={remove}
                   onMove={(code, delta) => move(code, delta, visibleWatch)}
                   onOpen={openDrawer}

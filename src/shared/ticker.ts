@@ -2,9 +2,14 @@
  * 悬浮条滚动内容的判据（docs/06 §2.1）。
  *
  * 与 `featured.ts` 的关系：那条规则解决「一行只能显示一只」，这条解决
- * 「**全部自选轮流显示**」—— 条子改成跑马灯之后，选谁不再是问题，**先后顺序**才是。
+ * 「**该轮流显示的那些，先后顺序怎么排**」。
  * 放在 shared 而非组件里，理由与 `hit-test.ts` / `featured.ts` 相同：
  * 这是可测的纯判据，不该埋在 JSX 里靠肉眼验收。
+ *
+ * ⚠ **「该轮流显示的那些」不等于「全部自选」**（2026-08-18 起）：
+ * `buildTicker` 仍然为全集算条目，**收窄由 `visibleTicker` 单独一步做**
+ * —— 有持仓的恒在，没持仓的要今天真出了未静默信号才露出。
+ * 两步分开是因为排序判据要看到全集，而收窄的判据（`action`）是排序算完才有的。
  *
  * ## 规则
  *
@@ -30,8 +35,8 @@
  * 条子上还写着「买入」是在替一条已被否掉的结论继续背书。判据在 `watch-mark.ts`
  * —— 只有命中的**来源信号就是当前这条**时才改写，理由见那个文件的头注释。
  *
- * 日内做T建议（`tHint`）**不参与排序**：它是给「主动看一眼」的标注，
- * 而跑马灯本来就会把全部自选轮一遍，让它去抢前排等于把一个几十分钟时效的东西
+ * 日内做T建议（`tHint`）**不参与排序**：它只对持仓给，而持仓本来就恒在跑马灯里
+ * （`visibleTicker`），让它去抢前排等于把一个几十分钟时效的东西
  * 放到与引擎结论同一个位置上。`orderFingerprint` 也因此不含它 ——
  * 做T建议每轮都可能翻转，进指纹会让条目位置跟着来回跳（那正是指纹要防的事）。
  */
@@ -111,6 +116,30 @@ export function orderFingerprint(entries: readonly TickerEntry[]): string {
     .map((entry) => `${entry.code}:${entry.action ?? '-'}:${entry.mark ?? '-'}`)
     .sort()
     .join(',')
+}
+
+/**
+ * 跑马灯真正要显示哪几条（2026-08-18 用户拍板收窄）。
+ *
+ * **有持仓的恒在；没持仓的只有今天真出了未静默信号才露出。**
+ * 悬浮条是常驻的、被动进入视野的那一面，注意力预算最紧（300px，一次看得见一两条）——
+ * 把全部自选轮一遍，等于让 20 只没事发生的票把真持仓的露出频次摊薄一个量级。
+ *
+ * ⚠ **必须作用在 `buildTicker` 的产物上，不能只滤它的 `items` 入参。**
+ * `buildTicker` 的主集合是 `items ∪ quotes ∪ 今日有信号的`（见那里的 `codes`），
+ * 而 `push:quoteTick` 推的是**全部**自选 —— 2026-08-15 那次「跑马灯不含行业ETF」
+ * 就是只滤了 `items`，于是那条过滤从来没有生效过，而界面上完全看不出来。
+ *
+ * 判据用 `action !== null` 而不是「有没有信号」：`buildTicker` 已经把被风控静默的
+ * 那些排除在 `action` 之外了（`suppressedReason` 非空的不算），两处判据必须是同一个。
+ *
+ * @param held 有持仓的代码集合。调用方从 `WatchItem.hasPosition` 现算，不新增 IPC
+ */
+export function visibleTicker(
+  entries: readonly TickerEntry[],
+  held: ReadonlySet<SecCode>
+): TickerEntry[] {
+  return entries.filter((entry) => held.has(entry.code) || entry.action !== null)
 }
 
 /** 按给定的代码顺序重排；不在其中的（本轮新出现）留在末尾，相对次序不变 */

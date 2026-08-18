@@ -86,10 +86,18 @@ const REGIME_LABEL: Record<Regime, string> = {
   TRANSITION: '转换期',
 }
 
+/**
+ * 级别标签。**L2 与 L3 的渠道是一样的**（都是状态点 + 气泡，2026-08-13 系统通知与
+ * 托盘角标已移除），所以这里不能再拿渠道名去区分它们 —— L3 写「通知」是在承诺
+ * 一个不存在的出口。真正的区别在**冷却窗口**（L2 两小时 / L3 当日一次）与每日 L3 上限，
+ * 标签因此照着那个区别写。
+ *
+ * ⚠ 两行看起来快一样了，但**级别本身不许合并**（见 dispatcher.ts 的 CHANNELS_BY_LEVEL）。
+ */
 const LEVEL_LABEL: Record<AlertLevel, string> = {
   L1: '静默',
   L2: '气泡',
-  L3: '通知',
+  L3: '气泡 · 当日一次',
 }
 
 const STAGE_LABEL: Record<SignalRecord['stage'], string> = {
@@ -198,7 +206,9 @@ export function SignalRow({
    */
   mark?: WatchMark | null
   /**
-   * 这条结论来自「行业ETF」观察名单（`INDUSTRY_ETF_GROUP`）。
+   * 这条结论走**观察轨**：来自「行业ETF」观察名单**且当前没有持仓**（2026-08-18 补后半句 ——
+   * 判据必须与主进程的 `alertTrackOf` 一致，有持仓的 ETF 已按个股待遇提醒，
+   * 继续画成观察色就是在说一句与实际行为相反的话）。
    * true → 方向标签换成中性青色 + 加一枚「行业」标记，见 `OBSERVED_TONE`。
    */
   observational?: boolean
@@ -241,7 +251,7 @@ export function SignalRow({
             {observational ? (
               <span
                 className="shrink-0 rounded bg-teal-400/15 px-1 text-[10px] text-teal-200/85"
-                title="来自行业 ETF 观察名单：不发提醒、不设持仓，仅供观察行业动向"
+                title="来自行业 ETF 观察名单，且当前没有持仓：走观察轨（提醒配额独立、不抢气泡），仅供观察行业动向"
               >
                 行业
               </span>

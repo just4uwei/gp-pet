@@ -3,6 +3,7 @@ import {
   applyOrder,
   buildTicker,
   orderFingerprint,
+  visibleTicker,
   type TickerItem,
   type TickerQuote,
   type TickerSignal,
@@ -248,5 +249,75 @@ describe('buildTicker', () => {
         entries.filter((e) => e.code !== 'SZ300001').map((e) => e.code)
       )
     })
+  })
+})
+
+/**
+ * 跑马灯的**范围**（2026-08-18 用户拍板收窄）：有持仓的恒在，
+ * 没持仓的要今天真出了未静默信号才露出。
+ *
+ * 两条钉在这里，各自对应一个已经踩过或差点踩到的坑：
+ *
+ * 1. **收窄必须发生在 `buildTicker` 之后。** 它的主集合是
+ *    `items ∪ quotes ∪ 今日有信号的` —— 2026-08-15 那次「跑马灯不含行业ETF」
+ *    只滤了 `items`，而 `push:quoteTick` 推的是全部自选，于是那条过滤从来没生效过。
+ *    下面第一条用例故意**不把标的放进 `items`**，只放进 `quotes`，
+ *    正是为了让「只滤 items」的写法过不了。
+ * 2. **被风控静默的信号不算「今天出了信号」**，与 `action` 的口径共用一处判据。
+ */
+describe('visibleTicker', () => {
+  const item = (code: string, name: string): TickerItem => ({ code: code as SecCode, name })
+  const quote = (code: string, changePct = 1): TickerQuote => ({
+    code: code as SecCode,
+    last: 10,
+    changePct,
+    stale: false,
+  })
+  const signal = (code: string, suppressedReason?: string): TickerSignal => ({
+    id: `sig-${code}`,
+    code: code as SecCode,
+    name: `信号-${code}`,
+    createdAt: 1_000,
+    direction: 'BUY',
+    score: 0.7,
+    level: 'L2',
+    ...(suppressedReason === undefined ? {} : { suppressedReason }),
+  })
+  const held = (...codes: string[]): Set<SecCode> => new Set(codes as SecCode[])
+
+  it('没持仓、今天没信号的滤掉 —— 哪怕它只从 quotes 那条路进来', () => {
+    // items 是空的：这一只完全靠 quotes 并进主集合，只滤 items 的写法拦不住它
+    const entries = buildTicker([], [quote('SH512800')])
+    expect(entries.map((e) => e.code)).toEqual(['SH512800'])
+    expect(visibleTicker(entries, held())).toEqual([])
+  })
+
+  it('有持仓的恒在，哪怕今天一条信号都没有', () => {
+    const entries = buildTicker([item('SH512800', '银行ETF')], [quote('SH512800')])
+    expect(visibleTicker(entries, held('SH512800')).map((e) => e.code)).toEqual(['SH512800'])
+  })
+
+  it('没持仓但今天出了未静默信号的露出', () => {
+    const entries = buildTicker([item('SH600000', 'A')], [quote('SH600000')], [signal('SH600000')])
+    expect(visibleTicker(entries, held()).map((e) => e.code)).toEqual(['SH600000'])
+  })
+
+  it('被风控静默的信号不算 —— 它在提醒日志里可查，但不构成「值得看一眼」', () => {
+    const entries = buildTicker(
+      [item('SH600000', 'A')],
+      [quote('SH600000')],
+      [signal('SH600000', 'STALE_SNAPSHOT')]
+    )
+    expect(entries[0]?.action).toBeNull()
+    expect(visibleTicker(entries, held())).toEqual([])
+  })
+
+  it('保持 buildTicker 排好的相对顺序，只做过滤', () => {
+    const entries = buildTicker(
+      [item('SH600000', 'A'), item('SZ000001', 'B'), item('SH512800', 'C')],
+      [quote('SH600000', 1), quote('SZ000001', 5), quote('SH512800', 3)]
+    )
+    const kept = visibleTicker(entries, held('SH600000', 'SZ000001', 'SH512800'))
+    expect(kept.map((e) => e.code)).toEqual(entries.map((e) => e.code))
   })
 })
