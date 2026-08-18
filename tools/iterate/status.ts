@@ -93,6 +93,14 @@ interface BaselineSnapshot {
   at: string
   engineVersion: string
   codes: number
+  /**
+   * 这份报告覆盖的窗口（`meta.from` / `meta.to`）。**必须打印出来**（2026-08-18 加）——
+   * 之前表头写死「全期收益」，而选中的 `recheck-after-idx.json` 的 `to` 是 **2023-12-31**
+   * ⇒ 那是**训练窗口**，看板把一个它没挣到的标签盖在了 −1.99% 上。
+   * 读不到就给 null，绝不猜「大概是全期」。
+   */
+  from: string | null
+  to: string | null
   positions: number
   trades: number
   totalReturn: number
@@ -113,7 +121,7 @@ function latestBaseline(): Maybe<BaselineSnapshot> {
   for (const { f } of candidates) {
     try {
       const j = JSON.parse(readFileSync(join(REPORTS, f), 'utf8')) as {
-        meta?: { engineVersion?: string; codes?: unknown[]; generatedAt?: number }
+        meta?: { engineVersion?: string; codes?: unknown[]; generatedAt?: number; from?: string; to?: string }
         performance?: Record<string, number>
         trades?: { code: string; entryDate: string; pnl: number }[]
       }
@@ -131,6 +139,8 @@ function latestBaseline(): Maybe<BaselineSnapshot> {
         at: j.meta?.generatedAt === undefined ? '—' : shanghaiStamp(j.meta.generatedAt).slice(0, 10),
         engineVersion: j.meta?.engineVersion ?? '—',
         codes,
+        from: j.meta?.from ?? null,
+        to: j.meta?.to ?? null,
         positions: byEntry.size,
         trades: j.trades.length,
         totalReturn: j.performance.totalReturn ?? 0,
@@ -236,8 +246,42 @@ const BOOT_MARKER = '窗口与托盘就绪'
  *   但宿主偏移 < −1.5h 时北京 09:30 会掉到前一个本地日 ⇒ 那种机器上计数可能偏少。
  *   `straddlesLocalMidnight()` 会在看板上显式提示，而不是悄悄给一个偏小的数。
  */
-function restartsByDay(dates: readonly TradeDate[]): Map<TradeDate, number | null> {
-  const out = new Map<TradeDate, number | null>()
+/**
+ * 一天的重启情况。`total` 是那天启动了几次，`inSession` 是其中**落在盘中**的几次。
+ *
+ * ## 为什么必须分开（2026-08-18 加，原先只有 total）
+ *
+ * 判据原来是 `total === 0` 才算干净。但**盘后重启污染不了当天已经写完的提醒日志** ——
+ * 冷却/配额是当日语义，跨日本来就重置。实测 2026-08-18：全天只启动 1 次，
+ * 在**北京 16:49（收盘后）**，而看板把那天判成「不干净」⇒ M3 的「自用一周」
+ * 在「每天都会重启一次」的现实下**结构上永远到不了 5**。
+ *
+ * ⚠ **但盘后重启不是完全无害**：`lastForcedLoss`（强制类那 2% 台阶）是**跨日**语义，
+ * 清零会让**下一个交易日**的同一条止损多发一次。所以看板报三档、
+ * **不替 M3 清单 §4.0 拍板「仅盘外重启算不算干净」** —— 那是判据问题，得人定。
+ */
+interface DayRestarts {
+  total: number
+  inSession: number
+}
+
+/**
+ * 日志行的时刻是**宿主本地**时钟（`logging.ts` 用 `getHours()`），而盘中窗口是北京时间。
+ * 用那一天的宿主偏移换算（`getTimezoneOffset` 按日期取，宿主若有夏令时也对得上）。
+ *
+ * 盘中窗口取 **[09:00, 15:10)** —— 起点是 `PRE_OPEN`（`needsQuotes` 从那时起为真、
+ * 提醒也从那时起会发，实测 09:04 就有 settle 补跑、09:30 就有 `[alert] … 发出 3 条`），
+ * 终点是 `SETTLE` 结束。**不取 09:15（集合竞价）** —— 那会把 09:00–09:15 的重启
+ * 误判成「盘外」，而失败方向必须朝「多判成不干净」那边掰。
+ */
+function inSessionBeijing(date: TradeDate, hh: number, mm: number): boolean {
+  const hostOffsetMin = -new Date(`${date}T12:00:00`).getTimezoneOffset()
+  const beijing = hh * 60 + mm + (480 - hostOffsetMin)
+  return beijing >= 9 * 60 && beijing < 15 * 60 + 10
+}
+
+function restartsByDay(dates: readonly TradeDate[]): Map<TradeDate, DayRestarts | null> {
+  const out = new Map<TradeDate, DayRestarts | null>()
   const appData = process.env.APPDATA
   const dir = appData === undefined ? null : join(appData, 'gp-pet', 'logs')
   if (dir === null || !existsSync(dir)) {
@@ -245,11 +289,20 @@ function restartsByDay(dates: readonly TradeDate[]): Map<TradeDate, number | nul
     return out
   }
   const files = readdirSync(dir).filter((f) => f.startsWith('main-') && f.endsWith('.log'))
-  const countIn = (file: string): number | null => {
+  /** 那个文件里的启动行，逐行给出「几点几分」；读不到给 null */
+  const bootsIn = (file: string): { hh: number; mm: number }[] | null => {
     const path = join(dir, file)
     if (!existsSync(path)) return null
-    return readFileSync(path, 'utf8').split(BOOT_MARKER).length - 1
+    const out: { hh: number; mm: number }[] = []
+    for (const line of readFileSync(path, 'utf8').split('\n')) {
+      if (!line.includes(BOOT_MARKER)) continue
+      const m = /^\[\d{4}-\d{2}-\d{2} (\d{2}):(\d{2}):/.exec(line)
+      // 解析不出时刻仍要计入总数（少算一次重启比多算危险），只是不算进盘中
+      out.push(m === null ? { hh: -1, mm: -1 } : { hh: Number(m[1]), mm: Number(m[2]) })
+    }
+    return out
   }
+  const countIn = (file: string): number | null => bootsIn(file)?.length ?? null
   // 自检：整个目录一条都没有 ⇒ 更可能是文案改了，不是一周没重启过
   const anyMarker = files.some((f) => (countIn(f) ?? 0) > 0)
   for (const d of dates) {
@@ -259,10 +312,11 @@ function restartsByDay(dates: readonly TradeDate[]): Map<TradeDate, number | nul
       out.set(d, null)
       continue
     }
-    out.set(
-      d,
-      same.reduce((sum, f) => sum + (countIn(f) ?? 0), 0)
-    )
+    const boots = same.flatMap((f) => bootsIn(f) ?? [])
+    out.set(d, {
+      total: boots.length,
+      inSession: boots.filter((b) => b.hh >= 0 && inSessionBeijing(d, b.hh, b.mm)).length,
+    })
   }
   return out
 }
@@ -288,7 +342,7 @@ interface RuntimeSnapshot {
    * 每个有 signal 的交易日重启过几次（`null` = 日志读不到）。
    * **M3 的「自用一周」只数 0 那一档** —— 理由见 `restartsByDay`。
    */
-  restarts: { date: TradeDate; count: number | null }[]
+  restarts: { date: TradeDate; boots: DayRestarts | null }[]
   /** 库里最新一行 signal / alert_log 的北京时间日子，null = 一行都没有 */
   latestSignalDate: TradeDate | null
   latestAlertDate: TradeDate | null
@@ -408,7 +462,7 @@ async function runtimeState(): Promise<Maybe<RuntimeSnapshot>> {
       alerts: one('SELECT COUNT(*) FROM alert_log'),
       alertsWithGate: one('SELECT COUNT(*) FROM alert_log WHERE would_block IS NOT NULL'),
       shadowPoints: one('SELECT COUNT(*) FROM shadow_equity'),
-      restarts: tradeDates.map((date) => ({ date, count: restarts.get(date) ?? null })),
+      restarts: tradeDates.map((date) => ({ date, boots: restarts.get(date) ?? null })),
       latestSignalDate,
       latestAlertDate,
       signalFreshness: dataFreshness({ now, latest: latestSignalDate, calendar }),
@@ -422,14 +476,30 @@ async function runtimeState(): Promise<Maybe<RuntimeSnapshot>> {
 }
 
 /**
- * 干净 / 污染 / 读不到三档。**三档必须分开** ——
- * 把「日志读不到」并进任何一边都是在编一个事实（见 `restartsByDay`）。
+ * 四档，**必须分开**（2026-08-18 从三档扩到四档）：
+ *
+ * | 档 | 含义 | 那天的提醒日志能不能当判据 |
+ * |---|---|---|
+ * | `clean` | 一次都没启动 | 能 |
+ * | `postOnly` | 启动过，但**全在盘外** | **能**（当日计数器没被清）—— 但它清掉了跨日的 `lastForcedLoss`，下一个交易日可能多一条强制类 |
+ * | `dirty` | **盘中**启动过 | 不能（冷却/配额/台阶当场清零） |
+ * | `unknown` | 日志读不到 | 不知道 —— **绝不并进任何一边**，那是编事实 |
+ *
+ * **`postOnly` 算不算「干净交易日」是判据问题，看板不替 M3 清单 §4.0 拍板。**
+ * 所以下面的 `clean` 仍然只数零重启那一档，`postOnly` 单独报出来给人看。
  */
-function cleanDaysOf(r: RuntimeSnapshot): { clean: number; dirty: number; unknown: number } {
+function cleanDaysOf(r: RuntimeSnapshot): {
+  clean: number
+  postOnly: number
+  dirty: number
+  unknown: number
+} {
   return {
-    clean: r.restarts.filter((d) => d.count === 0).length,
-    dirty: r.restarts.filter((d) => d.count !== null && d.count > 0).length,
-    unknown: r.restarts.filter((d) => d.count === null).length,
+    clean: r.restarts.filter((d) => d.boots !== null && d.boots.total === 0).length,
+    postOnly: r.restarts.filter((d) => d.boots !== null && d.boots.total > 0 && d.boots.inSession === 0)
+      .length,
+    dirty: r.restarts.filter((d) => d.boots !== null && d.boots.inSession > 0).length,
+    unknown: r.restarts.filter((d) => d.boots === null).length,
   }
 }
 
@@ -536,9 +606,10 @@ function tasks(input: {
         清零、同一条止损重新发一次，那样的日子拿去回答 4.1「几条值不值得被打断」
         必然得出「太吵」，而真实原因是开发期在重启。
       */
-      const { clean, dirty, unknown: unclear } = cleanDaysOf(r)
+      const { clean, postOnly, dirty, unknown: unclear } = cleanDaysOf(r)
       const tail = [
-        dirty > 0 ? `${dirty} 天因重启作废` : null,
+        dirty > 0 ? `${dirty} 天盘中重启作废` : null,
+        postOnly > 0 ? `${postOnly} 天只在盘外重启（算不算干净待 §4.0 定）` : null,
         unclear > 0 ? `${unclear} 天日志读不到` : null,
       ]
         .filter((s) => s !== null)
@@ -752,9 +823,11 @@ function render(input: {
   L.push('')
   if (baseline.known) {
     const b = baseline.value
-    L.push(`来源 \`${b.file}\`（${b.engineVersion} · ${b.at} · ${b.codes} 只）`)
+    const window = b.from === null || b.to === null ? '窗口读不到' : `${b.from} → ${b.to}`
+    L.push(`来源 \`${b.file}\`（${b.engineVersion} · ${b.at} · ${b.codes} 只 · **${window}**）`)
     L.push('')
-    L.push('| 全期收益 | 建仓 | 逐笔 | 建仓级胜率 | 最大回撤 | 夏普 | 平均占用 |')
+    // 表头刻意不写「全期」：选中的那份可能是训练窗口的报告（2026-08-18 踩过）
+    L.push('| 区间收益 | 建仓 | 逐笔 | 建仓级胜率 | 最大回撤 | 夏普 | 平均占用 |')
     L.push('|---|---|---|---|---|---|---|')
     L.push(
       `| **${pct(b.totalReturn)}** | ${b.positions} | ${b.trades} | ${pct(b.winRate)} | ` +
@@ -762,6 +835,10 @@ function render(input: {
     )
     L.push('')
     L.push('> 「超额收益」离开平均资金占用就会被读反（基准是满仓的，§5.13）。')
+    L.push(
+      `> ⚠ **这一行是上面那个窗口的收益，不是「全期」** —— 选中的是 \`reports/calib/\` 里最新的合格报告，` +
+        '它很可能是某次实验的**训练窗口**跑（判据见 docs/07 §3 的三段划分）。'
+    )
     if (!sameEngine(b.engineVersion, params.engineVersion)) {
       L.push(`> ⚠ **基线是 ${b.engineVersion}，当前引擎是 ${params.engineVersion}** —— 这张表描述的不是当前代码。`)
     }
@@ -786,17 +863,31 @@ function render(input: {
     */
     const c = cleanDaysOf(r)
     L.push(
-      `其中**没重启过**的交易日 **${c.clean}** 天` +
-        (c.dirty > 0 ? ` · 重启过 ${c.dirty} 天（提醒日志不可当判据）` : '') +
+      `其中**零重启**的交易日 **${c.clean}** 天` +
+        (c.postOnly > 0 ? ` · **只在盘外重启 ${c.postOnly} 天**（当日日志仍可用）` : '') +
+        (c.dirty > 0 ? ` · 盘中重启 ${c.dirty} 天（提醒日志不可当判据）` : '') +
         (c.unknown > 0 ? ` · ${c.unknown} 天日志读不到` : '') +
         '：'
     )
     L.push('')
     L.push(
       r.restarts
-        .map((d) => `\`${d.date}\` ${d.count === null ? '日志读不到' : d.count === 0 ? '干净' : `启动 ${d.count} 次`}`)
+        .map((d) => {
+          if (d.boots === null) return `\`${d.date}\` 日志读不到`
+          if (d.boots.total === 0) return `\`${d.date}\` 零重启`
+          const where = d.boots.inSession > 0 ? `其中盘中 ${d.boots.inSession} 次` : '**全在盘外**'
+          return `\`${d.date}\` 启动 ${d.boots.total} 次（${where}）`
+        })
         .join(' · ')
     )
+    if (c.postOnly > 0) {
+      L.push('')
+      L.push(
+        '> **「只在盘外重启」这一档算不算干净，看板不替你定**（M3 清单 §4.0 的判据问题）。' +
+          '当日的冷却/配额没被污染（那些是当日语义），但 `lastForcedLoss` 是**跨日**的 —— ' +
+          '清零会让**下一个交易日**的同一条止损多发一次。'
+      )
+    }
     if (straddlesLocalMidnight()) {
       L.push('')
       L.push(
