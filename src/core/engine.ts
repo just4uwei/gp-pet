@@ -19,7 +19,7 @@ import { aggregateWeekly } from './indicators/weekly'
 import { assessSufficiency, type DataSufficiency } from './indicators/sufficiency'
 import { classifyRegimes, currentRegime } from './regime'
 import { combineSignals, type CombineResult } from './combine'
-import { gateSignal } from './risk'
+import { gateSignal, type GateInput } from './risk'
 import { runStrategies } from './strategies'
 import { CONTINUOUS_MINUTES } from './session'
 import { DEFAULT_PARAMS, engineVersionOf, type EngineParams } from './params'
@@ -36,6 +36,16 @@ import type {
 } from './types'
 
 export interface Evaluation {
+  /**
+   * 这次判定**实际喂给风控层的那一份上下文**（引用，不是拷贝）。
+   *
+   * 存在的唯一理由：建仓体检（`core/risk/entry.ts`）要按**买入**方向把同样几条规则
+   * 再跑一遍，而它必须用**同一份**输入。另拼一份的症状是「体检说没事、提醒说涨停买不到」
+   * —— 两个口径分叉之后没有人分得清哪个才对，与 `trade:preview` 那条纪律同一形状。
+   *
+   * 里面含 `candles` 与 `ind` 的引用，**不要序列化它**（落库走 `evidencePayload`）。
+   */
+  gateInput: GateInput
   code: SecCode
   /** 被判定那根 K 线的日期。盘中即今日（临时线），收盘后即当日收盘线 */
   date: TradeDate
@@ -111,7 +121,7 @@ export function evaluate(ctx: EngineContext, params: EngineParams = DEFAULT_PARA
     params,
   })
 
-  const gated = gateSignal({
+  const gateInput: GateInput = {
     signal: combine.signal,
     profile: ctx.profile,
     candles,
@@ -127,9 +137,11 @@ export function evaluate(ctx: EngineContext, params: EngineParams = DEFAULT_PARA
       atMs: ctx.now.atMs,
     },
     params,
-  })
+  }
+  const gated = gateSignal(gateInput)
 
   return {
+    gateInput,
     code: ctx.profile.code,
     date: last.date,
     index,

@@ -613,6 +613,120 @@ describe('日内做T建议的接线（intraday-t.ts）', () => {
     const gated = gateSignal(input({ snapshot: snapshot(atHigh), signal: signalOf('BUY', 0.8) }))
     expect(gated.tTrade).toBeUndefined()
   })
+
+  it('全仓都是今天买的 → 不给高抛：T+0 只能用老仓做', () => {
+    const gated = gateSignal(
+      input({
+        position: position({ shares: 1000, lockedShares: 1000 }),
+        snapshot: snapshot(atHigh),
+        signal: signalOf('BUY', 0.8),
+      })
+    )
+    expect(gated.tTrade).toBeUndefined()
+  })
+
+  it('老仓还剩一些 → 高抛照给（可卖的那部分是真的卖得掉的）', () => {
+    const gated = gateSignal(
+      input({
+        position: position({ shares: 1000, lockedShares: 400 }),
+        snapshot: snapshot(atHigh),
+        signal: signalOf('BUY', 0.8),
+      })
+    )
+    expect(gated.tTrade?.side).toBe('HIGH_SELL')
+  })
+
+  it('全仓今日买入 → 低吸也不给（低吸卖的也是老仓那部分）', () => {
+    // 昨收 10、今日 9.5–10.5、现价踩在最低点 → 位置 0%
+    const atLow = { last: 9.5, high: 10.5, low: 9.5, preClose: 10 }
+    const locked = gateSignal(
+      input({
+        position: position({ shares: 1000, lockedShares: 1000 }),
+        snapshot: snapshot(atLow),
+        signal: signalOf('NONE', 0.1),
+      })
+    )
+    expect(locked.tTrade).toBeUndefined()
+    // 同一根、同一时刻，只把锁定股数换掉 —— 这条是上面那条的对照
+    const free = gateSignal(
+      input({ position: position({ shares: 1000 }), snapshot: snapshot(atLow), signal: signalOf('NONE', 0.1) })
+    )
+    expect(free.tTrade?.side).toBe('LOW_BUY')
+  })
+})
+
+/**
+ * T+1 卖出锁定（docs/05 §2.1，2026-08-19）。
+ *
+ * 两件事要分开钉：**全仓锁住**是硬抑制（连 alert_log 都不落），
+ * **部分锁住**只标注（老仓那部分是真的卖得掉的）。混成一条会让
+ * 「今天买了 100 股」把 900 股老仓的止损提醒一起吞掉。
+ *
+ * 最后一条是回测保证：`lockedShares` 缺省时行为与改动前逐位相同 ——
+ * `src/backtest` 与 `main/shadow` 永不设置它，这条用例是那个承诺的可执行版本。
+ */
+describe('T+1 卖出锁定（docs/05 §2.1）', () => {
+  it('全仓都是今天买的 → SELL 与 REDUCE 都被硬抑制', () => {
+    const held = position({ shares: 1000, lockedShares: 1000 })
+    for (const direction of ['SELL', 'REDUCE'] as const) {
+      const rules = hardSuppressions(input({ position: held }), direction).map((v) => v.rule)
+      expect(rules).toContain('T1_SELL_LOCK')
+    }
+  })
+
+  it('不抑制买入 —— 今天买不影响再买', () => {
+    const held = position({ shares: 1000, lockedShares: 1000 })
+    expect(hardSuppressions(input({ position: held }), 'BUY').map((v) => v.rule)).not.toContain('T1_SELL_LOCK')
+  })
+
+  it('老仓还剩一些 → 不抑制，只标注可卖多少', () => {
+    const held = position({ shares: 1000, lockedShares: 400 })
+    expect(hardSuppressions(input({ position: held }), 'SELL').map((v) => v.rule)).not.toContain('T1_SELL_LOCK')
+
+    const gated = gateSignal(input({ position: held, signal: signalOf('SELL', 0.8) }))
+    const note = gated.verdicts.find((v) => v.rule === 'T1_PARTIAL_LOCK')
+    expect(note?.action).toBe('ANNOTATE')
+    expect(note?.reason).toContain('600')
+    expect(gated.suppressed).toBe(false)
+  })
+
+  it('跌破止损线 + 全仓今日买入 → 强制卖出被压成 L1 且 suppressed（当天确实卖不掉）', () => {
+    // 成本 12、现价 10 → 亏 16.7%，触及 8% 止损线
+    const gated = gateSignal(
+      input({
+        position: position({ cost: 12, shares: 1000, lockedShares: 1000 }),
+        signal: signalOf('NONE', 0.1),
+      })
+    )
+    expect(gated.direction).toBe('SELL')
+    expect(gated.verdicts.some((v) => v.rule === 'STOP_LOSS')).toBe(true)
+    expect(gated.verdicts.some((v) => v.rule === 'T1_SELL_LOCK')).toBe(true)
+    // 硬抑制后一律 L1 且不进提醒层（alerts/candidates.ts 见 suppressed 直接 continue）
+    expect(gated.level).toBe('L1')
+    expect(gated.suppressed).toBe(true)
+    // 原因照样留在裁决里 —— 面板的「今日被静默的信号」要答得出「为什么没提醒我」
+    expect(gated.reasons.some((r) => r.includes('T+1'))).toBe(true)
+  })
+
+  it('次日同一根：lockedShares 归零 → 止损照发 L3', () => {
+    const gated = gateSignal(input({ position: position({ cost: 12, shares: 1000 }), signal: signalOf('NONE', 0.1) }))
+    expect(gated.direction).toBe('SELL')
+    expect(gated.level).toBe('L3')
+    expect(gated.suppressed).toBe(false)
+  })
+
+  it('lockedShares 缺省时逐字段与「显式给 0」相同 —— 回测与影子运行不受影响', () => {
+    const base = input({ position: position({ cost: 12, shares: 1000 }), signal: signalOf('SELL', 0.8) })
+    const explicitZero = input({
+      position: position({ cost: 12, shares: 1000, lockedShares: 0 }),
+      signal: signalOf('SELL', 0.8),
+    })
+    expect(JSON.stringify(gateSignal(base))).toBe(JSON.stringify(gateSignal(explicitZero)))
+  })
+
+  it('没有持仓时不产出这条 —— 无仓可卖不是「T+1 锁住了」', () => {
+    expect(hardSuppressions(input(), 'SELL').map((v) => v.rule)).not.toContain('T1_SELL_LOCK')
+  })
 })
 
 describe('文案（docs/05 §5）', () => {

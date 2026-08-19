@@ -22,6 +22,7 @@ import type { Candle, Position, SecCode, SecProfile, SignalStage, Snapshot } fro
 import type { MarketContext } from '@main/engine/market-data'
 import type { WatchEntry } from '@main/storage/repositories/watchlist'
 import type { SignalRow } from '@main/storage/repositories/signal'
+import { shanghaiDayStartMs } from '@shared/time'
 import { buildCandles, chopCloses, goldenCrossBreakout } from '../../fixtures/klines'
 
 const PROFILE: SecProfile = { code: 'SH600000', name: '浦发银行', market: 'SH', board: 'MAIN', isST: false }
@@ -567,6 +568,58 @@ describe('查询与解释', () => {
     expect(engine.latest().length).toBe(1)
     engine.run({ ...TICK, producesSignals: false })
     expect(engine.latest()).toEqual([])
+  })
+})
+
+/**
+ * T+1 的锁定股数（2026-08-19）。
+ *
+ * 编排层这里只钉两件事：**日界按 `tick.at` 算**（不是「现在」—— 收盘补跑传的是
+ * D 的收盘时刻，用「现在」会拿今天的流水去判昨天的信号），以及**它真的传进了引擎**。
+ * 规则本身在 `tests/unit/risk/risk.test.ts`。
+ */
+describe('T+1 锁定股数的接线', () => {
+  const held: Position = { code: PROFILE.code, shares: 1000, cost: 10, peakPrice: 10, openedAt: 0 }
+
+  it('按 tick.at 所在的**北京日**去数买入，不是按「现在」', () => {
+    const h = harness({ position: held })
+    const calls: { code: SecCode; sinceMs: number }[] = []
+    createSignalEngine({
+      ...h.deps,
+      lockedSharesOf: (code, sinceMs) => {
+        calls.push({ code, sinceMs })
+        return 0
+      },
+    }).run(TICK)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.code).toBe(PROFILE.code)
+    expect(calls[0]?.sinceMs).toBe(shanghaiDayStartMs(TICK.at))
+    // 日界必须落在 tick.at 之前、且相差不到一天 —— 「拿今天的日界判昨天」会破这条
+    expect(calls[0]?.sinceMs).toBeLessThanOrEqual(TICK.at)
+    expect(TICK.at - (calls[0]?.sinceMs ?? 0)).toBeLessThan(86_400_000)
+  })
+
+  it('全仓今日买入 → 卖出方向被 T1_SELL_LOCK 抑制（锁定量真的传到了风控层）', () => {
+    const h = harness({ position: { ...held, cost: 20 } }) // 成本 20、现价 10 → 跌破止损线
+    const outcomes = createSignalEngine({ ...h.deps, lockedSharesOf: () => 1000 }).run(TICK)
+    const gated = outcomes[0]?.evaluation.gated
+    expect(gated?.verdicts.some((v) => v.rule === 'T1_SELL_LOCK')).toBe(true)
+    expect(gated?.suppressed).toBe(true)
+  })
+
+  it('不传这个依赖时逐位保持旧行为（缺省 0）', () => {
+    const h = harness({ position: { ...held, cost: 20 } })
+    const gated = createSignalEngine(h.deps).run(TICK)[0]?.evaluation.gated
+    expect(gated?.verdicts.some((v) => v.rule === 'T1_SELL_LOCK')).toBe(false)
+    expect(gated?.suppressed).toBe(false)
+  })
+
+  it('没有持仓时不去查流水 —— 无仓可锁', () => {
+    const h = harness()
+    const calls: number[] = []
+    createSignalEngine({ ...h.deps, lockedSharesOf: (_code, sinceMs) => (calls.push(sinceMs), 0) }).run(TICK)
+    expect(calls).toHaveLength(0)
   })
 })
 

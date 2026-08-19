@@ -19,11 +19,21 @@
  * 3. **手续费不让用户填**，按回测那套默认费率算（佣金万 2.5 / 最低 5 元、印花税千 1、
  *    过户费万 0.1）。与影子运行、回测同一口径，三边的盈亏数字才能横向比。
  *    **但不套滑点** —— 用户填的就是真实成交价（见 ledger.ts 头注释）。
+ *
+ * ## T+1 与建仓体检（2026-08-19）
+ *
+ * - 选「买入」时表单**上方**是 `EntryCheckCard`（建仓体检）。摆在上方是刻意的：
+ *   「先帮我判断危险性」要求它在决定之前被看到，摆在按钮下面等于事后诸葛。
+ * - 选「卖出」时若股数超过当日可卖（A 股 T+1），`preview.warning` 给一条**琥珀色**提示
+ *   而按钮**仍然可用** —— 与玫红色的 `error`（真的录不进去）严格区分。
+ *   不硬拒的理由在 `TradePreview.warning` 上：跨境/债券 ETF 与可转债是 T+0。
+ * - 持仓卡上显示「其中 N 股今日买入」。不说的话用户会按全仓去挂单，然后被券商拒掉。
  */
 
 import { useEffect, useState } from 'react'
 import type { SecCode } from '@core/types'
 import type { PositionView, QuoteTick, TradeLedger, TradePreview, TradeView } from '@shared/ipc-types'
+import { EntryCheckCard } from './EntryCheckCard'
 import { StopFloorForm, StopFloorNotice } from './StopFloorForm'
 
 const FIELD =
@@ -63,6 +73,17 @@ function dateValue(ms: number): string {
 function parseDate(text: string, fallback: number): number {
   const parsed = new Date(`${text}T12:00:00`).getTime()
   return Number.isFinite(parsed) ? parsed : fallback
+}
+
+/**
+ * 输入框里的字符串 → 正数或 `undefined`。
+ *
+ * **不退成 0**：建仓体检靠「有没有这个值」决定要不要算止损参考与行业占比，
+ * 0 会让「还没填」看起来像「打算 0 元买 0 股」（约束 4 的展示层版本）。
+ */
+function positiveOrUndefined(text: string): number | undefined {
+  const value = Number(text)
+  return Number.isFinite(value) && value > 0 ? value : undefined
 }
 
 export function TradePanel({
@@ -109,8 +130,20 @@ export function TradePanel({
   const position = ledger?.position ?? null
 
   /**
+   * 表单里那两个输入框的「意向值」。填不出正数时是 `undefined` ——
+   * **不要退成 0**：体检那边靠「有没有这个值」决定要不要算止损参考与行业占比，
+   * 而 0 会让「还没填」看起来像「打算 0 元买 0 股」。
+   */
+  const intentPrice = positiveOrUndefined(price)
+  const intentShares = positiveOrUndefined(shares)
+
+  /**
    * 试算。数值填全之前不发请求（`null` = 还没得算，不是「算不出来」）。
    * `position` 进依赖数组是必须的：刚录完一笔之后账本变了，试算要跟着重算。
+   *
+   * **`tradedAt` 要一起送过去**（2026-08-19）：T+1 的那条提示按**这笔成交自己的日期**
+   * 判「当天买了多少」，不是按今天。漏传的症状是补录上周那笔卖出时凭空报一次 T+1
+   * —— 而用户会以为软件不让他补录。
    */
   const [preview, setPreview] = useState<TradePreview | null>(null)
   useEffect(() => {
@@ -122,7 +155,7 @@ export function TradePanel({
     }
     let cancelled = false
     void window.gp
-      .invoke('trade:preview', { code, side, price: p, shares: n })
+      .invoke('trade:preview', { code, side, price: p, shares: n, tradedAt: parseDate(tradedAt, Date.now()) })
       .then((result) => {
         if (!cancelled) setPreview(result)
       })
@@ -132,7 +165,7 @@ export function TradePanel({
     return () => {
       cancelled = true
     }
-  }, [code, price, shares, side, position])
+  }, [code, price, shares, side, tradedAt, position])
 
   const valid = preview !== null && preview.error === undefined
 
@@ -165,7 +198,20 @@ export function TradePanel({
         {position ? (
           <div className="grid grid-cols-2 gap-y-1.5 text-xs">
             <span className="text-white/40">持有</span>
-            <span className="text-right font-mono">{position.shares} 股</span>
+            <span className="text-right font-mono">
+              {position.shares} 股
+              {/*
+                A 股 T+1：今天买的今天卖不掉。**必须显示** —— 用户看到的是持有数，
+                不说的话他会按全仓挂单，然后被券商拒掉。
+                `lockedShares` 由主进程按成交流水算（判据与风控层同一个数）
+              */}
+              {position.lockedShares !== undefined && position.lockedShares > 0 ? (
+                <span className="ml-1 text-[10px] text-amber-200/70">
+                  （可卖 {Math.max(0, position.shares - position.lockedShares)}，
+                  {position.lockedShares} 股今日买入）
+                </span>
+              ) : null}
+            </span>
             <span className="text-white/40">摊薄成本（含费）</span>
             <span className="text-right font-mono">{position.cost.toFixed(3)}</span>
             <span className="text-white/40">现价</span>
@@ -236,6 +282,21 @@ export function TradePanel({
           <span className="font-mono text-white/35">{(ledger?.feeTotal ?? 0).toFixed(2)}</span>
         </div>
       </section>
+
+      {/*
+        ── 建仓体检 ────────────────────────────────────────────
+        只在「买入」时出现，且**在录入表单之上** —— 「先帮我判断危险性」
+        要求它在决定之前被看到。价与股数没填也照样出（结构性风险与买多少无关）。
+      */}
+      {side === 'BUY' ? (
+        <EntryCheckCard
+          code={code}
+          price={intentPrice}
+          shares={intentShares}
+          revision={position}
+          onError={onError}
+        />
+      ) : null}
 
       {/* ── 录一笔成交 ─────────────────────────────────────────── */}
       <section className="rounded border border-sky-400/25 bg-sky-500/[0.06] p-3">
@@ -312,6 +373,17 @@ export function TradePanel({
               ) : null}
             </div>
           )
+        ) : null}
+
+        {/*
+          T+1 提示（琥珀色）。**与上面那条玫红色的 error 严格分开**：
+          error 是「录不进去」，这条是「能录，但你可能把日期填错了」——
+          按钮照样可用（跨境/债券 ETF 与可转债是 T+0，见 TradePreview.warning）。
+        */}
+        {preview?.warning !== undefined ? (
+          <p className="mt-1.5 rounded border border-amber-400/25 bg-amber-400/[0.07] px-2 py-1.5 text-[10px] leading-snug text-amber-200/85">
+            {preview.warning}
+          </p>
         ) : null}
 
         <button className="gp-btn mt-2 w-full justify-center" disabled={!valid || busy} onClick={submit}>

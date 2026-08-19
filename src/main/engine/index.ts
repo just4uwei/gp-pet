@@ -12,7 +12,15 @@ export {
 } from './market-data'
 export { MINUTE_CACHE_TTL_MS, createMinuteCache, mergeIntraday, shanghaiTradeDate } from './intraday'
 export type { IntradayWindow, LocalIntraday, MinuteCache } from './intraday'
-export { BENCHMARK_CODE, createSignalEngine, evidencePayload, snapshotOfIndicators, toSignalRecord } from './signals'
+export {
+  BENCHMARK_CODE,
+  createSignalEngine,
+  evidencePayload,
+  industryMapOf,
+  industryValueShares,
+  snapshotOfIndicators,
+  toSignalRecord,
+} from './signals'
 export type { SignalEngine, SignalEngineDeps, SignalOutcome, TickInfo } from './signals'
 export { closeMsOf, settleDay } from './settle'
 export type { SettleDeps, SettleResult } from './settle'

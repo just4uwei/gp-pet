@@ -85,6 +85,14 @@ export function registerHandlers(controller: AppController): void {
     controller.previewTrade({ ...draft, code: normalizeCode(draft.code) })
   )
 
+  handle('trade:entryCheck', (_event, query) =>
+    controller.entryCheck({
+      code: normalizeCode(query.code),
+      ...(query.price === undefined ? {} : { price: query.price }),
+      ...(query.shares === undefined ? {} : { shares: query.shares }),
+    })
+  )
+
   handle('trade:add', (_event, draft) =>
     controller.addTrade({ ...draft, code: normalizeCode(draft.code) })
   )

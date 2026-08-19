@@ -30,6 +30,7 @@ import type {
   TradingSession,
 } from '@core/types'
 import type { SignalEvidence, SignalRecord } from '@shared/ipc-types'
+import { shanghaiDayStartMs } from '@shared/time'
 import type { IndicatorRepo } from '../storage/repositories/indicator'
 import type { SignalEvidencePayload, SignalRepo, SignalRow } from '../storage/repositories/signal'
 import type { WatchEntry } from '../storage/repositories/watchlist'
@@ -45,6 +46,18 @@ export interface SignalEngineDeps {
   positions: { get(code: SecCode): Position | null; list(): Position[]; bumpPeak(code: SecCode, price: number): void }
   signals: SignalRepo
   indicators: IndicatorRepo
+  /**
+   * 某只票里「今天买进、T+1 下今天卖不掉」的股数（`Position.lockedShares`）。
+   *
+   * 做成依赖而不是让引擎自己去查流水，是因为 `SignalEngineDeps.positions` 只认 `Position`
+   * 那张表，而这个数住在 `trade_log` 里。缺省返回 0 —— 单测与「还没接流水」的调用方
+   * 因此逐位保持旧行为。
+   *
+   * ⚠ **`sinceMs` 由引擎按 `tick.at` 算，不是「现在」。** 收盘补跑（`settle.ts`）传的
+   * `tick.at` 是那一天的收盘时刻，于是它算的是**那天**的锁定量；用「现在」会让补跑
+   * 拿今天的流水去判昨天的信号。
+   */
+  lockedSharesOf?: (code: SecCode, sinceMs: number) => number
   params?: EngineParams
   benchmarkCode?: SecCode
   /** 引擎每次可见的最大回看根数，与 MarketDataService.initialBars 对齐 */
@@ -116,6 +129,18 @@ export interface SignalEngine {
   readonly engineVersion: string
   /** 跑一轮全量评估。竞市之外的时段返回空数组且不落库 */
   run(tick: TickInfo): SignalOutcome[]
+  /**
+   * 就地评估**一只**票并把结果原样交出来 —— 建仓体检（`trade:entryCheck`）用。
+   *
+   * 与 `run()` 的差别是它**什么都不写**：不落 `signal` 表、不写指标缓存、不 bumpPeak、
+   * 不跑收盘确认与「明日观察」复活。用户点开一个体检面板不该在信号历史里留下一行，
+   * 也不该把 `persistedSignature` 的去重状态搅乱（那会让下一轮真信号被误判成「没变」）。
+   *
+   * **不受 `producesSignals` 限制**：这是用户主动要的一次查看，不是提醒。
+   * 拿不到日线（不在自选、还没回补）时返回 null —— 调用方必须把它显示成
+   * 「体检做不了」，**不许显示成「没问题」**。
+   */
+  assess(code: SecCode, tick: TickInfo): Evaluation | null
   /** 最近一轮的评估结果，供面板与桌宠状态使用 */
   latest(): SignalOutcome[]
   history(query: { code?: SecCode; from?: number; to?: number; limit?: number; perCode?: number }): SignalRecord[]
@@ -131,6 +156,7 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
     positions,
     signals,
     indicators,
+    lockedSharesOf = () => 0,
     params = DEFAULT_PARAMS,
     benchmarkCode = BENCHMARK_CODE,
     lookback = 320,
@@ -167,27 +193,13 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
     return marketSentiment(context.candles.map((c) => c.closeAdj))
   }
 
-  /**
-   * 行业集中度（docs/05 §2.2）。按持仓市值占比算，取不到价格的持仓按成本价估。
-   * 没有任何持仓时返回空 Map —— 让风控层看到 undefined 而不是 0（见 EngineContext.industryShare）。
-   */
+  /** 行业集中度（docs/05 §2.2）。口径在 `industryValueShares()`，这里只把依赖接上 */
   function industryShares(entries: readonly WatchEntry[]): Map<string, number> {
-    const held = positions.list()
-    if (held.length === 0) return new Map()
-    const industryOf = new Map(entries.map((e) => [e.profile.code, e.profile.industry ?? '未分类']))
-    const values = new Map<string, number>()
-    let total = 0
-    for (const position of held) {
-      const price = market.snapshotOf(position.code)?.last ?? position.cost
-      const value = price * position.shares
-      total += value
-      const industry = industryOf.get(position.code) ?? '未分类'
-      values.set(industry, (values.get(industry) ?? 0) + value)
-    }
-    if (total <= 0) return new Map()
-    const shares = new Map<string, number>()
-    for (const [industry, value] of values) shares.set(industry, value / total)
-    return shares
+    return industryValueShares({
+      held: positions.list(),
+      industryOf: industryMapOf(entries),
+      priceOf: (code) => market.snapshotOf(code)?.last ?? null,
+    })
   }
 
   /** 只缓存收盘指标：临时线算出来的指标每 tick 都在变（docs/04 §6） */
@@ -210,7 +222,14 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
     const context = market.getContext(profile.code, tick.date, lookback)
     if (context.candles.length === 0) return null
 
-    const position = positions.get(profile.code)
+    // T+1：今天买进的今天卖不掉。合进 `Position` 而不是另开一个入参，
+    // 是因为风控层的三条判据（硬抑制 / 标注 / 做T的底仓）都跟着持仓走。
+    // 日界按 `tick.at` 算 —— 引擎不读时钟（见 lockedSharesOf 的注释）
+    const held = positions.get(profile.code)
+    const position =
+      held === null
+        ? null
+        : withLockedShares(held, lockedSharesOf(profile.code, shanghaiDayStartMs(tick.at)))
     const industry = profile.industry ?? '未分类'
     const share = position ? shares.get(industry) : undefined
 
@@ -378,6 +397,19 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
       return outcomes
     },
 
+    assess(code, tick) {
+      const entry = watchlist.list().find((item) => item.profile.code === code)
+      // 指数不产出交易信号（docs/04 §1.6），体检同理 —— 它不是可交易品种
+      if (!entry || entry.profile.board === 'INDEX') return null
+      try {
+        return evaluateOne(entry, tick, sentimentOf(tick.date), industryShares(watchlist.list()))?.evaluation ?? null
+      } catch (error) {
+        // 与 run() 同一条：一只算不出来只是这一次体检做不了，不该把异常抛给 IPC
+        log.warn(`[signal] ${code} 建仓体检评估失败：${String(error)}`)
+        return null
+      }
+    },
+
     latest: () => lastOutcomes,
 
     history(query) {
@@ -407,6 +439,65 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
 
     purgeStaleCache: () => indicators.purgeOtherVersions(engineVersion),
   }
+}
+
+/** 自选清单 → 「代码 → 行业」。缺行业的一律归「未分类」，那是一个真实的分组不是缺省值 */
+export function industryMapOf(entries: readonly WatchEntry[]): (code: SecCode) => string {
+  const map = new Map(entries.map((e) => [e.profile.code, e.profile.industry ?? '未分类']))
+  return (code) => map.get(code) ?? '未分类'
+}
+
+/**
+ * 行业集中度（docs/05 §2.2）：每个行业在**持仓市值**里占多少。
+ *
+ * 取不到现价的持仓按成本价估 —— 停牌股与刚加进来还没取到快照的票不该整个消失，
+ * 那会让分母缩小、其余行业的占比集体虚高。
+ *
+ * **没有任何持仓时返回空 Map**，让风控层看到 `undefined` 而不是 0
+ * （见 `EngineContext.industryShare`：0 是「完全没有同行业持仓」这个明确结论，
+ * 拿它顶替「没统计」会让规则永不触发且看不出是缺数据）。
+ *
+ * `extra` 是给**建仓体检**用的：把「还没成交的这一笔」按金额加进分子与分母，
+ * 于是同一个上限能回答「买完会不会超」而不只是「现在有没有超」。
+ * 单独抽出来是因为它有两个调用方（引擎每轮 + 体检），照抄一份必然分叉。
+ */
+export function industryValueShares(input: {
+  held: readonly Position[]
+  industryOf: (code: SecCode) => string
+  /** 现价；取不到给 null（**不是 0**，那会让这只票的市值凭空归零） */
+  priceOf: (code: SecCode) => number | null
+  extra?: { industry: string; amount: number }
+}): Map<string, number> {
+  const { held, industryOf, priceOf, extra } = input
+  if (held.length === 0 && !extra) return new Map()
+
+  const values = new Map<string, number>()
+  let total = 0
+  for (const position of held) {
+    const price = priceOf(position.code) ?? position.cost
+    const value = price * position.shares
+    total += value
+    const industry = industryOf(position.code)
+    values.set(industry, (values.get(industry) ?? 0) + value)
+  }
+  if (extra && extra.amount > 0) {
+    total += extra.amount
+    values.set(extra.industry, (values.get(extra.industry) ?? 0) + extra.amount)
+  }
+  if (total <= 0) return new Map()
+
+  const shares = new Map<string, number>()
+  for (const [industry, value] of values) shares.set(industry, value / total)
+  return shares
+}
+
+/**
+ * 把「今天买的股数」挂到持仓上。**0 时不带这个键** —— `exactOptionalPropertyTypes`
+ * 下塞一个 `undefined` 与不塞是两回事，而回测那边正是靠「这个键不存在」保持行为不变。
+ */
+function withLockedShares(position: Position, locked: number): Position {
+  const value = Math.max(0, Math.trunc(locked))
+  return value > 0 ? { ...position, lockedShares: value } : position
 }
 
 /** 被缓存的指标截面：只留被判定那根的值。整条序列没必要落库（K 线在，随时能重算） */

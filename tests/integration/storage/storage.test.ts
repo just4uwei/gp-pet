@@ -577,6 +577,36 @@ describe('TradeRepo（007）', () => {
     expect(storage.trades.sumFees('SH600000')).toBe(11)
   })
 
+  /**
+   * T+1 的锁定股数（`Position.lockedShares` 的来源）。
+   *
+   * 两条容易写错的：**只数 BUY**（`OPENING` 按定义是老仓，把它算进来会让
+   * 刚导入配置的用户一整天卖不出任何东西），以及**日界是闭区间下界**
+   * （`>= sinceMs`，恰好落在日界那一刻的成交算今天的）。
+   */
+  it('boughtSharesSince 只数买入，且不含期初建仓', () => {
+    seedWatch()
+    const base = { code: 'SH600000' as const, price: 10, fee: 1, createdAt: T }
+    storage.trades.insert({ ...base, id: 'old', side: 'BUY', tradedAt: T - 1, shares: 700 })
+    storage.trades.insert({ ...base, id: 'opening', side: 'OPENING', tradedAt: T + 10, shares: 5000 })
+    storage.trades.insert({ ...base, id: 'today1', side: 'BUY', tradedAt: T, shares: 300 })
+    storage.trades.insert({ ...base, id: 'today2', side: 'BUY', tradedAt: T + 100, shares: 200 })
+    storage.trades.insert({ ...base, id: 'sell', side: 'SELL', tradedAt: T + 200, shares: 400 })
+
+    // 日界那一刻的成交算「今天的」；更早的那笔不算；期初与卖出都不数
+    expect(storage.trades.boughtSharesSince('SH600000', T)).toBe(500)
+    expect(storage.trades.boughtSharesSince('SH600000', T - 1)).toBe(1200)
+    expect(storage.trades.boughtSharesSince('SH600000', T + 1000)).toBe(0)
+  })
+
+  it('boughtSharesSince 按标的隔离，且没有流水时是 0', () => {
+    seedWatch()
+    storage.trades.insert({
+      id: 'x', code: 'SZ000001', side: 'BUY', tradedAt: T, price: 10, shares: 100, fee: 1, createdAt: T,
+    })
+    expect(storage.trades.boughtSharesSince('SH600000', 0)).toBe(0)
+  })
+
   it('移出自选**不**连带删账本 —— 卖光之后把票删掉，赚了多少不该跟着消失', () => {
     seedWatch()
     storage.trades.insert({

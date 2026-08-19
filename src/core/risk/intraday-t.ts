@@ -34,7 +34,12 @@ import type { Snapshot, TTradeAdvice, TradingSession } from '../types'
 
 export interface TTradeInput {
   snapshot: Snapshot | undefined
-  /** 有底仓才谈得上做T。这里只要股数 */
+  /**
+   * 有底仓才谈得上做T。这里要的是**今天卖得掉的**股数（`risk/index.ts` 的
+   * `sellableShares()`），**不是持有股数** —— 今天刚买进的那部分 T+1 下今天卖不掉，
+   * 把它算成底仓会让同一句判据变成一条开仓建议，而那是买入信号的活。
+   * 高抛与低吸两侧都要：低吸也是「先买，卖的是老仓那部分」。
+   */
   shares: number
   session: TradingSession
   /** 含午休的自然分钟（与 `risk.lateBuyCutoffMinutes` 同一口径） */

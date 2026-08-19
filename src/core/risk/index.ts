@@ -96,6 +96,23 @@ export function belowStopLine(price: number, position: Position, params: EngineP
   return (price - position.cost) / position.cost <= -params.risk.stopLossPct
 }
 
+/**
+ * 今天卖得掉的股数（A 股 T+1：今天买进的今天卖不掉）。
+ *
+ * **单独导出**，因为它有三个调用方：`hardSuppressions()`（决定卖出信号要不要抑制）、
+ * `gateSignal()` 里喂给 `tTradeAdvice()` 的「有没有底仓」、以及主进程的 `PositionView`
+ * （界面上显示「其中 N 股今日买入」）。各写一遍必然分叉，与 `belowStopLine` 同一个形状。
+ *
+ * 没有持仓返回 0；`lockedShares` 缺省（回测、影子运行、以及今天没买过）时
+ * 逐位等于 `shares` —— 那正是这个字段不影响 `src/backtest` 的原因。
+ * 取 `max(0, …)` 是因为流水可以补录：用户把卖出的日期填成买入之前时，
+ * 减出来可能是负数，而负的「可卖股数」会让下面每一条判据都读反。
+ */
+export function sellableShares(position: Position | undefined): number {
+  if (!position || position.shares <= 0) return 0
+  return Math.max(0, position.shares - Math.max(0, position.lockedShares ?? 0))
+}
+
 /** 持仓风控的四条强制规则，按严重程度排序 —— 命中第一条即定案 */
 export function positionVerdict(input: GateInput): { verdict: RiskVerdict; direction: GatedDirection; level: AlertLevel } | null {
   const { position, params } = input
@@ -267,6 +284,34 @@ export function hardSuppressions(input: GateInput, direction: GatedDirection): R
     }
   }
 
+  /*
+    T+1：今天买进的今天卖不掉（docs/05 §2.1）。
+
+    **归硬抑制而不是降级**，先例就在上面那条 `HARD_LIMIT_DOWN`「已跌停，卖不掉」——
+    两者是同一类事实：不是「风险大」（那是 `downgrades()` 管的，且它只作用于 BUY），
+    而是**这一刻根本执行不了**。
+
+    ⚠ 代价要知道：这条命中之后 `gated.suppressed` 为 true，而 `alerts/candidates.ts`
+    见到 suppressed 直接 continue ⇒ **连 alert_log 都不落，一条气泡都没有**。
+    今天买、今天就跌破 8% 止损线的那种情形因此当天完全静默。这是刻意的
+    （今天确实卖不掉），而且不是永久静默：次日开盘第一轮 `lockedShares` 归零，
+    STOP_LOSS 照常发 L3。那一行仍带着本条原因进 `signal` 表，面板与持仓卡都看得见。
+
+    **只在全仓都锁住时抑制。** 部分锁定（老仓还有一些）走 `gateSignal()` 里那条
+    `T1_PARTIAL_LOCK` 标注 —— 老仓那部分是真的卖得掉的。
+  */
+  if (direction === 'SELL' || direction === 'REDUCE') {
+    const position = input.position
+    if (position && position.shares > 0 && sellableShares(position) <= 0) {
+      out.push({
+        rule: 'T1_SELL_LOCK',
+        action: 'SUPPRESS',
+        reason: `持有的 ${position.shares} 股均为今日买入，T+1 下今天卖不出；明日开盘可执行`,
+        evidence: { shares: position.shares, lockedShares: position.lockedShares ?? 0 },
+      })
+    }
+  }
+
   // 快照陈旧：连续竞价时段里超过 5 分钟没有新价，结论不可信。
   // 没有 atMs（回测）或不在连续竞价时段时不判 —— 收盘后快照本来就是「旧」的
   const continuous = input.now.session === 'CONTINUOUS_AM' || input.now.session === 'CONTINUOUS_PM'
@@ -367,7 +412,9 @@ export function gateSignal(input: GateInput): GatedSignal {
       ? null
       : tTradeAdvice({
           snapshot: input.snapshot,
-          shares: input.position?.shares ?? 0,
+          // **可卖**股数，不是持有股数：T+0 只能用老仓做（intraday-t.ts 头注释）。
+          // 今天刚买进的那部分今天卖不掉，拿它当底仓会把一条开仓建议讲成做T建议
+          shares: sellableShares(input.position),
           session: input.now.session,
           minuteOfDay: input.now.minuteOfDay,
           limits: limitPrices(input),
@@ -393,6 +440,21 @@ export function gateSignal(input: GateInput): GatedSignal {
 
   const downgradeVerdicts = downgrades(input, direction)
   verdicts.push(...downgradeVerdicts)
+
+  /*
+    T+1 部分锁定：老仓还卖得掉，但今天买的那部分卖不了（见 hardSuppressions 里那条）。
+    **只标注不抑制** —— 抑制会把一条真能执行的卖出提醒整个吞掉，
+    而这里要说的只是「别按全仓去挂单」。全仓锁住的情形已经在硬抑制里定案了。
+  */
+  const locked = input.position ? Math.max(0, input.position.lockedShares ?? 0) : 0
+  if ((direction === 'SELL' || direction === 'REDUCE') && locked > 0 && sellableShares(input.position) > 0) {
+    verdicts.push({
+      rule: 'T1_PARTIAL_LOCK',
+      action: 'ANNOTATE',
+      reason: `其中 ${locked} 股为今日买入，今天卖不了（可卖 ${sellableShares(input.position)} 股）`,
+      evidence: { lockedShares: locked, sellable: sellableShares(input.position) },
+    })
+  }
 
   const dataNote = input.sufficiency.limited && input.sufficiency.usable
   if (dataNote) {
@@ -480,3 +542,11 @@ function limitPrices(input: GateInput): { limitUp: number; limitDown: number } |
 
 export * from './text'
 export { tTradeAdvice, type TTradeInput } from './intraday-t'
+export {
+  entryCheck,
+  type EntryCheckInput,
+  type EntryCheckItem,
+  type EntryCheckResult,
+  type EntrySeverity,
+  type EntryVerdict,
+} from './entry'

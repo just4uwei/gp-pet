@@ -118,6 +118,46 @@ export function applyTrade(
 }
 
 /**
+ * 「这笔卖出超过了成交当日的可卖股数」的提示语 —— A 股 T+1，当日买入当日卖不出。
+ *
+ * ## 为什么是提示而不是拒绝
+ *
+ * 这个函数**不属于** `applyTrade`，它的结论也不进 `TradeOutcome.error`：
+ * 跨境 / 债券 / 黄金 ETF 与可转债确实是 T+0，而用户还可能在补录历史成交、
+ * 或者把成交日期填错了。把一条**合法**成交挡在外面，症状是
+ * 「我明明这么成交的，软件说存不进去」—— 那比多给一句提示贵得多。
+ * 所以它落在 `TradePreview.warning`（琥珀色）而不是 `error`（玫红色）。
+ *
+ * ## 三个入参的口径
+ *
+ * - `heldShares` 是**这笔成交之前**的持股数；
+ * - `sameDayBuyShares` 是**该成交日**（不是「今天」）买入的股数 ——「补录上周那笔卖出」
+ *   是常态，拿今天的日界去卡它会对每一笔历史成交都报一次；
+ * - 两者相减就是那天真正卖得掉的量，与风控层的 `sellableShares()` 是同一个算式。
+ *
+ * 放在这个纯函数模块里而不是 controller 里，是为了让措辞与判据能被用例钉住 ——
+ * 它是唯一一处会直接影响用户「要不要按下确认」的文案。
+ */
+export function t1SellNotice(input: {
+  side: TradeSide
+  shares: number
+  heldShares: number
+  sameDayBuyShares: number
+}): string | null {
+  const { side, shares, heldShares, sameDayBuyShares } = input
+  if (side !== 'SELL') return null
+  if (heldShares <= 0 || sameDayBuyShares <= 0) return null
+
+  const sellable = Math.max(0, heldShares - sameDayBuyShares)
+  if (Math.trunc(shares) <= sellable) return null
+  return (
+    `成交当日买入过 ${sameDayBuyShares} 股 —— A 股 T+1 下当日买入当日卖不出，` +
+    `那天最多卖 ${sellable} 股。确认一下成交日期是否填对。` +
+    `（跨境 / 债券 / 黄金 ETF 与可转债是 T+0，不受此限，可以照录）`
+  )
+}
+
+/**
  * 按流水重放出持仓。`trade:remove`（录错了要删）走这条路。
  *
  * **不做反向增量回滚**：在「买入 → 卖出 → 又买入」这类序列上，

@@ -29,6 +29,7 @@ export const INVOKE_CHANNELS = [
   'kline:daily',
   'trade:list',
   'trade:preview',
+  'trade:entryCheck',
   'trade:add',
   'trade:remove',
   'alert:history',

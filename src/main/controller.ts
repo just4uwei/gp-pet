@@ -31,6 +31,7 @@ import type {
   DailyBar,
   DailyReport,
   EngineStatus,
+  EntryCheckView,
   IntradaySeries,
   MaintenanceResult,
   ParamRow,
@@ -57,7 +58,7 @@ import type {
 import type { Board, Candle, Position, SecCode, Snapshot, TradeDate } from '@core/types'
 import { DEFAULT_PARAMS, engineVersionOf, withSensitivity } from '@core/params'
 import { sma } from '@core/indicators/series'
-import { belowStopLine } from '@core/risk'
+import { belowStopLine, entryCheck } from '@core/risk'
 import {
   AI_CONFIG_FILE,
   AI_REPORT_PROMPT,
@@ -83,7 +84,7 @@ import { alertTrackOf } from './alerts/track'
 import { createNotificationStateProbe, type NotificationStateProbe } from './alerts/notification-state'
 import type { DataLayer } from './data-layer'
 import type { SignalOutcome } from './engine'
-import { BENCHMARK_CODE } from './engine'
+import { BENCHMARK_CODE, industryMapOf, industryValueShares } from './engine'
 import { log } from './logging'
 import { shanghaiTime, type TickContext } from './scheduler'
 import type { WatchEntry } from './storage/repositories/watchlist'
@@ -127,7 +128,7 @@ import { pruneAll, vacuum } from './storage/retention'
 import { isQuiet, quietUntil, type QuietPreset } from './util/quiet'
 import { evaluateWatchPoints, type WatchHit } from './watch/evaluate'
 import { isWatchMetric } from './watch/metrics'
-import { applyTrade, isTradeError, replayTrades } from './trades/ledger'
+import { applyTrade, isTradeError, replayTrades, t1SellNotice } from './trades/ledger'
 import { splitCode } from '@core/code'
 import type { TradeRow } from './storage/repositories/trade'
 import type { WatchPointRow } from './storage/repositories/watch'
@@ -194,6 +195,14 @@ function toTradeLogView(row: TradeRow): TradeView {
   if (row.realized !== undefined) view.realized = row.realized
   if (row.note !== undefined) view.note = row.note
   return view
+}
+
+/**
+ * 渲染层传来的数值 → 正数或 null。空表单、`Number('')`、`NaN` 全部归 null。
+ * **不用 0 兜底**：0 会让「还没填」与「填了个 0」再也分不开（约束 4 的同一形状）。
+ */
+function positiveNumber(value: number | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null
 }
 
 /** 数据层未就绪时报的引擎版本：出厂参数的那一个（此时也确实还没有别的） */
@@ -374,6 +383,7 @@ export class AppController {
    */
   private toPositionView(code: SecCode, held: Position): PositionView {
     const ack = this.data?.storage.positions.stopAck(code) ?? null
+    const locked = this.lockedShares(code)
     return {
       code: held.code,
       shares: held.shares,
@@ -383,7 +393,14 @@ export class AppController {
       // exactOptionalPropertyTypes：没确认过就不要这个键
       ...(ack === null ? {} : { stopAck: ack }),
       ...(this.stopBreached(code, held) ? { stopBreached: true } : {}),
+      // T+1：今天买的今天卖不掉。为 0 时不带这个键（界面据此决定要不要说这句话）
+      ...(locked > 0 ? { lockedShares: locked } : {}),
     }
+  }
+
+  /** 某只票里「今天买进、T+1 下今天卖不掉」的股数。数据层没起来时是 0 */
+  private lockedShares(code: SecCode): number {
+    return this.data?.lockedShares(code) ?? 0
   }
 
   /**
@@ -875,12 +892,118 @@ export class AppController {
       { side: draft.side, price: draft.price, shares: draft.shares, board: this.boardOf(draft.code) }
     )
     if (isTradeError(outcome)) return { ...empty, error: outcome.error }
+    const warning = this.t1SellWarning(draft, current)
     return {
       fee: outcome.fee,
       amount: draft.price * Math.trunc(draft.shares),
       position: outcome.position,
       realized: outcome.realized,
+      ...(warning === null ? {} : { warning }),
     }
+  }
+
+  /**
+   * T+1 提示。判据与措辞都在 `trades/ledger.ts` 的 `t1SellNotice()`（纯函数、有用例钉着），
+   * 这一层只负责去流水里取「**该成交日**买入了多少」。
+   *
+   * 日界用的是**这笔成交自己的 `tradedAt`**，不是「今天」——「补录上周那笔卖出」是常态，
+   * 拿今天的日界去卡它会对每一笔历史成交都报一次。缺省时按「现在」，与 `addTrade` 一致。
+   */
+  private t1SellWarning(draft: TradeDraft, current: Position | null): string | null {
+    const layer = this.data
+    if (!layer || !current) return null
+    return t1SellNotice({
+      side: draft.side,
+      shares: draft.shares,
+      heldShares: current.shares,
+      sameDayBuyShares: layer.storage.trades.boughtSharesSince(
+        draft.code,
+        shanghaiDayStartMs(draft.tradedAt ?? Date.now())
+      ),
+    })
+  }
+
+  /**
+   * 建仓体检（`trade:entryCheck`）：把这只票此刻**已知的阻碍**摆出来。
+   *
+   * 判据全在 `core/risk/entry.ts`（纯函数、可测），这一层只做三件事：
+   * 就地评估一次、算「建仓后的行业占比」、把「体检做不了」这件事说清楚。
+   *
+   * ⚠ **拿不到评估时返回 `UNKNOWN` 而不是 `CLEAR`。** 数据层没起来、这只票不在自选、
+   * 日线还没回补 —— 三者都是「不知道」，而「不知道」显示成「没问题」正是
+   * 这个项目一直在防的那类错误。
+   */
+  entryCheck(query: { code: SecCode; price?: number; shares?: number }): EntryCheckView {
+    const code = query.code
+    const unknown = (reason: string): EntryCheckView => ({
+      code,
+      engine: null,
+      verdict: 'UNKNOWN',
+      items: [{ rule: 'NO_EVALUATION', severity: 'NOTE', text: reason }],
+    })
+
+    const layer = this.data
+    if (!layer) return unknown('数据层还没就绪，稍后再试')
+    if (!layer.storage.watchlist.get(code)) return unknown('这只票不在自选里 —— 先加进来，引擎才会为它备日线与指标')
+
+    const evaluation = layer.assess(code)
+    if (!evaluation) return unknown('这只票还没有足够的日线，体检做不了（不是「没问题」）')
+
+    const price = positiveNumber(query.price)
+    const shares = positiveNumber(query.shares)
+    // 价与股数都填了才谈得上「建仓后」；只填一个时那一笔的金额是未知的，
+    // 拿 0 当金额会算出「占比不变」这个假结论
+    const amount = price !== null && shares !== null ? price * Math.trunc(shares) : 0
+    const shareAfter = this.industryShareAfter(code, amount)
+
+    const result = entryCheck({
+      // **同一份**上下文，与本轮提醒走的是同一批规则（见 Evaluation.gateInput）
+      gate: evaluation.gateInput,
+      ...(price === null && shares === null
+        ? {}
+        : { intent: { ...(price === null ? {} : { price }), ...(shares === null ? {} : { shares }) } }),
+      ...(shareAfter === undefined ? {} : { industryShareAfter: shareAfter }),
+    })
+
+    const gated = evaluation.gated
+    return {
+      code,
+      engine: {
+        direction: gated.direction,
+        level: gated.level,
+        score: evaluation.signal.score,
+        regime: evaluation.signal.regime,
+        stage: evaluation.signal.stage,
+        headline: gated.headline,
+      },
+      verdict: result.verdict,
+      items: result.items.map((item) => ({ ...item })),
+      ...(result.stop === undefined ? {} : { stop: result.stop }),
+      ...(result.dayPosition === undefined ? {} : { dayPosition: result.dayPosition }),
+      ...(result.amount === undefined ? {} : { amount: result.amount }),
+      ...(shareAfter === undefined ? {} : { industryShareAfter: shareAfter }),
+    }
+  }
+
+  /**
+   * 建仓**之后**该行业在持仓里的占比。口径复用引擎那一份（`industryValueShares`）——
+   * 在这里照抄一遍就会与 `downgrades()` 里那条规则分叉，而两者用的是同一个上限。
+   *
+   * 返回 `undefined` = 算不出来（没有持仓、也没有这一笔），**不是 0**：
+   * 0 是「完全没有同行业持仓」这个明确结论（约束 4）。
+   */
+  private industryShareAfter(code: SecCode, amount: number): number | undefined {
+    const layer = this.data
+    if (!layer) return undefined
+    const entries = layer.storage.watchlist.list()
+    const industryOf = industryMapOf(entries)
+    const shares = industryValueShares({
+      held: layer.storage.positions.list(),
+      industryOf,
+      priceOf: (target) => layer.market.snapshotOf(target)?.last ?? null,
+      ...(amount > 0 ? { extra: { industry: industryOf(code), amount } } : {}),
+    })
+    return shares.get(industryOf(code))
   }
 
   /**
@@ -929,6 +1052,9 @@ export class AppController {
     })
 
     log.info(`[trade] ${code} ${draft.side} ${draft.shares}股 @${draft.price}（费 ${outcome.fee}）`)
+    // T+1 提示**不拦**录入（见 t1SellWarning），但要留一行 —— 日后查「这笔怎么会有」时用得上
+    const t1 = this.t1SellWarning(draft, current)
+    if (t1 !== null) log.info(`[trade] ${code} 这笔卖出触发 T+1 提示：${t1}`)
     this.onStateChanged()
     return this.tradeLedger(code)
   }

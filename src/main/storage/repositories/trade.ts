@@ -105,6 +105,29 @@ export class TradeRepo {
     return this.db.prepare(`DELETE FROM trade_log WHERE id = ?`).run(id).changes > 0
   }
 
+  /**
+   * `sinceMs` 之后买入的股数合计 —— A 股 T+1 的「今天卖不掉的那部分」（`Position.lockedShares`）。
+   *
+   * 三条：
+   *   * **只数 `BUY`**。`OPENING` 按定义就是老仓（迁移或导入时按当时持仓补的），
+   *     把它算进来会让刚导入配置的用户一整天卖不出任何东西；
+   *   * **日界由调用方给**，一律传 `shanghaiDayStartMs(...)`，不在这里读时钟；
+   *   * ⚠ `traded_at` 是**用户在表单里选的日期**，`TradePanel` 把它存成**本机**中午 12:00
+   *     （`parseDate` 的 `T12:00:00`）。与北京日界比较在 UTC+7/+8 上正确，
+   *     在极西时区（如 UTC−5）上会把昨天的买入也算成今天的。修法是把那个表单的
+   *     日期口径换成北京日，属另一处改动 —— 这里先把口径写明白。
+   */
+  boughtSharesSince(code: SecCode, sinceMs: number): number {
+    return (
+      this.db
+        .prepare(
+          `SELECT COALESCE(SUM(shares), 0) AS total FROM trade_log
+           WHERE code = ? AND side = 'BUY' AND traded_at >= ?`
+        )
+        .get<{ total: number }>(code, Math.round(sinceMs))?.total ?? 0
+    )
+  }
+
   /** 已实现盈亏合计。没有任何卖出时返回 0 —— 这里 0 是对的：一笔都没卖就是没实现 */
   sumRealized(code: SecCode): number {
     return (

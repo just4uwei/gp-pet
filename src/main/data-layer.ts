@@ -26,9 +26,12 @@ import type {
   SignalRecord,
 } from '@shared/ipc-types'
 import type { SecCode } from '@core/types'
+import type { Evaluation } from '@core/engine'
 import { parseCode } from '@core/code'
 import { withSensitivity } from '@core/params'
+import { sessionAt } from '@core/session'
 import { INDUSTRY_ETF_GROUP, INDUSTRY_ETFS } from '@shared/industry-etf'
+import { shanghaiDayStartMs } from '@shared/time'
 import {
   BENCHMARK_CODE,
   createMarketDataService,
@@ -63,6 +66,7 @@ import {
   createScheduler,
   createTradingCalendar,
   loadHolidayTable,
+  shanghaiTime,
   type ClockReport,
   type Scheduler,
   type TickContext,
@@ -136,6 +140,16 @@ export interface DataLayer {
   explainSignal(id: string): SignalEvidence | null
   /** 最近一轮的评估结果，供桌宠状态与面板使用 */
   latestSignals(): SignalOutcome[]
+  /**
+   * 就地评估一只票（建仓体检用）。**不落库、不发提醒**，见 `SignalEngine.assess`。
+   *
+   * 摆在这一层而不是 controller，是因为只有它同时握着**校准钟**（`clock.now()`，
+   * 不是本机系统钟）与**当前那个**引擎实例 —— 换灵敏度会整个重建引擎，
+   * 在别处快照式地持有它会一直用着旧参数（data-layer 里 `signals` 是 `let` 的理由）。
+   */
+  assess(code: SecCode): Evaluation | null
+  /** 某只票里「今天买进、T+1 下今天卖不掉」的股数。没有就是 0 */
+  lockedShares(code: SecCode): number
   dispose(): void
 }
 
@@ -313,6 +327,10 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
       signals: storage.signals,
       indicators: storage.indicators,
       lookback: market.options.initialBars,
+      // T+1：今天买进的今天卖不掉（`Position.lockedShares`）。**补跑那条路上也要传**，
+      // 见下面 settle 的同名参数 —— 漏一处的症状是补跑轮与盘中轮结论不一致，
+      // 而界面上完全看不出来
+      lockedSharesOf: (code, sinceMs) => storage.trades.boughtSharesSince(code, sinceMs),
       params: withSensitivity(tier),
       log,
     })
@@ -376,6 +394,9 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
         signals: storage.signals,
         indicators: storage.indicators,
         lookback: market.options.initialBars,
+        // 与 buildEngine 那处**必须成对**。补跑传的 `tick.at` 是 D 的收盘时刻，
+        // 于是引擎按 D 当天的日界去数买入 —— 用「现在」会拿今天的流水去判昨天的信号
+        lockedSharesOf: (code, sinceMs) => storage.trades.boughtSharesSince(code, sinceMs),
         params: withSensitivity(settings.sensitivity),
         closedAt: closeMsOf(date),
         log,
@@ -546,6 +567,33 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
 
     latestSignals() {
       return signals.latest()
+    },
+
+    /*
+      建仓体检的现场评估。**不复用 `latestSignals()`**：那一份在休市、竞价、
+      刚启动时是空的，而用户想查「明天要不要买这只」恰恰多半在收盘之后。
+
+      时刻走校准钟 `now()`（本机钟 + HTTP Date 校准量），时段由它推 ——
+      与调度器同一套 `sessionAt`。`producesSignals` 这里恒为 true 而不是照抄调度器：
+      这是用户主动点出来的一次查看，不是提醒，竞价时段也该给他答案
+      （虚价的代价由界面上那句「体检基于此刻行情」承担，而它不落库、不进影子）。
+    */
+    assess(code) {
+      const at = now()
+      const { date, minuteOfDay } = shanghaiTime(at)
+      return signals.assess(code, {
+        date,
+        minuteOfDay,
+        // 休市日 `sessionAt` 给 CLOSED —— 那正是我们要的：`T1_LATE_BUY`
+        // 与快照陈旧那两条都只在盘中成立，周末不该凭空报出来
+        session: sessionAt(minuteOfDay, calendar.resolve(date).isOpen),
+        at,
+        producesSignals: true,
+      })
+    },
+
+    lockedShares(code) {
+      return storage.trades.boughtSharesSince(code, shanghaiDayStartMs(now()))
     },
 
     quoteTicks() {

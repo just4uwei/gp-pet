@@ -338,7 +338,8 @@ src/backtest 回测 CLI，复用 src/core
 | 换托盘 / 应用图标 | [resources/icons/README.md](./resources/icons/README.md)（png 是手绘资产；只有 `icon.ico` 是生成件，跑 `node tools/logo/make-ico.mjs` 重出，它**不在** package.json 的 scripts 里） |
 | 改提醒逻辑 | [docs/05](./docs/05-风控与提醒规则.md) |
 | 改影子运行 | [docs/07 §2.3](./docs/07-回测与验证方案.md)（四条前向纪律 + 记账口径） |
-| 改成交记账 / 持仓 | [`src/main/trades/ledger.ts`](./src/main/trades/ledger.ts) 头注释（含费摊薄、卖出不动成本、**不套滑点**）+ [007_trade_log.sql](./src/main/storage/migrations/007_trade_log.sql) |
+| 改成交记账 / 持仓 | [`src/main/trades/ledger.ts`](./src/main/trades/ledger.ts) 头注释（含费摊薄、卖出不动成本、**不套滑点**、T+1 只提示不硬拒）+ [007_trade_log.sql](./src/main/storage/migrations/007_trade_log.sql) |
+| 改建仓体检 / T+1 卖出锁定 | [docs/05 §2.1a / §2.5](./docs/05-风控与提醒规则.md) + [`src/core/risk/entry.ts`](./src/core/risk/entry.ts) 头注释（三条边界：只复述、无新阈值、verdict 纯派生） |
 | 改设置页 / 参数表 | [docs/01 §5.5](./docs/01-产品需求与范围.md) + [ADR-0003](./docs/adr/ADR-0003-来源文档数值不作为出厂默认.md) |
 | 改 AI 解读 | [src/main/ai/index.ts](./src/main/ai/index.ts) 头注释（五条纪律）+ [src/main/ai/service.ts](./src/main/ai/service.ts)（两层缓存 / 只有 done 落库）+ [AiPanel.tsx](./src/renderer/panel/AiPanel.tsx) 头注释（为什么是页签、搬过两次家）+ [docs/08 §后续](./docs/08-开发路线图.md) |
 | 改 AI 历史 / 保留策略 | [008_ai_explain.sql](./src/main/storage/migrations/008_ai_explain.sql) 头注释（不加外键、不裁剪、只能手删） |
@@ -546,6 +547,32 @@ src/backtest 回测 CLI，复用 src/core
   持仓强制类或硬抑制命中时不给（止损那一刻并排一句「可考虑高抛」自相矛盾）。
   **尾盘不给低吸**最容易漏：T+1 下今天买的明天才能卖，过了 14:50 再买就是加仓，
   而用户以为自己在做T。见 `src/core/risk/intraday-t.ts`。
+  **`TTradeInput.shares` 是「可卖」股数不是「持有」股数**（2026-08-19 改，`sellableShares()`）
+  —— 今天刚买进的那部分今天卖不掉，把它当底仓会让同一句判据变成一条开仓建议。
+  高抛与低吸**两侧都要**（低吸也是「先买，卖的是老仓那部分」）。**别改回 `position.shares`。**
+- **`Position.lockedShares` 与 `stopFloor` 同一条纪律：回测与影子运行绝不设它**（2026-08-19）。
+  它是「持有的这些股里今天买进的有多少」，A 股 T+1 下今天卖不掉。全仓锁住 ⇒ 卖出/减仓
+  **硬抑制**（`T1_SELL_LOCK`，先例是「已跌停，卖不掉」）；部分锁住 ⇒ 只标注
+  （`T1_PARTIAL_LOCK`）—— **两者混成一条**会让「今天买了 100 股」把 900 股老仓的止损提醒
+  一起吞掉。代价要记住：硬抑制 ⇒ `candidates.ts` 直接 `continue` ⇒ **连 `alert_log` 都不落**，
+  「今天买、今天就跌破止损线」当天一条气泡都没有（次日开盘归零后照发 L3）。
+  可卖股数只有 `sellableShares()` 一处定义，三个调用方共用（硬抑制 / 做T底仓 / 界面）。
+  见 [docs/05 §2.1a](./docs/05-风控与提醒规则.md)。
+- **建仓体检只复述，不推导，且一个新阈值都不许有**（`src/core/risk/entry.ts`，2026-08-19）。
+  它的每一条都来自一个已经存在的裁决（`hardSuppressions` / `downgrades` / `positionVerdict`
+  按 **BUY** 方向再跑一遍），`verdict` 纯由 items 派生。往里加一个「涨幅超过 X% 就警告」
+  等于凭空造一个未标定参数，而它会挂着「体检」这个看起来很权威的名字。
+  因此 `dayPosition` **只报位置不判高低**（判高低要阈值）。
+  它用的是 `Evaluation.gateInput`（`evaluate()` 原样带出来的**同一份**上下文）——
+  另拼一份的症状是「体检说没事、提醒说涨停买不到」，与 `trade:preview` 那条纪律同一形状。
+  拿不到评估时是 `UNKNOWN` 而不是 `CLEAR`：**「不知道」不许显示成「没问题」**。
+- **成交录入的 T+1 检查是提示（`TradePreview.warning`）不是拒绝（`error`），别「顺手」改硬。**
+  跨境 / 债券 / 黄金 ETF 与可转债确实是 T+0，用户还可能在补录历史或把日期填错 ——
+  把一条合法成交挡在外面，症状是「我明明这么成交的，软件说存不进去」。
+  判据按**这笔成交自己的 `tradedAt`** 算，不是「今天」（否则补录上周那笔卖出会每次都报）。
+  措辞在 `trades/ledger.ts` 的 `t1SellNotice()`（纯函数，有用例钉着「不硬拒」这条）。
+  ⚠ `traded_at` 存的是**本机**中午 12:00（`TradePanel` 的 `parseDate`），与北京日界比较
+  在 UTC+7/+8 上正确、在极西时区会多锁一天 —— 修法是换那个表单的日期口径，属另一处改动。
 - **`params.tTrade` 三个数是 `UNTESTABLE` 不是 `GUESS`，别放进标定网格。**
   差别是硬的：`GUESS` 是「还没跑」，这三个是**日线回测原理上测不到** ——
   一根日线只有开高低收，不知道当天先到高点还是先到低点，「日内位置」没有对应量。

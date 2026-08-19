@@ -124,6 +124,15 @@ export interface TradeLedger {
 export interface TradePreview {
   /** 非空 = 这笔录不进去（超卖、数值非法），原样显示给用户；此时其余字段无意义 */
   error?: string
+  /**
+   * 非空 = **能录，但你可能填错了**。眼下只有一种：卖出股数超过该成交日的可卖股数
+   * （A 股 T+1，当日买入当日卖不出）。
+   *
+   * **与 `error` 严格分开、且刻意不硬拒**：跨境 ETF、债券/黄金 ETF、可转债确实是 T+0，
+   * 用户也可能在补录历史成交或把日期填错。把一条合法成交挡在外面，
+   * 症状是「我明明这么成交的，软件说存不进去」—— 那比一条提示贵得多。
+   */
+  warning?: string
   fee: number
   amount: number
   /** 录入后的持仓；null = 清仓 */
@@ -271,6 +280,59 @@ export interface PositionView {
    * 「界面说该改止损线了，引擎却还没打算提醒」，两个口径分叉后没人分得清哪个对。
    */
   stopBreached?: boolean
+  /**
+   * 这些股里「今天买进、T+1 下今天卖不掉」的股数。**为 0 时缺省**。
+   *
+   * 界面上必须显示出来：可卖 = `shares − lockedShares`，而用户看到的持仓数是 `shares`
+   * —— 不说的话他会按全仓去挂单，然后被券商拒掉。
+   * 由主进程按成交流水算（`trades.boughtSharesSince`），判据与风控层
+   * `sellableShares()` 同一个数（渲染层不许自己去数流水）。
+   */
+  lockedShares?: number
+}
+
+/**
+ * 建仓体检（`trade:entryCheck`，2026-08-19）：用户自己想买时，把**已知的阻碍**摆出来。
+ *
+ * ## 它不是什么
+ *
+ * 它**不回答「该不该买」**，只回答「有没有已知的阻碍」。每一项都指回一个已经存在的
+ * 风控裁决或一个能核对的数（`src/core/risk/entry.ts` 的三条边界）——
+ * 不新造判断、不新增阈值。措辞上因此不出现「可以买 / 建议买入」。
+ */
+export interface EntryCheckView {
+  code: SecCode
+  /**
+   * 引擎此刻对这只票的结论，**复述**用。`null` = 这次没评估出来
+   * （此时 `verdict` 必为 `UNKNOWN`）。
+   */
+  engine: {
+    direction: GatedDirection
+    level: AlertLevel
+    /** UI 一律称「置信度」，不得称胜率或概率 */
+    score: number
+    regime: Regime
+    stage: SignalStage
+    headline: string
+  } | null
+  /**
+   * `BLOCKED` 有硬阻碍（这一刻执行不了）· `CAUTION` 有已知风险 · `CLEAR` 未发现已知阻碍 ·
+   * `UNKNOWN` **体检做不了**（数据层没起来 / 不在自选 / 日线不够）。
+   *
+   * ⚠ `UNKNOWN` 与 `CLEAR` 必须分开显示：「不知道」显示成「没问题」
+   * 是这个项目一直在防的那类错误。
+   */
+  verdict: 'BLOCKED' | 'CAUTION' | 'CLEAR' | 'UNKNOWN'
+  /** `UNKNOWN` 时这里放做不了的原因（不是空数组） */
+  items: { rule: string; severity: 'BLOCK' | 'WARN' | 'NOTE'; text: string }[]
+  /** 按 `risk.stopLossPct` 从意向价算出的止损参考。没填意向价、或用户已重画过止损线时缺省 */
+  stop?: { price: number; lossPerShare: number; lossAmount?: number }
+  /** 现价在今日振幅中的位置 0..1。四个快照数缺一个就没有 —— **只报位置，不判高低** */
+  dayPosition?: number
+  /** 建仓后该行业在持仓中的占比 0..1。算不出来时缺省（**不是 0**） */
+  industryShareAfter?: number
+  /** 这一笔的名义金额（价 × 股数，不含费） */
+  amount?: number
 }
 
 /**
@@ -1061,6 +1123,14 @@ export interface IpcInvokeMap {
   'trade:list': (query: { code: SecCode }) => TradeLedger
   /** 录入前试算。与 `trade:add` 走同一个 `applyTrade`，不许两处各算一遍 */
   'trade:preview': (draft: TradeDraft) => TradePreview
+  /**
+   * 建仓体检：把这只票此刻**已知的阻碍**摆出来（见 `EntryCheckView`）。
+   *
+   * 意向价与股数可以不填 —— 结构性的那几条（停牌、涨停、ST、次新股、引擎当前结论）
+   * 与买多少无关，而那正是「先帮我判断危险性」最想看的部分。
+   * 这条**不发网络请求**：就地跑一次评估，不落库、不进提醒、不进影子运行。
+   */
+  'trade:entryCheck': (query: { code: SecCode; price?: number; shares?: number }) => EntryCheckView
   /** 录一笔成交：追加流水 + 按加权平均更新持仓。参数非法时抛错，由渲染层显示 */
   'trade:add': (draft: TradeDraft) => TradeLedger
   /** 删一笔（录错了）。**按剩余流水重放重建持仓**，不做反向增量 */

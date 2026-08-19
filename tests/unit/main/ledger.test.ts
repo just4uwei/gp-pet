@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { applyTrade, isTradeError, replayTrades } from '@main/trades/ledger'
+import { applyTrade, isTradeError, replayTrades, t1SellNotice } from '@main/trades/ledger'
 import { DEFAULT_COSTS, buyFees, sellFees } from '../../../src/backtest/costs'
 
 /**
@@ -161,5 +161,53 @@ describe('场内基金的记账', () => {
     )
     // 少收的费直接进已实现盈亏
     expect((etf.realized ?? 0) - (stock.realized ?? 0)).toBeCloseTo(stock.fee - etf.fee, 1)
+  })
+})
+
+/**
+ * T+1 提示（2026-08-19）。
+ *
+ * **它是提示不是拒绝** —— 这一点必须有用例钉着：跨境 / 债券 / 黄金 ETF 与可转债
+ * 确实是 T+0，硬拒会把合法成交挡在外面，而用户只会觉得软件坏了。
+ * 所以这个函数与 `applyTrade` 完全分开，它的返回值也不进 `TradeOutcome.error`。
+ */
+describe('t1SellNotice', () => {
+  const held = { heldShares: 1000, sameDayBuyShares: 400 }
+
+  it('卖出没超过可卖股数 → 不提示', () => {
+    expect(t1SellNotice({ side: 'SELL', shares: 600, ...held })).toBeNull()
+  })
+
+  it('卖出超过可卖股数 → 提示并给出那天最多能卖多少', () => {
+    const notice = t1SellNotice({ side: 'SELL', shares: 601, ...held })
+    expect(notice).toContain('400 股')
+    expect(notice).toContain('最多卖 600 股')
+    expect(notice).toContain('T+1')
+    // T+0 品种的出口要写在同一句里 —— 不然用户会以为这是个错误
+    expect(notice).toContain('可转债')
+  })
+
+  it('全仓都是当日买入 → 那天一股都卖不了', () => {
+    expect(t1SellNotice({ side: 'SELL', shares: 1, heldShares: 1000, sameDayBuyShares: 1000 })).toContain(
+      '最多卖 0 股'
+    )
+  })
+
+  it('买入方向永不提示', () => {
+    expect(t1SellNotice({ side: 'BUY', shares: 10_000, ...held })).toBeNull()
+  })
+
+  it('那天没买过 → 不提示（补录上周那笔卖出不该被打扰）', () => {
+    expect(t1SellNotice({ side: 'SELL', shares: 1000, heldShares: 1000, sameDayBuyShares: 0 })).toBeNull()
+  })
+
+  it('没有持仓 → 不提示（那是 applyTrade 的 error 管的事，别两处都说）', () => {
+    expect(t1SellNotice({ side: 'SELL', shares: 100, heldShares: 0, sameDayBuyShares: 100 })).toBeNull()
+  })
+
+  it('提示与 applyTrade 互不影响：同一笔照样算得出账', () => {
+    const outcome = applyTrade({ shares: 1000, cost: 10 }, { side: 'SELL', price: 11, shares: 1000, board: 'MAIN' })
+    expect(isTradeError(outcome)).toBe(false)
+    expect(t1SellNotice({ side: 'SELL', shares: 1000, ...held })).not.toBeNull()
   })
 })
