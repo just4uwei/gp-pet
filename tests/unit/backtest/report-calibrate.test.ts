@@ -136,13 +136,44 @@ describe('绩效块与分状态归因', () => {
     expect(block.totalReturn).toBeCloseTo(0.05, 10)
     expect(block.benchmarkReturn).toBeCloseTo(0.01, 10)
     expect(block.excessReturn).toBeCloseTo(0.04, 10)
+    // 除法版：(1+0.05)/(1+0.01) − 1 ≈ 3.96%，比减法版小 —— 基准涨幅越大差得越多（M2 §5.41 ④）
+    expect(block.excessReturnRatio).toBeCloseTo(1.05 / 1.01 - 1, 10)
+    expect(block.excessReturnRatio!).toBeLessThan(block.excessReturn!)
   })
 
-  it('缺基准时超额与信息比率为 null（不以 0 代替）', () => {
+  it('缺基准时超额（两种）、信息比率与 beta 一律为 null（不以 0 代替）', () => {
     const block = performanceOf(mergeEquity([codeResult()]), [trade()])
     expect(block.benchmarkReturn).toBeNull()
     expect(block.excessReturn).toBeNull()
+    expect(block.excessReturnRatio).toBeNull()
     expect(block.informationRatio).toBeNull()
+    // beta = 0 会被读成「与大盘无关」，而这里是「没有基准，算不出」
+    expect(block.beta).toBeNull()
+  })
+
+  /**
+   * beta 进报告的理由是它与 `exposure` 互为交叉验证（M2 §5.41 ①）。
+   * 这条用例钉的是「它真的按 Cov/Var 算」——用一段净值恰好跟着基准走一半幅度的曲线。
+   */
+  it('beta 由净值曲线算出，与基准同向半幅 ⇒ 约 0.5', () => {
+    const benchmarkByDate = new Map<TradeDate, number>([
+      ['2024-01-02', 100],
+      ['2024-01-03', 104],
+      ['2024-01-04', 102],
+      ['2024-01-05', 106],
+    ])
+    const half = codeResult({
+      equity: [
+        { date: '2024-01-02', equity: 100_000, benchmark: null },
+        { date: '2024-01-03', equity: 102_000, benchmark: null },
+        { date: '2024-01-04', equity: 101_019.23, benchmark: null },
+        { date: '2024-01-05', equity: 103_000, benchmark: null },
+      ],
+    })
+    const block = performanceOf(mergeEquity([half], benchmarkByDate), [trade()])
+    // 三个日收益逐个恰好是基准的一半 ⇒ beta 精确落在 0.500000
+    expect(block.beta).not.toBeNull()
+    expect(block.beta!).toBeCloseTo(0.5, 5)
   })
 
   it('归因按建仓时的市场状态分组，四种状态都出现（没有交易也要有行）', () => {
@@ -279,8 +310,10 @@ function block(overrides: { annualized?: number | null; maxDrawdown?: number; tr
     sharpe: 1,
     benchmarkReturn: null,
     excessReturn: null,
+    excessReturnRatio: null,
     informationRatio: null,
     exposure: 0.2,
+    beta: null,
     trades: {
       count: overrides.trades ?? 50,
       wins: 30,

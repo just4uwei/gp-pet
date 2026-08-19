@@ -166,6 +166,65 @@ export function informationRatio(
   return (mean(excess) / sd) * Math.sqrt(BARS_PER_YEAR)
 }
 
+/** 样本协方差（除 n−1，与 `sampleStdev` 同口径） */
+export function sampleCovariance(a: readonly number[], b: readonly number[]): number | null {
+  const n = Math.min(a.length, b.length)
+  if (n < 2) return null
+  const ma = mean(a.slice(0, n))
+  const mb = mean(b.slice(0, n))
+  let sum = 0
+  for (let i = 0; i < n; i++) sum += ((a[i] ?? 0) - ma) * ((b[i] ?? 0) - mb)
+  return sum / (n - 1)
+}
+
+/**
+ * 市场 beta = `Cov(策略日收益, 基准日收益) / Var(基准日收益)`（口径与聚宽/通行定义一致）。
+ *
+ * **为什么值得算**：它是 `averageExposure` 的**第二种量法**，而且**不含任何参数** ——
+ * 前者按建仓价 × 持仓天数近似「投进去多少钱」，后者由净值曲线回归出「跟着大盘动多少」。
+ * 实测两者逐份同向（主池 261 只：占用 3.49% ↔ beta 0.0205；单指数：11.52% ↔ 0.0371，M2 §5.41）。
+ * ⇒ 「超额收益离开占用率会被读反」那条老纪律因此有了一个独立确认量。
+ *
+ * ## ⚠ 刻意不做的两件事（M2 §5.41 的否定结论，别「顺手补全」）
+ *
+ * 1. **不算 CAPM alpha**（`Rp − [Rf + β(Rm−Rf)]`）。低暴露策略几乎全程持现 ⇒
+ *    `α ≈ Rp − Rf(1−β) − βRm`，`Rf` 那一项直接支配结果，实测**连符号都能翻**
+ *    （单指数择时 2005–2017：rf=0 → +1.29%/年、rf=4% → −2.57%/年，而事实是
+ *    +24.14% vs 被动 +301.70%）。而 `Rf` 没有可靠的本地来源 —— 与夏普那里 rf = 0 同一条理由，
+ *    只是后果更严重：夏普不参与门槛，而一个正的 alpha 会被读成「风险调整后跑赢了」。
+ * 2. **不算日胜率**（跑赢基准的天数占比）。空仓日的日收益是 0，基准跌它就「赢」 ⇒
+ *    实测它约等于「基准下跌天数占比」（单指数那份 45.9% vs 45.9%）⇒ 零信息量。
+ *
+ * 两个都能在 `scripts/verify/jq-riskmetrics.mjs` 里按需算出来看，那是调研工具、不进报告。
+ *
+ * 缺基准或基准无波动（比如一段只有一个交易日、或基准整段缺失）时给 null，不用 0 冒充 ——
+ * beta = 0 的含义是「与大盘无关」，与「算不出来」是两件事。
+ */
+export function betaOf(strategy: readonly number[], benchmark: readonly number[]): number | null {
+  const varBenchmark = sampleCovariance(benchmark, benchmark)
+  if (varBenchmark === null || varBenchmark === 0) return null
+  const covariance = sampleCovariance(strategy, benchmark)
+  if (covariance === null) return null
+  return covariance / varBenchmark
+}
+
+/**
+ * 除法版超额收益 `(1+Rp)/(1+Rm) − 1` —— 净值是几何增长，所以「相对基准多赚了多少」
+ * 自然的运算是除法而不是减法。
+ *
+ * **减法版（`totalReturn − benchmarkReturn`）在基准涨幅大的窗口上会给出读不出意思的数**：
+ * 单指数 2005–2017 那份减法是 **−277.56%**，除法是 **−69.10%** ——
+ * 后者可以直接读成「策略净值只有被动持有的 30.9%」（M2 §5.41 ④）。
+ * 两个都保留是刻意的：`excessReturn` 是历史上所有引用过的口径，改掉它会让旧结论对不上号。
+ */
+export function ratioExcessReturn(totalReturn: number, benchmarkReturn: number | null): number | null {
+  if (benchmarkReturn === null) return null
+  const benchmarkGrowth = 1 + benchmarkReturn
+  // 基准归零/为负增长（本金全损）时这个比值没有意义，给 null 而不是一个巨大的正数
+  if (benchmarkGrowth <= 0) return null
+  return (1 + totalReturn) / benchmarkGrowth - 1
+}
+
 export interface TradeStats {
   count: number
   wins: number

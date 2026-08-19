@@ -50,8 +50,10 @@ function block(annualized: number | null, trades = 50): PerformanceBlock {
     sharpe: 1,
     benchmarkReturn: null,
     excessReturn: null,
+    excessReturnRatio: null,
     informationRatio: null,
     exposure: 0.04,
+    beta: null,
     trades: {
       count: trades,
       wins: 20,

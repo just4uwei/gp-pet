@@ -17,9 +17,11 @@ import type { BacktestTrade, CodeResult } from './simulate'
 import {
   annualizedReturn,
   averageExposure,
+  betaOf,
   groupPositions,
   informationRatio,
   maxDrawdown,
+  ratioExcessReturn,
   returnsOf,
   sharpeRatio,
   summarizeTrades,
@@ -38,13 +40,29 @@ export interface PerformanceBlock {
   sharpe: number | null
   /** 基准缺失时为 null —— 不用 0 冒充「无超额」 */
   benchmarkReturn: number | null
+  /** **减法版**超额 `Rp − Rm`。历史上所有引用都是这个口径，所以它留着不动 */
   excessReturn: number | null
+  /**
+   * **除法版**超额 `(1+Rp)/(1+Rm) − 1`（2026-08-19 加，M2 §5.41 ④）。
+   * 基准涨幅大的窗口上减法版会给出读不出意思的数（单指数 2005–2017：减法 −277.56%、
+   * 除法 −69.10% = 净值只有被动的 30.9%）。**引用超额时用这个**，两个并存是刻意的。
+   */
+  excessReturnRatio: number | null
   informationRatio: number | null
   /**
    * 平均资金占用率 0..1。**读 `excessReturn` 之前先读它**：基准是满仓的，
    * 策略绝大多数时间空仓，两者的收益率不在同一个口径上（见 `averageExposure` 的注释）。
    */
   exposure: number | null
+  /**
+   * 市场 beta（2026-08-19 加）——「暴露」的第二种量法，与 `exposure` 互为交叉验证，
+   * 且不含任何参数。实测两者逐份同向（M2 §5.41 ①）。
+   *
+   * ⚠ **刻意没有 alpha 与日胜率**：前者的符号由 `Rf` 决定（低暴露策略上 rf=0 与 rf=4%
+   * 能给出相反结论），后者约等于「基准下跌天数占比」⇒ 两个都是零信息或误导，
+   * 判据不采纳，理由在 `metrics.ts` 的 `betaOf` 头注释。别往这里补。
+   */
+  beta: number | null
   trades: TradeStats
   /**
    * 建仓级统计（把减仓拆出来的多行归并回一次建仓）。
@@ -188,9 +206,11 @@ export function performanceOf(equity: readonly EquityPoint[], trades: readonly B
     sharpe: sharpeRatio(strategyReturns),
     benchmarkReturn,
     excessReturn: benchmarkReturn === null ? null : totalReturn - benchmarkReturn,
+    excessReturnRatio: ratioExcessReturn(totalReturn, benchmarkReturn),
     informationRatio:
       benchmarkReturns.length > 0 ? informationRatio(strategyReturns, benchmarkReturns) : null,
     exposure: averageExposure(trades, first, equity.length),
+    beta: betaOf(strategyReturns, benchmarkReturns),
     trades: summarizeTrades(trades),
     positions: groupPositions(trades),
   }
@@ -359,9 +379,17 @@ export function renderReport(report: BacktestReport): string {
       p.drawdownRecoveryBars === null ? '' : ' 日'
     }）`
   )
-  lines.push(`  基准 ${pct(p.benchmarkReturn)}  超额 ${pct(p.excessReturn)}  信息比率 ${num(p.informationRatio)}`)
-  // 超额与占用率必须相邻打印：基准满仓、策略多数时间空仓，只看超额会把「没投钱」读成「策略差」
-  lines.push(`  平均资金占用 ${pct(p.exposure)}（基准为满仓 100%，超额收益须结合本行读）`)
+  // 两种超额并排打印，除法版在后：减法版在基准涨幅大的窗口上会给出 −277.56% 这种
+  // 读不出意思的数（M2 §5.41 ④）。老口径不删 —— 历史 M2 里的引用全是减法版。
+  lines.push(
+    `  基准 ${pct(p.benchmarkReturn)}  超额 ${pct(p.excessReturn)}（除法 ${pct(p.excessReturnRatio)}）` +
+      `  信息比率 ${num(p.informationRatio)}`
+  )
+  // 超额与占用率必须相邻打印：基准满仓、策略多数时间空仓，只看超额会把「没投钱」读成「策略差」。
+  // beta 跟在同一行是因为它答的是同一个问题（暴露多少），只是量法不同、且不含参数。
+  lines.push(
+    `  平均资金占用 ${pct(p.exposure)}  beta ${num(p.beta, 4)}（基准为满仓 100%，超额收益须结合本行读）`
+  )
   // 「未做自相关调整」这半句是 2026-08-19 加的（迭代计划 §4.6）：
   // ×√243 假设日收益 iid，而策略净值有自相关（持仓跨日、同池标的同涨同跌）⇒ 这个数偏大。
   // 与折间 t 那处同一个病，只是夏普不参与任何门槛（排名口径是 Calmar），所以按 §4.6 的

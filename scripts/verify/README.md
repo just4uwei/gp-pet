@@ -55,6 +55,26 @@ npx tsx scripts/verify/jq-crosscheck.ts
 历史回测基线就复现不出来了）；**聚宽示例里写的 `check_date` 与打印出来的数值不是同一天**，
 真实日期是反查出来的（脚本头注释里写了）。
 
+## `jq-riskmetrics.mjs`：用组合层口径重读一份已有报告（2026-08-19 加）
+
+```bash
+node scripts/verify/jq-riskmetrics.mjs reports/calib/t3fix.json reports/calib/liq-base.json
+```
+
+与上面那个脚本是**两件事**：`jq-crosscheck.ts` 验的是**指标算得对不对**，
+这个验的是**绩效口径怎么读**（beta / alpha / 除法版超额 / 日胜率，定义抄自聚宽「风险指标」一节）。
+它**只读**报告 JSON，算出来的数**不进任何门槛**。
+
+⚠ **四个量里两个已经进报告了**（2026-08-19 用户拍板）：`beta` 与**除法版超额**现在是
+`PerformanceBlock` 的字段、报告直接打印。⇒ 跑这个脚本只剩两个理由：读 **08-19 之前**
+产出的老 JSON（那些文件没有这两个字段），或者看**那两个被否掉的量**
+（`alpha` 的 Rf 敏感性、`日胜率` 的机械偏置）——
+它们**刻意不进报告**，理由在 `src/backtest/metrics.ts` 的 `betaOf` 头注释。
+
+⚠ 三条读法（实测见 [M2 §5.41](../../docs/notes/M2-偏差报告.md)）：
+**alpha 只看 rf=0 那一栏**（低暴露策略上 `Rf` 支配符号）· **日胜率对低暴露策略零信息**
+（≈ 基准下跌天数占比）· **beta 与 `performance.exposure` 是同一件事的两种量法**，对不上先怀疑口径。
+
 ## 首台能联网的机器上怎么补上
 
 1. 让数据层把几只沪深300 成分股的日线补到 500 根以上（`pnpm dev` 跑一天，或用回测 CLI 的 `--db`）

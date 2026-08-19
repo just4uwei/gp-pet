@@ -20,8 +20,10 @@ import {
   BARS_PER_YEAR,
   annualizedReturn,
   averageExposure,
+  betaOf,
   informationRatio,
   maxDrawdown,
+  ratioExcessReturn,
   mean,
   returnsOf,
   sampleStdev,
@@ -187,6 +189,29 @@ describe('绩效指标', () => {
     expect(informationRatio([0.02, 0.02], [0.01, 0.01])).toBeNull()
     expect(informationRatio([0.02, -0.01, 0.03], [0.01, 0.0, 0.02])).not.toBeNull()
     expect(informationRatio([0.01], [0.01])).toBeNull()
+  })
+
+  it('beta：按 Cov/Var 算，基准无波动或样本不足给 null（0 会被读成「与大盘无关」）', () => {
+    // 策略日收益恰好是基准的一半 ⇒ beta = 0.5，与幅度无关
+    const benchmark = [0.02, -0.01, 0.03, -0.02]
+    expect(betaOf(benchmark.map((r) => r * 0.5), benchmark)).toBeCloseTo(0.5, 10)
+    expect(betaOf(benchmark, benchmark)).toBeCloseTo(1, 10)
+    // 空仓策略：日收益恒 0 ⇒ beta 恰好 0（这是真的「与大盘无关」，不是算不出）
+    expect(betaOf([0, 0, 0, 0], benchmark)).toBe(0)
+    // 基准无波动 / 样本不足 ⇒ 算不出，给 null
+    expect(betaOf([0.01, -0.02, 0.03], [0.01, 0.01, 0.01])).toBeNull()
+    expect(betaOf([0.01], [0.02])).toBeNull()
+    expect(betaOf([0.01, 0.02], [])).toBeNull()
+  })
+
+  it('除法版超额：与减法版在大基准涨幅上差得很远，基准本金全损时给 null', () => {
+    // 单指数 2005–2017 那组真实数字（M2 §5.41 ④）：减法 −277.56%、除法 −69.10%
+    const ratio = ratioExcessReturn(0.2414, 3.017)
+    expect(ratio).not.toBeNull()
+    expect(ratio!).toBeCloseTo(-0.691, 3)
+    expect(0.2414 - 3.017).toBeCloseTo(-2.7756, 4)
+    expect(ratioExcessReturn(0.05, null)).toBeNull()
+    expect(ratioExcessReturn(0.05, -1)).toBeNull()
   })
 
   it('均值与样本标准差（除 n-1）', () => {
