@@ -48,4 +48,24 @@ export const META_KEYS = {
    * 那样会变成每轮都重跑。
    */
   lastSettledDate: 'last_settled_date',
+  /**
+   * 当日日线**已经补齐**的那个交易日（`engine/tick.ts` 的收盘后补齐窗口）。**存日期串。**
+   *
+   * 收盘（15:10）之后应用本来一个请求都不发，而个股日线数据源 15:05–15:30 才发布 ⇒
+   * 当天的收盘线要到次日盘前才入库 ⇒ 日报整天卡在「未定稿」。收盘后那个窗口专门补这一下，
+   * 补齐即置这个键并停手 —— 少了它，那 10 只结构性拉不到的 ETF 会把整个窗口每一轮都烧满。
+   */
+  dailyCompleteDate: 'daily_complete_date',
+  /** 收盘后补齐窗口在 `dailyCompleteDate` 那天已经试过几轮。上限见 tick.ts 的 `CLOSE_CATCHUP` */
+  dailyCatchupAttempts: 'daily_catchup_attempts',
+  /** `dailyCatchupAttempts` 属于哪个交易日（跨日要清零，否则昨天用满了今天就一轮都不跑） */
+  dailyCatchupDate: 'daily_catchup_date',
+  /**
+   * 提醒闸门的跨重启状态（`alerts/dispatcher.ts` 的 `DispatcherState`，JSON）。
+   *
+   * 存 meta 而不是新建一张表：它是**单值状态**，为它建表只会多一处「忘了初始化」
+   * （与 `SHADOW_KEYS` 同一个模式）。恢复时按当前时刻重新裁剪，
+   * 所以一份很旧的状态不会把闸门长期卡住 —— 判据在 `AlertDispatcher.restore`。
+   */
+  alertGateState: 'alert_gate_state',
 } as const

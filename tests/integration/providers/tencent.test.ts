@@ -194,6 +194,43 @@ describe('tencent · 日线', () => {
       /没有 sh600000/
     )
   })
+
+  /*
+    指数只有 `day` 一轨（2026-08-19 实测 sh000300：请不请 qfq 都只返回 day）。
+
+    在此之前基准指数在腾讯这条路上**永远失败**，只剩 eastmoney 单源（约 78% 成功率），
+    而它失败的那一天影子净值的基准列就永久留 null —— 实测 2/2 行都是 null。
+
+    ⚠ 下面第二条与第一条同等重要：ETF 与个股真的有复权，
+    拿不复权顶替是**错的失败方式**，那条严格失败必须留着。
+  */
+  describe('指数没有复权轨', () => {
+    const indexRaw = KLINE_RAW.replaceAll('sh600000', 'sh000300')
+
+    it('指数请复权轨时回退到 day —— 对它而言 day 就是复权轨', async () => {
+      const { provider: p } = provider([['fqkline/get', indexRaw]])
+      const candles = await p.fetchDaily('SH000300', '2024-01-02', '2024-02-05', 'hfq')
+
+      expect(candles).toHaveLength(25)
+      // 不复权与复权逐位相同 —— 指数本来就没有除权除息
+      expect(candles[0]).toMatchObject({ date: '2024-01-02', close: 6.6, closeAdj: 6.6 })
+    })
+
+    it('个股缺复权轨时照旧报错 —— 不许拿不复权顶替', async () => {
+      const { provider: p } = provider([['fqkline/get', KLINE_RAW]])
+      await expect(p.fetchDaily('SH600000', '2024-01-02', '2024-02-05', 'hfq')).rejects.toThrow(
+        /没有 hfqday 数组/
+      )
+    })
+
+    it('ETF 缺复权轨时同样报错 —— 它有分红，与指数不是一回事', async () => {
+      const etfRaw = KLINE_RAW.replaceAll('sh600000', 'sh510300')
+      const { provider: p } = provider([['fqkline/get', etfRaw]])
+      await expect(p.fetchDaily('SH510300', '2024-01-02', '2024-02-05', 'hfq')).rejects.toThrow(
+        /没有 hfqday 数组/
+      )
+    })
+  })
 })
 
 describe('tencent · 基础信息与日历', () => {

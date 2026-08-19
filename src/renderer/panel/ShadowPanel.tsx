@@ -18,13 +18,37 @@
  */
 
 import { useCallback, useEffect, useState } from 'react'
-import type { MaintenanceResult, ShadowSummary, ShadowTradeView } from '@shared/ipc-types'
+import { shanghaiHhmm } from '@shared/time'
+import type {
+  MaintenanceResult,
+  ShadowJournalView,
+  ShadowSummary,
+  ShadowTradeView,
+} from '@shared/ipc-types'
 
 const REGIME_LABEL: Record<string, string> = {
   TREND_UP: '上升趋势',
   TREND_DOWN: '下降趋势',
   RANGE: '震荡',
   TRANSITION: '过渡',
+}
+
+const ACTION_LABEL: Record<string, string> = { BUY: '买入', SELL: '卖出', REDUCE: '减仓' }
+
+/**
+ * 流水每一档的显示样式。**只陈述动作，不评价** —— 与这个文件其余部分同一条纪律。
+ *
+ * `NOT_ADVANCED` 用警示色是刻意的：它意味着那个交易日的前向记录**永久缺失**，
+ * 而这件事此前只在主进程日志里出现一行，界面上完全不可见。
+ */
+const KIND_LABEL: Record<ShadowJournalView['kind'], { text: string; tone: string }> = {
+  PLACED: { text: '挂委托', tone: 'text-sky-300/80' },
+  FILLED_BUY: { text: '建仓', tone: 'text-rose-300/90' },
+  FILLED_SELL: { text: '平仓', tone: 'text-emerald-300/90' },
+  VOIDED: { text: '委托作废', tone: 'text-white/45' },
+  DEFERRED: { text: '顺延', tone: 'text-white/45' },
+  CLOSED_OUT: { text: '移出自选而了结', tone: 'text-white/45' },
+  NOT_ADVANCED: { text: '未推进', tone: 'text-amber-300/90' },
 }
 
 function pct(value: number | null, digits = 2): string {
@@ -76,16 +100,19 @@ export function ShadowPanel({
 }): React.JSX.Element {
   const [summary, setSummary] = useState<ShadowSummary | null>(null)
   const [trades, setTrades] = useState<ShadowTradeView[]>([])
+  const [journal, setJournal] = useState<ShadowJournalView[]>([])
   const [notice, setNotice] = useState<MaintenanceResult | null>(null)
 
   const load = useCallback((): void => {
     void Promise.all([
       window.gp.invoke('shadow:summary'),
       window.gp.invoke('shadow:trades', { limit: 30 }),
+      window.gp.invoke('shadow:journal', { limit: 60 }),
     ])
-      .then(([next, rows]) => {
+      .then(([next, rows, log]) => {
         setSummary(next)
         setTrades(rows)
+        setJournal(log)
       })
       .catch((err: unknown) => onError(err instanceof Error ? err.message : String(err)))
   }, [onError])
@@ -116,6 +143,19 @@ export function ShadowPanel({
           （补出来的那个叫回测，而它证明不了同一件事）。
         </p>
         <p className="text-xs text-white/30">起始资金 100 万元，每笔建仓名义金额 10 万元，按双边佣金 + 印花税 + 过户费 + 0.1% 滑点扣费。</p>
+        {/* 一天都没推进过，但流水里有东西 —— 那正是「为什么还没开始」的答案，
+            这一屏恰恰是最该显示它的地方 */}
+        {journal.length > 0 ? (
+          <ul className="flex flex-col gap-1 text-[11px]">
+            {journal.map((row) => (
+              <li key={`${row.date}-${row.seq}`} className="flex items-start gap-2">
+                <span className="w-11 shrink-0 font-mono text-white/30">{row.date.slice(5)}</span>
+                <span className={`w-24 shrink-0 ${KIND_LABEL[row.kind].tone}`}>{KIND_LABEL[row.kind].text}</span>
+                <span className="min-w-0 flex-1 text-white/30">{row.reason ?? ''}</span>
+              </li>
+            ))}
+          </ul>
+        ) : null}
       </div>
     )
   }
@@ -173,10 +213,60 @@ export function ShadowPanel({
         <span className="gp-chip">
           净值 <span className="text-white/70">{money(summary.equity)}</span> / {money(summary.startCapital)}
         </span>
-        {summary.pendingOrders > 0 ? (
-          <span className="gp-chip">
-            待成交 <span className="text-white/70">{summary.pendingOrders}</span>
-          </span>
+      </div>
+
+      {/* ── 运行状态 ────────────────────────────────────────────────
+          「它在不在跑」用现有几个数答不出来：全空仓时净值曲线是一条 1000000 的直线，
+          与「压根没推进」长得一模一样。所以这一块只摆事实：推进到哪天、挂着什么。 */}
+      <div className="rounded border border-white/10 bg-white/[0.03] p-3">
+        <h3 className="text-xs font-medium text-white/70">运行状态</h3>
+        <div className="mt-1.5 flex flex-col gap-1 text-[11px] text-white/55">
+          <div>
+            最后推进到 <span className="font-mono text-white/80">{summary.lastAdvancedDate ?? '—'}</span>
+            {summary.lastTradingDate === null ? null : (
+              <>
+                ，最后一个已收盘交易日是{' '}
+                <span className="font-mono text-white/80">{summary.lastTradingDate}</span>
+              </>
+            )}
+          </div>
+          {/* 「晚一天」是设计，不是故障 —— 不许把它显示成告警（tick.ts 的 feedShadow 闸门） */}
+          <p className="text-[10px] leading-snug text-white/30">
+            影子在<span className="text-white/50">次日盘前</span>那一跳推进（那时 D 的收盘线刚补进来、
+            D+1 的开盘还没发生，按次日开盘成交仍是前向的）。所以它正常就比最后一个交易日晚一天；
+            应用某天没开机，或开机时已过开盘，那一天的记录<span className="text-white/50">永久缺失</span>
+            —— 下面的流水里会有一条「未推进」。
+          </p>
+        </div>
+
+        {summary.pending.length > 0 ? (
+          <div className="mt-2 border-t border-white/10 pt-2">
+            <div className="text-[11px] text-white/45">待次日开盘成交 {summary.pending.length} 笔</div>
+            <ul className="mt-1 flex flex-col gap-1">
+              {summary.pending.map((order) => (
+                <li key={order.code} className="flex items-center gap-2 text-[11px]">
+                  <span className="w-20 shrink-0 truncate text-white/70" title={order.code}>
+                    {order.name}
+                  </span>
+                  <span className="w-16 shrink-0 font-mono text-white/30">{order.code}</span>
+                  <span className="w-8 shrink-0 text-white/60">{ACTION_LABEL[order.action] ?? order.action}</span>
+                  <span className="w-24 shrink-0 truncate text-white/40" title={order.rule}>
+                    {order.rule}
+                  </span>
+                  <span className="w-14 shrink-0 text-white/30">
+                    {REGIME_LABEL[order.regime] ?? order.regime}
+                  </span>
+                  <span className="w-12 shrink-0 text-right font-mono text-white/40">
+                    {order.score.toFixed(2)}
+                  </span>
+                  <span className="text-white/25">
+                    {order.placedDate.slice(5)} 挂
+                    {order.deferredBars > 0 ? ` · 已顺延 ${order.deferredBars} 天` : ''}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
         ) : null}
       </div>
 
@@ -327,6 +417,40 @@ export function ShadowPanel({
               </li>
             ))}
           </ul>
+        </div>
+      ) : null}
+
+      {/* ── 推进流水 ────────────────────────────────────────────────
+          委托一旦成交 `clearOrder` 就把它删了 ⇒ 只靠上面那张待成交表，
+          事后拼不出「那天挂了哪两单」。这张流水是它唯一的出处（013）。 */}
+      {journal.length > 0 ? (
+        <div className="rounded border border-white/10 bg-white/[0.03] p-3">
+          <h3 className="text-xs font-medium text-white/70">推进流水</h3>
+          <ul className="mt-1.5 flex max-h-64 flex-col gap-1 overflow-y-auto">
+            {journal.map((row) => {
+              const kind = KIND_LABEL[row.kind]
+              return (
+                <li key={`${row.date}-${row.seq}`} className="flex items-start gap-2 text-[11px]">
+                  <span className="w-11 shrink-0 font-mono text-white/30">{row.date.slice(5)}</span>
+                  <span className="w-10 shrink-0 font-mono text-white/25">{shanghaiHhmm(row.at)}</span>
+                  <span className={`w-24 shrink-0 ${kind.tone}`}>{kind.text}</span>
+                  <span className="w-20 shrink-0 truncate text-white/60" title={row.code ?? ''}>
+                    {row.name ?? row.code ?? ''}
+                  </span>
+                  <span className="w-24 shrink-0 text-right font-mono text-white/45">
+                    {row.shares === null ? '' : `${row.shares} 股`}
+                    {row.price === null ? '' : ` @${row.price.toFixed(2)}`}
+                  </span>
+                  <span className="min-w-0 flex-1 text-white/25">
+                    {[row.rule, row.reason].filter((part) => part !== null && part !== '').join(' · ')}
+                  </span>
+                </li>
+              )
+            })}
+          </ul>
+          <p className="mt-1.5 text-[10px] leading-snug text-white/30">
+            这张流水只记录发生了什么，不参与任何绩效计算 —— 上面那些数字一律来自模拟账本。
+          </p>
         </div>
       ) : null}
 

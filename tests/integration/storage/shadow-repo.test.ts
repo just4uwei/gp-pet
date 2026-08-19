@@ -247,6 +247,21 @@ describe('与保留策略的关系', () => {
       })
       storage.shadow.putPosition(position())
       storage.shadow.putOrder(order())
+      // 流水（013）同一档：它是前向记录的一部分，历史 K 线补不出来
+      storage.shadow.putJournal('2023-01-12', [
+        {
+          at: Date.UTC(2023, 0, 12),
+          kind: 'PLACED',
+          code: 'SH600000',
+          action: 'BUY',
+          shares: null,
+          price: null,
+          rule: 'T1_MA_CROSS',
+          regime: 'RANGE',
+          score: 0.7,
+          reason: null,
+        },
+      ])
 
       pruneAll(storage.db, Date.UTC(2026, 7, 13))
 
@@ -254,6 +269,7 @@ describe('与保留策略的关系', () => {
       expect(storage.shadow.barCount()).toBe(1)
       expect(storage.shadow.positions()).toHaveLength(1)
       expect(storage.shadow.orders()).toHaveLength(1)
+      expect(storage.shadow.journal()).toHaveLength(1)
     } finally {
       storage.close()
     }
@@ -261,7 +277,7 @@ describe('与保留策略的关系', () => {
 })
 
 describe('reset', () => {
-  it('清四张表并清掉全部 meta 状态键', async () => {
+  it('清五张表并清掉全部 meta 状态键', async () => {
     const storage = await openMemory()
     try {
       storage.shadow.putOrder(order())
@@ -274,6 +290,20 @@ describe('reset', () => {
         equity: 1,
         benchmark: null,
       })
+      storage.shadow.putJournal('2026-08-12', [
+        {
+          at: 1,
+          kind: 'PLACED',
+          code: 'SH600000',
+          action: 'BUY',
+          shares: null,
+          price: null,
+          rule: 'T1_MA_CROSS',
+          regime: 'RANGE',
+          score: 0.7,
+          reason: null,
+        },
+      ])
       storage.meta.setNumber(SHADOW_KEYS.startedAt, 123)
       storage.meta.setNumber(SHADOW_KEYS.cash, 999)
       storage.meta.set(SHADOW_KEYS.engineVersion, 'v1')
@@ -284,6 +314,7 @@ describe('reset', () => {
       expect(storage.shadow.positions()).toEqual([])
       expect(storage.shadow.trades()).toEqual([])
       expect(storage.shadow.equity()).toEqual([])
+      expect(storage.shadow.journal()).toEqual([])
       for (const key of Object.values(SHADOW_KEYS)) {
         expect(storage.meta.get(key)).toBeNull()
       }

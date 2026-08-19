@@ -21,6 +21,7 @@ import { createStorage, openDatabase, type Storage } from '@main/storage'
 import { SHADOW_KEYS } from '@main/storage/repositories/shadow'
 import {
   DEFAULT_SHADOW_NOTIONAL,
+  MAX_DEFER_BARS,
   createShadowRunner,
   executeOrder,
   orderFrom,
@@ -432,6 +433,46 @@ describe('推进器', () => {
     expect(h.storage.shadow.equity()[0]?.benchmark).toBeNull()
   })
 
+  /*
+    真机上 2/2 行的 benchmark 都是 null（2026-08-19 查）：推进与日线回补在同一跳里，
+    回补先失败（腾讯对指数结构性没有复权轨、eastmoney 又是间歇性的），
+    0.24 秒后推进读基准就拿到 null；当天晚些时候 kline 补上了，但那一天不会再推进。
+    而 summarize() 的 lastBenchmark 取**最后一行** ⇒ 收尾那天是 null 就整条对比为 null。
+  */
+  it('基准当时没取到、后来 K 线补上了 —— 下一次推进要把那天补齐', async () => {
+    const h = await harness({ SH600000: [candle('2026-08-12', 10), candle('2026-08-13', 10)] })
+
+    h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [] })
+    expect(h.storage.shadow.equity()[0]?.benchmark).toBeNull()
+
+    // 基准的两根日线这时才入库（真机上就是当天晚些时候那次重试成功）
+    h.storage.klines.upsertMany(
+      'SH000300',
+      [candle('2026-08-12', 4000), candle('2026-08-13', 4100)],
+      'test'
+    )
+    h.runner.advance({ date: '2026-08-13', at: 2, outcomes: [] })
+
+    expect(h.storage.shadow.equity().map((row) => row.benchmark)).toEqual([4000, 4100])
+  })
+
+  it('补的只是基准这个事实列 —— 不动净值、不补跑任何信号或成交', async () => {
+    const h = await harness({ SH600000: [candle('2026-08-12', 10), candle('2026-08-13', 10)] })
+
+    // 08-12 有一条买入信号，但那天基准取不到
+    h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [outcome({ date: '2026-08-12' })] })
+    const before = h.storage.shadow.equity()[0]
+
+    h.storage.klines.upsertMany('SH000300', [candle('2026-08-12', 4000)], 'test')
+    h.runner.advance({ date: '2026-08-13', at: 2, outcomes: [] })
+
+    const after = h.storage.shadow.equity()[0]
+    expect(after?.benchmark).toBe(4000)
+    expect(after?.cash).toBe(before?.cash)
+    expect(after?.equity).toBe(before?.equity)
+    expect(after?.positionValue).toBe(before?.positionValue)
+  })
+
   it('停牌（当日无 K 线）时委托顺延，连续超上限才作废', async () => {
     const h = await harness({ SH600000: [candle('2026-08-12', 10)] })
     h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [outcome({ date: '2026-08-12' })] })
@@ -477,6 +518,80 @@ describe('推进器', () => {
     expect(h.storage.shadow.positions()).toHaveLength(0)
     const trades = h.storage.shadow.trades()
     expect(trades[0]?.exitRule).toBe('WATCHLIST_REMOVED')
+  })
+
+  /*
+    操作流水（013）。它存在的理由只有一个：净值曲线全空仓时是一条 1000000 的直线，
+    与「压根没推进」在图上无法区分 —— 而委托一旦成交 `clearOrder` 就把它删了，
+    事后拼不出「那天挂了哪两单」。
+  */
+  describe('操作流水', () => {
+    it('挂单与成交各落一行，成交那行带股数与成交价', async () => {
+      const h = await harness({
+        SH600000: [candle('2026-08-12', 10), candle('2026-08-13', 10.2, { open: 10.2 })],
+      })
+      h.runner.advance({ date: '2026-08-12', at: 111, outcomes: [outcome({ date: '2026-08-12' })] })
+      h.runner.advance({ date: '2026-08-13', at: 222, outcomes: [] })
+
+      const rows = h.storage.shadow.journal()
+      const placed = rows.find((row) => row.kind === 'PLACED')
+      const filled = rows.find((row) => row.kind === 'FILLED_BUY')
+
+      expect(placed).toMatchObject({ date: '2026-08-12', code: 'SH600000', action: 'BUY', at: 111 })
+      expect(filled).toMatchObject({ date: '2026-08-13', code: 'SH600000', action: 'BUY', at: 222 })
+      expect(filled?.shares).toBeGreaterThan(0)
+      expect(filled?.price).toBeGreaterThan(0)
+    })
+
+    it('顺延与作废都带人话理由 —— 「作废」与「没赚到」在净值上长得一样', async () => {
+      const h = await harness({ SH600000: [candle('2026-08-12', 10)] })
+      h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [outcome({ date: '2026-08-12' })] })
+
+      // 08-13 起没有 K 线：先顺延，超上限才作废
+      for (let i = 0; i < MAX_DEFER_BARS + 1; i++) {
+        h.runner.advance({ date: `2026-08-${14 + i}`, at: 2 + i, outcomes: [] })
+      }
+
+      const kinds = h.storage.shadow.journal(100).map((row) => row.kind)
+      expect(kinds).toContain('DEFERRED')
+      expect(kinds).toContain('VOIDED')
+      const voided = h.storage.shadow.journal(100).find((row) => row.kind === 'VOIDED')
+      expect(voided?.reason).toContain('拿不到 K 线')
+    })
+
+    it('什么都没发生的那天也写一行流水日期 —— 「没动作」与「没推进」是两件事', async () => {
+      const h = await harness({ SH600000: [candle('2026-08-12', 10)] })
+      h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [] })
+
+      // 那天确实一个动作都没有 ⇒ 流水为空，但净值行在
+      expect(h.storage.shadow.journal()).toHaveLength(0)
+      expect(h.storage.shadow.equity()).toHaveLength(1)
+    })
+
+    it('noteNotAdvanced 记下「那一天永久缺失」，但不覆盖真推进过的记录', async () => {
+      const h = await harness({ SH600000: [candle('2026-08-12', 10)] })
+
+      h.runner.noteNotAdvanced({ date: '2026-08-11', at: 5, reason: '开盘已过' })
+      expect(h.storage.shadow.journal()).toMatchObject([
+        { date: '2026-08-11', kind: 'NOT_ADVANCED', reason: '开盘已过', code: null },
+      ])
+
+      // 08-12 真推进过 —— 再喊一次「没推进」不该把那天的记录改写掉
+      h.runner.advance({ date: '2026-08-12', at: 6, outcomes: [outcome({ date: '2026-08-12' })] })
+      h.runner.noteNotAdvanced({ date: '2026-08-12', at: 7, reason: '开盘已过' })
+
+      const day12 = h.storage.shadow.journal(100).filter((row) => row.date === '2026-08-12')
+      expect(day12.map((row) => row.kind)).toEqual(['PLACED'])
+    })
+
+    it('重复推进同一天不会攒出两份流水', async () => {
+      const h = await harness({ SH600000: [candle('2026-08-12', 10)] })
+      h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [outcome({ date: '2026-08-12' })] })
+      // 第二次被幂等闸门挡住，流水也不该变
+      h.runner.advance({ date: '2026-08-12', at: 2, outcomes: [outcome({ date: '2026-08-12' })] })
+
+      expect(h.storage.shadow.journal(100).filter((row) => row.date === '2026-08-12')).toHaveLength(1)
+    })
   })
 
   it('reset() 清空账本且不预设起点 —— 「已清空」不该显示成「已运行 0 天」', async () => {

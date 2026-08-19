@@ -29,7 +29,13 @@ import type { SignalOutcome } from '../engine/signals'
 import type { AlertRepo, AlertRow } from '../storage/repositories/alert'
 import type { WatchHit } from '../watch/evaluate'
 import { buildAlerts, type QuoteView } from './candidates'
-import { AlertDispatcher, type AlertCandidate, type AlertDecision, type AlertTrack } from './dispatcher'
+import {
+  AlertDispatcher,
+  type AlertCandidate,
+  type AlertDecision,
+  type AlertTrack,
+  type DispatcherState,
+} from './dispatcher'
 import type { QuietVerdict } from './dnd'
 import { PetStateMachine } from './pet-state'
 
@@ -52,6 +58,17 @@ export interface AlertServiceDeps {
   quotes?: () => ReadonlyMap<SecCode, QuoteView>
   /** code → 名称。提醒日志要显示名称，而 alert_log 里只有代码 */
   nameOf?: (code: SecCode) => string
+  /**
+   * 闸门状态的落点（2026-08-19）。不传 = 老行为（重启即清零）。
+   *
+   * **接口刻意只有一个字符串键值对**：这一层不认识 SQLite，也不该认识 ——
+   * 它与「不读时钟」同一条纪律，为的是让「重启后冷却还在不在」能写成用例。
+   * 读到坏 JSON 一律当成没有（`AlertDispatcher.restore` 也会再挡一次版本）。
+   */
+  gateStore?: {
+    load(): string | null
+    save(json: string): void
+  }
   /**
    * 这只标的允不允许发提醒。默认全允许。
    *
@@ -100,6 +117,14 @@ export interface AlertService {
   unreadCount(): number
   /** 状态机随时间回落后重算用 */
   petStateAt(at: number): void
+  /**
+   * 当前闸门用量。**是「状态落库」这个决定的配套** ——
+   * 冷却与配额跨重启活下来之后，用户必须看得见今天已经用掉多少，
+   * 否则「怎么一条都不弹」就没有出处了。
+   */
+  gateUsage(at: number): ReturnType<AlertDispatcher['gateUsage']>
+  /** 清空全部闸门状态。逃生口，清完之后同一条止损会重新发一次 */
+  clearGates(): void
 }
 
 export function createAlertService(deps: AlertServiceDeps): AlertService {
@@ -112,6 +137,7 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
     nameOf = (code) => code,
     alertable = () => true,
     trackOf,
+    gateStore,
     dispatcher = new AlertDispatcher(),
     pet = new PetStateMachine(),
     newId = () => randomUUID(),
@@ -193,10 +219,42 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
     }
   }
 
+  /**
+   * 启动时把上一次的闸门状态装回来（2026-08-19，见 `AlertDispatcher` 头注释）。
+   *
+   * ⚠ **恢复要等到第一轮 tick 才做**，因为 `restore` 必须拿到 `now` 才能裁剪
+   * （跨日的当日计数要丢、超 1 小时的滑动窗口要过期），而这一层不读时钟。
+   * 在这之前一轮提醒都还没发生过，所以晚一点恢复没有任何代价。
+   */
+  let gatesRestored = gateStore === undefined
+  function restoreGatesOnce(now: number): void {
+    if (gatesRestored) return
+    gatesRestored = true
+    const raw = gateStore?.load() ?? null
+    if (raw === null) return
+    try {
+      dispatcher.restore(JSON.parse(raw) as DispatcherState, now)
+    } catch (error) {
+      // 坏 JSON 一律当成没有：猜一个半对的状态比从零开始危险得多
+      log.warn(`[alert] 闸门状态读不出来，本次从零开始：${String(error)}`)
+    }
+  }
+
+  function saveGates(): void {
+    if (gateStore === undefined) return
+    try {
+      gateStore.save(JSON.stringify(dispatcher.snapshot()))
+    } catch (error) {
+      // 存不下不该影响这一轮已经发出去的提醒
+      log.warn(`[alert] 闸门状态写入失败：${String(error)}`)
+    }
+  }
+
   return {
     pet,
 
     handle(outcomes, ctx) {
+      restoreGatesOnce(ctx.at)
       const app = settings()
       /*
         观察名单在**进闸门之前**就被摘掉（见 `alertable` 的注释）。
@@ -305,6 +363,9 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
       sink.unread(repo.unreadCount())
       sink.petState(pet.nextChangeAt(ctx.at))
 
+      // 闸门状态落盘。放在最后：这一轮的冷却与配额已经记完了（commit 在 dispatch 里）
+      saveGates()
+
       return { decisions, delivered, suppressed: decisions.length - delivered }
     },
 
@@ -342,6 +403,17 @@ export function createAlertService(deps: AlertServiceDeps): AlertService {
 
     petStateAt(at) {
       sink.petState(pet.nextChangeAt(at))
+    },
+
+    gateUsage(at) {
+      restoreGatesOnce(at)
+      return dispatcher.gateUsage(at)
+    },
+
+    clearGates() {
+      dispatcher.clearGates()
+      // 立刻落盘，否则重启之后被清掉的状态会原样回来
+      saveGates()
     },
   }
 }

@@ -125,6 +125,11 @@ export function registerHandlers(controller: AppController): void {
 
   handle('alert:markRead', (_event, ids) => controller.markAlertsRead(ids))
 
+  // 闸门用量与逃生口 —— 闸门状态从 2026-08-19 起跨重启保留，这两条是它的配套
+  handle('alert:gateUsage', () => controller.alertGateUsage())
+
+  handle('alert:clearGates', () => controller.clearAlertGates())
+
   // ── 设置 ─────────────────────────────────────────────────────────
 
   handle('settings:get', () => controller.getSettings())
@@ -140,13 +145,15 @@ export function registerHandlers(controller: AppController): void {
   handle('config:import', () => controller.importConfig())
 
   // ── 影子运行（M4，docs/07 §2.3）───────────────────────────────────
-  // 只读两条 + 一条重置。**推进不走 IPC**：它挂在 tick 上，因为
+  // 只读三条 + 一条重置。**推进不走 IPC**：它挂在 tick 上，因为
   // 「一个交易日推进一次」是数据层的节奏，给渲染层一个「推进」按钮
   // 等于让界面能凭空多造一根净值点
 
   handle('shadow:summary', () => controller.shadowSummary())
 
   handle('shadow:trades', (_event, query) => controller.shadowTrades(query.limit))
+
+  handle('shadow:journal', (_event, query) => controller.shadowJournal(query.limit))
 
   handle('shadow:reset', () => controller.resetShadow())
 

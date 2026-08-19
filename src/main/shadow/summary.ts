@@ -50,6 +50,14 @@ export interface SummaryInput {
   engineVersion: string
   /** 账本里记的引擎版本与当前不一致时传它 —— 推进已暂停 */
   stalledEngineVersion: string | null
+  /**
+   * 最后一个**已收盘**的交易日。与净值末端一比就知道影子跟上没有 ——
+   * 全空仓时净值曲线是一条直线，和「压根没推进」在图上无法区分，这个数是唯一的判据。
+   * 拿不到日历时给 null（**别拿「今天」顶替**：休市日会算出一个假的落后）。
+   */
+  lastTradingDate: string | null
+  /** 委托上显示的股票名。拿不到就回落成代码 —— 展示层的事，缺了不影响任何数字 */
+  nameOf?: (code: string) => string | undefined
   /** 墙上时间，由调用方传入（不读时钟） */
   now: number
 }
@@ -164,6 +172,18 @@ export function summarize(input: SummaryInput): ShadowSummary {
       barsHeld: p.barsHeld,
     })),
     pendingOrders: input.orders.length,
+    pending: input.orders.map((order) => ({
+      code: order.code,
+      name: input.nameOf?.(order.code) ?? order.code,
+      action: order.action,
+      placedDate: order.placedDate,
+      rule: order.rule,
+      regime: order.regime,
+      score: order.score,
+      deferredBars: order.deferred,
+    })),
+    lastAdvancedDate: last?.date ?? null,
+    lastTradingDate: input.lastTradingDate,
     skippedNoCash: input.skippedNoCash,
     limitBlocked: input.limitBlocked,
     engineVersion: input.engineVersion,
@@ -207,6 +227,9 @@ export function emptyShadowSummary(engineVersion: string): ShadowSummary {
     },
     entries: { count: 0, wins: 0, winRate: null, avgPnl: null, avgReturn: null, payoffRatio: null, reduced: 0 },
     open: [],
+    pending: [],
+    lastAdvancedDate: null,
+    lastTradingDate: null,
     pendingOrders: 0,
     skippedNoCash: 0,
     limitBlocked: 0,

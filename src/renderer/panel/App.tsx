@@ -38,7 +38,7 @@ import type {
 import { groupSignals } from '@shared/signal-group'
 import { watchMarkOf } from '@shared/watch-mark'
 import { T_HINT_LABEL, T_HINT_TITLE } from '@shared/intraday-t'
-import { SHANGHAI_OFFSET_MS, shanghaiDayStartMs } from '@shared/time'
+import { SHANGHAI_OFFSET_MS, shanghaiDayStartMs, shanghaiMdHhmm } from '@shared/time'
 import { INDUSTRY_ETF_GROUP, INDUSTRY_ETFS } from '@shared/industry-etf'
 import { splitWatchItems, watchTabOf, type WatchTab } from '@shared/watch-split'
 import type { SecCode } from '@core/types'
@@ -386,7 +386,16 @@ function WatchRow({
             </span>
           </span>
 
-          <span className={`w-16 text-right font-mono ${stale ? 'text-white/35' : ''}`}>
+          {/*
+            `title` 上标出数据时刻（2026-08-19）。灰显只说「别当实时用」，
+            答不了「有多旧」—— 而重启之后差别很大：3 分钟前的和上周五收盘的都是灰的，
+            但只有一个还值得看。走 shanghaiMdHhmm，**不许用 toLocaleTimeString**
+            （宿主时区上会把北京 09:03 写成 08:03，而同一屏还有一个北京时钟）
+          */}
+          <span
+            className={`w-16 text-right font-mono ${stale ? 'text-white/35' : ''}`}
+            title={quote && stale ? `${shanghaiMdHhmm(quote.at)} 的价，非实时` : undefined}
+          >
             {quote ? quote.last.toFixed(2) : '—'}
           </span>
           <span

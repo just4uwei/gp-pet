@@ -380,8 +380,17 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
       15:00 是收盘时刻，按北京时间换算（`shanghaiToEpochMs` 与分时那边共用一个口径 ——
       用 `new Date(...)` 会让非 +08 的机器上算出偏 8 小时的 created_at）。
     */
-    settle: (date, feedShadow) =>
-      settleDay(date, {
+    settle: (date, feedShadow) => {
+      // 「没喂影子」= 那个交易日的前向记录永久缺失。日志里那一行答不了「哪天缺了」，
+      // 所以同时落一行流水（013），面板上看得见
+      if (!feedShadow) {
+        shadow.noteNotAdvanced({
+          date,
+          at: Date.now(),
+          reason: '补跑时今天的开盘已过（或今日休市），按前向纪律不喂影子 —— 这一天的记录永久缺失',
+        })
+      }
+      return settleDay(date, {
         /*
           影子运行挂在补跑这条路上（settle.ts 边界 2，2026-08-17 改）。
           `feedShadow` 由 tick 判「成交机会还没过」——**给了就喂，不给就不喂**，
@@ -400,7 +409,8 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
         params: withSensitivity(settings.sensitivity),
         closedAt: closeMsOf(date),
         log,
-      }),
+      })
+    },
     /*
       分时留痕 + 转发。**始终**挂这个回调（不再是 `...(onQuotes ? …)`）——
       落库是数据层自己的事，不该取决于外面有没有人订阅推送。
@@ -596,17 +606,75 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
       return storage.trades.boughtSharesSince(code, shanghaiDayStartMs(now()))
     },
 
+    /*
+      面板与悬浮条的价格投影。
+
+      ## 内存里没有时从库里读回来（2026-08-19）
+
+      快照缓存 (`market-data.ts` 的 `cache`) 是内存 Map，**重启即空**；而休市时段
+      `needsQuotes` 为 false ⇒ 不会有任何一轮 tick 去补 ⇒ 晚上/周末重启之后，
+      面板与悬浮条一直空到下一个交易日 09:00。用户看到的是「软件把我的股票忘了」。
+
+      两级回落，都带**真实数据时刻**并标 `STORED`：
+        ① `quote_tick` 那只票的最后一行（保留 7 天，且刻意不存 stale 快照 ⇒ 是真实观测）
+        ② 再退到日线：最后一根收盘 + 前一根收盘算涨跌幅
+
+      ⚠ **只改这个展示投影，不碰 `market-data.ts` 的缓存。** 引擎照旧看不到快照，
+      于是不会拿一个上周五的价去判信号 —— 这正是这个改法比「把缓存也恢复」安全的全部理由。
+      渲染层两处都已按 `stale` 灰显（bar/App.tsx、panel/App.tsx），再加上 `at` 说清有多旧。
+    */
     quoteTicks() {
       const stale = pipeline.state().lastSnapshots?.stale ?? false
+      const codes = watchlist.codes()
       const ticks: QuoteTick[] = []
-      for (const code of watchlist.codes()) {
+      const missing: SecCode[] = []
+
+      for (const code of codes) {
         const snapshot = market.snapshotOf(code)
-        if (!snapshot) continue
+        if (!snapshot) {
+          missing.push(code)
+          continue
+        }
         ticks.push({
           code,
           last: snapshot.last,
           changePct: changePct(snapshot.last, snapshot.preClose),
           stale,
+          at: snapshot.at,
+          source: 'LIVE',
+        })
+      }
+
+      if (missing.length === 0) return ticks
+
+      const stored = storage.quoteTicks.latest(missing)
+      for (const code of missing) {
+        const tick = stored.get(code)
+        if (tick) {
+          ticks.push({
+            code,
+            last: tick.last,
+            // 昨收拿不到就给 0 涨跌幅，**不编一个** —— 与 `changePct` 自己的口径一致
+            changePct: tick.preClose === null ? 0 : changePct(tick.last, tick.preClose),
+            stale: true,
+            at: tick.ts,
+            source: 'STORED',
+          })
+          continue
+        }
+        // 留痕也没有（超过 7 天没开机、或刚加进来的票）：退到日线收盘
+        const bars = storage.klines.recent(code, 2)
+        const day = bars[bars.length - 1]
+        if (!day) continue
+        const prev = bars[bars.length - 2]
+        ticks.push({
+          code,
+          last: day.close,
+          changePct: prev ? changePct(day.close, prev.close) : 0,
+          stale: true,
+          // 收盘线的时刻就是那天的收盘 —— 与日报的 quoteOf 同一条口径
+          at: closeMsOf(day.date),
+          source: 'STORED',
         })
       }
       return ticks

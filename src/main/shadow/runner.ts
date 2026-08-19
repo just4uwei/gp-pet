@@ -11,7 +11,14 @@
  * ⑤ 持仓逐日盯市：峰值、最后收盘、持有根数
  * ⑥ 用今天的收盘确认信号挂明天的委托
  * ⑦ 写一行净值（含沪深300 收盘）
+ * ⑧ 把历史上没取到基准的那些天补齐
  * ```
+ *
+ * **⑧ 不是「补跑历史」。** 前向纪律管的是信号、委托与成交 —— 它们必须按真实时间往前走，
+ * 用历史 K 线补出来的叫回测。而沪深300 在某一天的收盘价是一个与我们的决策无关的**事实**，
+ * 当时没有它只是取数失败（推进与日线回补在同一跳里，回补先失败 0.2 秒后推进就读到 null），
+ * 不是「那天还不知道」。少了这一步，只要收尾那天的基准是 null，
+ * `summarize()` 的同期对比整条就是 null —— 影子曲线没有刻度。
  *
  * **不读时钟**：`date` / `at` 全部由调用方传入，与 `src/core` 和提醒层同一条纪律。
  * 「15:00 那一轮会不会重复推进」「跨天唤醒补不补」必须能写成用例。
@@ -38,7 +45,7 @@ import type { SignalOutcome } from '../engine'
 import type { Board, Candle, SecCode, TradeDate } from '@core/types'
 import type { KlineRepo } from '../storage/repositories/kline'
 import type { MetaRepo } from '../storage/repositories/meta'
-import type { ShadowRepo } from '../storage/repositories/shadow'
+import type { ShadowJournalEntry, ShadowRepo } from '../storage/repositories/shadow'
 import { SHADOW_KEYS } from '../storage/repositories/shadow'
 import { DEFAULT_COSTS, sellFees, sellFill, type CostModel } from '../../backtest/costs'
 import {
@@ -46,6 +53,7 @@ import {
   exitRuleOf,
   executeOrder,
   orderFrom,
+  type ShadowOrder,
   type ShadowPosition,
   type VoidReason,
 } from './portfolio'
@@ -84,6 +92,38 @@ export interface ShadowAdvanceResult {
   cash: number
 }
 
+/** 攒在内存里的一行流水（落盘时由 repo 补上 date 与 seq） */
+type JournalDraft = Omit<ShadowJournalEntry, 'date' | 'seq'>
+
+/**
+ * 委托作废理由的人话。**每一种都要显示** —— 「作废」与「没赚到」在净值上长得一样，
+ * 但一个是「这条信号没法执行」、一个是「这条信号不值钱」（portfolio.ts 的 `VoidReason`）。
+ */
+const VOID_TEXT: Record<VoidReason, string> = {
+  LIMIT_UP: '开盘涨停买不到（追高一天的成本已经不是这条信号的成本）',
+  LIMIT_DOWN: '跌停卖不掉且已超顺延上限',
+  GAP: '缺口段不成交 —— 那一段的价格连续性本身不可信',
+  NO_CASH: '模拟现金池不足',
+  NO_LOT: '单笔名义金额买不起一手',
+  NO_POSITION: '没有可卖的持仓',
+  NO_BAR: `连续 ${MAX_DEFER_BARS} 天拿不到 K 线（长期停牌 / 退市）`,
+}
+
+function voidNote(at: number, order: ShadowOrder, reason: VoidReason): JournalDraft {
+  return {
+    at,
+    kind: 'VOIDED',
+    code: order.code,
+    action: order.action,
+    shares: null,
+    price: null,
+    rule: order.rule,
+    regime: order.regime,
+    score: order.score,
+    reason: VOID_TEXT[reason],
+  }
+}
+
 /** 推进被跳过的理由。**都要能报给 UI** —— 「影子曲线为什么不动」必须答得出来 */
 export type ShadowSkip =
   | { kind: 'ALREADY_DONE'; date: TradeDate }
@@ -93,6 +133,17 @@ export interface ShadowRunner {
   /** 推进一个交易日。返回 null = 本轮什么都没做，理由见 `lastSkip()` */
   advance(input: { date: TradeDate; at: number; outcomes: readonly SignalOutcome[] }): ShadowAdvanceResult | null
   lastSkip(): ShadowSkip | null
+  /**
+   * 记一行「这一天整轮没推进」。
+   *
+   * 调用方是 data-layer 的补跑适配器：只有它同时知道 `feedShadow` 的判据与理由，
+   * 而那道闸门（成交机会已过 ⇒ 不喂）意味着**那个交易日的前向记录永久缺失** ——
+   * 此前这件事只在主进程日志里出现一行，界面上完全不可见，
+   * 而它恰恰是「影子为什么不动」最常见的答案。
+   *
+   * **已经有那天的流水就不覆盖**：真推进过的记录比一句「没推进」值钱得多。
+   */
+  noteNotAdvanced(input: { date: TradeDate; at: number; reason: string }): void
   /** 清空。下一个交易日的 advance() 会重新初始化起点（引擎参数变更后用） */
   reset(): void
 }
@@ -151,6 +202,11 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
     meta.setNumber(key, (meta.getNumber(key) ?? 0) + delta)
   }
 
+  /** 基准指数在 `date` 那天的收盘。那天的那根还没入库时为 null（**不是 0**） */
+  function benchmarkOn(date: TradeDate): number | null {
+    return lastIf(klines.recentThrough(benchmarkCode, date, 1), date)?.closeAdj ?? null
+  }
+
   return {
     lastSkip: () => skip,
 
@@ -184,6 +240,8 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
       }
 
       const tracked = trackedCodes()
+      const journal: JournalDraft[] = []
+      const note = (entry: JournalDraft): void => void journal.push(entry)
 
       // ③ 执行昨天挂下的委托 —— 今天的开盘价
       for (const order of repo.orders()) {
@@ -193,8 +251,21 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
           if (order.deferred >= MAX_DEFER_BARS) {
             repo.clearOrder(order.code)
             result.voided.push({ reason: 'NO_BAR', code: order.code })
+            note(voidNote(at, order, 'NO_BAR'))
           } else {
             repo.putOrder({ ...order, deferred: order.deferred + 1 })
+            note({
+              at,
+              kind: 'DEFERRED',
+              code: order.code,
+              action: order.action,
+              shares: null,
+              price: null,
+              rule: order.rule,
+              regime: order.regime,
+              score: order.score,
+              reason: `当日无 K 线（停牌或尚未回补），已顺延 ${order.deferred + 1}/${MAX_DEFER_BARS} 天`,
+            })
           }
           continue
         }
@@ -217,6 +288,18 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
             repo.putPosition(outcome.position)
             repo.clearOrder(order.code)
             result.opened++
+            note({
+              at,
+              kind: 'FILLED_BUY',
+              code: order.code,
+              action: 'BUY',
+              shares: outcome.position.shares,
+              price: outcome.position.entryPriceRaw,
+              rule: order.rule,
+              regime: order.regime,
+              score: order.score,
+              reason: null,
+            })
             break
           case 'FILLED_SELL':
             cash = outcome.cash
@@ -225,10 +308,34 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
             else repo.clearPosition(order.code)
             repo.clearOrder(order.code)
             result.closed++
+            note({
+              at,
+              kind: 'FILLED_SELL',
+              code: order.code,
+              action: outcome.trade.partial ? 'REDUCE' : 'SELL',
+              shares: outcome.trade.shares,
+              price: outcome.trade.exitPriceRaw,
+              rule: outcome.trade.exitRule,
+              regime: order.regime,
+              score: order.score,
+              reason: null,
+            })
             break
           case 'DEFERRED':
             repo.putOrder(outcome.order)
             bump(SHADOW_KEYS.limitBlocked, 1)
+            note({
+              at,
+              kind: 'DEFERRED',
+              code: order.code,
+              action: order.action,
+              shares: null,
+              price: null,
+              rule: order.rule,
+              regime: order.regime,
+              score: order.score,
+              reason: `开盘跌停卖不掉，已顺延 ${outcome.order.deferred}/${MAX_DEFER_BARS} 天`,
+            })
             break
           case 'VOID':
             repo.clearOrder(order.code)
@@ -237,6 +344,7 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
             if (outcome.reason === 'LIMIT_UP' || outcome.reason === 'LIMIT_DOWN') {
               bump(SHADOW_KEYS.limitBlocked, 1)
             }
+            note(voidNote(at, order, outcome.reason))
             break
         }
       }
@@ -276,6 +384,18 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
           repo.clearPosition(position.code)
           repo.clearOrder(position.code)
           result.closed++
+          note({
+            at,
+            kind: 'CLOSED_OUT',
+            code: position.code,
+            action: 'SELL',
+            shares: position.shares,
+            price: sellFill(position.lastCloseAdj, costs),
+            rule: 'WATCHLIST_REMOVED',
+            regime: position.entryRegime,
+            score: position.entryScore,
+            reason: '已移出自选，按最后收盘价了结（不再跟踪 = 影子也不再持有）',
+          })
           continue
         }
 
@@ -313,22 +433,63 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
         if (!order) continue
         repo.putOrder(order)
         result.placed++
+        note({
+          at,
+          kind: 'PLACED',
+          code: order.code,
+          action: order.action,
+          shares: null,
+          price: null,
+          rule: order.rule,
+          regime: order.regime,
+          score: order.score,
+          reason: '按次日开盘价成交',
+        })
       }
 
       // ⑦ 写一行净值
-      const benchmark = lastIf(klines.recentThrough(benchmarkCode, date, 1), date)?.closeAdj ?? null
+      const benchmark = benchmarkOn(date)
       const equity = cash + positionValue
       repo.putEquity({ date, cash, positionValue, equity, benchmark })
       meta.setNumber(SHADOW_KEYS.cash, cash)
 
+      // ⑧ 把历史上没取到基准的那些天补齐（见 `ShadowRepo.setBenchmark` 的边界说明）
+      for (const missing of repo.equityMissingBenchmark()) {
+        const value = benchmarkOn(missing)
+        if (value !== null) {
+          repo.setBenchmark(missing, value)
+          log.info(`[shadow] ${missing} 的基准收盘价已补齐（当时取数失败）`)
+        }
+      }
+
+      // ⑨ 流水整批落盘。空的那天也要写 —— 面板上「那天什么都没发生」与
+      // 「那天压根没推进」是两件事，而它们在净值曲线上长得一模一样
+      repo.putJournal(date, journal)
+
       result.cash = cash
       result.equity = equity
-      if (result.opened + result.closed + result.placed > 0) {
-        log.info(
-          `[shadow] ${date} 建仓 ${result.opened} · 平仓 ${result.closed} · 挂单 ${result.placed} · 净值 ${equity.toFixed(0)}`
-        )
-      }
+      log.info(
+        `[shadow] ${date} 建仓 ${result.opened} · 平仓 ${result.closed} · 挂单 ${result.placed} · 净值 ${equity.toFixed(0)}`
+      )
       return result
+    },
+
+    noteNotAdvanced({ date, at, reason }) {
+      if (repo.hasDate(date)) return
+      repo.putJournal(date, [
+        {
+          at,
+          kind: 'NOT_ADVANCED',
+          code: null,
+          action: null,
+          shares: null,
+          price: null,
+          rule: null,
+          regime: null,
+          score: null,
+          reason,
+        },
+      ])
     },
 
     reset() {

@@ -456,3 +456,117 @@ describe('双轨提醒：OBSERVE 轨的独立配额', () => {
     expect(d.dispatch([c], T0 + MIN, calm)[0]?.level).toBe('L2')
   })
 })
+
+/*
+  闸门状态跨重启（2026-08-19）。
+
+  此前 dispatcher.ts 的头注释写着「刻意不落库」，理由是「落库会让『重启后被冷却挡住、
+  什么都不弹』变成一个很难查的问题」。**推翻它的是真机数据**：实测 08-13 启动 14 次、
+  08-14 二十七次，那两天「一天 10 条止损气泡」逐条对得上启动时刻。
+
+  下面五条钉的是那条旧顾虑被堵住的方式 —— 少任何一条都不该落库。
+*/
+describe('跨重启：snapshot / restore', () => {
+  /**
+   * 模拟一次重启：把状态搬到一个全新实例上。
+   *
+   * 默认 `debounceTicks: 1` —— 防抖是**闸门①**，它会先于冷却拦下第一轮，
+   * 于是 `blockedBy` 报的是 DEBOUNCE，这一组想验的冷却根本轮不到。
+   * 唯一例外是下面那条专门验防抖的用例，它自己传 2。
+   */
+  function restart(from: AlertDispatcher, now: number, options: DispatcherOptions = {}): AlertDispatcher {
+    const next = make({ debounceTicks: 1, ...options })
+    next.restore(JSON.parse(JSON.stringify(from.snapshot())) as ReturnType<AlertDispatcher['snapshot']>, now)
+    return next
+  }
+
+  it('冷却活过重启 —— 同一条提醒不会因为重开应用重发一次', () => {
+    const d = make({ debounceTicks: 1 })
+    const c = candidate()
+    expect(d.dispatch([c], T0, calm)[0]?.level).toBe('L2')
+
+    // 30 分钟后重启：L2 的冷却是 2 小时，还没过
+    const after = restart(d, T0 + 30 * MIN)
+    expect(after.dispatch([c], T0 + 30 * MIN, calm)[0]?.blockedBy).toBe('COOLDOWN')
+  })
+
+  it('强制类台阶活过重启 —— 这正是 2026-08-17 那个漏报 bug 的反面', () => {
+    const d = make({ debounceTicks: 1 })
+    const forced = candidate({ level: 'L3', forced: true, lossPct: -0.08 })
+    d.dispatch([forced], T0, calm)
+
+    const after = restart(d, T0 + 10 * MIN)
+    // 浮亏没再扩大 2%：台阶应当仍然挡着它
+    const same = after.dispatch([candidate({ ...forced, lossPct: -0.085 })], T0 + 10 * MIN, calm)
+    expect(same[0]?.blockedBy).toBe('COOLDOWN')
+  })
+
+  it('跨日重启后当日计数清零 —— restore 会立刻按 now 裁剪一遍', () => {
+    const d = make({ debounceTicks: 1, dailyL3Limit: 1 })
+    d.dispatch([candidate({ level: 'L3' })], T0, calm)
+
+    const nextDay = utcStartOfDay(T0) + 86_400_000 + 9 * HOUR
+    const after = restart(d, nextDay, { dailyL3Limit: 1 })
+    const other = candidate({ level: 'L3', code: 'SZ000001' as SecCode })
+    expect(after.dispatch([other], nextDay, calm)[0]?.level).toBe('L3')
+  })
+
+  it('每小时滑动窗口按 now 过期 —— 一份很旧的状态卡不住闸门', () => {
+    const d = make({ debounceTicks: 1, hourlyLimit: 1 })
+    d.dispatch([candidate()], T0, calm)
+
+    // 两小时后重启：那条 L2 早就滚出滑动窗口了
+    const after = restart(d, T0 + 2 * HOUR, { hourlyLimit: 1 })
+    const other = candidate({ code: 'SZ000001' as SecCode })
+    expect(after.dispatch([other], T0 + 2 * HOUR, calm)[0]?.level).toBe('L2')
+  })
+
+  it('防抖计数**不**跨重启 —— 重启跨过一段没有观测的时间，续上等于用不存在的连续性放行', () => {
+    const d = make({ debounceTicks: 2 })
+    const c = candidate()
+    // 第一次只是攒了一个 streak，还没发出
+    expect(d.dispatch([c], T0, calm)[0]?.blockedBy).toBe('DEBOUNCE')
+
+    const after = restart(d, T0 + MIN, { debounceTicks: 2 })
+    // 若 streak 被恢复，这一轮就会直接发出去
+    expect(after.dispatch([c], T0 + MIN, calm)[0]?.blockedBy).toBe('DEBOUNCE')
+  })
+
+  it('版本对不上就整份丢弃 —— 猜一个半对的状态比从零开始危险得多', () => {
+    const d = make({ debounceTicks: 1 })
+    const c = candidate()
+    d.dispatch([c], T0, calm)
+
+    const next = make({ debounceTicks: 1 })
+    next.restore({ ...d.snapshot(), v: 2 as unknown as 1 }, T0 + MIN)
+    // 状态没装进去 ⇒ 冷却不存在，这条照发
+    expect(next.dispatch([c], T0 + MIN, calm)[0]?.level).toBe('L2')
+  })
+
+  it('restore(null) 是合法的空操作（第一次运行、或状态读不出来）', () => {
+    const d = make({ debounceTicks: 1 })
+    d.restore(null, T0)
+    expect(d.dispatch([candidate()], T0, calm)[0]?.level).toBe('L2')
+  })
+
+  it('gateUsage 报的是当前用量，且**不改状态**（一次查询不该影响分发）', () => {
+    const d = make({ debounceTicks: 1, hourlyLimit: 6, dailyL3Limit: 10, observeDailyLimit: 2 })
+    d.dispatch([candidate()], T0, calm)
+
+    // 两小时后：那条 L2 已滚出滑动窗口
+    expect(d.gateUsage(T0 + 2 * HOUR).hourly).toEqual({ used: 0, limit: 6 })
+    expect(d.gateUsage(T0 + 2 * HOUR).dailyL3).toEqual({ used: 0, limit: 10 })
+    // 上面那次查询没有把 recentHigh 裁掉：换个时刻问，那条又在窗口里了
+    expect(d.gateUsage(T0 + 30 * MIN).hourly.used).toBe(1)
+  })
+
+  it('clearGates 把冷却清干净 —— 逃生口必须真的能自救', () => {
+    const d = make({ debounceTicks: 1 })
+    const c = candidate()
+    d.dispatch([c], T0, calm)
+    expect(d.dispatch([c], T0 + MIN, calm)[0]?.blockedBy).toBe('COOLDOWN')
+
+    d.clearGates()
+    expect(d.dispatch([c], T0 + 2 * MIN, calm)[0]?.level).toBe('L2')
+  })
+})

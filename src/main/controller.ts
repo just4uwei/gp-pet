@@ -25,6 +25,7 @@ import type {
   AiExplainRecord,
   AiExplainStart,
   AiTestResult,
+  AlertGateUsage,
   AlertRecord,
   AppSettings,
   ConfigTransferResult,
@@ -44,6 +45,7 @@ import type {
   DailyBrief,
   ReportNoteView,
   ShadowSummary,
+  ShadowJournalView,
   ShadowTradeView,
   SignalEvidence,
   SignalRecord,
@@ -84,9 +86,10 @@ import { alertTrackOf } from './alerts/track'
 import { createNotificationStateProbe, type NotificationStateProbe } from './alerts/notification-state'
 import type { DataLayer } from './data-layer'
 import type { SignalOutcome } from './engine'
-import { BENCHMARK_CODE, industryMapOf, industryValueShares } from './engine'
+import { BENCHMARK_CODE, expectedLastBar, industryMapOf, industryValueShares } from './engine'
 import { log } from './logging'
 import { shanghaiTime, type TickContext } from './scheduler'
+import { META_KEYS } from './storage/repositories/meta'
 import type { WatchEntry } from './storage/repositories/watchlist'
 import { DEFAULT_SETTINGS } from './settings/schema'
 import {
@@ -291,6 +294,19 @@ export class AppController {
           layer.storage.positions.get(code) !== null,
           INDUSTRY_ETF_GROUP
         ),
+      /*
+        闸门状态跨重启（2026-08-19，推翻了 dispatcher.ts 原来那条「刻意不落库」）。
+
+        推翻它的是真机数据：08-13 启动 14 次、08-14 二十七次，那两天「一天 10 条止损气泡」
+        逐条对得上启动时刻 —— 冷却/配额/强制类台阶全在内存里，重启即清零。
+
+        存 `meta` 而不是新建一张表：它是**单值状态**，为它建表只会多一处「忘了初始化」。
+        与 `SHADOW_KEYS` 同一个模式。
+      */
+      gateStore: {
+        load: () => layer.storage.meta.get(META_KEYS.alertGateState),
+        save: (json) => layer.storage.meta.set(META_KEYS.alertGateState, json),
+      },
       log,
     })
     this.unread = layer.storage.alerts.unreadCount()
@@ -630,6 +646,7 @@ export class AppController {
     const meta = layer.storage.meta
     const recorded = meta.get(SHADOW_KEYS.engineVersion)
     const current = layer.signals.engineVersion
+    const today = shanghaiTime(Date.now())
     return summarize({
       startedAt: meta.getNumber(SHADOW_KEYS.startedAt),
       startedDate: meta.get(SHADOW_KEYS.startedDate),
@@ -643,8 +660,32 @@ export class AppController {
       engineVersion: current,
       // 只有「记过、且不一致」才算暂停。从未记过（还没开始）不是暂停
       stalledEngineVersion: recorded !== null && recorded !== current ? recorded : null,
+      /*
+        「跟上了没有」的参照系。复用 `expectedLastBar`（「此刻应该已经存在的最后一根日线」），
+        **别拿「今天」顶替** —— 休市日会算出一个假的落后。
+
+        ⚠ 面板不许拿它直接判「落后 = 出问题」：影子按**次日盘前**推进
+        （tick.ts 的 feedShadow 闸门），所以正常情况下它本来就晚一天。
+        这里只给两个事实，怎么读由那一屏的文案说清楚。
+      */
+      lastTradingDate: expectedLastBar(layer.calendar, today.date, today.minuteOfDay),
+      nameOf: (code) => layer.storage.watchlist.get(code as SecCode)?.profile.name,
       now: Date.now(),
     })
+  }
+
+  /**
+   * 逐日操作流水（013）。答的是「它今天到底做了什么」——
+   * 净值曲线全空仓时是一条直线，与「压根没推进」在图上无法区分。
+   */
+  shadowJournal(limit = 60): ShadowJournalView[] {
+    const layer = this.data
+    if (!layer) return []
+    return layer.storage.shadow.journal(limit).map((row) => ({
+      ...row,
+      // 名字拿不到（已移出自选）就给 null，由渲染层显示代码 —— 不在这里编一个
+      name: row.code === null ? null : (layer.storage.watchlist.get(row.code)?.profile.name ?? null),
+    }))
   }
 
   shadowTrades(limit = 50): ShadowTradeView[] {
@@ -1315,6 +1356,43 @@ export class AppController {
   /** 空数组 = 全部已读（用户打开提醒日志即视为看过） */
   markAlertsRead(ids: string[]): number {
     return this.alerts?.markRead(ids, Date.now()) ?? 0
+  }
+
+  /**
+   * 当前闸门用量。数据层还没起来时给一屏 0 —— 那时确实一条都没发过。
+   */
+  alertGateUsage(): AlertGateUsage {
+    return (
+      this.alerts?.gateUsage(Date.now()) ?? {
+        hourly: { used: 0, limit: 0 },
+        dailyL3: { used: 0, limit: 0 },
+        observe: { used: 0, limit: 0 },
+        cooling: 0,
+      }
+    )
+  }
+
+  /**
+   * 清空闸门状态。**走确认框** —— 代价要说清楚：清完之后同一条止损会重新发一次。
+   *
+   * 这个逃生口是「状态落库」那个决定的配套：落库带来的唯一新风险是
+   * 「一份状态把闸门卡住而用户无法自救」，这里是它的答案（dispatcher.ts 头注释）。
+   */
+  async clearAlertGates(): Promise<MaintenanceResult> {
+    if (!this.alerts) return { status: 'FAILED', message: '数据层尚未就绪' }
+    const usage = this.alerts.gateUsage(Date.now())
+    const confirmed = await confirmDestructive(this.windows.panelWindow.browserWindow, {
+      title: '清空提醒闸门状态',
+      message: '清空冷却、当日配额与强制类台阶？',
+      detail:
+        `当前：本小时已发 ${usage.hourly.used}/${usage.hourly.limit} 条，` +
+        `今日 L3 ${usage.dailyL3.used}/${usage.dailyL3.limit} 条，${usage.cooling} 条仍在冷却里。\n\n` +
+        '清空之后，此前已经提醒过的同一件事会重新提醒一次。',
+      confirmLabel: '清空',
+    })
+    if (!confirmed) return { status: 'CANCELED', message: '已取消，闸门状态未改动' }
+    this.alerts.clearGates()
+    return { status: 'DONE', message: '闸门状态已清空' }
   }
 
   /**

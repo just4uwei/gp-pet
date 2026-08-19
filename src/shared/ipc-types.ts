@@ -32,6 +32,24 @@ export interface QuoteTick {
   changePct: number
   /** 数据陈旧 —— UI 应显示灰态而非假装实时 */
   stale: boolean
+  /**
+   * 这个价是**什么时候**的（2026-08-19）。
+   *
+   * `stale` 只说「别当实时用」，答不了「有多旧」——
+   * 而重启之后差别很大：3 分钟前的和上周五收盘的都是 stale，但只有一个还值得看。
+   * 一律按北京时间显示（`@shared/time` 的 `shanghaiHhmm` / `shanghaiMdHhmm`）。
+   */
+  at: number
+  /**
+   * 这个价从哪来：
+   *   `LIVE`   本轮（或最近一轮）真的拉到的快照；
+   *   `STORED` 内存里没有，从 `quote_tick` 留痕或日线收盘价里读回来的 ——
+   *            **重启之后就是它**。这一档必然 `stale: true`。
+   *
+   * 分开两个字段而不是复用 `stale`：盘中取数失败时也是 stale，但那是 LIVE 的陈旧，
+   * 与「这台机器刚开机、这个价是上周五的」不是一回事。
+   */
+  source: 'LIVE' | 'STORED'
 }
 
 /**
@@ -212,6 +230,23 @@ export interface AlertPayload {
 export type AlertChannelName = 'PET' | 'BUBBLE'
 
 /**
+ * 当前的闸门用量（2026-08-19）。
+ *
+ * 闸门状态从这一版起**跨重启保留**（`alerts/dispatcher.ts` 头注释），
+ * 于是「今天已经用掉多少额度」必须看得见 —— 否则「怎么一条都不弹」没有出处。
+ */
+export interface AlertGateUsage {
+  /** 全局每小时 L2+L3（滑动窗口，不是整点桶） */
+  hourly: { used: number; limit: number }
+  /** 全局今日 L3 */
+  dailyL3: { used: number; limit: number }
+  /** `OBSERVE` 轨的独立日配额。**不占上面两个** */
+  observe: { used: number; limit: number }
+  /** 还在冷却里的 `代码:方向` 条数 */
+  cooling: number
+}
+
+/**
  * 提醒日志的一行（docs/05 §6）。
  *
  * **每一条候选都有一行**，包括被丢弃的 —— 用户要能回答「它是不是漏提醒了」。
@@ -378,6 +413,44 @@ export interface ShadowOpenPosition {
   barsHeld: number
 }
 
+/** 已挂着、等次日开盘成交的一张模拟委托 */
+export interface ShadowPendingOrder {
+  code: SecCode
+  name: string
+  action: 'BUY' | 'SELL' | 'REDUCE'
+  /** 挂单日（= 产出这条信号的那个收盘确认轮） */
+  placedDate: TradeDate
+  /** 触发它的子信号 / 风控规则 */
+  rule: string
+  regime: Regime
+  score: number
+  /** 已经顺延几天没成交（停牌、K 线未回补、跌停卖不掉）。0 = 昨天刚挂 */
+  deferredBars: number
+}
+
+/**
+ * 影子运行的一行操作流水（013_shadow_journal）。
+ *
+ * **给人看的，不参与任何绩效计算** —— 绩效一律读 `trades` / `open` / 净值那几个数。
+ * 它存在的理由只有一个：净值曲线全空仓时是一条直线，与「压根没推进」长得一模一样。
+ */
+export interface ShadowJournalView {
+  date: TradeDate
+  seq: number
+  at: number
+  kind: 'PLACED' | 'FILLED_BUY' | 'FILLED_SELL' | 'VOIDED' | 'DEFERRED' | 'CLOSED_OUT' | 'NOT_ADVANCED'
+  code: SecCode | null
+  /** 拿不到名字（已移出自选）时回落成代码 */
+  name: string | null
+  action: 'BUY' | 'SELL' | 'REDUCE' | null
+  shares: number | null
+  price: number | null
+  rule: string | null
+  regime: string | null
+  score: number | null
+  reason: string | null
+}
+
 /** 影子组合里一笔已平仓的模拟交易。一行 = **一次卖出**（减仓会拆成多行） */
 export interface ShadowTradeView {
   id: string
@@ -458,6 +531,22 @@ export interface ShadowSummary {
   open: ShadowOpenPosition[]
   /** 已挂待次日开盘成交的委托数 */
   pendingOrders: number
+  /**
+   * 那几张委托**分别**是什么（2026-08-19）。
+   *
+   * 只给一个数字答不了用户唯一会问的那个问题（「这两笔是什么？」），
+   * 而委托一旦成交 `clearOrder` 就把它删了 —— 事后再想看只能靠 `journal`。
+   */
+  pending: ShadowPendingOrder[]
+  /**
+   * 最后一个已经推进过的交易日（= 净值曲线的末端）。一天都没推进过时为 null。
+   *
+   * 与 `lastTradingDate` 一起读才有意义：两者相等 = 跟上了；
+   * 落后 = 中间那些天永久缺失（应用没开机 / 开机时开盘已过 / 引擎版本变了）。
+   */
+  lastAdvancedDate: TradeDate | null
+  /** 最后一个**已收盘**的交易日，由日历给。拿不到日历时为 null */
+  lastTradingDate: TradeDate | null
   /** 因现金池空了而没开的仓数 —— 静默跳过会让「信号密集期的收益」凭空消失 */
   skippedNoCash: number
   /** 因涨停买不到 / 跌停卖不掉而作废或顺延的次数 */
@@ -1149,6 +1238,17 @@ export interface IpcInvokeMap {
   }) => SignalRecord[]
   'signal:explain': (id: string) => SignalEvidence
   /** 提醒日志（docs/05 §6）：含被丢弃与被降级的条目 */
+  /**
+   * 当前闸门用量（2026-08-19）。**是「闸门状态跨重启」那个改动的配套** ——
+   * 冷却与配额活过重启之后，用户必须看得见今天已经用掉多少，
+   * 否则「怎么一条都不弹」就没有出处了。
+   */
+  'alert:gateUsage': () => AlertGateUsage
+  /**
+   * 清空全部闸门状态（冷却 / 配额 / 强制类台阶）。逃生口，走确认框 ——
+   * 清完之后同一条止损会重新发一次。
+   */
+  'alert:clearGates': () => MaintenanceResult
   'alert:history': (query: { code?: SecCode; from?: number; to?: number; limit?: number }) => AlertRecord[]
   /** 标记已读。空数组 = 全部已读（用户打开日志视图即视为看过） */
   'alert:markRead': (ids: string[]) => number
@@ -1166,6 +1266,11 @@ export interface IpcInvokeMap {
   /** 影子运行绩效（M4，docs/07 §2.3）。未开始时 `startedAt` 为 null */
   'shadow:summary': () => ShadowSummary
   'shadow:trades': (query: { limit?: number }) => ShadowTradeView[]
+  /**
+   * 逐日操作流水。答的是「它今天到底做了什么」——
+   * 净值曲线全空仓时是一条直线，与「压根没推进」在图上无法区分。
+   */
+  'shadow:journal': (query: { limit?: number }) => ShadowJournalView[]
   /**
    * 清空影子账本并重新开始。**唯一的正当用途是引擎参数变了** ——
    * 丢掉的是一段无法重建的前向记录（用历史 K 线补出来的那个叫回测）。

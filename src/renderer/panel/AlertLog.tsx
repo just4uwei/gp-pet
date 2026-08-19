@@ -22,7 +22,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import type { AlertLevel, GatedDirection } from '@core/types'
-import type { AlertRecord } from '@shared/ipc-types'
+import type { AlertGateUsage, AlertRecord } from '@shared/ipc-types'
 import { shanghaiHhmm } from '@shared/time'
 
 const DIRECTION_LABEL: Record<GatedDirection, string> = {
@@ -119,15 +119,20 @@ export function AlertLog({
   onError: (message: string) => void
 }): React.JSX.Element {
   const [records, setRecords] = useState<AlertRecord[]>([])
+  const [usage, setUsage] = useState<AlertGateUsage | null>(null)
   const [open, setOpen] = useState(false)
 
   useEffect(() => {
     if (!open) return
     let cancelled = false
-    void window.gp
-      .invoke('alert:history', { from: startOfToday(), limit: 200 })
-      .then((rows) => {
-        if (!cancelled) setRecords(rows)
+    void Promise.all([
+      window.gp.invoke('alert:history', { from: startOfToday(), limit: 200 }),
+      window.gp.invoke('alert:gateUsage'),
+    ])
+      .then(([rows, gates]) => {
+        if (cancelled) return
+        setRecords(rows)
+        setUsage(gates)
       })
       .catch((error: unknown) => {
         onError(error instanceof Error ? error.message : String(error))
@@ -136,6 +141,21 @@ export function AlertLog({
       cancelled = true
     }
   }, [refreshKey, open, onError])
+
+  /*
+    清空闸门状态。**这是「闸门状态跨重启」那个改动的配套逃生口**：
+    落库带来的唯一新风险是「一份状态把闸门卡住而用户无法自救」。
+    确认框在主进程（代价要说清楚：清完之后同一件事会重新提醒一次）。
+  */
+  const clearGates = useCallback((): void => {
+    void window.gp
+      .invoke('alert:clearGates')
+      .then((result) => {
+        if (result.status === 'FAILED') onError(result.message)
+        return window.gp.invoke('alert:gateUsage').then(setUsage)
+      })
+      .catch((error: unknown) => onError(error instanceof Error ? error.message : String(error)))
+  }, [onError])
 
   const toggle = useCallback((): void => {
     const next = !open
@@ -165,6 +185,31 @@ export function AlertLog({
         <span className="ml-auto text-xs text-white/35">{open ? '收起' : '展开'}</span>
       </button>
 
+      {/*
+        闸门用量（2026-08-19）。冷却与配额从这一版起**跨重启保留** ——
+        于是「今天已经用掉多少额度」必须看得见，否则「怎么一条都不弹」没有出处。
+        只陈述数字，不评价（措辞纪律）。
+      */}
+      {open && usage ? (
+        <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-white/[0.06] px-3 py-2 text-[11px]">
+          <span className="gp-chip">
+            本小时 <span className="text-white/70">{usage.hourly.used}</span>/{usage.hourly.limit}
+          </span>
+          <span className="gp-chip">
+            今日 L3 <span className="text-white/70">{usage.dailyL3.used}</span>/{usage.dailyL3.limit}
+          </span>
+          <span className="gp-chip">
+            观察轨 <span className="text-white/70">{usage.observe.used}</span>/{usage.observe.limit}
+          </span>
+          <span className="gp-chip">
+            冷却中 <span className="text-white/70">{usage.cooling}</span>
+          </span>
+          <button className="ml-auto text-white/30 hover:text-white/60" onClick={clearGates}>
+            清空…
+          </button>
+        </div>
+      ) : null}
+
       {open ? (
         records.length === 0 ? (
           <p className="px-3 py-8 text-center text-xs text-white/35">
@@ -175,6 +220,7 @@ export function AlertLog({
             <p className="shrink-0 border-b border-white/[0.06] px-3 py-2 text-xs text-white/35">
               今日 {records.length} 条判定，其中 {silenced} 条未发出。
               下面写的是分发器的原话，可据此调整灵敏度与静默时段。
+              冷却与配额<span className="text-white/50">跨重启保留</span>，所以重开应用不会让同一件事重新提醒。
             </p>
             {/*
               两行式而不是一行五列：右栏只有 ~330px 宽，

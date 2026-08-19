@@ -175,9 +175,46 @@ const DEFAULT_COOLDOWN: Record<AlertLevel, number> = {
 */
 
 /**
+ * 分发器的可持久化状态（2026-08-19）。**不含防抖计数**，理由见 `snapshot()`。
+ *
+ * 带 `v` 是为了日后加字段时能识别旧格式：读不认识的版本一律丢弃从零开始 ——
+ * 猜一个半对的状态比清零危险得多（提醒层的错误方向是「少发」，而少发用户发现不了）。
+ */
+export interface DispatcherState {
+  v: 1
+  /** 当日计数所属的那个北京日零点 */
+  day: number
+  /** `code:direction` → 最近一次实际发出 */
+  lastSent: [string, { level: AlertLevel; at: number }][]
+  /** `code` → 上次真的弹过气泡时的浮亏幅度 */
+  lastForcedLoss: [SecCode, number][]
+  /** 最近一小时内实际发出的 L2/L3 时间戳 */
+  recentHigh: number[]
+  perCodeToday: [SecCode, number][]
+  l3Today: number
+  observeToday: number
+}
+
+/**
  * 分发器。**有状态**（防抖计数、冷却时间、各级计数器），所以整个应用只应有一个实例。
- * 状态全部在内存里：重启后冷却清零是可以接受的（用户重启应用时本来就期待看到当前状态），
- * 而把它们落库会让「重启后被冷却挡住、什么都不弹」变成一个很难查的问题。
+ *
+ * ## 状态会落库（2026-08-19 改，此前刻意不落）
+ *
+ * 旧决定是「重启后冷却清零可以接受，落库会让『重启后被冷却挡住、什么都不弹』
+ * 变成一个很难查的问题」。**推翻它的是真机数据**：实测 08-13 启动 14 次、
+ * 08-14 二十七次（盘中 12 次），那两天「一天 10 条止损气泡」逐条对得上启动时刻 ——
+ * 清零带来的**重复打扰**是每天都在发生的事实，而它同时让 M3 的「自用一周」
+ * 5 天里只有 1 天算干净（重启过的那天的提醒日志不能当判据）。
+ *
+ * 旧顾虑用三件事堵掉，缺一件就不该落库：
+ *
+ * 1. **恢复后立刻按 `now` 重新裁剪**（`restore` 里跑 `rollDay` + `pruneHourly`）——
+ *    跨日的当日计数直接丢、超 1 小时的滑动窗口自动过期。
+ *    ⇒ 陈旧状态在结构上不可能长期卡住闸门。
+ * 2. **防抖计数不落**（见 `snapshot()`）。
+ * 3. **拦截可查**：每一条裁决本来就写 `alert_log`（011 的 `suppressed_gate` 记着是哪道闸门），
+ *    面板的提醒日志里另给一行当前闸门用量（`gateUsage()`）。
+ *    ⇒ 「什么都不弹又查不出为什么」不再成立。
  */
 export class AlertDispatcher {
   private readonly debounceTicks: number
@@ -423,6 +460,90 @@ export class AlertDispatcher {
    */
   private pruneHourly(now: number): void {
     this.recentHigh = this.recentHigh.filter((at) => now - at < HOUR)
+  }
+
+  // ── 跨重启的状态（2026-08-19，见类头注释）──────────────────────────
+
+  /**
+   * 可持久化的那部分状态。
+   *
+   * **`streaks` 刻意不在里面。** 防抖计数表达的是「这个条件连续成立了 N 个 tick」，
+   * 而重启跨越了一段完全没有观测的时间 —— 拿旧计数续上，等于用一段**不存在的连续性**
+   * 放行一条提醒。重启后从 0 开始只让第一条晚一轮，那是安全方向。
+   */
+  snapshot(): DispatcherState {
+    return {
+      v: 1,
+      day: this.day,
+      lastSent: [...this.lastSent.entries()],
+      lastForcedLoss: [...this.lastForcedLoss.entries()],
+      recentHigh: [...this.recentHigh],
+      perCodeToday: [...this.perCodeToday.entries()],
+      l3Today: this.l3Today,
+      observeToday: this.observeToday,
+    }
+  }
+
+  /**
+   * 装回上一次的状态，**并立刻按 `now` 裁剪一遍**。
+   *
+   * 那一步是这整件事能成立的前提：跨日的当日计数直接丢、超 1 小时的滑动窗口自动过期
+   * ⇒ 一份很旧的状态不会把闸门长期卡住。版本对不上就整份丢弃 ——
+   * 猜一个半对的状态比从零开始危险得多。
+   */
+  restore(state: DispatcherState | null, now: number): void {
+    if (!state || state.v !== 1) return
+    this.day = state.day
+    this.lastSent = new Map(state.lastSent)
+    this.lastForcedLoss = new Map(state.lastForcedLoss)
+    this.recentHigh = [...state.recentHigh]
+    this.perCodeToday = new Map(state.perCodeToday)
+    this.l3Today = state.l3Today
+    this.observeToday = state.observeToday
+    this.rollDay(now)
+    this.pruneHourly(now)
+  }
+
+  /**
+   * 当前闸门用量，给面板显示。
+   *
+   * 它是「落库」这个决定的配套：状态跨重启活下来之后，用户必须能看见
+   * 「今天已经用掉多少额度」——否则「怎么一条都不弹」就真的没有出处了。
+   * **不改任何状态**（连 `pruneHourly` 都不跑，那会让一次查询影响分发行为），
+   * 过期项在这里现算。
+   */
+  gateUsage(now: number): {
+    hourly: { used: number; limit: number }
+    dailyL3: { used: number; limit: number }
+    observe: { used: number; limit: number }
+    /** 还在冷却里的 `code:direction` 条数 */
+    cooling: number
+  } {
+    const sameDay = this.startOfDay(now) === this.day
+    return {
+      hourly: { used: this.recentHigh.filter((at) => now - at < HOUR).length, limit: this.hourlyLimit },
+      dailyL3: { used: sameDay ? this.l3Today : 0, limit: this.dailyL3Limit },
+      observe: { used: sameDay ? this.observeToday : 0, limit: this.observeDailyLimit },
+      cooling: [...this.lastSent.values()].filter((last) => now - last.at < this.cooldownMs[last.level])
+        .length,
+    }
+  }
+
+  /**
+   * 清空全部闸门状态 —— 「怎么一条都不弹」的逃生口。
+   *
+   * 落库带来的唯一新风险是「一份状态把闸门卡住而用户无法自救」，这个方法是它的答案。
+   * 代价说清楚：清完之后同一条止损会重新发一次。
+   */
+  clearGates(): void {
+    this.streaks.clear()
+    this.lastSent.clear()
+    this.lastForcedLoss.clear()
+    this.recentHigh = []
+    this.perCodeToday.clear()
+    this.l3Today = 0
+    this.observeToday = 0
+    this.day = -1
   }
 }
 

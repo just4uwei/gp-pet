@@ -10,6 +10,7 @@
  *   PRE_OPEN 及之后  → 先补日线缺口（无缺口则零请求），再批量拉快照
  *   连续竞价 / 盘后   → 取数之后跑一轮引擎（M2）
  *   15:00 之后       → 目标日线变成当日，收盘线由这一轮补进来，引擎据此做收盘确认
+ *   15:10–16:00      → **只补日线**的收尾窗口（见 `CLOSE_CATCHUP`），不拉快照、不跑引擎
  *
  * 顺序是刻意的：**先取数、再算信号**。反过来会让引擎用上一轮的数据产出「新」信号。
  * 引擎失败不影响取数结果的上报 —— 行情能看，只是这一轮没有信号（docs/02 §7：缺口要看得见）。
@@ -27,6 +28,41 @@ import type { WatchlistService } from './watchlist'
 
 /** 日历与基础信息的刷新间隔（docs/03 §1：每周一次足够，节假日安排不会天天变） */
 export const MAINTENANCE_INTERVAL_MS = 7 * 24 * 60 * 60_000
+
+/**
+ * 收盘后的**日线收尾窗口**（2026-08-19）。
+ *
+ * ## 修的是什么
+ *
+ * 日报 `stage = FINAL` 要求**每只有行情的自选票**都拿到当日收盘线（`report/build.ts`），
+ * 而 `needsQuotes('CLOSED') === false` 让应用 15:10 之后一个日线请求都不发，
+ * 个股日线数据源却是 15:05–15:30 才发布 —— 于是当天的收盘线要到**次日盘前**才入库。
+ * 后果不是「慢一点」而是「几乎永远看不到」：`reportSubjectDate` 在次日 09:30 之后就切到新一天，
+ * 所以定稿版只在次日 08:05–09:30 那段窗口里存在。实测 2026-08-19 15:29，
+ * 库里当天的日线只有 12/80 只，而 08-18 是 80/80。
+ *
+ * ## 为什么可以挂在休市时段上（docs/03 §2.4 的请求礼节）
+ *
+ * 三条一起才成立，少一条就会变成「休市期间一直在发请求」：
+ *
+ * 1. **只补日线**。不拉快照、不跑引擎、不碰 settle —— `market.backfill` 在已补齐时
+ *    **一个请求都不发**，这是它能挂在这里的前提。
+ * 2. **窗口收口在 16:00**。数据源 15:30 前发完，留半小时余量。
+ * 3. **两道停手闸门**。全部补齐 → 记 `dailyCompleteDate` 从此不再试；
+ *    补不齐（那 10 只腾讯结构性没有 `qfqday`、eastmoney 又间歇失败的 ETF）→
+ *    按 `maxAttempts` 数轮停手。没有第二道的话，那几只会把窗口里每一轮都烧满。
+ *
+ * CLOSED 的 tick 间隔是 300s ⇒ 窗口内至多 10 轮，实际被 `maxAttempts` 压到 8 轮，
+ * 且每轮只请求仍然缺的那几只。
+ */
+export const CLOSE_CATCHUP = {
+  /** 从这一分钟开始（15:10，`SESSION_BOUNDS.settleEnd`，正常轮询恰好在这里停） */
+  from: SESSION_BOUNDS.settleEnd,
+  /** 到这一分钟为止（16:00） */
+  to: 16 * 60,
+  /** 同一个交易日最多试几轮 */
+  maxAttempts: 8,
+} as const
 
 /**
  * 「喂了影子、但它自己跳过了」的人话。
@@ -178,6 +214,51 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
     backup?.(at)
   }
 
+  /**
+   * 补日线。返回「这一轮之后是不是每只都补齐了」——
+   * 有一只 FAILED 就是 false（还缺着，值得下一轮再试）。
+   */
+  async function backfillDaily(codes: readonly SecCode[], through: string): Promise<boolean> {
+    const daily = [...new Set([...codes, ...(auxCodes?.() ?? [])])]
+    let complete = true
+    for (const outcome of await market.backfill(daily, through)) {
+      if (outcome.status === 'FAILED') {
+        complete = false
+        log.warn(`[daily] ${outcome.code} 回补失败：${outcome.error}`)
+      }
+      if (outcome.status === 'REFETCHED') {
+        log.info(`[daily] ${outcome.code} 复权口径变化（${outcome.drift?.date}），已整只重拉`)
+      }
+    }
+    return complete
+  }
+
+  /** 收盘后的日线收尾窗口。四道闸门全过才发请求，见 `CLOSE_CATCHUP` */
+  async function closeCatchup(ctx: TickContext, codes: readonly SecCode[]): Promise<void> {
+    if (codes.length === 0) return
+    if (!ctx.isTradingDay) return
+    if (ctx.minuteOfDay < CLOSE_CATCHUP.from || ctx.minuteOfDay >= CLOSE_CATCHUP.to) return
+    if (meta.get(META_KEYS.dailyCompleteDate) === ctx.date) return
+
+    // 次数跨日清零：昨天用满的额度不该让今天一轮都不跑
+    const counted = meta.get(META_KEYS.dailyCatchupDate) === ctx.date
+    const attempts = counted ? (meta.getNumber(META_KEYS.dailyCatchupAttempts) ?? 0) : 0
+    if (attempts >= CLOSE_CATCHUP.maxAttempts) return
+
+    // 收盘后 expectedLastBar 给的就是当日。给不出当日说明日历判它不是交易日 —— 上面已经挡过，
+    // 这里再判一次是因为「补的必须是今天那根」是这段代码存在的全部理由
+    const through = expectedLastBar(calendar, ctx.date, ctx.minuteOfDay)
+    if (through !== ctx.date) return
+
+    meta.set(META_KEYS.dailyCatchupDate, ctx.date)
+    meta.setNumber(META_KEYS.dailyCatchupAttempts, attempts + 1)
+
+    if (await backfillDaily(codes, through)) {
+      meta.set(META_KEYS.dailyCompleteDate, ctx.date)
+      log.info(`[daily] ${ctx.date} 当日收盘线已补齐（收盘后第 ${attempts + 1} 轮），日报可定稿`)
+    }
+  }
+
   return {
     async run(ctx) {
       lastTickAt = ctx.at
@@ -186,6 +267,8 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
       const codes: SecCode[] = watchlist.codes()
 
       if (!ctx.needsQuotes) {
+        // 休市期间唯一允许发出的两种请求：收盘后的日线收尾 + 每周一次的维护
+        await closeCatchup(ctx, codes)
         await maintain(ctx.at)
         return
       }
@@ -196,12 +279,9 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
       // 而那会静默地让 RSI 阈值停在 75/25，没人看得出来
       const through = expectedLastBar(calendar, ctx.date, ctx.minuteOfDay)
       if (through) {
-        const daily = [...new Set([...codes, ...(auxCodes?.() ?? [])])]
-        for (const outcome of await market.backfill(daily, through)) {
-          if (outcome.status === 'FAILED') log.warn(`[daily] ${outcome.code} 回补失败：${outcome.error}`)
-          if (outcome.status === 'REFETCHED') {
-            log.info(`[daily] ${outcome.code} 复权口径变化（${outcome.drift?.date}），已整只重拉`)
-          }
+        // 补齐了就记一笔：收盘后那个窗口据此停手（15:00–15:10 的 SETTLE 轮偶尔就能补齐）
+        if ((await backfillDaily(codes, through)) && through === ctx.date) {
+          meta.set(META_KEYS.dailyCompleteDate, ctx.date)
         }
       }
 

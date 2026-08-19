@@ -663,6 +663,31 @@ describe('QuoteTickRepo', () => {
     ])
     expect(storage.quoteTicks.preCloseOf('SH600000', T, T + 5000)).toBe(10.4)
   })
+
+  /*
+    `latest` 只服务一件事：重启之后先把上次看到的价显示出来。
+
+    快照缓存在内存里，重启即空；而休市时段 `needsQuotes` 为 false ⇒ 不会有任何一轮 tick
+    去补 ⇒ 晚上/周末重启之后，面板与悬浮条一直空到下一个交易日 09:00。
+  */
+  it('latest 每只票取最后一行，没有留痕的那只不出现在结果里', () => {
+    storage.quoteTicks.record([
+      { code: 'SH600000', ts: T, last: 10, preClose: 9.9 },
+      { code: 'SH600000', ts: T + 2000, last: 11, preClose: 9.9 },
+      { code: 'SZ000001', ts: T + 1000, last: 5, preClose: null },
+    ])
+
+    const latest = storage.quoteTicks.latest(['SH600000', 'SZ000001', 'SZ300750'])
+
+    expect(latest.get('SH600000')).toEqual({ ts: T + 2000, last: 11, preClose: 9.9 })
+    // 昨收缺失时是 null 而不是 0 —— 调用方据此给 0 涨跌幅，而不是算出一个 +∞
+    expect(latest.get('SZ000001')).toEqual({ ts: T + 1000, last: 5, preClose: null })
+    expect(latest.has('SZ300750')).toBe(false)
+  })
+
+  it('latest 传空数组时一条查询都不发', () => {
+    expect(storage.quoteTicks.latest([]).size).toBe(0)
+  })
 })
 
 describe('AiExplainRepo（008）', () => {

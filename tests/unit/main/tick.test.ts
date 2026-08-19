@@ -10,7 +10,7 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import type { SecCode, Snapshot, TradeDate, TradingSession } from '@core/types'
-import { createTickPipeline, MAINTENANCE_INTERVAL_MS, type TickPipelineDeps } from '@main/engine'
+import { CLOSE_CATCHUP, createTickPipeline, MAINTENANCE_INTERVAL_MS, type TickPipelineDeps } from '@main/engine'
 import type { SnapshotOutcome } from '@main/engine'
 import type { TickContext } from '@main/scheduler'
 import { META_KEYS } from '@main/storage/repositories/meta'
@@ -421,6 +421,88 @@ describe('createTickPipeline', () => {
       const h = harness()
       await expect(createTickPipeline(h.deps).run(ctxOf())).resolves.toBeUndefined()
       expect(h.meta.has(META_KEYS.lastSettledDate)).toBe(false)
+    })
+  })
+
+  /*
+    收盘后的日线收尾窗口（2026-08-19，CLOSE_CATCHUP）。
+
+    为什么要钉：错法全是静默的 ——
+    不跑 → 当日收盘线要到次日盘前才入库，日报整天卡在「未定稿」而界面上看不出原因；
+    不停手 → 那 10 只结构性拉不到的 ETF 会让休市期间每 5 分钟发一轮请求，
+    而请求礼节（docs/03 §2.4）没有任何东西会替我们报警。
+  */
+  describe('收盘后的日线收尾窗口', () => {
+    /** 15:20，落在 15:10–16:00 里 */
+    const afterClose = { session: 'CLOSED' as TradingSession, needsQuotes: false, minuteOfDay: 15 * 60 + 20 }
+
+    it('窗口内补当日日线（且不拉快照、不跑引擎）', async () => {
+      const h = harness()
+      const engine = { run: vi.fn(() => []) }
+
+      await createTickPipeline({ ...h.deps, engine }).run(ctxOf(afterClose))
+
+      expect(h.backfill).toHaveBeenCalledWith(['SH600000'], '2026-03-10')
+      expect(h.refreshSnapshots).not.toHaveBeenCalled()
+      expect(engine.run).not.toHaveBeenCalled()
+    })
+
+    it('补齐之后不再发请求 —— 停手闸门是 dailyCompleteDate', async () => {
+      const h = harness()
+      const pipeline = createTickPipeline(h.deps)
+
+      await pipeline.run(ctxOf(afterClose))
+      expect(h.meta.get(META_KEYS.dailyCompleteDate)).toBe('2026-03-10')
+
+      h.backfill.mockClear()
+      await pipeline.run(ctxOf(afterClose))
+      expect(h.backfill).not.toHaveBeenCalled()
+    })
+
+    it('一直补不齐时按 maxAttempts 停手，不会整夜每 5 分钟发一轮', async () => {
+      const h = harness()
+      h.backfill.mockResolvedValue([{ code: 'SH600000', status: 'FAILED', written: 0, error: '源上没有' }])
+      const pipeline = createTickPipeline({ ...h.deps, log: { info: () => {}, warn: () => {} } })
+
+      for (let i = 0; i < CLOSE_CATCHUP.maxAttempts + 3; i++) await pipeline.run(ctxOf(afterClose))
+
+      expect(h.backfill).toHaveBeenCalledTimes(CLOSE_CATCHUP.maxAttempts)
+      expect(h.meta.has(META_KEYS.dailyCompleteDate)).toBe(false)
+    })
+
+    it('用满的次数跨日清零 —— 昨天补不齐不该让今天一轮都不跑', async () => {
+      const h = harness()
+      h.meta.set(META_KEYS.dailyCatchupDate, '2026-03-09')
+      h.meta.set(META_KEYS.dailyCatchupAttempts, CLOSE_CATCHUP.maxAttempts)
+
+      await createTickPipeline(h.deps).run(ctxOf(afterClose))
+
+      expect(h.backfill).toHaveBeenCalledOnce()
+    })
+
+    it('16:00 之后不再补 —— 数据源 15:30 前就发完了', async () => {
+      const h = harness()
+
+      await createTickPipeline(h.deps).run(ctxOf({ ...afterClose, minuteOfDay: 16 * 60 }))
+
+      expect(h.backfill).not.toHaveBeenCalled()
+    })
+
+    it('休市日不补', async () => {
+      const h = harness({ isOpen: false })
+
+      await createTickPipeline(h.deps).run(ctxOf({ ...afterClose, isTradingDay: false }))
+
+      expect(h.backfill).not.toHaveBeenCalled()
+    })
+
+    it('收盘确认轮的补跑仍然不在这里触发 —— 前向纪律一个字没动', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: false }))
+      const h = harness({ settle })
+
+      await createTickPipeline(h.deps).run(ctxOf(afterClose))
+
+      expect(settle).not.toHaveBeenCalled()
     })
   })
 

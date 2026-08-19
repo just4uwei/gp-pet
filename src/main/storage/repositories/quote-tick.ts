@@ -83,6 +83,31 @@ export class QuoteTickRepo {
     )
   }
 
+  /**
+   * 每只票最后一次留痕（2026-08-19）。**只服务「重启后先把上次看到的价显示出来」。**
+   *
+   * 为什么需要它：快照缓存在内存里（`market-data.ts` 的 `cache`），重启即空；
+   * 而休市时段 `needsQuotes` 为 false ⇒ **不会有任何一轮 tick 去补** ⇒
+   * 晚上/周末重启之后，面板与悬浮条的价格一直空到下一个交易日 09:00。
+   *
+   * 拿它当「上次看到的价」是安全的：这张表**刻意不存 stale 快照**
+   * （004 头注释的第三条），所以每一行都是真实观测到的成交价。
+   * 但调用方必须把它标成 `stale` 并把 `ts` 显示出来 —— 绝不假装实时（docs/03）。
+   */
+  latest(codes: readonly SecCode[]): Map<SecCode, { ts: number; last: number; preClose: number | null }> {
+    const out = new Map<SecCode, { ts: number; last: number; preClose: number | null }>()
+    if (codes.length === 0) return out
+    // 主键是 (code, ts)，所以这条按 code 定位再取尾是走索引的
+    const stmt = this.db.prepare(
+      `SELECT ts, last, pre_close FROM quote_tick WHERE code = ? ORDER BY ts DESC LIMIT 1`
+    )
+    for (const code of codes) {
+      const row = stmt.get<{ ts: number; last: number; pre_close: number | null }>(code)
+      if (row) out.set(code, { ts: row.ts, last: row.last, preClose: row.pre_close })
+    }
+    return out
+  }
+
   /** 删掉 before 之前的全部点（docs/03 §4.3） */
   prune(before: number): number {
     return this.db.prepare(`DELETE FROM quote_tick WHERE ts < ?`).run(Math.round(before)).changes

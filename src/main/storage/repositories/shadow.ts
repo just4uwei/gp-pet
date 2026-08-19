@@ -138,6 +138,59 @@ function toTrade(row: TradeRow): ShadowTrade {
   }
 }
 
+/**
+ * 一行流水（013_shadow_journal）。**给人看的**，不参与任何绩效计算。
+ *
+ * 不复用 `ShadowTrade` / `ShadowOrder`：那两个是账本，字段齐全且各有口径；
+ * 这里要的是「那一刻发生了什么」，缺什么就是 null（比如 `NOT_ADVANCED` 只有 reason）。
+ */
+export interface ShadowJournalEntry {
+  date: TradeDate
+  seq: number
+  at: number
+  kind: 'PLACED' | 'FILLED_BUY' | 'FILLED_SELL' | 'VOIDED' | 'DEFERRED' | 'CLOSED_OUT' | 'NOT_ADVANCED'
+  code: SecCode | null
+  action: 'BUY' | 'SELL' | 'REDUCE' | null
+  shares: number | null
+  price: number | null
+  rule: string | null
+  regime: string | null
+  score: number | null
+  reason: string | null
+}
+
+interface JournalRow {
+  trade_date: string
+  seq: number
+  at: number
+  kind: string
+  code: string | null
+  action: string | null
+  shares: number | null
+  price: number | null
+  rule: string | null
+  regime: string | null
+  score: number | null
+  reason: string | null
+}
+
+function toJournal(row: JournalRow): ShadowJournalEntry {
+  return {
+    date: row.trade_date,
+    seq: row.seq,
+    at: row.at,
+    kind: row.kind as ShadowJournalEntry['kind'],
+    code: row.code,
+    action: row.action as ShadowJournalEntry['action'],
+    shares: row.shares,
+    price: row.price,
+    rule: row.rule,
+    regime: row.regime,
+    score: row.score,
+    reason: row.reason,
+  }
+}
+
 export class ShadowRepo {
   constructor(private readonly db: Database) {}
 
@@ -319,6 +372,79 @@ export class ShadowRepo {
   }
 
   /**
+   * 基准列还空着的那些交易日（2026-08-19）。
+   *
+   * 为什么会空：推进与日线回补在同一跳里，回补先失败（腾讯对指数结构性没有复权轨、
+   * eastmoney 又是间歇性的），0.2 秒后推进读基准就拿到 null；当天晚些时候 kline 补上了，
+   * 但那一天不会再推进 ⇒ 永久留 null。而 `summary` 的 `lastBenchmark` 取**最后一行**，
+   * 所以只要收尾那天是 null，整条同期对比就是 null —— 影子曲线没有刻度。
+   */
+  equityMissingBenchmark(): TradeDate[] {
+    return this.db
+      .prepare(`SELECT trade_date FROM shadow_equity WHERE benchmark IS NULL ORDER BY trade_date ASC`)
+      .all<{ trade_date: string }>()
+      .map((row) => row.trade_date)
+  }
+
+  /**
+   * 只补基准这一个**事实列**。
+   *
+   * ⚠ 这不是「补跑历史」—— 前向纪律（docs/07 §2.3）管的是信号、委托与成交，
+   * 那些必须按真实时间往前走。而沪深300 在某一天的收盘价是一个与我们的决策无关的事实，
+   * 它当时没取到只是取数失败，不是「那天还不知道」。两者混为一谈会让这条修复
+   * 看起来像在破纪律，所以写在这里。
+   */
+  setBenchmark(date: TradeDate, benchmark: number): void {
+    this.db
+      .prepare(`UPDATE shadow_equity SET benchmark = ? WHERE trade_date = ? AND benchmark IS NULL`)
+      .run(benchmark, date)
+  }
+
+  // ── 操作流水（013）────────────────────────────────────────────────
+
+  /** 最近的流水，**按 (日期, seq) 倒序** —— 面板从最新往回翻 */
+  journal(limit = 60): ShadowJournalEntry[] {
+    return this.db
+      .prepare(`SELECT * FROM shadow_journal ORDER BY trade_date DESC, seq DESC LIMIT ?`)
+      .all<JournalRow>(Math.max(1, Math.floor(limit)))
+      .map(toJournal)
+  }
+
+  /**
+   * 一次推进的流水整批落盘。**先清掉那天的旧行** ——
+   * 与 `shadow_equity.trade_date` 是同一条幂等纪律：推进本身只该发生一次，
+   * 但真发生第二次（重置后重推、跨日唤醒补跑）时，流水不该出现两份互相矛盾的记录。
+   */
+  putJournal(date: TradeDate, entries: readonly Omit<ShadowJournalEntry, 'date' | 'seq'>[]): void {
+    this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM shadow_journal WHERE trade_date = ?`).run(date)
+      let seq = 0
+      for (const entry of entries) {
+        this.db
+          .prepare(
+            `INSERT INTO shadow_journal
+               (trade_date, seq, at, kind, code, action, shares, price, rule, regime, score, reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            date,
+            ++seq,
+            entry.at,
+            entry.kind,
+            entry.code,
+            entry.action,
+            entry.shares,
+            entry.price,
+            entry.rule,
+            entry.regime,
+            entry.score,
+            entry.reason
+          )
+      }
+    })
+  }
+
+  /**
    * 整块清空并重新开始。
    *
    * 唯一的正当用途是**引擎版本变了**：参数一改，此前累积的影子绩效衡量的是另一套引擎，
@@ -332,6 +458,7 @@ export class ShadowRepo {
       this.db.exec(`DELETE FROM shadow_position`)
       this.db.exec(`DELETE FROM shadow_trade`)
       this.db.exec(`DELETE FROM shadow_equity`)
+      this.db.exec(`DELETE FROM shadow_journal`)
       for (const key of Object.values(SHADOW_KEYS)) {
         this.db.prepare(`DELETE FROM meta WHERE key = ?`).run(key)
       }

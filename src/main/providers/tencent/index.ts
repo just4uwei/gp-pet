@@ -241,6 +241,21 @@ interface KlineResponse {
 /** 复权模式 → 响应里承载数据的键名 */
 const SERIES_KEY: Record<AdjustMode, string> = { none: 'day', qfq: 'qfqday', hfq: 'hfqday' }
 
+/**
+ * 这个 external 是**指数**吗（2026-08-19）。
+ *
+ * 指数没有复权这个概念，腾讯的 `fqkline` 因此只给 `day` 一轨 —— 实测 `sh000300`
+ * 无论请不请 qfq，返回里都只有 `day`。于是基准指数的日线在腾讯这条路上**永远失败**，
+ * 只剩 eastmoney 单源（成功率约 78%），而它失败的那一天影子净值的基准列就永久留 null。
+ *
+ * ⚠ **只对指数放行 `day` 回退。** ETF 与个股真的有复权，拿不复权顶替是错的失败方式
+ * （CLAUDE.md 那条「`assertKey` 拒绝拿不复权顶替 —— 那是对的失败方式」说的就是它们）。
+ */
+function isIndex(external: string): boolean {
+  const code = fromLowerPrefixed(external)
+  return code !== null && splitCode(code)?.board === 'INDEX'
+}
+
 export function parseKline(
   body: string,
   external: string,
@@ -262,7 +277,11 @@ export function parseKline(
   if (!entry) throw new ProviderDataError(ID, `日线返回里没有 ${external}`)
 
   const key = SERIES_KEY[adjust]
-  const rows = entry[key]
+  let rows = entry[key]
+  // 指数：请的是复权轨、返回只有 day —— 对它而言 day 就是复权轨（见 isIndex）
+  if (!Array.isArray(rows) && adjust !== 'none' && isIndex(external) && Array.isArray(entry['day'])) {
+    rows = entry['day']
+  }
   if (!Array.isArray(rows)) {
     throw new ProviderDataError(ID, `日线返回里没有 ${key} 数组（${external}）`)
   }
