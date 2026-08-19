@@ -114,7 +114,16 @@ export function annualizedReturn(totalReturn: number, bars: number): number | nu
   return growth ** (1 / years) - 1
 }
 
-/** 夏普比率，rf = 0。样本少于 2 期时给 null 而不是 0 —— 0 会被读成「无风险调整收益」 */
+/**
+ * 夏普比率，rf = 0。样本少于 2 期时给 null 而不是 0 —— 0 会被读成「无风险调整收益」。
+ *
+ * ⚠ **`×√243` 假设日收益 iid，而这里的日收益不是**（持仓跨日、同池标的同涨同跌）——
+ * 自相关为正时这个数**偏大**，迭代计划 §4.6 记的三处相关性问题之一。
+ * 按 §4.6 的处置它停在「立刻」档：**报告如实标注、算法不改**。
+ * 理由是夏普不参与任何门槛（标定排名口径是 Calmar，折上口径是总收益），
+ * 而 Newey-West / Lo (2002) 的调整要选截断滞后阶数 —— 那是一个新的判断，
+ * 该单独做一次并单独归档，不该顺手塞进一次判据修复里。
+ */
 export function sharpeRatio(returns: readonly number[]): number | null {
   const sd = sampleStdev(returns)
   if (returns.length < 2 || sd === 0) return null

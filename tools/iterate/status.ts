@@ -162,6 +162,14 @@ interface AlphaSnapshot {
   matchRegime: boolean
   shuffleSpans: boolean
   seed: number
+  /**
+   * 零分布的时间结构（2026-08-19，迭代计划 §4.6）。看板必须把它印出来 ——
+   * `INDEPENDENT` 的分位是**未调整上界**（偏向显著），只报数字不报口径正是 §4.6 记的那条
+   * 报告缺陷。旧报告没有这个字段，那种情况按未调整看待（`null` ⇒ 当上界读）。
+   */
+  timingNull: 'BLOCK' | 'INDEPENDENT' | null
+  timingNullReason: string | null
+  crossCode: boolean
   byStratum: { label: string; count: number; paired: number | null; percentile: number }[]
 }
 
@@ -174,7 +182,14 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
   for (const { f } of files) {
     try {
       const j = JSON.parse(readFileSync(join(REPORTS, f), 'utf8')) as {
-        meta?: { engineVersion?: string; matchRegime?: boolean; seed?: number }
+        meta?: {
+          engineVersion?: string
+          matchRegime?: boolean
+          seed?: number
+          timingNull?: 'BLOCK' | 'INDEPENDENT' | null
+          timingNullReason?: string | null
+          crossCode?: boolean
+        }
         strata?: {
           label: string
           realCount: number
@@ -190,6 +205,9 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
         matchRegime: j.meta?.matchRegime === true,
         shuffleSpans: j.strata.some((s) => s.shuffled !== null),
         seed: j.meta?.seed ?? 0,
+        timingNull: j.meta?.timingNull ?? null,
+        timingNullReason: j.meta?.timingNullReason ?? null,
+        crossCode: j.meta?.crossCode === true,
         byStratum: j.strata
           .filter((s) => core.includes(s.label))
           .map((s) => ({
@@ -805,6 +823,22 @@ function render(input: {
     }
     L.push('')
     L.push('> 50% = 与随机无异 · 接近 0% = 入场系统性更差 · 高于 50% = 有正 alpha。')
+    // 零分布的时间结构必须与数字一起印（§4.6）：只报数字不报口径，读的人无从判断
+    // 这一栏是「已做时间聚集调整」还是「把成批发生的建仓当成独立样本算出来的」。
+    if (a.crossCode) {
+      L.push('> 跨票口径固定日期 ⇒ 真实建仓的时间聚集原样保留，**无需时间结构调整**（§4.6 的例外）。')
+    } else if (a.timingNull === 'BLOCK') {
+      L.push('> 零分布按建仓月**整块位移**（§4.6）⇒ 分位**已做时间聚集调整**（块内残余自相关仍在，仍略偏乐观）。')
+    } else {
+      L.push(
+        '> ⚠ 零分布是**逐次独立抽日** ⇒ 方差偏小 ⇒ **上面每一个分位都是未调整上界、偏向显著**（§4.6）。' +
+          (a.timingNull === null
+            ? '（这份报告早于 2026-08-19，没有口径字段，按未调整看待。）'
+            : a.timingNullReason === null
+              ? ''
+              : `降级原因：${a.timingNullReason}`)
+      )
+    }
     if (!a.shuffleSpans) {
       L.push('> ⚠ 这份没开 `--shuffle-spans`，数值被 `holdingBars` 内生性系统性压低，只能当下界。')
     }

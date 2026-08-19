@@ -127,10 +127,14 @@ export const DEFAULT_SPLITS: readonly Split[] = [
  * 单折绩效与 `overall` 不可横向比较（窗口短、标的少、回撤分母小 —— 见 `cellScore`
  * 为什么折上不能用 Calmar），**只有同一折上两个候选之差才有意义**，
  * 所以下面所有用到 cells 的地方都是配对比较。
+ *
+ * `cluster` 是**折间相关性的分组标签**（2026-08-19 加，迭代计划 §4.6）：同一个时间片里的
+ * 不同标的子集共享市场 beta，它们**不是独立样本**。缺省（未给标签）时标准误退回朴素的
+ * `stdev/√n`，而那个数是**上界** —— 报告会照实标注。
  */
 export interface SplitRun {
   overall: PerformanceBlock
-  cells: readonly { name: string; block: PerformanceBlock }[]
+  cells: readonly { name: string; block: PerformanceBlock; cluster?: string }[]
 }
 
 /**
@@ -205,29 +209,98 @@ export interface PairedDelta {
   affected: number
   /** 折间 Δ 的均值（**含**未受影响的 0 折 —— 那是整池效应被摊薄的真实程度） */
   mean: number
-  /** 折间 Δ 均值的标准误 = stdev(Δ) / √n。折数 < 2 或 Δ 恒等时为 null */
+  /**
+   * 朴素标准误 = stdev(Δ) / √n。**未做相关性调整 ⇒ 它是个下界，由它算出的 t 是上界。**
+   * 保留是为了与 2026-08-19 之前的历史报告可比，**不再用作判据**。
+   */
   stderr: number | null
   /** Δ > 0 的折数 */
   wins: number
-  /** |mean| / stderr。**这不是 p 值**，是「差值相对它自己的抖动有多大」的量级标尺 */
+  /** |mean| / stderr。**未调整上界**，不是判据。见 `clusteredT` */
   t: number | null
+  /** 聚类数（时间片数）。未给聚类标签时为 null —— 那种情况下没有调整过 */
+  clusters: number | null
+  /** 按时间片聚类的稳健标准误（CR1）。簇数 < 2 或簇内残差和恒为 0 时 null */
+  clusteredStderr: number | null
+  /** |mean| / clusteredStderr。**这才是判据**（`calibrate` 的 `minDeltaT` 卡的是它） */
+  clusteredT: number | null
+}
+
+/**
+ * 折间标准误的**聚类稳健**估计（CR1），聚类单位 = 时间片。
+ *
+ * ## 为什么必须调整（迭代计划 §4.6，2026-08-19）
+ *
+ * `stdev(Δ)/√n` 的 `√n` 收敛只在折相互独立时成立。而 12 个折单元是
+ * **从同一次模拟里切出来的** 4 个标的子集 × 3 个时间片：
+ * 同一时间片里的四个子集共享市场 beta（A 股同涨同跌），它们提供的**不是 4 份独立信息**。
+ * 极端情形下（子集之间完全同步）真实的有效样本量就是 **3**，而朴素式子按 12 算 ——
+ * 标准误被低估约 √4 = 2 倍，`t` 相应被高估 2 倍。
+ *
+ * ## 公式
+ *
+ * `Var(mean) = G/(G−1) × (1/N²) × Σ_c (Σ_{i∈c} (d_i − mean))²`
+ *
+ * 这是均值的 CR1 估计。等大簇时它恰好化简为「**簇均值的标准误**」
+ * `stdev(簇均值)/√G` —— 也就是说：**横截面折不再贡献 √n，只贡献簇内平均**。
+ * 这正是我们想要的结论：加横截面折能降低每个簇均值的噪音，但**不增加独立样本数**。
+ *
+ * ## 它还没修的部分（不许写成「已经调整过了」）
+ *
+ * 时间片之间也**不完全独立**：片是连续的，且持仓会跨片重叠。
+ * 聚类只掐掉了横截面那一层相关性，时间维度的自相关仍在，
+ * 所以 `clusteredT` 仍略偏乐观 —— 只是比 `t` 好得多。要彻底得上
+ * block bootstrap（按时间片整块重抽），那需要保存逐折 Δ 的原始序列，留作后续。
+ *
+ * @param deltas   逐折 Δ，与 `labels` 同序
+ * @param labels   每折的聚类标签（时间片名）
+ */
+export function clusteredStderrOf(
+  deltas: readonly number[],
+  labels: readonly string[]
+): { stderr: number | null; clusters: number } {
+  const sums = new Map<string, number>()
+  const m = mean(deltas)
+  for (let i = 0; i < deltas.length; i++) {
+    const label = labels[i]
+    const d = deltas[i]
+    if (label === undefined || d === undefined) continue
+    sums.set(label, (sums.get(label) ?? 0) + (d - m))
+  }
+  const groups = [...sums.values()]
+  const G = groups.length
+  const N = deltas.length
+  if (G < 2 || N === 0) return { stderr: null, clusters: G }
+  const meat = groups.reduce((sum, s) => sum + s * s, 0)
+  const variance = (G / (G - 1)) * (meat / (N * N))
+  // 簇内残差和恒为 0（例如每个候选在每折上都改善同一个常数）⇒ 与朴素式子同一处守卫：
+  // 给 null 而不是 0，0 会让 t 变成 Infinity 而被读成「无穷显著」
+  return { stderr: variance > 0 ? Math.sqrt(variance) : null, clusters: G }
 }
 
 export function pairedDelta(
   challenger: readonly (number | null)[],
-  incumbent: readonly (number | null)[]
+  incumbent: readonly (number | null)[],
+  clusterLabels?: readonly (string | undefined)[]
 ): PairedDelta | null {
   const deltas: number[] = []
+  const labels: string[] = []
+  let labelled = true
   for (let i = 0; i < Math.min(challenger.length, incumbent.length); i++) {
     const a = challenger[i]
     const b = incumbent[i]
     if (a === null || a === undefined || b === null || b === undefined) continue
     deltas.push(a - b)
+    const label = clusterLabels?.[i]
+    if (label === undefined) labelled = false
+    labels.push(label ?? '')
   }
   if (deltas.length === 0) return null
   const m = mean(deltas)
   const sd = sampleStdev(deltas)
   const stderr = deltas.length >= 2 && sd > 0 ? sd / Math.sqrt(deltas.length) : null
+  // 标签缺一个都不算聚类过 —— 半套标签算出来的稳健标准误没有定义，而它会被当成判据
+  const clustered = labelled && clusterLabels !== undefined ? clusteredStderrOf(deltas, labels) : null
   return {
     cells: deltas.length,
     affected: deltas.filter((d) => d !== 0).length,
@@ -235,7 +308,23 @@ export function pairedDelta(
     stderr,
     wins: deltas.filter((d) => d > 0).length,
     t: stderr !== null && stderr > 0 ? Math.abs(m) / stderr : null,
+    clusters: clustered?.clusters ?? null,
+    clusteredStderr: clustered?.stderr ?? null,
+    clusteredT:
+      clustered?.stderr !== null && clustered?.stderr !== undefined && clustered.stderr > 0
+        ? Math.abs(m) / clustered.stderr
+        : null,
   }
+}
+
+/**
+ * 判据用的那个 t。
+ *
+ * **有聚类标签就必须用聚类版**：退回朴素版恰恰是这次要修掉的那件事。
+ * 没有标签时（旧调用方、手工构造的报告）退回朴素版，但报告必须标成「未调整上界」。
+ */
+export function effectiveT(delta: PairedDelta): number | null {
+  return delta.clusters !== null ? delta.clusteredT : delta.t
 }
 
 export interface Candidate {
@@ -318,16 +407,26 @@ export type Verdict =
 export interface Resolution {
   /** 折数 */
   cells: number
-  /** 可分辨的最小 Δ（= minDeltaT × stderr），按最好的那个挑战者估 */
+  /** 聚类数（时间片）。未聚类时 null —— 那种情况下下面的数全是未调整上界 */
+  clusters: number | null
+  /** 可分辨的最小 Δ（= minDeltaT × **判据用的那个** stderr），按最好的那个挑战者估 */
   noiseFloor: number | null
   /** 观测到的最大 Δ（挑战者中 delta.mean 最大者） */
   bestDelta: number | null
   /**
-   * 要让 `bestDelta` 变得可分辨，大约需要多少折。
+   * 【**朴素口径，未做相关性调整**】要让 `bestDelta` 可分辨大约需要多少折。
    * 按 stderr ∝ 1/√n 反解：n* = cells × (minDeltaT × stdev / bestDelta)²。
-   * **量级估计**，不是样本量计算 —— 折之间不独立，且假设了 Δ 与离散度都不随样本变。
+   * 保留仅为与 2026-08-19 之前的报告可比 —— **它系统性偏小**（折不独立）。
    */
   requiredCells: number | null
+  /**
+   * 【判据口径】要让 `bestDelta` 可分辨大约需要多少个**独立时间片**。
+   *
+   * 加横截面折**不改变这个数** —— 那正是聚类要说的话：多切几个标的子集只让每个
+   * 时间片的估计更稳，不增加独立样本。要降它只有两条路：**拉长窗口**（更多时间片）
+   * 或**承认这个参数在当前数据量下不可标定**（M2 清单 4.9c）。
+   */
+  requiredClusters: number | null
 }
 
 export interface CalibrationReport {
@@ -482,6 +581,12 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
   }
 
   const candidates: Candidate[] = []
+  /**
+   * 折单元的聚类标签（时间片），由第一个真的跑出验证段的候选提供。
+   * 所有候选的 cells 由 `runSplit` 用同一套 groups × timeSlices 构造 ⇒ 同序同标签，
+   * 所以只取一次；**取不到就是没有聚类**，标准误退回朴素上界并在报告里说明。
+   */
+  let clusterLabels: (string | undefined)[] | null = null
 
   for (const [i, overrides] of queue.entries()) {
     const params = withParams(overrides, input.base)
@@ -538,6 +643,9 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     const validationBlock = validationRun?.overall ?? null
     const validationScore = validationBlock ? calmar(validationBlock) : null
     const foldScores = (validationRun?.cells ?? []).map((cell) => cellScore(cell.block))
+    if (clusterLabels === null && validationRun && validationRun.cells.length > 0) {
+      clusterLabels = validationRun.cells.map((cell) => cell.cluster)
+    }
 
     const flags: string[] = []
     let rejected: string | null = null
@@ -577,7 +685,11 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
   if (incumbent) {
     for (const candidate of candidates) {
       if (candidate.incumbent) continue
-      candidate.delta = pairedDelta(candidate.foldScores, incumbent.foldScores)
+      candidate.delta = pairedDelta(
+        candidate.foldScores,
+        incumbent.foldScores,
+        clusterLabels ?? undefined
+      )
     }
   }
 
@@ -604,9 +716,13 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
       if (incumbentWinRate !== null && winRate !== null && winRate < incumbentWinRate) return false
       // ② 至少要有三折真的被改动，否则「改善」只是一两折的巧合
       if (delta.affected < 3) return false
-      // ③ 改善要稳定、且大于它自己的抖动
+      // ③ 改善要稳定、且大于它自己的抖动。
+      //    **卡的是聚类稳健 t**（2026-08-19，§4.6）：朴素 t 把同一时间片里的 4 个标的
+      //    子集当成 4 份独立信息，而 A 股同涨同跌 —— 那个数是上界，用它当门槛
+      //    等于系统性放行「刚过线」的候选。
       if (delta.mean <= 0) return false
-      if (delta.t === null || delta.t < minDeltaT) return false
+      const t = effectiveT(delta)
+      if (t === null || t < minDeltaT) return false
       return delta.wins / delta.affected >= minWinRate
     })
     .sort((a, b) => (b.delta?.mean ?? 0) - (a.delta?.mean ?? 0))
@@ -620,16 +736,32 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     const cells = incumbent?.foldScores.length ?? 0
     if (cells === 0) return null
     const delta = bestByDelta?.delta ?? null
+    const clusters = delta?.clusters ?? null
     if (!delta || delta.stderr === null) {
-      return { cells, noiseFloor: null, bestDelta: delta?.mean ?? null, requiredCells: null }
+      return {
+        cells,
+        clusters,
+        noiseFloor: null,
+        bestDelta: delta?.mean ?? null,
+        requiredCells: null,
+        requiredClusters: null,
+      }
     }
     // 要求 minDeltaT × stdev/√n < mean ⇒ n > (minDeltaT × stdev / mean)²
     const stdev = delta.stderr * Math.sqrt(delta.cells)
+    // 聚类口径同理，只是 n 换成簇数：stderr_cl ∝ 1/√G ⇒ G* = G × (minDeltaT × stderr_cl / mean)²
+    const requiredClusters =
+      delta.clusteredStderr !== null && clusters !== null && clusters >= 2
+        ? Math.ceil(clusters * ((minDeltaT * delta.clusteredStderr) / delta.mean) ** 2)
+        : null
     return {
       cells,
-      noiseFloor: minDeltaT * delta.stderr,
+      clusters,
+      // 门槛按**判据用的那个**标准误给 —— 印朴素值等于告诉人一个够不着的门槛
+      noiseFloor: minDeltaT * (delta.clusteredStderr ?? delta.stderr),
       bestDelta: delta.mean,
       requiredCells: Math.ceil(((minDeltaT * stdev) / delta.mean) ** 2),
+      requiredClusters,
     }
   })()
 
@@ -645,7 +777,7 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     case 'WRITE_BACK':
       notes.push(
         `裁决 WRITE_BACK：${JSON.stringify(winner?.overrides)} 在 ${winner?.delta?.cells} 个折单元上` +
-          `平均优于出厂值 ${pp(winner?.delta?.mean)}（|Δ|/stderr = ${winner?.delta?.t?.toFixed(1)}，` +
+          `平均优于出厂值 ${pp(winner?.delta?.mean)}（${tLabel(winner?.delta ?? null)}，` +
           `受影响的 ${winner?.delta?.affected} 折里 ${winner?.delta?.wins} 折为正），` +
           '整池 Calmar 不低于出厂值，且邻域不断崖。仍需人工复核后写回（M2 清单 4.9a）。'
       )
@@ -662,7 +794,11 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
       //    出厂值落在一个测得出边界的区域里，这是**支持这个转述值**的正面证据。
       // 只印「没有候选够格」会把 ② 读成 ①，白扔掉这个项目最缺的那种证据。
       const worse = candidates.filter(
-        (c) => !c.incumbent && c.delta !== null && c.delta.mean < 0 && (c.delta.t ?? 0) >= minDeltaT
+        (c) =>
+          !c.incumbent &&
+          c.delta !== null &&
+          c.delta.mean < 0 &&
+          (effectiveT(c.delta) ?? 0) >= minDeltaT
       )
       if (worse.length > 0) {
         notes.push(
@@ -674,13 +810,21 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
             '与「怎么动都测不出差别」的 KEEP 不是一回事，归档时要分开写。'
         )
       }
-      if (resolution?.requiredCells !== null && resolution?.requiredCells !== undefined) {
+      if (resolution && resolution.requiredClusters !== null) {
         notes.push(
-          `分辨率（折上口径 = 本折总收益）：观测到的最大改进 Δ = ${pp(resolution.bestDelta)}，` +
-            `当前 ${resolution.cells} 折下的可分辨门槛是 ${pp(resolution.noiseFloor)}。` +
-            `要让这个 Δ 变得可分辨大约需要 ${resolution.requiredCells} 折（量级估计）——` +
-            '要么把标的池 / 窗口扩到那个量级，要么承认这个参数在当前数据量下不可标定' +
+          `分辨率（折上口径 = 本折总收益，聚类稳健）：观测到的最大改进 Δ = ${pp(resolution.bestDelta)}，` +
+            `当前 ${resolution.clusters} 个时间片下的可分辨门槛是 ${pp(resolution.noiseFloor)}。` +
+            `要让这个 Δ 变得可分辨大约需要 ${resolution.requiredClusters} 个**独立时间片**（量级估计）——` +
+            '注意**多切横截面折不管用**（同一时间片里的标的子集不是独立样本，这正是聚类要说的话），' +
+            '只有拉长窗口才增加时间片。要么扩到那个量级，要么承认这个参数在当前数据量下不可标定' +
             '（M2 清单 4.9c，别再重跑同一个网格）。'
+        )
+      } else if (resolution?.requiredCells !== null && resolution?.requiredCells !== undefined) {
+        notes.push(
+          `分辨率（折上口径 = 本折总收益，**未做相关性调整、是下界**）：观测到的最大改进 ` +
+            `Δ = ${pp(resolution.bestDelta)}，当前 ${resolution.cells} 折下的可分辨门槛是 ` +
+            `${pp(resolution.noiseFloor)}。要让它可分辨大约需要 ${resolution.requiredCells} 折 ——` +
+            '这一档没有聚类标签，真实需要量更大（M2 清单 4.9c，别再重跑同一个网格）。'
         )
       }
       break
@@ -694,6 +838,28 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
   }
   if (candidates.some((c) => c.flags.length > 0)) {
     notes.push('有候选被标记（疑似过拟合 / 孤峰 / 邻域未测），已排除在优胜者之外，但保留在报告中以备复核。')
+  }
+  // 判据的相关性调整状态**每次都印**（2026-08-19，§4.6）。
+  // 这一节存在的理由就是「报告没有任何一行说这个 t 未做相关性调整」——
+  // 有条件地印等于让「没印」重新变成一种可能。
+  {
+    const clusters = incumbent?.delta?.clusters ?? candidates.find((c) => c.delta)?.delta?.clusters ?? null
+    const G = clusterLabels === null ? null : new Set(clusterLabels.filter((l) => l !== undefined)).size
+    const n = G ?? clusters
+    if (n !== null && n >= 2) {
+      notes.push(
+        `判据 t 按 **${n} 个时间片聚类稳健**（CR1，迭代计划 §4.6）：同一时间片里的多个标的子集` +
+          '共享市场 beta，不是独立样本，朴素的 stdev/√n 会把标准误低估、t 高估。' +
+          `报告里同时给出朴素值，标着「未调整上界」。⚠ **簇数只有 ${n} ⇒ 自由度 ${n - 1}**，` +
+          `此时 t ≥ ${minDeltaT} 的保证远弱于大样本直觉 —— 时间片之间也不完全独立` +
+          '（片连续、持仓跨片重叠），所以调整后的 t **仍然偏乐观，只是比调整前好得多**。'
+      )
+    } else {
+      notes.push(
+        '⚠ **本次没有折间聚类标签，所有 t 都是「未调整上界」**（把非独立折当成独立样本算的）。' +
+          '按 §4.6 的读数纪律，这一档的 t 不得直接与门槛比较。'
+      )
+    }
   }
   notes.push(
     input.touchTest
@@ -741,6 +907,24 @@ function pp(value: number | null | undefined, digits = 2): string {
   return value === null || value === undefined ? '—' : `${(value * 100).toFixed(digits)}pp`
 }
 
+/**
+ * 把 t 连同「调整了没有」一起打。
+ *
+ * 单独印一个 `t = 2.3` 是 §4.6 记的那条报告缺陷本身：读的人无从知道它是聚类稳健的
+ * 还是把 12 个非独立折当成 12 份独立信息算出来的。**两个数一起给**，
+ * 未聚类时明写「未调整上界」。
+ */
+function tLabel(delta: PairedDelta | null): string {
+  if (!delta) return 't —'
+  if (delta.clusters === null) {
+    return `t ${fmt(delta.t, 1)}（**未做相关性调整，是上界**）`
+  }
+  return `t ${fmt(delta.clusteredT, 1)}（按 ${delta.clusters} 个时间片聚类稳健；未调整上界 ${fmt(
+    delta.t,
+    1
+  )}）`
+}
+
 export function renderCalibration(report: CalibrationReport): string {
   const lines: string[] = []
   lines.push('─'.repeat(78))
@@ -751,11 +935,15 @@ export function renderCalibration(report: CalibrationReport): string {
   }
   if (report.resolution) {
     lines.push(
-      `  折单元 ${report.resolution.cells} 个（标的子集 × 时间片，同一次模拟切出来，不额外跑）`
+      `  折单元 ${report.resolution.cells} 个（标的子集 × 时间片，同一次模拟切出来，不额外跑）` +
+        (report.resolution.clusters === null
+          ? ' · ⚠ 无聚类标签，t 是未调整上界'
+          : ` · 聚类 ${report.resolution.clusters} 个时间片（判据 t 已做相关性调整）`)
     )
   }
   lines.push('─'.repeat(78))
   lines.push('候选（按整池验证集 Calmar 排序；Δ 是与出厂值的逐折配对**总收益**差值）：')
+  lines.push('  t 列 = 聚类稳健值，括号里是未调整上界（§4.6）')
 
   const sorted = [...report.candidates].sort((a, b) => (b.score ?? -Infinity) - (a.score ?? -Infinity))
   for (const candidate of sorted) {
@@ -770,8 +958,12 @@ export function renderCalibration(report: CalibrationReport): string {
             : '通过'
     const delta = candidate.delta
     const deltaText = delta
-      ? `Δ ${delta.mean >= 0 ? '+' : ''}${pp(delta.mean)} ± ${pp(delta.stderr)}  ` +
-        `t ${fmt(delta.t, 1).padStart(4)}  胜 ${delta.wins}/${delta.affected} 折（动了 ${delta.affected}/${delta.cells}）`
+      ? `Δ ${delta.mean >= 0 ? '+' : ''}${pp(delta.mean)} ± ${pp(
+          delta.clusteredStderr ?? delta.stderr
+        )}  ` +
+        `t ${fmt(effectiveT(delta), 1).padStart(4)}${
+          delta.clusters === null ? '!' : `(${fmt(delta.t, 1)})`
+        }  胜 ${delta.wins}/${delta.affected} 折（动了 ${delta.affected}/${delta.cells}）`
       : candidate.incumbent
         ? '（基准）'
         : 'Δ —'

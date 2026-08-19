@@ -16,9 +16,12 @@ import { describe, expect, it } from 'vitest'
 import {
   calibrate,
   changedLeaves,
+  clusteredStderrOf,
   codeGroups,
+  effectiveT,
   pairedDelta,
   timeSlices,
+  type PairedDelta,
   type Split,
   type SplitRun,
 } from '@backtest/calibrate'
@@ -286,6 +289,121 @@ describe('三态裁决', () => {
       '0.55': { overall: 0.8, cells: [0.8, 0.8] },
     })
     expect(report.verdict).toBe('INCONCLUSIVE')
+  })
+})
+
+/**
+ * 折间相关性（迭代计划 §4.6，2026-08-19）。
+ *
+ * `stdev(Δ)/√n` 的 √n 收敛只在折独立时成立，而 12 个折单元是 4 个标的子集 × 3 个时间片、
+ * **从同一次模拟里切出来的**：同一片里的四个子集共享那段行情的市场 beta（A 股同涨同跌），
+ * 它们不是四份独立信息。于是朴素 t 系统性偏大。
+ *
+ * 这一组用例守的是**判据本身**，不是算术：下面第一条与第二条喂的是**逐位相同的分数**，
+ * 差别只有「有没有告诉工具哪些折属于同一个时间片」，而裁决从 WRITE_BACK 翻成 KEEP。
+ * 这正是 §4.6 要修的那件事 —— 它咬的是未来那个 t = 2.1 勉强过线的候选。
+ */
+describe('折间相关性：聚类稳健标准误（§4.6）', () => {
+  /** 逐折 Δ 在**片内恒定、片间不同** —— 横截面完全同步的极端形，也是最能说明问题的形状 */
+  const INCUMBENT_CELLS = [
+    0.28, 0.3, 0.29, 0.31, // p1
+    0.27, 0.31, 0.3, 0.28, // p2
+    0.29, 0.28, 0.32, 0.3, // p3
+  ]
+  const PER_SLICE_DELTA = [0.03, 0.012, 0.001]
+  const CHALLENGER_CELLS = INCUMBENT_CELLS.map(
+    (v, i) => v + (PER_SLICE_DELTA[Math.floor(i / 4)] ?? 0)
+  )
+
+  /** 12 折 = 4 子集 × 3 时间片；`clustered` 决定要不要给聚类标签 */
+  function runCells(overall: number, cells: readonly number[], clustered: boolean): SplitRun {
+    return {
+      overall: block(overall),
+      cells: cells.map((score, i) => ({
+        name: `g${(i % 4) + 1}/p${Math.floor(i / 4) + 1}`,
+        ...(clustered ? { cluster: `p${Math.floor(i / 4) + 1}` } : {}),
+        block: block(score, 10),
+      })),
+    }
+  }
+
+  function report(clustered: boolean) {
+    const rows: Record<string, { overall: number; cells: readonly number[] }> = {
+      // 0.5 与 0.65 只为让 0.55 两侧都有不塌的邻居（否则会被判孤峰 / 边界）
+      '0.5': { overall: 0.36, cells: INCUMBENT_CELLS.map((v) => v + 0.004) },
+      '0.55': { overall: 0.4, cells: CHALLENGER_CELLS },
+      [CENTRE]: { overall: 0.3, cells: INCUMBENT_CELLS },
+      '0.65': { overall: 0.25, cells: INCUMBENT_CELLS.map((v) => v - 0.01) },
+    }
+    return calibrate({
+      candidates: ['0.5', '0.55', '0.65'].map((v) => ({
+        combine: { scoreThreshold: Number(v) },
+      })),
+      base: DEFAULT_PARAMS,
+      splits,
+      run: (params, split) => {
+        const row = rows[String(params.combine.scoreThreshold)]
+        if (!row) throw new Error(`用例没给 ${params.combine.scoreThreshold} 的分数`)
+        if (split.name !== 'validation') return run(0.2, [])
+        return runCells(row.overall, row.cells, clustered)
+      },
+    })
+  }
+
+  it('没有聚类标签时，同一份分数会给出 WRITE_BACK —— 这是修之前的行为', () => {
+    const naive = report(false)
+    expect(naive.verdict).toBe('WRITE_BACK')
+    expect(naive.winner?.overrides).toEqual({ combine: { scoreThreshold: 0.55 } })
+    // 朴素 t 把 12 折当成 12 份独立信息 ⇒ 轻松过 2
+    expect(naive.winner?.delta?.t ?? 0).toBeGreaterThan(3)
+    expect(naive.winner?.delta?.clusters).toBeNull()
+  })
+
+  it('**同一份分数**加上聚类标签之后翻成 KEEP —— 折不独立，改进过不了门槛', () => {
+    const adjusted = report(true)
+    const peak = adjusted.candidates.find((c) => c.changed[0]?.value === 0.55)
+    expect(peak?.delta?.clusters).toBe(3)
+    // 朴素值不变（保留是为了与历史报告可比），判据换成聚类值之后掉到 2 以下
+    expect(peak?.delta?.t ?? 0).toBeGreaterThan(3)
+    expect(peak?.delta?.clusteredT ?? 99).toBeLessThan(2)
+    expect(adjusted.winner).toBeNull()
+    expect(adjusted.verdict).toBe('KEEP')
+  })
+
+  /**
+   * 等大簇时 CR1 恰好化简为「簇均值的标准误」。
+   * 这条把公式钉死，也是上面那个翻转的算术依据：横截面折只让每个簇均值更稳，
+   * **不增加独立样本数**。
+   */
+  it('等大簇 ⇒ 聚类标准误 = stdev(簇均值)/√G，横截面折不贡献 √n', () => {
+    const deltas = [1, 1, 1, 1, 3, 3, 3, 3, 5, 5, 5, 5]
+    const labels = deltas.map((_, i) => `p${Math.floor(i / 4) + 1}`)
+    const { stderr, clusters } = clusteredStderrOf(deltas, labels)
+    expect(clusters).toBe(3)
+    // 簇均值 1/3/5 ⇒ 样本标准差 2 ⇒ 标准误 2/√3
+    expect(stderr ?? 0).toBeCloseTo(2 / Math.sqrt(3), 10)
+    // 朴素式子会给出小得多的数（同一份 Δ，12 个样本）
+    const naive = pairedDelta(deltas, deltas.map(() => 0))
+    expect(naive?.stderr ?? 9).toBeLessThan(stderr ?? 0)
+  })
+
+  it('簇数 < 2 ⇒ 给不出聚类标准误，不许悄悄退回朴素值当判据', () => {
+    const { stderr, clusters } = clusteredStderrOf([1, 2, 3], ['p1', 'p1', 'p1'])
+    expect(clusters).toBe(1)
+    expect(stderr).toBeNull()
+    const delta = pairedDelta([1, 2, 3], [0, 0, 0], ['p1', 'p1', 'p1'])
+    expect(delta?.clusteredT).toBeNull()
+    // effectiveT 认「有标签」这件事，所以它跟着是 null —— 而不是回落到偏乐观的朴素 t
+    expect(effectiveT(delta as PairedDelta)).toBeNull()
+  })
+
+  /**
+   * §4.6 记的那条**报告缺陷**：打印 `|Δ|/stderr = 1.4` 时没有任何一行说它未做相关性调整。
+   * 有条件地印等于让「没印」重新变成一种可能，所以这两条都断言**每次都印**。
+   */
+  it('报告每次都说清 t 调整了没有', () => {
+    expect(report(true).notes.join(' ')).toContain('聚类稳健')
+    expect(report(false).notes.join(' ')).toContain('未调整上界')
   })
 })
 

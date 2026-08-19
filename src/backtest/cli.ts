@@ -435,10 +435,17 @@ function runSplit(
   const dates = mergeEquity(results, views.byDate)
     .map((p) => p.date)
     .filter((date) => date >= split.from && date <= split.to)
+  // `cluster` = 时间片，是折间相关性的分组单位（2026-08-19，迭代计划 §4.6）：
+  // 同一片里的 g1..gN 共享那段行情的市场 beta，不能当成 N 份独立信息。
+  // 标准误因此按它做聚类稳健估计，见 calibrate.ts 的 clusteredStderrOf()。
   const cells: SplitRun['cells'] = timeSlices(dates, options.timeSlices).flatMap((slice, s) =>
     groups.map((group, g) => {
       const subset = results.filter((r) => group.includes(r.code))
-      return { name: `g${g + 1}/p${s + 1}`, block: blockOf(subset, slice.from, slice.to) }
+      return {
+        name: `g${g + 1}/p${s + 1}`,
+        cluster: `p${s + 1}`,
+        block: blockOf(subset, slice.from, slice.to),
+      }
     })
   )
 

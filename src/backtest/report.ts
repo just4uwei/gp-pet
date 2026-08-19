@@ -332,7 +332,11 @@ export function renderReport(report: BacktestReport): string {
   lines.push(`  基准 ${pct(p.benchmarkReturn)}  超额 ${pct(p.excessReturn)}  信息比率 ${num(p.informationRatio)}`)
   // 超额与占用率必须相邻打印：基准满仓、策略多数时间空仓，只看超额会把「没投钱」读成「策略差」
   lines.push(`  平均资金占用 ${pct(p.exposure)}（基准为满仓 100%，超额收益须结合本行读）`)
-  lines.push(`  夏普 ${num(p.sharpe)}（rf = 0）`)
+  // 「未做自相关调整」这半句是 2026-08-19 加的（迭代计划 §4.6）：
+  // ×√243 假设日收益 iid，而策略净值有自相关（持仓跨日、同池标的同涨同跌）⇒ 这个数偏大。
+  // 与折间 t 那处同一个病，只是夏普不参与任何门槛（排名口径是 Calmar），所以按 §4.6 的
+  // 「立刻」档处理 —— **如实标注，不改算法**。要改得上 Newey-West/Lo，那是单独一次改动。
+  lines.push(`  夏普 ${num(p.sharpe)}（rf = 0，×√243 未做自相关调整 ⇒ 偏大，§4.6）`)
   lines.push(
     `  卖出 ${p.trades.count} 笔  逐笔胜率 ${pct(p.trades.winRate)}  盈亏比 ${num(
       p.trades.profitFactor

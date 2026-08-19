@@ -67,6 +67,53 @@ import { openFixtureSource, openSqliteSource, type DataSource, type LoadedSeries
 /** 与 simulate.ts 的 MAX_DEFER_BARS 同源：连续跌停超过这个天数就当作卖不掉 */
 const MAX_DEFER_BARS = 5
 
+/**
+ * 在**升序**的 `pool` 里找离 `target` 最近、且不等于 `exclude` 的元素（块位移的「吸附」）。
+ *
+ * `exclude` 是真实成交那一根：小 |δ| 会让吸附把随机样本吸回真实入场本身，
+ * 那次抽样就退化成「真实」，会把分位往 50% 拽（与排除 δ = 0 同一条理由）。
+ *
+ * ⚠ **必须按「值的距离」比，不能按「池下标的距离」外扩。**
+ * `pool` 是稀疏且不等距的（`--match-regime` 下它只含同状态的那些天），
+ * 左边一格可能跳 40 根、右边一格只跳 1 根 —— 按下标交替外扩会系统性偏向某一侧，
+ * 那是给零分布加了一个方向偏置，而零分布的中立性是这个工具全部可信度的来源。
+ * 第一版就是那么写的，这条注释是它的墓碑。
+ */
+export function nearestInPool(
+  pool: readonly number[],
+  target: number,
+  exclude: number
+): number | null {
+  let lo = 0
+  let hi = pool.length - 1
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if ((pool[mid] ?? 0) < target) lo = mid + 1
+    else hi = mid
+  }
+  // 从二分落点向两侧走，每一步都取「离 target 更近的那一侧」。
+  // **等距时按 target 的奇偶决定先看哪边**：固定偏向一侧会让所有平局都朝同一个方向落，
+  // 累积起来就是零分布的一个系统性时间偏移。按奇偶分是确定性的（可复现）且两侧各半。
+  const preferRight = target % 2 === 0
+  let right = lo
+  let left = lo - 1
+  while (right < pool.length || left >= 0) {
+    const a = right < pool.length ? pool[right] : undefined
+    const b = left >= 0 ? pool[left] : undefined
+    const da = a === undefined ? Infinity : Math.abs(a - target)
+    const db = b === undefined ? Infinity : Math.abs(b - target)
+    if (da === Infinity && db === Infinity) return null
+    if (da < db || (da === db && preferRight)) {
+      if (a !== undefined && a !== exclude) return a
+      right++
+    } else {
+      if (b !== undefined && b !== exclude) return b
+      left--
+    }
+  }
+  return null
+}
+
 const REGIMES: readonly Regime[] = ['TREND_UP', 'TREND_DOWN', 'RANGE', 'TRANSITION']
 
 // ── 报告读取 ─────────────────────────────────────────────────────────────
@@ -607,6 +654,26 @@ export interface RandomAuditPayload {
      * null = 不收窄（口径与 §5.27 逐位相同）。
      */
     crossPool: string | null
+    /**
+     * 择时零分布的时间结构（2026-08-19，§4.6）。读任何一个**分位**之前先看这一行：
+     * `INDEPENDENT` 的分位是**未调整上界**（偏向显著），`BLOCK` 才是调整过的。
+     * 跨票口径下恒为 null —— 它固定日期，本来就没有这个病。
+     */
+    timingNull: 'BLOCK' | 'INDEPENDENT' | null
+    /** 为什么是这个结构。自动降级时这里是唯一说得清「为什么没调整」的地方 */
+    timingNullReason: string | null
+    /** BLOCK 下的块数（建仓月）与退回独立抽样的建仓数。退化必须可见 */
+    blocks: number | null
+    blockFallback: number | null
+    /**
+     * 吸附距离（交易根）的中位数与 90 分位。
+     *
+     * **这是「时间聚集保住了多少」的唯一可检验的量**：块内共用位移 δ，但每个成员要吸附到
+     * 自己 `pool` 里最近的合法日。距离小 ⇒ 大家真的落在同一段行情里；
+     * 距离大到几十根 ⇒ 这个「块」只剩名义，读分位时要按未调整看待。
+     */
+    snapMedian: number | null
+    snapP90: number | null
     warmup: number
     minCount: number
     positionsTotal: number
@@ -678,6 +745,35 @@ interface Options {
    */
   crossCode: boolean
   crossPool: string | null
+  /**
+   * 择时零分布的**时间结构**（2026-08-19，迭代计划 §4.6）。
+   *
+   * ## 为什么默认不再是 INDEPENDENT
+   *
+   * 旧口径给每一次真实建仓**独立**抽一个随机日。但真实建仓**不是独立发生的** ——
+   * 引擎在同一段行情里成批出手（同一个月里几十次建仓共享那段市场涨跌）。
+   * 独立抽日把这种聚集打散了，于是随机组每一次试验的组合收益是几百个近似独立样本的平均，
+   * **零分布的方差被系统性压小** ⇒ 真实值落在尾部的机会被高估 ⇒ **分位偏向显著**。
+   *
+   * ## BLOCK 怎么修
+   *
+   * 按**建仓月**分块，每块**共用一个位移 δ**（单位：交易根）。同一个月里的那几十次建仓
+   * 于是整体被平移到另一段行情里，**块内的时间聚集原样保留**。
+   * δ 从「块内每一次建仓都合法」的位移集合里抽 —— 因此 `--match-regime` 仍然成立
+   * （`pool` 已经编码了状态过滤，取交集即可）。
+   *
+   * 交集为空的块**退回独立抽样**并计数报出（`blockFallback`）：静默退化会让
+   * 「已调整」这句话变成假话，而那正是这次要修的病。
+   *
+   * ## 一处仍然近似
+   *
+   * δ 是**交易根**位移，而不同标的的停牌日不同 ⇒ 同一个 δ 在两只票上对应的日历日
+   * 可能差几天。这个偏差远小于「把聚集整个打散」，但它在，别写成「完全保留」。
+   *
+   * ⚠ 跨票口径（`--cross-code`）**不需要这个修**：它固定日期只换标的，
+   * 真实建仓的时间结构原样在那儿 —— §4.6 里那处「歪打正着躲过了」说的就是它。
+   */
+  timingNull: 'BLOCK' | 'INDEPENDENT'
   warmup: number
   minCount: number
   /**
@@ -731,6 +827,12 @@ const USAGE = `用法：
                          默认口径在同一只票内抽样 ⇒ 票本身的涨跌被抵消 ⇒ 测的是「择时」；
                          这一档日期对齐、变的是标的 ⇒ 测的是「选股」。两个口径合起来才拆得开。
                          与 --match-regime 互斥（零点定义不同）
+  --independent-days     择时零分布退回**逐次独立抽日**（2026-08-19 之前的口径）。
+                         默认是**按建仓月整块位移**（block permutation）：真实建仓成批发生，
+                         独立抽日会打散这种时间聚集 ⇒ 零分布方差偏小 ⇒ 分位偏向显著。
+                         ⚠ **与 --match-regime 同用时会自动降级回独立抽日**：那一档的候选池
+                         稀疏，块位移只能靠吸附落地（实测中位 11 / P90 116 根），会按分层
+                         引入偏置。降级原因会打印在报告头上，分位按「未调整上界」读
   --cross-pool <file>    **收窄跨票候选池**到「当天也有买入方向信号的票」
                          （pnpm audit:crosssec --out 的产物）。只与 --cross-code 同用。
                          排除「抽到当天毫无异动的票」这个替代解释（M2 §5.27 读法 2）。
@@ -756,6 +858,7 @@ function parse(argv: readonly string[]): Options | 'help' {
     shuffleSpans: false,
     crossCode: false,
     crossPool: null,
+    timingNull: 'BLOCK',
     warmup: 300,
     minCount: 30,
     announceDays: 1,
@@ -766,6 +869,7 @@ function parse(argv: readonly string[]): Options | 'help' {
     '--match-regime',
     '--shuffle-spans',
     '--cross-code',
+    '--independent-days',
     '--announce-freq',
     '--json',
     '--help',
@@ -825,6 +929,9 @@ function parse(argv: readonly string[]): Options | 'help' {
         break
       case '--cross-code':
         o.crossCode = true
+        break
+      case '--independent-days':
+        o.timingNull = 'INDEPENDENT'
         break
       case '--out':
         o.out = need()
@@ -1132,6 +1239,103 @@ export async function run(argv: readonly string[]): Promise<number> {
     )
   }
 
+  /*
+    ③b 择时零分布的**块**（迭代计划 §4.6）。
+
+    块 = 建仓月。同一块里的所有建仓共用一个位移 δ（交易根），于是那一批建仓被整体
+    平移到另一段行情里、**块内的时间聚集原样保留** —— 而独立抽日会把它打散，
+    让零分布的方差偏小、分位偏向显著。
+
+    δ 的候选是「块内每一次建仓都合法」的位移，也就是各成员 `pool` 位移集合的**交集**。
+    `pool` 里已经编码了 `--match-regime` 与边界约束，所以取交集这一步同时把两者带上了。
+    交集为空 ⇒ 该块退回独立抽样，并计数报出（静默退化会让「已调整」变成假话）。
+  */
+  interface Block {
+    key: string
+    members: number[]
+    offsets: number[]
+  }
+  const blocks: Block[] = []
+  /** task 下标 → 它所属块在 `blocks` 里的下标 */
+  const blockOfTask = new Map<number, number>()
+  let blockFallback = 0
+  /*
+    ⚠ **`--match-regime` 下自动降级回独立抽样**（2026-08-19 实测后加的硬规则）。
+
+    块位移只在「每只票每天都是合法候选」时才是精确的：那时块内共用的 δ 对每个成员都成立，
+    吸附距离恒为 0。`--match-regime` 把 `pool` 收窄成「同状态的那些天」之后池变得稀疏，
+    共用 δ 要靠吸附才落得下去 —— 实测吸附距离**中位 11 根 / P90 116 根**，
+    块内的同步性已经名存实亡，而吸附方向依赖于该状态在这只票上的分布 ⇒ **按分层引入偏置**。
+
+    三种子实测（同一份基线、同样 200 次试验、配对胜率）：
+
+    | 口径 | 独立抽日 | 块位移 |
+    |---|---|---|
+    | 无 regime 匹配（吸附恒 0，块位移**精确**） | ALL 46.5 · TREND_UP 36.7 · RANGE 76.0 · TRANSITION 24.7 | ALL 55.5 · TREND_UP 43.2 · RANGE 73.2 · TRANSITION 38.5 |
+    | 同 regime（吸附 中位 11 / P90 116） | ALL 46.7 · TREND_UP 69.2 · RANGE 62.8 · TRANSITION 22.3 | ALL 42.8 · **TREND_UP 90.8** · **RANGE 22.3** · TRANSITION 39.0 |
+
+    精确那一行的改动是 +7 ~ +14pp、方向一致（都朝 50% 走 = 旧零分布太紧）；
+    吸附那一行是 +22 / **−40**、方向相反 —— 两者唯一的结构差别就是吸附。
+    ⇒ 那些摆动是**吸附的假象**，不是「块结构揭示了真实的小样本」。
+
+    所以这里不硬撑：降级，并把「同 regime 的分位仍是未调整上界」写进报告。
+    **假装调整过比不调整更坏** —— 后者至少是可见的。
+  */
+  let timingNullReason: string | null = null
+  let effectiveTimingNull = opts.timingNull
+  if (!opts.crossCode && opts.timingNull === 'BLOCK' && opts.matchRegime) {
+    effectiveTimingNull = 'INDEPENDENT'
+    timingNullReason =
+      '--match-regime 下候选池稀疏，块位移要靠吸附落地（实测中位 11 / P90 116 根），' +
+      '会按分层引入偏置 ⇒ 自动降级为独立抽日，本次分位是**未调整上界**（§4.6，2026-08-19 实测）'
+  }
+  if (!opts.crossCode && effectiveTimingNull === 'BLOCK') {
+    const byMonth = new Map<string, number[]>()
+    tasks.forEach((t, i) => {
+      const key = t.position.entryDate.slice(0, 7)
+      const list = byMonth.get(key)
+      if (list) list.push(i)
+      else byMonth.set(key, [i])
+    })
+    for (const [key, members] of [...byMonth.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+      /*
+        δ 的候选取成员位移集合的**并集**，不是交集。
+
+        交集试过一次，是**退化的**：`--match-regime` 下每只票的 `pool` 只含它自己的
+        同状态日，一个月里几十只票要凑出一个人人合法的位移几乎不可能 ——
+        实测 1675 次建仓里 **1426 次（85%）** 的块交集为空、只好退回独立抽样，
+        等于这个修根本没生效，而报告还会写着「已调整」。
+        并集 + 逐成员**吸附到最近的合法日**能永远成立：块内共用同一个 δ ⇒ 大家朝同一个
+        方向平移 ⇒ 时间聚集保住；吸附只在各自的 `pool` 内部找，所以 regime 过滤与边界
+        约束一条都没松。代价是吸附距离，那个距离下面会逐轮统计并报出来。
+      */
+      const union = new Set<number>()
+      for (const i of members) {
+        const t = tasks[i]
+        if (!t) continue
+        for (const idx of t.pool) union.add(idx - t.entryIdx)
+      }
+      // δ = 0 是真实入场本身，留着等于把「真实」当成随机样本，会把分位往 50% 拽
+      union.delete(0)
+      if (union.size === 0) {
+        blockFallback += members.length
+        continue
+      }
+      const b = blocks.length
+      blocks.push({ key, members, offsets: [...union].sort((a, b) => a - b) })
+      for (const i of members) blockOfTask.set(i, b)
+    }
+    process.stderr.write(
+      `择时零分布：按建仓月整块位移 · ${blocks.length} 块 · ` +
+        `覆盖 ${tasks.length - blockFallback}/${tasks.length} 次建仓` +
+        (blockFallback > 0 ? `（⚠ ${blockFallback} 次无可用位移，退回独立抽样）` : '') +
+        '\n'
+    )
+  }
+
+  /** 吸附距离（交易根）逐次记下来 —— 它是「时间聚集到底保住了多少」的唯一可检验的量 */
+  const snapDistances: number[] = []
+
   // ④ 跑 N 次随机试验
   const rng = makeRng(opts.seed)
   // 分层键是**逐建仓**算出来的，一次建仓同时进多个层（总体 / 状态 / 得分档 / 子信号组合 / 交叉）。
@@ -1196,6 +1400,8 @@ export async function run(argv: readonly string[]): Promise<number> {
         perm[j] = a
       }
     }
+    // 每块抽一个位移，块内所有建仓共用它 —— 这就是「保留时间聚集」的全部实现
+    const shiftOfBlock = blocks.map((b) => b.offsets[Math.floor(rng() * b.offsets.length)] ?? 0)
     const bucket = new Map<string, FillResult[]>()
     const passiveBucket = new Map<string, FillResult[]>()
     for (const s of strata) {
@@ -1229,7 +1435,23 @@ export async function run(argv: readonly string[]): Promise<number> {
           if (!otherEntry || otherIdx === undefined) continue
           fill = fillTrade(otherEntry.series, otherIdx, span, capital, costs)
         } else {
-          const pick = t.pool[Math.floor(rng() * t.pool.length)]
+          // 块位移优先：同一个月的建仓整体平移，各自吸附到最近的合法日。
+          // **只在第一次尝试用它** —— 重抽时换一个块位移会让同块成员各走各的，
+          // 等于把刚保住的聚集又打散了，所以后续尝试退回独立抽样
+          //（那只发生在涨跌停作废的少数样本上）
+          const blockIdx = blockOfTask.get(i)
+          const shift = attempt === 0 && blockIdx !== undefined ? shiftOfBlock[blockIdx] : undefined
+          let pick: number | undefined
+          if (shift === undefined) {
+            pick = t.pool[Math.floor(rng() * t.pool.length)]
+          } else {
+            const target = t.entryIdx + shift
+            const snapped = nearestInPool(t.pool, target, t.entryIdx)
+            if (snapped !== null) {
+              snapDistances.push(Math.abs(snapped - target))
+              pick = snapped
+            }
+          }
           if (pick === undefined) break
           fill = fillTrade(entry.series, pick, span, capital, costs)
         }
@@ -1298,6 +1520,12 @@ export async function run(argv: readonly string[]): Promise<number> {
       matchRegime: opts.matchRegime,
       crossCode: opts.crossCode,
       crossPool: opts.crossPool,
+      timingNull: opts.crossCode ? null : effectiveTimingNull,
+      timingNullReason,
+      blocks: opts.crossCode || effectiveTimingNull !== 'BLOCK' ? null : blocks.length,
+      blockFallback: opts.crossCode || effectiveTimingNull !== 'BLOCK' ? null : blockFallback,
+      snapMedian: snapDistances.length === 0 ? null : quantile([...snapDistances].sort((a, b) => a - b), 0.5),
+      snapP90: snapDistances.length === 0 ? null : quantile([...snapDistances].sort((a, b) => a - b), 0.9),
       warmup: opts.warmup,
       minCount: opts.minCount,
       positionsTotal: positions.length,
@@ -1392,6 +1620,28 @@ function renderText(p: RandomAuditPayload): string {
   */
   if (m.crossPool !== null) {
     lines.push(`候选池收窄 ${m.crossPool}（只抽「当天也有买入方向信号」的票；单信号日的建仓已摘除）`)
+  }
+  /*
+    零分布的时间结构**每次都打印**（2026-08-19，§4.6）。这条与 t 那条同一个理由：
+    报告以前没有任何一行说「这个分位是把非独立的建仓当成独立样本算出来的」，
+    于是读的人无从判断它可不可信。有条件地印等于让「没印」重新变成一种可能。
+  */
+  if (m.timingNull === 'BLOCK') {
+    lines.push(
+      `零分布结构 按建仓月整块位移（block permutation，§4.6）· ${m.blocks} 块` +
+        (m.blockFallback && m.blockFallback > 0
+          ? ` · ⚠ ${m.blockFallback} 次退回独立抽样`
+          : ' · 无退化') +
+        ` · 吸附距离 中位 ${m.snapMedian ?? '—'} / P90 ${m.snapP90 ?? '—'} 根` +
+        ' ⇒ 分位**已做时间聚集调整**（块内残余自相关仍在，仍略偏乐观；吸附距离越大调整越名义）'
+    )
+  } else if (m.timingNull === 'INDEPENDENT') {
+    lines.push(
+      '零分布结构 逐次独立抽日 ⇒ **零分布方差偏小，下面所有分位都是未调整上界、偏向显著**（§4.6）'
+    )
+    if (m.timingNullReason !== null) lines.push(`           自动降级原因：${m.timingNullReason}`)
+  } else {
+    lines.push('零分布结构 跨票口径固定日期 ⇒ 真实建仓的时间聚集原样保留，无需调整（§4.6 的例外）')
   }
   if (m.regimeSelfCheck) {
     const c = m.regimeSelfCheck
