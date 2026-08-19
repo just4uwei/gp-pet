@@ -27,6 +27,10 @@ data/announcements/
 # 恢复步骤见 docs/notes/交接-流动性维度.md
 data/liquidity/
 data/liquidity-em/
+# 口径交叉验证用的三只票（scripts/verify/jq-crosscheck.ts，可重出）。
+# ⚠ 刻意与 data/history 分开：往主 fixture 目录里补 2015–2017 的 K 线会改变
+# 那 261 只的预热段，历史回测基线就再也复现不出来了。重出命令写在那个脚本的头注释里
+data/verify-jq/
 .vite/
 .eslintcache
 
