@@ -173,6 +173,22 @@ export interface CodeResult {
    * **必须报出来**：静默剔除会让「这次剔了什么」事后查不清（no silent caps）。
    */
   poolBlocked: number
+  /**
+   * 因「一手都买不起」（`lotsAffordable` 返回 0）而没建成的次数。
+   *
+   * **它与 `poolBlocked` / `limitBlocked` 是同一类东西：没有这个计数器就是 silent cap。**
+   * 而这一个尤其隐蔽 —— 报告上只表现为「0 笔」，与「引擎没给信号」长得一模一样
+   * （M2 §5.40：主池 261 只里 10 只受影响，`SZ000001` **整段** 0 笔）。
+   *
+   * 成因不是「资金太少」这么简单：回测按 `*Adj`（**后复权**）价成交，而后复权锚在上市日
+   * ⇒ 分红送转多的老票，后复权价可达真实价的一两百倍（平安银行 2018 首根：真实 13.7 元 /
+   * 后复权 2069 元 ⇒ 一手 20.7 万 > 默认每标的 10 万）。
+   * ⇒ **被排除的恰恰是分红历史最长的大盘股，偏差方向不随机。**
+   *
+   * 这里**只计数、不改成交口径**（M2 §5.40 的处置 A）：改手数口径会让全部历史基线失效，
+   * 那是另一个决定。
+   */
+  unaffordable: number
   regimeBars: Map<Regime, number>
   /** 期末仍持仓（未平仓）—— 报告里要单独说明，否则「总收益」里混着浮盈 */
   openPosition: boolean
@@ -261,6 +277,7 @@ export function simulateCode(
     limitBlocked: 0,
     gapSkipped: 0,
     poolBlocked: 0,
+    unaffordable: 0,
     regimeBars: new Map(),
     openPosition: false,
     delistedClose: false,
@@ -309,6 +326,9 @@ export function simulateCode(
                 score: order.score,
                 barsInRegime: order.barsInRegime,
               }
+            } else {
+              // 一手都买不起 —— 计数，否则这次建仓意图会一声不响地消失（见 unaffordable 的说明）
+              result.unaffordable++
             }
             pending = null
           }

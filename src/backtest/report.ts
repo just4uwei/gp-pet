@@ -102,6 +102,11 @@ export interface BacktestReport {
      * **必须进报告**：只看「建仓数变少了」分不清是过滤剔的还是参数变严了。
      */
     poolBlocked: number
+    /**
+     * 因「一手都买不起」而没建成的次数（M2 §5.40）。
+     * **必须进报告**：不然它与「引擎没给信号」一样都显示成「0 笔」。
+     */
+    unaffordable: number
   }[]
   suppressions: { rule: string; count: number }[]
   /** 离场规则分布（按次数降序）—— 回答「是策略在卖还是风控在卖」 */
@@ -265,6 +270,30 @@ export function assembleReport(input: AssembleInput): BacktestReport {
     )
   }
 
+  /*
+    「一手都买不起」的建仓意图。与上面那条池过滤同一个理由（no silent caps），但它更隐蔽：
+    池过滤是用户显式加了参数，而这一条是**默认配置下就会发生**的 —— 回测按后复权价成交，
+    而后复权价可达真实价的一两百倍（M2 §5.40）。不写这一行，报告上就只有一个「0 笔」，
+    与「引擎在这只票上没给过信号」完全无法区分。
+  */
+  const unaffordable = input.results.reduce((sum, r) => sum + r.unaffordable, 0)
+  if (unaffordable > 0) {
+    const codes = input.results
+      .filter((r) => r.unaffordable > 0)
+      .sort((a, b) => b.unaffordable - a.unaffordable)
+    const shown = codes
+      .slice(0, 5)
+      .map((r) => `${r.code}×${r.unaffordable}`)
+      .join(' · ')
+    warnings.push(
+      `${unaffordable} 次建仓意图因**一手都买不起**未成交（涉及 ${codes.length} 只：${shown}` +
+        `${codes.length > 5 ? ' …' : ''}）。` +
+        '成交价用的是后复权价，而后复权锚在上市日 —— 分红送转多的老票后复权价可达真实价的一两百倍，' +
+        '于是一手就超过了 --capital。**这些标的的「0 笔」不代表引擎没给信号**，' +
+        '被排除的又恰恰是分红历史最长的大盘股（M2 §5.40）。要它们参与交易需调大 --capital。'
+    )
+  }
+
   return {
     meta: { ...input.meta, unvalidatedParams: ENGINE_VERSION.includes('unvalidated') },
     disclaimers: [...DISCLAIMERS],
@@ -285,6 +314,7 @@ export function assembleReport(input: AssembleInput): BacktestReport {
         gapSkipped: result.gapSkipped,
         limitBlocked: result.limitBlocked,
         poolBlocked: result.poolBlocked,
+        unaffordable: result.unaffordable,
       }
     }),
     suppressions: [...suppressions.entries()]

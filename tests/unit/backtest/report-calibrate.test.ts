@@ -69,6 +69,7 @@ function codeResult(overrides: Partial<CodeResult> = {}): CodeResult {
     limitBlocked: 1,
     gapSkipped: 0,
     poolBlocked: 0,
+    unaffordable: 0,
     regimeBars: new Map<Regime, number>([['TREND_UP', 8]]),
     openPosition: false,
     delistedClose: false,
@@ -183,6 +184,32 @@ describe('报告组装', () => {
     const report = assembleReport({ results: [codeResult({ openPosition: true })], meta })
     expect(report.warnings.join(' ')).toContain('未平仓')
     expect(report.warnings.join(' ')).toContain('基准')
+  })
+
+  /*
+    M2 §5.40：后复权价位让主池 10 只标的一手都买不起 ⇒ 整段 0 笔，而报告上与
+    「引擎没给信号」无法区分。处置 A 是「只让它可见」——**告警没了，缺陷就重新隐身**，
+    所以这两条钉的是「有它就必须说」与「没有就别乱说」。
+  */
+  it('一手都买不起会告警，并点名标的与次数（no silent caps）', () => {
+    const report = assembleReport({
+      results: [
+        codeResult({ code: 'SZ000001', trades: [], unaffordable: 12 }),
+        codeResult({ code: 'SH600309', trades: [], unaffordable: 3 }),
+      ],
+      meta,
+    })
+    const text = report.warnings.join(' ')
+    expect(text).toContain('买不起')
+    expect(text).toContain('SZ000001×12')
+    expect(text).toContain('SH600309×3')
+    // 「0 笔 ≠ 没给信号」这句话必须在，它才是这条告警存在的理由
+    expect(text).toContain('不代表引擎没给信号')
+  })
+
+  it('没有买不起的情形时不出这条告警', () => {
+    const report = assembleReport({ results: [codeResult()], meta })
+    expect(report.warnings.join(' ')).not.toContain('买不起')
   })
 
   it('抑制统计按次数降序', () => {

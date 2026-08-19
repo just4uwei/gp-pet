@@ -48,7 +48,7 @@
  * 好过一个方向错了的修正。名称只记进 `_meta.nameAtFetch` 供人工核对。
  */
 
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /**
@@ -114,6 +114,7 @@ const USAGE = `用法：
   --from <YYYY-MM-DD> 起始日，默认 2018-01-01（docs/07 §3 训练集起点）
   --to <YYYY-MM-DD>   截止日，默认今天
   --out <dir>         输出目录，默认 ./data/history
+  --allow-shrink      允许把已有文件截短（默认拒绝：本脚本整文件重写，小窗口请求会丢历史）
   --benchmark <code>  基准指数，默认 SH000300；给 none 可关闭
                       （它同时充当交易日历，用来标 has_gap）
   --concurrency <n>   同时在拉的**标的**数，默认 1（串行）。上限 2（4 实测会被 501 拦）
@@ -129,6 +130,7 @@ function parseArgs(argv) {
     benchmark: 'SH000300',
     concurrency: 1,
     dry: false,
+    allowShrink: false,
   }
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
@@ -149,6 +151,7 @@ function parseArgs(argv) {
       }
       args.concurrency = parsed
     } else if (flag === '--dry') args.dry = true
+    else if (flag === '--allow-shrink') args.allowShrink = true
     else if (flag === '--help' || flag === '-h') {
       process.stdout.write(USAGE)
       process.exit(0)
@@ -433,6 +436,8 @@ async function main(argv) {
   let tradingDays = null
   let ok = 0
   let written = 0
+  /** 因「会截短已有文件」而拒写的代码，最后单独报出来 —— 否则又是一次静默 */
+  const shrinkRefused = []
   const lines = []
 
   /**
@@ -476,6 +481,35 @@ async function main(argv) {
       return bundle
     }
     if (args.dry) return bundle
+
+    /*
+      ⚠ 覆盖保护：**本脚本每次都整文件重写**，只写这次请求的窗口。
+      于是「补 3 只票」这种小请求会把已有的长历史**截短**，而且一声不响 ——
+      2026-08-19 真踩过一次：`--codes 三只票 --from 2018-01-01` 把基准 `SH000300`
+      从 5183 根（2005-04-08 起）压成 2093 根，而 2005–2017 那段正是池外参照
+      （M2 §5.32）与波动率目标化实验（§5.37）的输入。
+      **基准最容易中招**，因为它是脚本自动加进来的（见 targets 那一行），不在你打的 --codes 里。
+    */
+    const target = join(args.out, `${code}.json`)
+    if (!args.allowShrink && existsSync(target)) {
+      let existingFirst
+      try {
+        const prev = JSON.parse(readFileSync(target, 'utf8'))
+        existingFirst = prev?.candles?.[0]?.date ?? null
+      } catch {
+        existingFirst = null // 读不动就当没有，正常写
+      }
+      const nextFirst = result.candles[0]?.date ?? null
+      if (existingFirst !== null && nextFirst !== null && nextFirst > existingFirst) {
+        process.stderr.write(
+          `  ✗ ${code} 拒绝写入：现有文件从 ${existingFirst} 起，这次只取到 ${nextFirst} 起 —— ` +
+            `写下去会**丢掉前面那段历史**。把 --from 提前，或确认要截短再加 --allow-shrink。
+`
+        )
+        shrinkRefused.push(code)
+        return bundle
+      }
+    }
 
     writeFileSync(
       join(args.out, `${code}.json`),
@@ -535,6 +569,18 @@ async function main(argv) {
   if (args.dry) {
     process.stdout.write('\ndry run，未写盘。\n')
     return ok === targets.length ? 0 : 1
+  }
+
+  if (shrinkRefused.length > 0) {
+    process.stdout.write(
+      `
+⚠ ${shrinkRefused.length} 个代码被拒绝写入（会丢历史）：${shrinkRefused.join(', ')}
+` +
+        `  多半是**基准被自动带进来了** —— 它不在你打的 --codes 里，却会按同一个 --from 重写。
+` +
+        `  补拉少数标的时用 --benchmark none，或把 --from 提前到与已有文件一致。
+`
+    )
   }
 
   process.stdout.write(
