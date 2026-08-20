@@ -591,6 +591,20 @@ export interface StratumResult {
   randomCounts: number[]
 }
 
+/**
+ * 择时零分布的时间结构（§4.6 / §5.42）。**读任何一个分位之前先看它是哪一档**：
+ *
+ * | 值 | 含义 | 分位可信度 |
+ * |---|---|---|
+ * | `INDEPENDENT` | 逐次独立抽日（2026-08-19 之前的唯一口径） | **未调整上界**，偏向显著 |
+ * | `BLOCK` | 按建仓月整块位移。**无条件口径下精确**（候选池含每一天 ⇒ 吸附恒 0） | 已做时间聚集调整 |
+ * | `REGIME_BLOCK` | 块 = (标的, 一段连续同状态行情)，整段刚性平移到同状态的另一段 —— `--match-regime` 下用它，**吸附恒 0 是结构保证** | 已调整，但要看块覆盖率 |
+ *
+ * 三档不是「越新越好」而是各管一种候选池：`BLOCK` 在同 regime 下会退化成吸附（§5.36 实测
+ * 按分层引入偏置），`REGIME_BLOCK` 在无条件下没有意义（整条序列就是一段）。
+ */
+export type TimingNull = 'BLOCK' | 'INDEPENDENT' | 'REGIME_BLOCK'
+
 export interface StratumRow {
   label: string
   realCount: number
@@ -659,12 +673,24 @@ export interface RandomAuditPayload {
      * `INDEPENDENT` 的分位是**未调整上界**（偏向显著），`BLOCK` 才是调整过的。
      * 跨票口径下恒为 null —— 它固定日期，本来就没有这个病。
      */
-    timingNull: 'BLOCK' | 'INDEPENDENT' | null
-    /** 为什么是这个结构。自动降级时这里是唯一说得清「为什么没调整」的地方 */
+    timingNull: TimingNull | null
+    /** 为什么是这个结构。降级或换块定义时这里是唯一说得清「为什么」的地方 */
     timingNullReason: string | null
-    /** BLOCK 下的块数（建仓月）与退回独立抽样的建仓数。退化必须可见 */
+    /** 块数（`BLOCK` 是建仓月 · `REGIME_BLOCK` 是「标的 × 同状态段」）与退回独立抽样的建仓数。退化必须可见 */
     blocks: number | null
     blockFallback: number | null
+    /**
+     * 块覆盖率 0..1 = 真的被块结构盖住的建仓占比。
+     * **低于 §5.42 预注册的 0.8 时，这一档的分位要按「未调整上界」读** —— 一个只盖住
+     * 一半建仓的调整与没调整的差别，读的人必须看得见。
+     */
+    blockCoverage: number | null
+    /**
+     * 逐 regime 的覆盖率（只有 `REGIME_BLOCK` 有）。分层报是必须的：块的定义就是状态段，
+     * 而不同状态的段长天生不同 ⇒ **某一层覆盖不足时只有那一层要按未调整看待**，
+     * 给一个总数会让人把整份报告一起打折或一起采信。
+     */
+    blockCoverageByRegime: readonly { regime: string; covered: number; total: number }[] | null
     /**
      * 吸附距离（交易根）的中位数与 90 分位。
      *
@@ -699,6 +725,91 @@ function regimeSeries(series: LoadedSeries, params: EngineParams, sentiment: num
   const indicators = computeIndicators(series.candles, params, { sentiment, intradayProgress: 1 })
   const classified = classifyRegimes(series.candles, indicators, params)
   return classified.map((r) => r.regime)
+}
+
+// ── regime 段块（`REGIME_BLOCK`，§5.42）────────────────────────────────────
+
+/**
+ * 块覆盖率的门槛。**预注册在 §5.42 里，不是事后挑的**：覆盖率低于这个数时，
+ * 报告要把这一档说成「未调整上界」而不是「已调整」—— 一个只盖住一半建仓的调整
+ * 与没调整的差别，读的人必须看得见。
+ */
+const REGIME_BLOCK_MIN_COVERAGE = 0.8
+
+interface RegimeBlock {
+  /** `标的#段号`，只用于报告 */
+  key: string
+  /** task 下标，按 `entryIdx` 升序 */
+  members: number[]
+  /** 各成员相对首成员的间距（交易根），与 `members` 同序。**这就是被保留的时间结构** */
+  rel: number[]
+  /** 合法落点：首成员可以放在哪些绝对下标上（此时每个成员都落在自己的 `pool` 里） */
+  bases: number[]
+}
+
+/** 极大同状态段（按**成交**下标给闭区间：`regimeAt(i) = seq[i-1]`，判定在成交那根的前一根） */
+export interface RegimeRun {
+  start: number
+  end: number
+  regime: Regime
+}
+
+/** 把一条 regime 序列切成极大同状态段。`seq` 的下标是判定根 ⇒ 成交下标要 +1 */
+export function regimeRuns(seq: readonly Regime[]): RegimeRun[] {
+  const runs: RegimeRun[] = []
+  for (let i = 0; i < seq.length; i++) {
+    const r = seq[i]
+    if (r === undefined) continue
+    const execIdx = i + 1
+    const last = runs[runs.length - 1]
+    if (last && last.regime === r && last.end === execIdx - 1) last.end = execIdx
+    else runs.push({ start: execIdx, end: execIdx, regime: r })
+  }
+  return runs
+}
+
+/**
+ * 找到每个块的合法落点：**整块刚性平移到同一状态的另一段里**。
+ *
+ * 判据只有一条：候选落点必须让**每个成员都落在它自己的 `pool` 里**（`pool` 已经编码了
+ * regime、预热与「跨度 + 顺延不能越过序列末尾」）。于是：
+ *
+ * - **吸附距离恒 0** —— 不再需要 `nearestInPool`，也就没有 §5.36 那个「吸附方向依赖于
+ *   该状态在这只票上的分布 ⇒ 按分层引入偏置」的病；
+ * - **块内间距逐位保留** —— 平移是刚性的；
+ * - **目标段必须是另一段**（`run !== source`），否则平移量可能小到把成员落回自己身边，
+ *   等于什么都没随机。
+ *
+ * ⚠ **它保住的与放弃的**：保住「同一段行情内部的聚集」，**放弃「跨票同月的同步」**
+ * （建仓月块保的是后者）。这是被迫的取舍 —— 同 regime 下每只票有自己的状态时间线，
+ * 一个跨票共用的位移根本落不下去（§5.36 实测 85% 的块交集为空）。
+ * 所以 `REGIME_BLOCK` 的分位仍然只是「比独立抽日更诚实」，不是「完全正确」。
+ */
+export function findBases(
+  members: readonly number[],
+  rel: readonly number[],
+  poolSets: readonly Set<number>[],
+  runs: readonly RegimeRun[],
+  source: RegimeRun
+): number[] {
+  const clusterSpan = rel[rel.length - 1] ?? 0
+  const bases: number[] = []
+  for (const run of runs) {
+    if (run === source) continue
+    if (run.regime !== source.regime) continue
+    for (let base = run.start; base + clusterSpan <= run.end; base++) {
+      let ok = true
+      for (let j = 0; j < members.length; j++) {
+        const set = poolSets[j]
+        if (!set || !set.has(base + (rel[j] ?? 0))) {
+          ok = false
+          break
+        }
+      }
+      if (ok) bases.push(base)
+    }
+  }
+  return bases
 }
 
 // ── 主流程 ───────────────────────────────────────────────────────────────
@@ -830,9 +941,12 @@ const USAGE = `用法：
   --independent-days     择时零分布退回**逐次独立抽日**（2026-08-19 之前的口径）。
                          默认是**按建仓月整块位移**（block permutation）：真实建仓成批发生，
                          独立抽日会打散这种时间聚集 ⇒ 零分布方差偏小 ⇒ 分位偏向显著。
-                         ⚠ **与 --match-regime 同用时会自动降级回独立抽日**：那一档的候选池
-                         稀疏，块位移只能靠吸附落地（实测中位 11 / P90 116 根），会按分层
-                         引入偏置。降级原因会打印在报告头上，分位按「未调整上界」读
+                         ⚠ **与 --match-regime 同用时换成 regime 段块**（§5.42）：块 = (标的,
+                         一段连续同状态行情)，整段刚性平移到同状态的另一段 ⇒ 吸附恒 0。
+                         2026-08-19 之前那一档是「降级回独立抽日」，理由是建仓月块在同 regime 下
+                         只能靠吸附落地（中位 11 / P90 116 根）、按分层引入偏置。
+                         报告头会印块数、**覆盖率**与逐层覆盖率；覆盖率低于 80%（预注册门槛）
+                         时那一档仍按「未调整上界」读
   --cross-pool <file>    **收窄跨票候选池**到「当天也有买入方向信号的票」
                          （pnpm audit:crosssec --out 的产物）。只与 --cross-code 同用。
                          排除「抽到当天毫无异动的票」这个替代解释（M2 §5.27 读法 2）。
@@ -1282,12 +1396,19 @@ export async function run(argv: readonly string[]): Promise<number> {
     **假装调整过比不调整更坏** —— 后者至少是可见的。
   */
   let timingNullReason: string | null = null
-  let effectiveTimingNull = opts.timingNull
+  let effectiveTimingNull: TimingNull = opts.timingNull
   if (!opts.crossCode && opts.timingNull === 'BLOCK' && opts.matchRegime) {
-    effectiveTimingNull = 'INDEPENDENT'
+    /*
+      2026-08-19 第二版（M2 §5.42 的预注册）：**不再降级回独立抽日，改用 regime 段块**。
+
+      上面那段说清了为什么「建仓月 + 吸附」在这一档不成立。修法不是把吸附调松，
+      而是换块的定义：块 = **(标的, 一段连续同状态行情)**，整块刚性平移到**同一状态的另一段**里。
+      于是 regime 约束由「目标段本身就是那个状态」保证 ⇒ **吸附距离恒 0 是结构性的**，
+      不再是一个需要实测的量。代价见 `buildRegimeBlocks` 头注释（放弃跨票同月的同步）。
+    */
+    effectiveTimingNull = 'REGIME_BLOCK'
     timingNullReason =
-      '--match-regime 下候选池稀疏，块位移要靠吸附落地（实测中位 11 / P90 116 根），' +
-      '会按分层引入偏置 ⇒ 自动降级为独立抽日，本次分位是**未调整上界**（§4.6，2026-08-19 实测）'
+      '--match-regime 下改用 regime 段块（块 = 一段连续同状态行情，整段刚性平移，吸附恒 0，§5.42）'
   }
   if (!opts.crossCode && effectiveTimingNull === 'BLOCK') {
     const byMonth = new Map<string, number[]>()
@@ -1330,6 +1451,77 @@ export async function run(argv: readonly string[]): Promise<number> {
         `覆盖 ${tasks.length - blockFallback}/${tasks.length} 次建仓` +
         (blockFallback > 0 ? `（⚠ ${blockFallback} 次无可用位移，退回独立抽样）` : '') +
         '\n'
+    )
+  }
+
+  /*
+    ③c `REGIME_BLOCK`：块 = (标的, 一段连续同状态行情)，整段刚性平移到同状态的另一段。
+    做法与取舍在 `findBases` 头注释里，判据与预测在 M2 §5.42（**写在跑之前**）。
+  */
+  const regimeBlocks: RegimeBlock[] = []
+  /** task 下标 → [块下标, 在块内的相对位移] */
+  const regimeBlockOfTask = new Map<number, { block: number; rel: number }>()
+  /** 逐层覆盖率：某一层覆盖不足时**只有那一层**要按未调整看待，所以要分层数 */
+  const regimeBlockCoverByStratum = new Map<string, { covered: number; total: number }>()
+  if (effectiveTimingNull === 'REGIME_BLOCK') {
+    const runsByCode = new Map<SecCode, RegimeRun[]>()
+    for (const [code, seq] of regimes) runsByCode.set(code, regimeRuns(seq))
+    /** `标的#段号` → task 下标 */
+    const byRun = new Map<string, number[]>()
+    const runIndexOf = new Map<number, number>()
+    tasks.forEach((t, i) => {
+      const runs = runsByCode.get(t.code)
+      if (!runs) return
+      const idx = runs.findIndex((r) => t.entryIdx >= r.start && t.entryIdx <= r.end)
+      if (idx < 0) return
+      runIndexOf.set(i, idx)
+      const key = `${t.code}#${idx}`
+      const list = byRun.get(key)
+      if (list) list.push(i)
+      else byRun.set(key, [i])
+    })
+    for (const [key, rawMembers] of byRun) {
+      const members = [...rawMembers].sort((a, b) => (tasks[a]?.entryIdx ?? 0) - (tasks[b]?.entryIdx ?? 0))
+      const head = tasks[members[0] ?? -1]
+      const runs = head ? runsByCode.get(head.code) : undefined
+      const runIdx = members[0] === undefined ? undefined : runIndexOf.get(members[0])
+      const source = runs && runIdx !== undefined ? runs[runIdx] : undefined
+      if (!head || !runs || !source) {
+        blockFallback += members.length
+        continue
+      }
+      const rel = members.map((i) => (tasks[i]?.entryIdx ?? 0) - head.entryIdx)
+      const poolSets = members.map((i) => new Set(tasks[i]?.pool ?? []))
+      const bases = findBases(members, rel, poolSets, runs, source)
+      if (bases.length === 0) {
+        // 同一只票上没有第二段够长的同状态行情 ⇒ 这一块退回独立抽样，且必须被数出来
+        blockFallback += members.length
+        continue
+      }
+      const b = regimeBlocks.length
+      regimeBlocks.push({ key, members, rel, bases })
+      members.forEach((i, j) => regimeBlockOfTask.set(i, { block: b, rel: rel[j] ?? 0 }))
+    }
+    // 逐层覆盖率：按 regimeAtEntry 分（那是这一档唯一有意义的切法 —— 块的定义就是状态段）
+    tasks.forEach((t, i) => {
+      const key = t.position.regimeAtEntry
+      const acc = regimeBlockCoverByStratum.get(key) ?? { covered: 0, total: 0 }
+      acc.total++
+      if (regimeBlockOfTask.has(i)) acc.covered++
+      regimeBlockCoverByStratum.set(key, acc)
+    })
+    const covered = tasks.length - blockFallback
+    const coverage = tasks.length === 0 ? 0 : covered / tasks.length
+    const perStratum = [...regimeBlockCoverByStratum.entries()]
+      .map(([k, v]) => `${k} ${((v.covered / Math.max(1, v.total)) * 100).toFixed(1)}%`)
+      .join(' · ')
+    process.stderr.write(
+      `择时零分布：regime 段整段平移 · ${regimeBlocks.length} 块 · ` +
+        `覆盖 ${covered}/${tasks.length} = ${(coverage * 100).toFixed(1)}%` +
+        (coverage < REGIME_BLOCK_MIN_COVERAGE
+          ? `（⚠ 低于预注册门槛 ${(REGIME_BLOCK_MIN_COVERAGE * 100).toFixed(0)}% ⇒ 按未调整上界读）`
+          : '') +
+        ` · 吸附恒 0（结构保证）· 逐层：${perStratum}\n`
     )
   }
 
@@ -1402,6 +1594,8 @@ export async function run(argv: readonly string[]): Promise<number> {
     }
     // 每块抽一个位移，块内所有建仓共用它 —— 这就是「保留时间聚集」的全部实现
     const shiftOfBlock = blocks.map((b) => b.offsets[Math.floor(rng() * b.offsets.length)] ?? 0)
+    // regime 段块：抽的是**首成员的落点**，成员各自加自己的 rel ⇒ 间距逐位保留、无需吸附
+    const baseOfRegimeBlock = regimeBlocks.map((b) => b.bases[Math.floor(rng() * b.bases.length)] ?? 0)
     const bucket = new Map<string, FillResult[]>()
     const passiveBucket = new Map<string, FillResult[]>()
     for (const s of strata) {
@@ -1441,8 +1635,18 @@ export async function run(argv: readonly string[]): Promise<number> {
           //（那只发生在涨跌停作废的少数样本上）
           const blockIdx = blockOfTask.get(i)
           const shift = attempt === 0 && blockIdx !== undefined ? shiftOfBlock[blockIdx] : undefined
+          // regime 段块与建仓月块互斥（前者只在 --match-regime 下建），所以这里不会两条都命中
+          const rb = attempt === 0 ? regimeBlockOfTask.get(i) : undefined
           let pick: number | undefined
-          if (shift === undefined) {
+          if (rb !== undefined) {
+            const base = baseOfRegimeBlock[rb.block]
+            // 落点由 `findBases` 保证在 pool 里 ⇒ 吸附距离恒 0，如实记 0（别不记：
+            // 报告里那行「吸附 中位/P90」是两档口径共用的，不记会显示成「—」= 看不出有没有调整）
+            if (base !== undefined) {
+              pick = base + rb.rel
+              snapDistances.push(0)
+            }
+          } else if (shift === undefined) {
             pick = t.pool[Math.floor(rng() * t.pool.length)]
           } else {
             const target = t.entryIdx + shift
@@ -1522,8 +1726,23 @@ export async function run(argv: readonly string[]): Promise<number> {
       crossPool: opts.crossPool,
       timingNull: opts.crossCode ? null : effectiveTimingNull,
       timingNullReason,
-      blocks: opts.crossCode || effectiveTimingNull !== 'BLOCK' ? null : blocks.length,
-      blockFallback: opts.crossCode || effectiveTimingNull !== 'BLOCK' ? null : blockFallback,
+      blocks:
+        opts.crossCode || effectiveTimingNull === 'INDEPENDENT'
+          ? null
+          : effectiveTimingNull === 'REGIME_BLOCK'
+            ? regimeBlocks.length
+            : blocks.length,
+      blockFallback: opts.crossCode || effectiveTimingNull === 'INDEPENDENT' ? null : blockFallback,
+      blockCoverage:
+        opts.crossCode || effectiveTimingNull === 'INDEPENDENT' || tasks.length === 0
+          ? null
+          : (tasks.length - blockFallback) / tasks.length,
+      blockCoverageByRegime:
+        effectiveTimingNull !== 'REGIME_BLOCK'
+          ? null
+          : [...regimeBlockCoverByStratum.entries()]
+              .map(([regime, v]) => ({ regime, covered: v.covered, total: v.total }))
+              .sort((a, b) => (a.regime < b.regime ? -1 : 1)),
       snapMedian: snapDistances.length === 0 ? null : quantile([...snapDistances].sort((a, b) => a - b), 0.5),
       snapP90: snapDistances.length === 0 ? null : quantile([...snapDistances].sort((a, b) => a - b), 0.9),
       warmup: opts.warmup,
@@ -1635,6 +1854,31 @@ function renderText(p: RandomAuditPayload): string {
         ` · 吸附距离 中位 ${m.snapMedian ?? '—'} / P90 ${m.snapP90 ?? '—'} 根` +
         ' ⇒ 分位**已做时间聚集调整**（块内残余自相关仍在，仍略偏乐观；吸附距离越大调整越名义）'
     )
+  } else if (m.timingNull === 'REGIME_BLOCK') {
+    const cov = m.blockCoverage
+    const enough = cov !== null && cov >= REGIME_BLOCK_MIN_COVERAGE
+    lines.push(
+      `零分布结构 regime 段整段平移（块 = 标的 × 一段连续同状态行情，§5.42）· ${m.blocks} 块` +
+        ` · 覆盖 ${cov === null ? '—' : `${(cov * 100).toFixed(1)}%`}` +
+        (m.blockFallback && m.blockFallback > 0 ? `（${m.blockFallback} 次无第二段同状态行情，退回独立抽样）` : '') +
+        ` · 吸附距离 中位 ${m.snapMedian ?? '—'} / P90 ${m.snapP90 ?? '—'} 根（结构上恒 0）` +
+        (enough
+          ? ' ⇒ 分位**已做时间聚集调整**（段内残余自相关仍在，仍略偏乐观）'
+          : ` ⇒ ⚠ **覆盖率低于预注册门槛 ${(REGIME_BLOCK_MIN_COVERAGE * 100).toFixed(0)}%，下面的分位仍按未调整上界读**`)
+    )
+    if (m.blockCoverageByRegime !== null) {
+      lines.push(
+        '           逐层覆盖 ' +
+          m.blockCoverageByRegime
+            .map((r) => {
+              const pct = (r.covered / Math.max(1, r.total)) * 100
+              const flag = pct / 100 < REGIME_BLOCK_MIN_COVERAGE ? ' ⚠' : ''
+              return `${r.regime} ${pct.toFixed(1)}%（${r.covered}/${r.total}）${flag}`
+            })
+            .join(' · ') +
+          '  ← 带 ⚠ 的那一层按未调整上界读'
+      )
+    }
   } else if (m.timingNull === 'INDEPENDENT') {
     lines.push(
       '零分布结构 逐次独立抽日 ⇒ **零分布方差偏小，下面所有分位都是未调整上界、偏向显著**（§4.6）'

@@ -163,12 +163,16 @@ interface AlphaSnapshot {
   shuffleSpans: boolean
   seed: number
   /**
-   * 零分布的时间结构（2026-08-19，迭代计划 §4.6）。看板必须把它印出来 ——
-   * `INDEPENDENT` 的分位是**未调整上界**（偏向显著），只报数字不报口径正是 §4.6 记的那条
-   * 报告缺陷。旧报告没有这个字段，那种情况按未调整看待（`null` ⇒ 当上界读）。
+   * 零分布的时间结构（2026-08-19，迭代计划 §4.6 / M2 §5.42）。看板必须把它印出来 ——
+   * 只报数字不报口径正是 §4.6 记的那条报告缺陷。三档的读法各不相同：
+   * `INDEPENDENT` 是**未调整上界**（偏向显著）· `BLOCK` 已做时间聚集调整 ·
+   * `REGIME_BLOCK` 换了零点定义（段内聚集保留、吸附恒 0），**但它与前两档不可互相替代**。
+   * 旧报告没有这个字段，那种情况按未调整看待（`null` ⇒ 当上界读）。
    */
-  timingNull: 'BLOCK' | 'INDEPENDENT' | null
+  timingNull: 'BLOCK' | 'INDEPENDENT' | 'REGIME_BLOCK' | null
   timingNullReason: string | null
+  /** `REGIME_BLOCK` 的块覆盖率（0..1）。低于 0.8 时那一档仍按未调整上界读（§5.42 预注册门槛） */
+  blockCoverage: number | null
   crossCode: boolean
   byStratum: { label: string; count: number; paired: number | null; percentile: number }[]
 }
@@ -186,8 +190,9 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
           engineVersion?: string
           matchRegime?: boolean
           seed?: number
-          timingNull?: 'BLOCK' | 'INDEPENDENT' | null
+          timingNull?: 'BLOCK' | 'INDEPENDENT' | 'REGIME_BLOCK' | null
           timingNullReason?: string | null
+          blockCoverage?: number | null
           crossCode?: boolean
         }
         strata?: {
@@ -207,6 +212,7 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
         seed: j.meta?.seed ?? 0,
         timingNull: j.meta?.timingNull ?? null,
         timingNullReason: j.meta?.timingNullReason ?? null,
+        blockCoverage: j.meta?.blockCoverage ?? null,
         crossCode: j.meta?.crossCode === true,
         byStratum: j.strata
           .filter((s) => core.includes(s.label))
@@ -829,6 +835,20 @@ function render(input: {
       L.push('> 跨票口径固定日期 ⇒ 真实建仓的时间聚集原样保留，**无需时间结构调整**（§4.6 的例外）。')
     } else if (a.timingNull === 'BLOCK') {
       L.push('> 零分布按建仓月**整块位移**（§4.6）⇒ 分位**已做时间聚集调整**（块内残余自相关仍在，仍略偏乐观）。')
+    } else if (a.timingNull === 'REGIME_BLOCK') {
+      const cov = a.blockCoverage
+      L.push(
+        '> 零分布按 **regime 段整段平移**（块 = 标的 × 一段连续同状态行情，§5.42）· ' +
+          `覆盖 ${cov === null ? '—' : pct(cov)} · 吸附恒 0。`
+      )
+      L.push(
+        '> ⚠ **它与「独立抽日」的差别不只是方差，还有成分**：实测随机组的 sd 几乎没动、均值上移' +
+          '（RANGE +0.19pp/次）⇒ 长段被按位置数加权。所以两档的数**不可互相替代**，' +
+          '同一层跨口径的差可以有 20pp（RANGE 65.0 → 43.5）。**别单独引用任何一档**（§5.42）。'
+      )
+      if (cov !== null && cov < 0.8) {
+        L.push('> ⚠ 覆盖率低于预注册门槛 80% ⇒ 这一档仍按**未调整上界**读。')
+      }
     } else {
       L.push(
         '> ⚠ 零分布是**逐次独立抽日** ⇒ 方差偏小 ⇒ **上面每一个分位都是未调整上界、偏向显著**（§4.6）。' +

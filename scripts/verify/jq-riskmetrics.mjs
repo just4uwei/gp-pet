@@ -93,6 +93,57 @@ function annualized(totalReturn, bars) {
 
 const pct = (v, digits = 2) => (v === null || v === undefined ? '—' : `${(v * 100).toFixed(digits)}%`)
 
+/**
+ * 凯利仓位（[配置形态论证 §10](../../docs/notes/配置形态-论证.md)）—— **参考量，不是判据**。
+ *
+ * 两个都算，因为它们回答的不是同一个问题：
+ * - `binary`：`f* = p − q/b`，`p`/`b` 取报告的**建仓级**胜率与盈亏比。它假设赔付固定，我们不是。
+ * - `empirical`：把 `trades` 按 `code+entryDate` 归并成建仓级收益率，在 `f ∈ [0,3]` 上
+ *   直接最大化 `E[log(1+f·r)]`。这是不假设分布的那个版本，也是该引用的那个。
+ *
+ * ⚠ **`f* ≤ 0` 时它说的是「不下注」，不是「调小一点」。** 而 `f*` 对 `p` 的导数 ≈ 1+1/b ≈ 2
+ * ⇒ 小样本上 `f*` 的一个标准误可能比点估计本身还大（ETF 那份 59 次建仓：±13pp vs +8.21%）。
+ */
+function kellyOf(report) {
+  const ps = report.performance?.positions
+  const p = ps?.winRate ?? null
+  const b = ps?.payoffRatio ?? null
+  const binary = p === null || b === null || b <= 0 ? null : p - (1 - p) / b
+
+  const trades = Array.isArray(report.trades) ? report.trades : []
+  const byPosition = new Map()
+  for (const t of trades) {
+    const key = `${t.code}|${t.entryDate}`
+    const acc = byPosition.get(key) ?? { pnl: 0, cost: 0 }
+    acc.pnl += t.pnl ?? 0
+    acc.cost += (t.entryPrice ?? 0) * (t.shares ?? 0)
+    byPosition.set(key, acc)
+  }
+  const returns = [...byPosition.values()].filter((o) => o.cost > 0).map((o) => o.pnl / o.cost)
+  let empirical = null
+  if (returns.length >= 2) {
+    let best = { f: 0, u: 0 }
+    // f = 0 的效用恰好是 0（log 1）⇒ 扫不到更好的就是「不下注」，这正是我们要看的答案
+    for (let f = 0.02; f <= 3.0001; f += 0.02) {
+      let sum = 0
+      let ok = true
+      for (const r of returns) {
+        const growth = 1 + f * r
+        if (growth <= 0) {
+          ok = false
+          break
+        }
+        sum += Math.log(growth)
+      }
+      if (!ok) break
+      const u = sum / returns.length
+      if (u > best.u) best = { f, u }
+    }
+    empirical = { f: best.f, positions: returns.length, mean: mean(returns) }
+  }
+  return { p, b, binary, empirical }
+}
+
 for (const file of files) {
   const report = JSON.parse(readFileSync(file, 'utf8'))
   const equity = report.equity
@@ -124,6 +175,7 @@ for (const file of files) {
   const Rm = annualized(perf.benchmarkReturn, bars)
   const alphaAt = (rf) => (Rp === null || Rm === null || beta === null ? null : Rp - (rf + beta * (Rm - rf)))
 
+  const kelly = kellyOf(report)
   const divExcess = (1 + perf.totalReturn) / (1 + perf.benchmarkReturn) - 1
   let wins = 0
   let benchDown = 0
@@ -145,6 +197,13 @@ for (const file of files) {
       `  超额：减法 ${pct(perf.excessReturn)}（老口径）  除法 ${pct(divExcess)}（引用用这个；两者现在报告里都有）`,
       `  日胜率 ${pct(wins / n, 1)}   基准下跌天数占比 ${pct(benchDown / n, 1)}  ← 两者接近 ⇒ 日胜率没有信息量`,
       `  年化波动：策略 ${pct(Math.sqrt(varP * BARS_PER_YEAR))}   基准 ${pct(Math.sqrt(varM * BARS_PER_YEAR))}`,
+      `  凯利（参考量，不是判据）：建仓级 p ${pct(kelly.p)} · b ${kelly.b === null ? '—' : kelly.b.toFixed(3)}` +
+        ` ⇒ 二元 f* ${pct(kelly.binary)}` +
+        (kelly.empirical === null
+          ? ''
+          : ` · 经验分布 f* ${kelly.empirical.f.toFixed(2)}（${kelly.empirical.positions} 次建仓，` +
+            `平均 ${pct(kelly.empirical.mean, 3)}）`),
+      '  ↑ f* ≤ 0 的含义是「不下注」而不是「调小」；小样本上它的标准误可能比点估计还大（§10.2）',
       '',
     ].join('\n')
   )

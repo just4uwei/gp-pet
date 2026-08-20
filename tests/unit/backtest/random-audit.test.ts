@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { nearestInPool } from '@backtest/random-audit'
+import { findBases, nearestInPool, regimeRuns, type RegimeRun } from '@backtest/random-audit'
 
 describe('块位移的吸附：nearestInPool', () => {
   it('目标就在池里时原样返回', () => {
@@ -61,5 +61,86 @@ describe('块位移的吸附：nearestInPool', () => {
   it('池里只有 exclude 一个元素 ⇒ null（调用方据此退回独立抽样，不许静默用 exclude）', () => {
     expect(nearestInPool([20], 20, 20)).toBeNull()
     expect(nearestInPool([], 20, -1)).toBeNull()
+  })
+})
+
+/**
+ * regime 段块（M2 §5.42，2026-08-19）—— **同 regime 口径的第二版修法**。
+ *
+ * 第一版（建仓月 + 吸附）在这一档失败了：候选池只含同状态的天、稀疏，共用位移要靠吸附
+ * 落地（实测中位 11 / P90 116 根），而吸附方向依赖该状态在这只票上的分布 ⇒ 按分层引入偏置。
+ * 第二版换块的定义：块 = **(标的, 一段连续同状态行情)**，整段刚性平移到**同状态的另一段**。
+ *
+ * 下面守的是这一版的两条结构性质 —— 它们是「吸附恒 0」的全部依据：
+ * ① 段的切法与判定根的错位（`regimeAt(i) = seq[i-1]`）；
+ * ② 落点必须让**每个**成员都落在自己的 `pool` 里，否则不算合法落点。
+ */
+describe('regime 段块：regimeRuns', () => {
+  it('切成极大同状态段，且下标按「成交根 = 判定根 + 1」错一位', () => {
+    // 判定序列下标 0,1 是 RANGE ⇒ 成交下标 1,2；下标 2,3,4 是 TREND_UP ⇒ 成交下标 3,4,5
+    const runs = regimeRuns(['RANGE', 'RANGE', 'TREND_UP', 'TREND_UP', 'TREND_UP'])
+    expect(runs).toEqual([
+      { start: 1, end: 2, regime: 'RANGE' },
+      { start: 3, end: 5, regime: 'TREND_UP' },
+    ])
+  })
+
+  it('同一个状态被别的状态隔开时算两段（这正是「另一段」的来源）', () => {
+    const runs = regimeRuns(['RANGE', 'TREND_UP', 'RANGE'])
+    expect(runs.map((r) => r.regime)).toEqual(['RANGE', 'TREND_UP', 'RANGE'])
+    expect(runs.map((r) => [r.start, r.end])).toEqual([
+      [1, 1],
+      [2, 2],
+      [3, 3],
+    ])
+  })
+
+  it('空序列不抛错', () => {
+    expect(regimeRuns([])).toEqual([])
+  })
+})
+
+describe('regime 段块：findBases', () => {
+  const runs: RegimeRun[] = [
+    { start: 0, end: 9, regime: 'RANGE' },
+    { start: 10, end: 19, regime: 'TREND_UP' },
+    { start: 20, end: 29, regime: 'RANGE' },
+  ]
+  const source = runs[0] as RegimeRun
+  /** 池 = 目标段那 10 根全合法 */
+  const fullPool = () => new Set([20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
+
+  it('整段刚性平移：块内间距逐位保留，落点只在同状态的另一段里', () => {
+    // 两次建仓相距 3 根 ⇒ 首成员能放在 20..26（26+3 = 29 是段尾）
+    const bases = findBases([0, 1], [0, 3], [fullPool(), fullPool()], runs, source)
+    expect(bases).toEqual([20, 21, 22, 23, 24, 25, 26])
+  })
+
+  it('**任一**成员落到自己 pool 外就不是合法落点（regime 与边界约束一条都没松）', () => {
+    // 第二个成员的池挖掉 24 ⇒ 首成员放 21 会让它落在 24 上 ⇒ 21 必须被排除
+    const holed = fullPool()
+    holed.delete(24)
+    const bases = findBases([0, 1], [0, 3], [fullPool(), holed], runs, source)
+    expect(bases).not.toContain(21)
+    expect(bases).toContain(20)
+  })
+
+  it('不同状态的段与源段本身都不是候选（源段本身会把样本落回真实入场附近）', () => {
+    // 只有 TREND_UP 段的下标进池 ⇒ 一个合法落点都没有（状态不匹配）
+    const trendOnly = new Set([10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
+    expect(findBases([0], [0], [trendOnly], runs, source)).toEqual([])
+    // 池里只有源段自己的下标 ⇒ 同样没有落点
+    const sourceOnly = new Set([0, 1, 2, 3, 4])
+    expect(findBases([0], [0], [sourceOnly], runs, source)).toEqual([])
+  })
+
+  it('目标段短于块的跨度时放不进去 ⇒ 该块无落点（会被记进 blockFallback）', () => {
+    const shortRuns: RegimeRun[] = [
+      { start: 0, end: 9, regime: 'RANGE' },
+      { start: 10, end: 12, regime: 'RANGE' },
+    ]
+    const pool = new Set([10, 11, 12])
+    // 块跨度 5 根，目标段只有 3 根
+    expect(findBases([0, 1], [0, 5], [pool, pool], shortRuns, shortRuns[0] as RegimeRun)).toEqual([])
   })
 })
