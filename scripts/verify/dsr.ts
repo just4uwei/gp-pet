@@ -40,8 +40,19 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 
+import {
+  BARS_PER_YEAR,
+  mean,
+  normCdf,
+  normInv,
+  pearsonKurtosis,
+  returnsFromEquity,
+  sampleStdev,
+  sharpeVarianceTerm,
+  skewness,
+} from './stats'
+
 const CALIB_DIR = join(process.cwd(), 'reports', 'calib')
-const BARS_PER_YEAR = 243
 const EULER_MASCHERONI = 0.5772156649015329
 
 /** 那 10 张 `--grid` 报告（顶层含 `candidates` 的都算） */
@@ -96,64 +107,6 @@ function collectTrials(files: readonly string[]): Trial[] {
   return out
 }
 
-function mean(xs: readonly number[]): number {
-  return xs.reduce((a, b) => a + b, 0) / xs.length
-}
-
-/** 样本方差（n−1），与 `metrics.ts` 的 `sampleStdev` 同口径 */
-function sampleVariance(xs: readonly number[]): number {
-  const m = mean(xs)
-  return xs.reduce((a, b) => a + (b - m) * (b - m), 0) / (xs.length - 1)
-}
-
-function centralMoment(xs: readonly number[], k: number): number {
-  const m = mean(xs)
-  return xs.reduce((a, b) => a + Math.pow(b - m, k), 0) / xs.length
-}
-
-/** 偏度 `γ₃ = m₃/m₂^1.5`（总体口径） */
-function skewness(xs: readonly number[]): number {
-  return centralMoment(xs, 3) / Math.pow(centralMoment(xs, 2), 1.5)
-}
-
-/** **皮尔逊**峰度 `γ₄ = m₄/m₂²`（正态 = 3，不是超额峰度） */
-function pearsonKurtosis(xs: readonly number[]): number {
-  return centralMoment(xs, 4) / Math.pow(centralMoment(xs, 2), 2)
-}
-
-/** 标准正态 CDF（Abramowitz & Stegun 7.1.26 的 erf 有理近似，|ε| < 1.5e-7） */
-function normCdf(z: number): number {
-  const sign = z < 0 ? -1 : 1
-  const x = Math.abs(z) / Math.SQRT2
-  const t = 1 / (1 + 0.3275911 * x)
-  const y =
-    1 -
-    ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) *
-      t *
-      Math.exp(-x * x)
-  return 0.5 * (1 + sign * y)
-}
-
-/** 标准正态分位（Acklam 有理近似，|ε| < 1.15e-9） */
-function normInv(p: number): number {
-  const a = [-3.969683028665376e1, 2.209460984245205e2, -2.759285104469687e2, 1.38357751867269e2, -3.066479806614716e1, 2.506628277459239]
-  const b = [-5.447609879822406e1, 1.615858368580409e2, -1.556989798598866e2, 6.680131188771972e1, -1.328068155288572e1]
-  const c = [-7.784894002430293e-3, -3.223964580411365e-1, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783]
-  const d = [7.784695709041462e-3, 3.224671290700398e-1, 2.445134137142996, 3.754408661907416]
-  const pLow = 0.02425
-  if (p < pLow) {
-    const q = Math.sqrt(-2 * Math.log(p))
-    return (((((c[0]! * q + c[1]!) * q + c[2]!) * q + c[3]!) * q + c[4]!) * q + c[5]!) / ((((d[0]! * q + d[1]!) * q + d[2]!) * q + d[3]!) * q + 1)
-  }
-  if (p <= 1 - pLow) {
-    const q = p - 0.5
-    const r = q * q
-    return (((((a[0]! * r + a[1]!) * r + a[2]!) * r + a[3]!) * r + a[4]!) * r + a[5]!) * q / (((((b[0]! * r + b[1]!) * r + b[2]!) * r + b[3]!) * r + b[4]!) * r + 1)
-  }
-  const q = Math.sqrt(-2 * Math.log(1 - p))
-  return -(((((c[0]! * q + c[1]!) * q + c[2]!) * q + c[3]!) * q + c[4]!) * q + c[5]!) / ((((d[0]! * q + d[1]!) * q + d[2]!) * q + d[3]!) * q + 1)
-}
-
 /**
  * 期望最大夏普 `SR̂₀`（零均值零假设下）。`sdTrials` 与返回值同频。
  *
@@ -174,7 +127,7 @@ function dsr(
   denomAt: 'observed' | 'benchmark',
 ): { z: number; p: number; denom: number } {
   const s = denomAt === 'observed' ? srDaily : sr0Daily
-  const denom = Math.sqrt(1 - skew * s + ((kurt - 1) / 4) * s * s)
+  const denom = Math.sqrt(sharpeVarianceTerm(s, skew, kurt))
   const z = ((srDaily - sr0Daily) * Math.sqrt(t - 1)) / denom
   return { z, p: normCdf(z), denom }
 }
@@ -232,7 +185,7 @@ function main(): void {
   const uniq = [...byFingerprint.values()]
   const annual = uniq.map((t) => t.sharpeAnnual)
   const daily = annual.map((s) => s / Math.sqrt(BARS_PER_YEAR))
-  const sdDaily = Math.sqrt(sampleVariance(daily))
+  const sdDaily = sampleStdev(daily)
   const sorted = [...annual].sort((a, b) => a - b)
 
   console.log('# DSR —— 多重比较的正式处理（M2 §5.48）\n')
@@ -249,9 +202,9 @@ function main(): void {
   console.log(`训练窗口 bars = ${uniq[0]!.bars}`)
   console.log('')
   console.log(`年化夏普：最小 ${pct(sorted[0]!)} · 中位 ${pct(sorted[Math.floor(sorted.length / 2)]!)} · 最大 ${pct(sorted[sorted.length - 1]!)} · 极差 ${pct(sorted[sorted.length - 1]! - sorted[0]!)}`)
-  console.log(`年化夏普 sd = ${pct(Math.sqrt(sampleVariance(annual)))} ⇒ 日频 sd = ${pct(sdDaily, 6)}`)
+  console.log(`年化夏普 sd = ${pct(sampleStdev(annual))} ⇒ 日频 sd = ${pct(sdDaily, 6)}`)
   const m = mean(annual)
-  const sdA = Math.sqrt(sampleVariance(annual))
+  const sdA = sampleStdev(annual)
   const outliers = uniq.filter((t) => Math.abs(t.sharpeAnnual - m) > 3 * sdA)
   console.log(`离群（|x−mean| > 3sd）：${outliers.length === 0 ? '无' : outliers.map((t) => `${t.file}:${t.axis}=${pct(t.sharpeAnnual)}`).join(' · ')}`)
   console.log(`夏普为正的候选：${annual.filter((s) => s > 0).length} / ${annual.length}`)
@@ -262,14 +215,9 @@ function main(): void {
     performance: { sharpe: number | null; totalReturn: number; maxDrawdown: number }
     equity: Array<{ date: string; equity: number }>
   }
-  const rets: number[] = []
-  for (let i = 1; i < base.equity.length; i++) {
-    const prev = base.equity[i - 1]!.equity
-    const cur = base.equity[i]!.equity
-    if (prev > 0) rets.push(cur / prev - 1)
-  }
+  const rets = returnsFromEquity(base.equity)
   const t = rets.length
-  const srDaily = mean(rets) / Math.sqrt(sampleVariance(rets))
+  const srDaily = mean(rets) / sampleStdev(rets)
   const skew = skewness(rets)
   const kurt = pearsonKurtosis(rets)
 
