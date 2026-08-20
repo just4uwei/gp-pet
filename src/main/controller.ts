@@ -33,6 +33,7 @@ import type {
   DailyReport,
   EngineStatus,
   EntryCheckView,
+  IndicatorSnapshotView,
   IntradaySeries,
   MaintenanceResult,
   ParamRow,
@@ -57,6 +58,7 @@ import type {
   WatchPointDraft,
   WatchPointView,
 } from '@shared/ipc-types'
+import { INDICATOR_CATALOG } from '@shared/indicator-catalog'
 import type { Board, Candle, Position, SecCode, Snapshot, TradeDate } from '@core/types'
 import { DEFAULT_PARAMS, engineVersionOf, withSensitivity } from '@core/params'
 import { sma } from '@core/indicators/series'
@@ -86,7 +88,7 @@ import { alertTrackOf } from './alerts/track'
 import { createNotificationStateProbe, type NotificationStateProbe } from './alerts/notification-state'
 import type { DataLayer } from './data-layer'
 import type { SignalOutcome } from './engine'
-import { BENCHMARK_CODE, expectedLastBar, industryMapOf, industryValueShares } from './engine'
+import { BENCHMARK_CODE, expectedLastBar, industryMapOf, industryValueShares, snapshotOfIndicators } from './engine'
 import { log } from './logging'
 import { shanghaiTime, type TickContext } from './scheduler'
 import { META_KEYS } from './storage/repositories/meta'
@@ -1023,6 +1025,51 @@ export class AppController {
       ...(result.dayPosition === undefined ? {} : { dayPosition: result.dayPosition }),
       ...(result.amount === undefined ? {} : { amount: result.amount }),
       ...(shareAfter === undefined ? {} : { industryShareAfter: shareAfter }),
+    }
+  }
+
+  /**
+   * 「当前指标」面板（`indicators:current`）。**就地评估一次**，不落库、不发网络请求。
+   *
+   * 三条边界：
+   *
+   * 1. **不复用「最新那条信号」的指标快照** —— 那条可能是三天前的，
+   *    而这一屏答的是「现在什么样」。拿旧快照冒充当前值与日报那条
+   *    「报的是当前交易日、不是库里最后一根」是同一形状的失真。
+   * 2. **拿不到评估就抛错，不返回一屏 0。** 未预热的指标是 `null`（约束 4），
+   *    而「这只票压根评估不了」与「指标是 0」是两件事。
+   * 3. **只带指标目录引用到的那些参数**（含标定状态）。整张参数表在设置页，
+   *    这里给的是「这个阈值有没有依据」——那是这一屏与行情软件指标栏的唯一区别。
+   */
+  indicatorSnapshot(code: SecCode): IndicatorSnapshotView {
+    const layer = this.data
+    if (!layer) throw new Error('数据层还没就绪，稍后再试')
+    if (!layer.storage.watchlist.get(code)) {
+      throw new Error('这只票不在自选里 —— 先加进来，引擎才会为它备日线与指标')
+    }
+    const evaluation = layer.assess(code)
+    if (!evaluation) throw new Error('这只票的日线还不够，算不出指标（不是「指标为 0」）')
+
+    // 目录里引用到的参数路径，去重后按 paramRows 的归档取状态
+    const wanted = new Set(INDICATOR_CATALOG.flatMap((meta) => meta.paramPaths ?? []))
+    const params = this.paramRows()
+      .map((row) => ({ path: `${row.group}.${row.key}`, row }))
+      .filter(({ path }) => wanted.has(path))
+      .map(({ path, row }) => ({
+        path,
+        value: row.value,
+        status: row.status,
+        ...(row.note === undefined ? {} : { note: row.note }),
+      }))
+
+    return {
+      code,
+      date: evaluation.date,
+      stage: evaluation.signal.stage,
+      regime: evaluation.signal.regime,
+      buyScore: evaluation.combine.breakdown.BUY.final,
+      values: snapshotOfIndicators(evaluation.indicators, evaluation.index),
+      params,
     }
   }
 

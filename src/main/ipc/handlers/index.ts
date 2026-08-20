@@ -110,6 +110,9 @@ export function registerHandlers(controller: AppController): void {
     })
   )
 
+  // 「当前指标」面板。与上面那条的关键差别：**它不发网络请求**，只读本地日线 + 就地评估一次
+  handle('indicators:current', (_event, code) => controller.indicatorSnapshot(normalizeCode(code)))
+
   // ── 提醒日志（M3，docs/05 §6）─────────────────────────────────────
   // 与「今日信号」是两张表两件事：signal 表回答「引擎判了什么」，
   // alert_log 回答「它有没有真的提醒我，没提醒是被哪道闸门挡的」

@@ -575,6 +575,34 @@ export interface ShadowSummary {
  * 而排查路径是「用户改坏了 → 零信号 → 以为程序坏了」。
  * 可调的只有灵敏度三档（同样标注未标定）与提醒级别偏移。
  */
+/**
+ * 「当前指标」面板的一屏（`indicators:current`，docs/06 §2.4）。
+ *
+ * **为什么不复用「最新那条信号」里的指标快照**：那条可能是三天前的，
+ * 而这一屏答的是「这只票**现在**什么样」—— 拿旧快照冒充当前值，
+ * 是这个项目一直在防的那类失真（与日报「当前交易日」那条同一形状）。
+ */
+export interface IndicatorSnapshotView {
+  code: SecCode
+  /** 被判定那根 K 线的日期 */
+  date: TradeDate
+  /**
+   * `CONFIRMED` = 收盘线上算的（定稿）· `PROVISIONAL` = 盘中临时线（**会抖**）。
+   * 面板据此显示「未定稿」标记 —— 与日报 `stage` 同一条纪律。
+   */
+  stage: SignalStage
+  regime: Regime
+  /** 组合层的买入方向得分 0..1。**它不是「上涨概率」**，措辞纪律禁止那样叫 */
+  buyScore: number | null
+  /** 指标键 → 当日值；未预热的指标是 **null 而不是 0**（约束 4） */
+  values: Record<string, number | null>
+  /**
+   * 指标目录里引用到的那些参数的**当前值 + 标定状态**。
+   * 面板把它挂在指标旁边 —— 「这个阈值有没有依据」是这一屏与行情软件指标栏的唯一区别。
+   */
+  params: { path: string; value: string; status: ParamRow['status']; note?: string }[]
+}
+
 export interface ParamRow {
   /** 参数块，如 `combine` / `risk` */
   group: string
@@ -1211,6 +1239,11 @@ export interface IpcInvokeMap {
    * 由用户交互直接触发取数的地方；轮询那份请求预算（docs/03 §2.4）不包含它，
    * 也不许反过来让 tick 去调它。
    */
+  /**
+   * 「当前指标」面板（docs/06 §2.4）。**用户点开行情页才调**，主进程就地评估一次。
+   * 与 `quote:intraday` 不同：它**不发网络请求**，只读本地日线。
+   */
+  'indicators:current': (code: SecCode) => IndicatorSnapshotView
   'quote:intraday': (query: { code: SecCode; from: number; to?: number }) => Promise<IntradaySeries>
   /** 日 K（不复权 + 展示用 MA）。`limit` 缺省 60 —— 抽屉里那张图就画这么多 */
   'kline:daily': (query: { code: SecCode; limit?: number }) => DailyBar[]

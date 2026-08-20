@@ -23,7 +23,7 @@ import type { MarketContext } from '@main/engine/market-data'
 import type { WatchEntry } from '@main/storage/repositories/watchlist'
 import type { SignalRow } from '@main/storage/repositories/signal'
 import { shanghaiDayStartMs } from '@shared/time'
-import { buildCandles, chopCloses, goldenCrossBreakout } from '../../fixtures/klines'
+import { buildCandles, chopCloses, goldenCrossBreakout, rampCloses } from '../../fixtures/klines'
 
 const PROFILE: SecProfile = { code: 'SH600000', name: '浦发银行', market: 'SH', board: 'MAIN', isST: false }
 
@@ -632,5 +632,25 @@ describe('指标截面', () => {
     // 60 根远不够 BBW 分位（需 269 根）
     expect(snapshot['bbwPct']).toBeNull()
     expect(snapshot['rsi']).not.toBeNull()
+  })
+})
+
+/**
+ * 「当前指标」面板的取数（`indicators:current` → `controller.indicatorSnapshot`）。
+ *
+ * 这里只钉两条**边界**，不测数值（数值由指标黄金用例负责）：
+ * ① 未预热的指标是 `null` 而不是 0（约束 4 —— 0 会被读成「指标是 0」）；
+ * ② 快照的键集合与目录一致（目录那侧另有一条用例从相反方向钉同一件事）。
+ */
+describe('当前指标快照', () => {
+  it('预热不足时给 null，不给 0', () => {
+    const candles = buildCandles(rampCloses(30, 10, 0.004))
+    const ind = computeIndicators(candles, DEFAULT_PARAMS, { sentiment: 0.5, intradayProgress: 1 })
+    const snapshot = snapshotOfIndicators(ind, candles.length - 1)
+    // 30 根远不够 MA120 / 带宽分位（250 根窗口）
+    expect(snapshot['ma120']).toBeNull()
+    expect(snapshot['bbwPct']).toBeNull()
+    // 而短周期的那些算得出来 —— 「不够」是逐指标的，不是整屏的
+    expect(snapshot['ma5']).not.toBeNull()
   })
 })

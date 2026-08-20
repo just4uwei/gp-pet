@@ -345,6 +345,7 @@ src/backtest 回测 CLI，复用 src/core
 | 写指标或策略 | [docs/04](./docs/04-指标与信号引擎.md)（公式与口径都在这，含与来源文档的差异说明） |
 | 接数据源 | [docs/03](./docs/03-数据源与存储设计.md) + [src/main/providers/README.md](./src/main/providers/README.md) |
 | 改窗口或交互 | [docs/06](./docs/06-桌宠交互与非干扰设计.md)（§2.1 悬浮条，§5 皮肤系统已删的说明） |
+| 改「当前指标」那一屏 | [`src/shared/indicator-catalog.ts`](./src/shared/indicator-catalog.ts) 头注释（三条文案纪律）+ [docs/06 §2.4](./docs/06-桌宠交互与非干扰设计.md) 的「行情页签的当前指标」 |
 | 改分时图 | [docs/03 §2.5](./docs/03-数据源与存储设计.md)（用户触发取数的三条边界）+ [`src/main/engine/intraday.ts`](./src/main/engine/intraday.ts) 头注释（远端/本机的取舍） |
 | 换托盘 / 应用图标 | [resources/icons/README.md](./resources/icons/README.md)（png 是手绘资产；只有 `icon.ico` 是生成件，跑 `node tools/logo/make-ico.mjs` 重出，它**不在** package.json 的 scripts 里） |
 | 改提醒逻辑 | [docs/05](./docs/05-风控与提醒规则.md) |
@@ -360,6 +361,14 @@ src/backtest 回测 CLI，复用 src/core
 
 ## 容易踩的坑
 
+- **「当前指标」那一屏只解释口径，不解释涨跌**（2026-08-20，`shared/indicator-catalog.ts`）。
+  每个指标带三样：**定义** · **与国内平台的口径差异** · **相关阈值的标定状态**。
+  ⚠ **不许加「金叉看涨」这类话** —— 08-20 实测买入得分与前瞻收益的横截面秩相关是**负的**
+  （M2 §5.46），在界面上印那种常识等于把一个已被本地数据否掉的说法当事实；
+  得分也不叫「概率」或「胜率」（措辞纪律）。`tests/unit/shared/indicator-catalog.test.ts`
+  钉着五条：**快照的每个键都要有文案**（写这一屏时就抓到 `ma120` 漏项）· 目录里不许有快照给不出的键 ·
+  禁词表 · ADX/ATR/MACD 柱/BBW 四项必须带口径说明 · 引用的参数路径必须是真实叶子。
+  取数走 `indicators:current`，**不发网络请求**（主进程就地评估一次），所以不占轮询预算。
 - **内置的 WebFetch 工具在这台机器上永久不可用，别再拿它当「站点访问不了」的证据。**
   它抓之前要做一次域名安全校验，而校验要摸 `claude.ai` —— 实测 `curl https://claude.ai` **000**
   ⇒ 它对**所有**域名都失败，包括同一时刻 curl 能 200 的站点

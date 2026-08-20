@@ -25,6 +25,7 @@ import type { SignalGroup } from '@shared/signal-group'
 import { shanghaiDayStartMs } from '@shared/time'
 import { AiPanel } from './AiPanel'
 import { DailyChart } from './DailyChart'
+import { IndicatorPanel } from './IndicatorPanel'
 import { IntradayChart, type IntradayMark } from './IntradayChart'
 import { TradePanel } from './TradePanel'
 
@@ -180,6 +181,15 @@ export function StockDrawer({
               <section className="border-t border-white/10 pt-3">
                 <h3 className="mb-1 text-[11px] text-white/40">日 K</h3>
                 <DailyChart code={code} onError={onError} />
+              </section>
+              {/*
+                「当前指标」放在图下面而不是另开页签：这一页问的就是「这只票现在什么样」，
+                而指标是那个问题的一部分。它自己取数（indicators:current，不发网络请求），
+                所以放这里也不会让打开抽屉变慢。
+              */}
+              <section className="border-t border-white/10 pt-3">
+                <h3 className="mb-1 text-[11px] text-white/40">当前指标</h3>
+                <IndicatorPanel code={code} />
               </section>
             </div>
           ) : null}

@@ -26,6 +26,7 @@ export const INVOKE_CHANNELS = [
   'signal:history',
   'signal:explain',
   'quote:intraday',
+  'indicators:current',
   'kline:daily',
   'trade:list',
   'trade:preview',
