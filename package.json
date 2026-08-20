@@ -27,6 +27,7 @@
     "audit:subsignals": "tsx src/backtest/subsignal-audit.ts",
     "audit:random": "tsx src/backtest/random-audit.ts",
     "audit:crosssec": "tsx src/backtest/crosssec-audit.ts",
+    "audit:ic": "tsx src/backtest/ic-audit.ts",
     "exp:vol-target": "tsx src/backtest/vol-target.ts",
     "iterate": "tsx --tsconfig tsconfig.base.json tools/iterate/status.ts",
     "verify:indicators": "node scripts/verify/run.mjs",

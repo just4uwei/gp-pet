@@ -11,6 +11,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { findBases, nearestInPool, regimeRuns, type RegimeRun } from '@backtest/random-audit'
+import { correlation, ranksOf } from '@backtest/ic-audit'
 
 describe('块位移的吸附：nearestInPool', () => {
   it('目标就在池里时原样返回', () => {
@@ -162,5 +163,27 @@ describe('regime 段块：findBases', () => {
     const pool = new Set([10, 11, 12])
     // 块跨度 5 根，目标段只有 3 根
     expect(findBases([0, 1], [0, 5], [pool, pool], shortRuns, shortRuns[0] as RegimeRun)).toEqual([])
+  })
+})
+
+/**
+ * rank IC 的两个纯函数（M2 §5.46）。守的是**并列**那一步 ——
+ * 实测 70.1% 的判定根买入得分为 0，Spearman 若不按平均秩处理并列，IC 就是垃圾。
+ */
+describe('rank IC：平均秩与相关系数', () => {
+  it('并列取平均秩（不是先到先得）', () => {
+    // [5, 5, 9] ⇒ 前两个并列，秩 (0+1)/2 = 0.5，第三个是 2
+    expect(ranksOf([5, 5, 9])).toEqual([0.5, 0.5, 2])
+    expect(ranksOf([9, 5, 5])).toEqual([2, 0.5, 0.5])
+    // 全并列 ⇒ 全部同一个秩 ⇒ 下游相关系数会因零方差给 null
+    expect(ranksOf([3, 3, 3])).toEqual([1, 1, 1])
+  })
+
+  it('相关系数：完全同序 +1、完全反序 −1、零方差给 null（不是 0）', () => {
+    expect(correlation([1, 2, 3, 4], [1, 2, 3, 4])).toBeCloseTo(1, 10)
+    expect(correlation([1, 2, 3, 4], [4, 3, 2, 1])).toBeCloseTo(-1, 10)
+    // 一侧全并列 ⇒ 无定义。给 0 会被读成「无关」，而事实是「算不出」
+    expect(correlation([1, 1, 1, 1], [1, 2, 3, 4])).toBeNull()
+    expect(correlation([1, 2], [2, 1])).toBeNull()
   })
 })
