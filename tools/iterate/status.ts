@@ -173,6 +173,8 @@ interface AlphaSnapshot {
   timingNullReason: string | null
   /** `REGIME_BLOCK` 的块覆盖率（0..1）。低于 0.8 时那一档仍按未调整上界读（§5.42 预注册门槛） */
   blockCoverage: number | null
+  /** 落点权重档（§5.43）。`runs` 与 `positions` 不是同一个零点，看板必须印出来 */
+  blockWeight: 'runs' | 'positions' | null
   crossCode: boolean
   byStratum: { label: string; count: number; paired: number | null; percentile: number }[]
 }
@@ -193,6 +195,7 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
           timingNull?: 'BLOCK' | 'INDEPENDENT' | 'REGIME_BLOCK' | null
           timingNullReason?: string | null
           blockCoverage?: number | null
+          blockWeight?: 'runs' | 'positions' | null
           crossCode?: boolean
         }
         strata?: {
@@ -213,6 +216,7 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
         timingNull: j.meta?.timingNull ?? null,
         timingNullReason: j.meta?.timingNullReason ?? null,
         blockCoverage: j.meta?.blockCoverage ?? null,
+        blockWeight: j.meta?.blockWeight ?? null,
         crossCode: j.meta?.crossCode === true,
         byStratum: j.strata
           .filter((s) => core.includes(s.label))
@@ -839,12 +843,15 @@ function render(input: {
       const cov = a.blockCoverage
       L.push(
         '> 零分布按 **regime 段整段平移**（块 = 标的 × 一段连续同状态行情，§5.42）· ' +
-          `覆盖 ${cov === null ? '—' : pct(cov)} · 吸附恒 0。`
+          `覆盖 ${cov === null ? '—' : pct(cov)} · 吸附恒 0 · 落点权重 ` +
+          `${a.blockWeight === 'positions' ? '**按位置**（长段加权，§5.43 的对照档）' : '**按段均匀**（§5.43 默认）'}。`
       )
       L.push(
-        '> ⚠ **它与「独立抽日」的差别不只是方差，还有成分**：实测随机组的 sd 几乎没动、均值上移' +
-          '（RANGE +0.19pp/次）⇒ 长段被按位置数加权。所以两档的数**不可互相替代**，' +
-          '同一层跨口径的差可以有 20pp（RANGE 65.0 → 43.5）。**别单独引用任何一档**（§5.42）。'
+        '> ⚠ **同 regime 的分位有一个控制不住的口径自由度**：同一批 1675 次建仓在四个零点下' +
+          '极差 **20–30pp**（RANGE 65.0 / 43.5 / 39.2 / 35.5 · ALL 46.5 / 36.5 / 31.3 / 55.0，§5.43）' +
+          '，而三个零点都在合理设计空间里、分不出胜负。⇒ **这些分位只能支撑粗结论**' +
+          '（方向与跨口径一致性），**不能**支撑「66.5 比 62.0 好」这种精细比较，也不能当写回门槛；' +
+          '改动前后必须用**同一零点**（docs/07 §3.6 第 ⑤ 条）。'
       )
       if (cov !== null && cov < 0.8) {
         L.push('> ⚠ 覆盖率低于预注册门槛 80% ⇒ 这一档仍按**未调整上界**读。')

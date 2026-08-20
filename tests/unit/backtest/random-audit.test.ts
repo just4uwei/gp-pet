@@ -112,15 +112,35 @@ describe('regime 段块：findBases', () => {
 
   it('整段刚性平移：块内间距逐位保留，落点只在同状态的另一段里', () => {
     // 两次建仓相距 3 根 ⇒ 首成员能放在 20..26（26+3 = 29 是段尾）
-    const bases = findBases([0, 1], [0, 3], [fullPool(), fullPool()], runs, source)
-    expect(bases).toEqual([20, 21, 22, 23, 24, 25, 26])
+    const byRun = findBases([0, 1], [0, 3], [fullPool(), fullPool()], runs, source)
+    // **按段分组**返回（§5.43）：这里只有一个合法段
+    expect(byRun).toEqual([[20, 21, 22, 23, 24, 25, 26]])
+  })
+
+  /**
+   * 分组本身就是 §5.43 那个抽样权重的全部依据：按段均匀 = 先在这个数组里选一项，
+   * 按位置均匀 = 先 flat() 再选。两段长度悬殊时两者的差别最大，所以这条用例造一长一短。
+   */
+  it('落点按段分组返回 —— 长段与短段各占一项（抽样权重据此分档）', () => {
+    const twoRuns: RegimeRun[] = [
+      { start: 0, end: 4, regime: 'RANGE' },
+      { start: 5, end: 6, regime: 'RANGE' }, // 短段：2 根
+      { start: 7, end: 20, regime: 'RANGE' }, // 长段：14 根
+    ]
+    const pool = new Set([5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
+    const byRun = findBases([0], [0], [pool], twoRuns, twoRuns[0] as RegimeRun)
+    expect(byRun).toHaveLength(2)
+    expect(byRun[0]).toHaveLength(2)
+    expect(byRun[1]).toHaveLength(14)
+    // 按段均匀：两段各 50% —— 按位置均匀：短段只有 2/16 = 12.5%
+    expect(byRun.flat()).toHaveLength(16)
   })
 
   it('**任一**成员落到自己 pool 外就不是合法落点（regime 与边界约束一条都没松）', () => {
     // 第二个成员的池挖掉 24 ⇒ 首成员放 21 会让它落在 24 上 ⇒ 21 必须被排除
     const holed = fullPool()
     holed.delete(24)
-    const bases = findBases([0, 1], [0, 3], [fullPool(), holed], runs, source)
+    const bases = findBases([0, 1], [0, 3], [fullPool(), holed], runs, source).flat()
     expect(bases).not.toContain(21)
     expect(bases).toContain(20)
   })

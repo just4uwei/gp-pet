@@ -680,6 +680,12 @@ export interface RandomAuditPayload {
     blocks: number | null
     blockFallback: number | null
     /**
+     * `REGIME_BLOCK` 的落点权重（§5.43）：`runs` = 先均匀选一段再在段内选（默认，
+     * 与「整段交换」的语义一致）· `positions` = 所有落点摊平后均匀选（长段被加权）。
+     * **两档不是同一个零点**，跨档比较无效。
+     */
+    blockWeight: 'runs' | 'positions' | null
+    /**
      * 块覆盖率 0..1 = 真的被块结构盖住的建仓占比。
      * **低于 §5.42 预注册的 0.8 时，这一档的分位要按「未调整上界」读** —— 一个只盖住
      * 一半建仓的调整与没调整的差别，读的人必须看得见。
@@ -743,8 +749,11 @@ interface RegimeBlock {
   members: number[]
   /** 各成员相对首成员的间距（交易根），与 `members` 同序。**这就是被保留的时间结构** */
   rel: number[]
-  /** 合法落点：首成员可以放在哪些绝对下标上（此时每个成员都落在自己的 `pool` 里） */
-  bases: number[]
+  /**
+   * 合法落点，**按段分组**（一段一个数组）。抽样权重见 `findBases` 头注释与 §5.43：
+   * `runs` = 先均匀选一段再在段内选（默认）· `positions` = 摊平后均匀选。
+   */
+  basesByRun: number[][]
 }
 
 /** 极大同状态段（按**成交**下标给闭区间：`regimeAt(i) = seq[i-1]`，判定在成交那根的前一根） */
@@ -780,6 +789,15 @@ export function regimeRuns(seq: readonly Regime[]): RegimeRun[] {
  * - **目标段必须是另一段**（`run !== source`），否则平移量可能小到把成员落回自己身边，
  *   等于什么都没随机。
  *
+ * **返回值按段分组**（`number[][]`，一段一个数组）—— 这样抽样时才分得清两种权重：
+ * **按段均匀**（先均匀选一段、再在段内选落点，`--block-weight runs`，**默认**）与
+ * **按位置均匀**（把所有落点摊平，`positions`，§5.42 那一版的行为）。
+ * 两者不是同一个零点：按位置均匀等于用段长给段加权 ⇒ 随机组被推向长段，
+ * 而长段的日子平均更赚（RANGE 每次 +0.19pp，§5.42 诊断）。
+ * **默认取 `runs` 是语义判据**：block permutation 的语义是**交换块**，
+ * 一次抽样 = 「这一簇建仓若发生在**另一段**同状态行情里」，那是按段的一次抽取。
+ * 详见 §5.43 的预注册（判据 3：默认口径由语义定，不由分位高低定）。
+ *
  * ⚠ **它保住的与放弃的**：保住「同一段行情内部的聚集」，**放弃「跨票同月的同步」**
  * （建仓月块保的是后者）。这是被迫的取舍 —— 同 regime 下每只票有自己的状态时间线，
  * 一个跨票共用的位移根本落不下去（§5.36 实测 85% 的块交集为空）。
@@ -791,12 +809,13 @@ export function findBases(
   poolSets: readonly Set<number>[],
   runs: readonly RegimeRun[],
   source: RegimeRun
-): number[] {
+): number[][] {
   const clusterSpan = rel[rel.length - 1] ?? 0
-  const bases: number[] = []
+  const byRun: number[][] = []
   for (const run of runs) {
     if (run === source) continue
     if (run.regime !== source.regime) continue
+    const bases: number[] = []
     for (let base = run.start; base + clusterSpan <= run.end; base++) {
       let ok = true
       for (let j = 0; j < members.length; j++) {
@@ -808,8 +827,9 @@ export function findBases(
       }
       if (ok) bases.push(base)
     }
+    if (bases.length > 0) byRun.push(bases)
   }
-  return bases
+  return byRun
 }
 
 // ── 主流程 ───────────────────────────────────────────────────────────────
@@ -885,6 +905,12 @@ interface Options {
    * 真实建仓的时间结构原样在那儿 —— §4.6 里那处「歪打正着躲过了」说的就是它。
    */
   timingNull: 'BLOCK' | 'INDEPENDENT'
+  /**
+   * `REGIME_BLOCK` 下落点的抽样权重（§5.43）。`runs`（默认）= 先均匀选一段再在段内选，
+   * 与「整段交换」的语义一致；`positions` = 所有落点摊平后均匀选（§5.42 那一版），
+   * 它用段长给段加权 ⇒ 随机组被推向长段。**两档不是同一个零点。**
+   */
+  blockWeight: 'runs' | 'positions'
   warmup: number
   minCount: number
   /**
@@ -951,6 +977,11 @@ const USAGE = `用法：
                          （pnpm audit:crosssec --out 的产物）。只与 --cross-code 同用。
                          排除「抽到当天毫无异动的票」这个替代解释（M2 §5.27 读法 2）。
                          同时**只保留当天确有其他候选的建仓** —— 否则两组比的不是同一批
+  --block-weight <档>    regime 段块的落点权重（只在 --match-regime 下有意义，§5.43）：
+                         runs（默认）先均匀选一段同状态行情、再在段内选落点，与「整段交换」
+                         的语义一致；positions 把所有合法落点摊平后均匀选 —— 那等于用段长
+                         给段加权，随机组会被推向长段（实测长段的日子平均更赚）。
+                         **两档不是同一个零点，数字不可互相替代**
   --warmup <根>          随机入场日的最早位置，默认 300（= params.data.fullBars）
   --min-count <n>        细分层的最小建仓数，低于它不打印，默认 30
   --announcements <dir>  历史公告目录（fetch-announcements.mjs 的产物）。给了它就多出
@@ -973,6 +1004,7 @@ function parse(argv: readonly string[]): Options | 'help' {
     crossCode: false,
     crossPool: null,
     timingNull: 'BLOCK',
+    blockWeight: 'runs',
     warmup: 300,
     minCount: 30,
     announceDays: 1,
@@ -1044,6 +1076,14 @@ function parse(argv: readonly string[]): Options | 'help' {
       case '--cross-code':
         o.crossCode = true
         break
+      case '--block-weight': {
+        const v = need()
+        if (v !== 'runs' && v !== 'positions') {
+          throw new Error(`--block-weight 只能是 runs 或 positions，收到 ${v}`)
+        }
+        o.blockWeight = v
+        break
+      }
       case '--independent-days':
         o.timingNull = 'INDEPENDENT'
         break
@@ -1492,14 +1532,14 @@ export async function run(argv: readonly string[]): Promise<number> {
       }
       const rel = members.map((i) => (tasks[i]?.entryIdx ?? 0) - head.entryIdx)
       const poolSets = members.map((i) => new Set(tasks[i]?.pool ?? []))
-      const bases = findBases(members, rel, poolSets, runs, source)
-      if (bases.length === 0) {
+      const basesByRun = findBases(members, rel, poolSets, runs, source)
+      if (basesByRun.length === 0) {
         // 同一只票上没有第二段够长的同状态行情 ⇒ 这一块退回独立抽样，且必须被数出来
         blockFallback += members.length
         continue
       }
       const b = regimeBlocks.length
-      regimeBlocks.push({ key, members, rel, bases })
+      regimeBlocks.push({ key, members, rel, basesByRun })
       members.forEach((i, j) => regimeBlockOfTask.set(i, { block: b, rel: rel[j] ?? 0 }))
     }
     // 逐层覆盖率：按 regimeAtEntry 分（那是这一档唯一有意义的切法 —— 块的定义就是状态段）
@@ -1595,7 +1635,19 @@ export async function run(argv: readonly string[]): Promise<number> {
     // 每块抽一个位移，块内所有建仓共用它 —— 这就是「保留时间聚集」的全部实现
     const shiftOfBlock = blocks.map((b) => b.offsets[Math.floor(rng() * b.offsets.length)] ?? 0)
     // regime 段块：抽的是**首成员的落点**，成员各自加自己的 rel ⇒ 间距逐位保留、无需吸附
-    const baseOfRegimeBlock = regimeBlocks.map((b) => b.bases[Math.floor(rng() * b.bases.length)] ?? 0)
+    /*
+      落点权重（§5.43）：`runs` 先均匀选一段、再在段内均匀选落点；`positions` 把所有落点
+      摊平后均匀选（= §5.42 那一版）。两次 `rng()` 与一次的差别会改变随机序列，
+      所以两档的数字不能互相替代 —— 报告里印的是用了哪一档。
+    */
+    const baseOfRegimeBlock = regimeBlocks.map((b) => {
+      if (opts.blockWeight === 'positions') {
+        const flat = b.basesByRun.flat()
+        return flat[Math.floor(rng() * flat.length)] ?? 0
+      }
+      const run = b.basesByRun[Math.floor(rng() * b.basesByRun.length)] ?? []
+      return run[Math.floor(rng() * run.length)] ?? 0
+    })
     const bucket = new Map<string, FillResult[]>()
     const passiveBucket = new Map<string, FillResult[]>()
     for (const s of strata) {
@@ -1733,6 +1785,7 @@ export async function run(argv: readonly string[]): Promise<number> {
             ? regimeBlocks.length
             : blocks.length,
       blockFallback: opts.crossCode || effectiveTimingNull === 'INDEPENDENT' ? null : blockFallback,
+      blockWeight: effectiveTimingNull === 'REGIME_BLOCK' ? opts.blockWeight : null,
       blockCoverage:
         opts.crossCode || effectiveTimingNull === 'INDEPENDENT' || tasks.length === 0
           ? null
@@ -1859,6 +1912,7 @@ function renderText(p: RandomAuditPayload): string {
     const enough = cov !== null && cov >= REGIME_BLOCK_MIN_COVERAGE
     lines.push(
       `零分布结构 regime 段整段平移（块 = 标的 × 一段连续同状态行情，§5.42）· ${m.blocks} 块` +
+        ` · 落点权重 ${m.blockWeight === 'positions' ? '按位置（长段加权，§5.43）' : '按段均匀（§5.43 默认）'}` +
         ` · 覆盖 ${cov === null ? '—' : `${(cov * 100).toFixed(1)}%`}` +
         (m.blockFallback && m.blockFallback > 0 ? `（${m.blockFallback} 次无第二段同状态行情，退回独立抽样）` : '') +
         ` · 吸附距离 中位 ${m.snapMedian ?? '—'} / P90 ${m.snapP90 ?? '—'} 根（结构上恒 0）` +
