@@ -103,11 +103,69 @@ export interface IcResult {
   days: number
   meanIc: number
   sdIc: number
-  /** `mean / (sd / √days)`。样本不足或零方差时 null，不用 0 冒充 */
+  /**
+   * **朴素 t** `mean / (sd / √days)`，把每个交易日当独立样本。
+   * **这是上界，不许引用**（§5.46 限制 1）—— 留着是为了与调整后的并排看。
+   * 样本不足或零方差时 null，不用 0 冒充。
+   */
   t: number | null
+  /**
+   * **Newey-West 调整后的 t**，滞后阶 `L = horizon − 1`（主口径，见 §5.47）。
+   * 前瞻收益是**重叠**的（每天都算一次 h 日收益）⇒ IC 序列在结构上带 MA(h−1)，
+   * 这个滞后阶不是估出来的、是**机械已知**的。
+   */
+  tNw: number | null
+  /** 主口径实际用的滞后阶 */
+  lagNw: number
+  /**
+   * 第二个**预承诺**滞后阶下的 t：`L = ⌊4(T/100)^(2/9)⌋`（Andrews 1991 的经验规则）。
+   * 报它是为了让「滞后阶怎么选」这件事**可见** —— 调滞后阶到显著为止是文献里
+   * 有记录的 p-hacking 通道，所以两档都在看结果之前写死（§5.47）。
+   */
+  tNwAndrews: number | null
+  lagAndrews: number
   /** 五等分（按当日得分排名）各组前瞻收益的**中位数** */
   quintileMedians: (number | null)[]
 }
+
+/**
+ * Bartlett 核的 Newey-West 长期方差（作用在**均值**上）：
+ *
+ * ```
+ * Var(x̄) = (1/T) · ( γ₀ + 2 · Σ_{k=1..L} (1 − k/(L+1)) · γₖ )
+ * ```
+ *
+ * `γₖ` 是滞后 k 的样本自协方差。三角权重 `1 − k/(L+1)` 是 Newey & West (1987) 的选择，
+ * 它保证估计出来的方差**非负**（早期 HAC 估计量会给出负方差）。
+ *
+ * ⚠ **两条容易读错的**：
+ * ① `L` 是**滞后截断阶**，不是「带宽」—— 两者按核函数换算，文献里同一个数两种叫法都有；
+ * ② `L = ⌊4(T/100)^(2/9)⌋` 那个经验规则应归 **Andrews (1991)**，
+ *    不是 Newey-West (1987)（后者把权重选择留开了）。
+ *
+ * 序列**必须按时间排好**再传进来：自协方差按相邻位置算，顺序错了这个数就没有意义。
+ * 返回 null 的两种情形：样本不足，或方差非正（全部并列会走到）。
+ */
+export function neweyWestVariance(series: readonly number[], lag: number): number | null {
+  const T = series.length
+  if (T < 2) return null
+  const mean = series.reduce((s, v) => s + v, 0) / T
+  const dev = series.map((v) => v - mean)
+  // γ₀ 用 1/T（与 NW 原式一致），不是 1/(T−1)：这里估的是长期方差不是样本方差
+  const gamma = (k: number): number => {
+    let sum = 0
+    for (let i = k; i < T; i++) sum += (dev[i] ?? 0) * (dev[i - k] ?? 0)
+    return sum / T
+  }
+  let lrv = gamma(0)
+  const L = Math.max(0, Math.min(lag, T - 1))
+  for (let k = 1; k <= L; k++) lrv += 2 * (1 - k / (L + 1)) * gamma(k)
+  if (!(lrv > 0)) return null
+  return lrv / T
+}
+
+/** Andrews (1991) 的经验滞后阶 `⌊4(T/100)^(2/9)⌋` */
+export const andrewsLag = (T: number): number => (T < 2 ? 0 : Math.floor(4 * (T / 100) ** (2 / 9)))
 
 /** 平均秩（并列取平均）—— Spearman 的前置 */
 export function ranksOf(values: readonly number[]): number[] {
@@ -163,7 +221,15 @@ const median = (values: readonly number[]): number | null => {
 export function icOf(byDate: Map<TradeDate, Row[]>, horizon: number): IcResult {
   const ics: number[] = []
   const quintiles: number[][] = [[], [], [], [], []]
-  for (const rows of byDate.values()) {
+  /*
+    **必须按日期排序再算**（2026-08-20 加）。`byDate` 的插入顺序由 `collect` 的扫描
+    决定 —— 第一只票按它自己的日期顺序插，之后的票只补它没有的日子 ⇒ 一只**起始更早**
+    的票会把它的早期日子**追加到尾部**。Newey-West 按相邻位置算自协方差，
+    顺序错了那个数就没有意义，**而且不会报错**。IC 的均值与五等分不受顺序影响，
+    所以这个坑在加 NW 之前是隐性的。
+  */
+  const byDateSorted = [...byDate.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  for (const [, rows] of byDateSorted) {
     const usable = rows.filter((r) => r.fwd.has(horizon))
     if (usable.length < MIN_CROSS_SECTION) continue
     const scores = usable.map((r) => r.score)
@@ -181,11 +247,22 @@ export function icOf(byDate: Map<TradeDate, Row[]>, horizon: number): IcResult {
   const mean = days === 0 ? 0 : ics.reduce((s, v) => s + v, 0) / days
   const sd =
     days < 2 ? 0 : Math.sqrt(ics.reduce((s, v) => s + (v - mean) ** 2, 0) / (days - 1))
+  // 主口径滞后阶 = h−1：重叠窗口带来的 MA(h−1) 是**机械已知**的，不用估
+  const lagNw = Math.max(0, horizon - 1)
+  const lagAndrewsL = andrewsLag(days)
+  const tOf = (lag: number): number | null => {
+    const v = neweyWestVariance(ics, lag)
+    return v === null ? null : mean / Math.sqrt(v)
+  }
   return {
     days,
     meanIc: mean,
     sdIc: sd,
     t: days < 2 || sd === 0 ? null : mean / (sd / Math.sqrt(days)),
+    tNw: tOf(lagNw),
+    lagNw,
+    tNwAndrews: tOf(lagAndrewsL),
+    lagAndrews: lagAndrewsL,
     quintileMedians: quintiles.map((q) => median(q)),
   }
 }
@@ -270,12 +347,18 @@ function render(
     `  判定根 ${counters.judged} · 数据不足 ${counters.unusable} · ` +
       `买入得分为 0 的占比 ${(tieShare * 100).toFixed(1)}%（并列会稀释 IC，纪律 4）`
   )
-  lines.push('  持有期    有效交易日   平均 IC      IC 标准差         t      Q1→Q5 前瞻收益中位数')
+  // 三个 t 并排打印是刻意的：只印调整后的会让「调整了多少」看不见，
+  // 而那个倍数（朴素/NW）恰恰是这一节要报的量（§5.47）
+  lines.push(
+    '  持有期    有效交易日   平均 IC      IC 标准差    t(朴素·上界)   t(NW,L=h−1)   t(NW,Andrews)      Q1→Q5 前瞻收益中位数'
+  )
   for (const h of HORIZONS) {
     const r = icOf(byDate, h)
+    const num = (v: number | null): string => (v === null ? '—' : v.toFixed(2))
     lines.push(
       `  ${String(h).padStart(4)} 日  ${String(r.days).padStart(10)}  ${pct(r.meanIc, 4).padStart(10)}  ` +
-        `${pct(r.sdIc, 4).padStart(12)}  ${(r.t === null ? '—' : r.t.toFixed(2)).padStart(8)}   ` +
+        `${pct(r.sdIc, 4).padStart(12)}  ${num(r.t).padStart(12)}   ` +
+        `${`${num(r.tNw)}(L=${r.lagNw})`.padStart(12)}  ${`${num(r.tNwAndrews)}(L=${r.lagAndrews})`.padStart(13)}   ` +
         r.quintileMedians.map((m) => pct(m, 2).padStart(8)).join(' ')
     )
   }
@@ -383,7 +466,11 @@ ${USAGE}`)
       ...render('得分 > 0 的子集', positive, counters),
       '',
       '  IC 是逐日横截面的 Spearman 秩相关（得分 vs 前瞻收益），**不构造零分布**（§5.46）。',
-      '  t = mean(IC)/(sd(IC)/√有效交易日)。判据：t ≥ 2 且五等分单调（端点差 ≥ 0.3pp）。',
+      '  t(朴素) = mean(IC)/(sd(IC)/√有效交易日) —— 把交易日当独立样本，**是上界，不许引用**。',
+      '  t(NW) = Newey-West/Bartlett 长期方差下的 t。主口径 L = h−1（重叠窗口的 MA(h−1) 是机械已知的）；',
+      '    Andrews(1991) 的 ⌊4(T/100)^(2/9)⌋ 并排报出，两档都在看结果之前写死 —— 调滞后阶到显著为止是',
+      '    文献里有记录的 p-hacking 通道（§5.47）。两档给出相反判断时，结论是「不稳健」而不是挑一个。',
+      '  判据：t(NW) ≥ 2 且五等分单调（端点差 ≥ 0.3pp）。',
       '  ⚠ IC 只回答「得分有没有横截面排序能力」，**不回答「这套系统赚不赚钱」**。',
       '',
     ]

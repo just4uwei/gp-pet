@@ -52,6 +52,10 @@ import { existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync, statSy
 import { join, dirname } from 'node:path'
 import { ENGINE_VERSION } from '@core/params'
 import type { TradeDate } from '@core/types'
+import type { CostModel } from '@backtest/costs'
+// 口径判据只有一个出处：报告自己按它打 warning、看板按它挑基线。
+// 照抄一份的症状是「报告说这是实验跑、看板说这是基线」
+import { auditKnobs } from '@backtest/report'
 import { countByStatus, paramRows } from '@main/settings/params-view'
 import { createTradingCalendar, parseHolidayTable, type TradingCalendar } from '@main/scheduler/calendar'
 import { SHANGHAI_OFFSET_MS } from '@shared/time'
@@ -108,6 +112,17 @@ interface BaselineSnapshot {
   maxDrawdown: number
   sharpe: number
   exposure: number
+  /**
+   * 因**非出厂口径**被跳过的报告（2026-08-20 加）。必须打印出来 —— 不然「为什么显示的
+   * 是三天前那份」没有答案，人会以为看板卡住了。判据是 `auditKnobs`（只有一个出处）。
+   */
+  skipped: { file: string; why: string }[]
+  /**
+   * 选中这份报告身上**无法核对**的旋钮（老报告没记 `meta.costs`）。
+   * 与「没有偏离」是两件事：`noslip-train.json`（`--slippage 0`，−1.21% vs 出厂 −1.99%）
+   * 就落在这一档，把它当成出厂口径正是这次要修的东西。
+   */
+  unverifiable: string[]
 }
 
 function latestBaseline(): Maybe<BaselineSnapshot> {
@@ -118,15 +133,47 @@ function latestBaseline(): Maybe<BaselineSnapshot> {
     .map((f) => ({ f, mtime: statSync(join(REPORTS, f)).mtimeMs }))
     .sort((a, b) => b.mtime - a.mtime)
 
+  /*
+    2026-08-20：这里曾经只按「最新 + 标的数 ≥ 200 + 含 trades」挑，于是 §5.44 候选 B 的
+    5× 资金实验跑（`cap-500000.json`）被当「回测基线」显示了一整天 ——
+    1114 建仓 / 43.81% / 占用 3.61%，而出厂那份是 1097 / 43.21% / 3.50%。
+    **偏离方向不随机**：资金调大只会让「一手都买不起」变少、数字更好看，
+    没有任何一处看起来像坏了。现在按 `auditKnobs` 跳过非出厂口径的报告，
+    并把跳过的**点名列出来** —— 不列的话「为什么显示的是三天前那份」没有答案。
+  */
+  const skipped: { file: string; why: string }[] = []
+
   for (const { f } of candidates) {
     try {
       const j = JSON.parse(readFileSync(join(REPORTS, f), 'utf8')) as {
-        meta?: { engineVersion?: string; codes?: unknown[]; generatedAt?: number; from?: string; to?: string }
+        meta?: {
+          engineVersion?: string
+          codes?: unknown[]
+          generatedAt?: number
+          from?: string
+          to?: string
+          capitalPerCode?: number
+          paramsFingerprint?: string
+          costs?: CostModel
+        }
         performance?: Record<string, number>
         trades?: { code: string; entryDate: string; pnl: number }[]
       }
       const codes = j.meta?.codes?.length ?? 0
       if (!j.performance || !j.trades || codes < 200) continue
+
+      // 口径核对。`capitalPerCode` / `paramsFingerprint` 读不到时**不许当成出厂** ——
+      // 那与「没记成本」同一档，走 unverifiable 而不是静默放行
+      const knobs = auditKnobs({
+        capitalPerCode: j.meta?.capitalPerCode ?? Number.NaN,
+        paramsFingerprint: j.meta?.paramsFingerprint ?? '',
+        costs: j.meta?.costs,
+      })
+      if (knobs.deviations.length > 0) {
+        skipped.push({ file: f, why: knobs.deviations.map((d) => d.detail).join(' · ') })
+        continue
+      }
+
       // 建仓级归并：一行 trade 是一次卖出，回撤减仓会把一次建仓拆成两三行（§5.18）
       const byEntry = new Map<string, number>()
       for (const t of j.trades) {
@@ -148,12 +195,22 @@ function latestBaseline(): Maybe<BaselineSnapshot> {
         maxDrawdown: j.performance.maxDrawdown ?? 0,
         sharpe: j.performance.sharpe ?? 0,
         exposure: j.performance.exposure ?? 0,
+        skipped,
+        unverifiable: knobs.unverifiable,
       })
     } catch {
       continue
     }
   }
-  return unknown('reports/calib/ 里没有标的数 ≥ 200 且含 trades 的报告')
+  // 一份出厂口径的都没挑到时**说「读不到」并点名跳过的**（纪律 3）——
+  // 退一步显示最近那份实验跑更糟：这个项目的历史是数字会被引用、警告会被读过去
+  const tail =
+    skipped.length === 0
+      ? ''
+      : `；另跳过 ${skipped.length} 份**非出厂口径**的报告：${skipped
+          .map((s) => `\`${s.file}\` — ${s.why}`)
+          .join('；')}`
+  return unknown(`reports/calib/ 里没有标的数 ≥ 200 且含 trades 的**出厂口径**报告${tail}`)
 }
 
 interface AlphaSnapshot {
@@ -917,6 +974,21 @@ function render(input: {
     )
     if (!sameEngine(b.engineVersion, params.engineVersion)) {
       L.push(`> ⚠ **基线是 ${b.engineVersion}，当前引擎是 ${params.engineVersion}** —— 这张表描述的不是当前代码。`)
+    }
+    // 跳过了哪几份必须点名：不然「为什么显示的是三天前那份」没有答案，人会以为看板卡住了
+    if (b.skipped.length > 0) {
+      L.push(
+        `> ⓘ 为挑出**出厂口径**，跳过了 ${b.skipped.length} 份更新的报告：` +
+          `${b.skipped.map((s) => `\`${s.file}\` — ${s.why}`).join('；')}。` +
+          '实验跑的绩效不可当基线引用（`auditKnobs`）。'
+      )
+    }
+    if (b.unverifiable.length > 0) {
+      L.push(
+        `> ⚠ 这份报告有**无法核对**的口径：${b.unverifiable.join('、')}。` +
+          '⇒ 不能确认它是不是 `--slippage 0` 那类跑（`noslip-train.json` 就是一份，' +
+          '−1.21% vs 出厂口径 −1.99%）。**未记录 ≠ 等于出厂**；重跑一次基线就会带上这一列。'
+      )
     }
   } else {
     L.push(`⚠ **读不到**：${baseline.why}`)

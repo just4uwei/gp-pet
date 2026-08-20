@@ -294,6 +294,9 @@ async function runBacktest(options: CliOptions): Promise<number> {
         to: range.to,
         dataSource: loaded.source.description,
         capitalPerCode: options.capital,
+        // 与 runSimulation 里传给 simulateCode 的是同一个 resolveCosts —— 报告记的必须
+        // 是**实际用的**那套，不是出厂那套（否则 --slippage 0 的跑在归档里认不出来）
+        costs: resolveCosts(options),
       },
     })
     if (options.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)

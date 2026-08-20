@@ -11,9 +11,10 @@
  * 报告头部固定三句免责：标的池偏差、参数未标定、回测≠实盘。
  */
 
-import { ENGINE_VERSION } from '../core/params'
+import { DEFAULT_PARAMS, ENGINE_VERSION, paramsFingerprint } from '../core/params'
 import type { Regime, SecCode, TradeDate } from '../core/types'
-import type { BacktestTrade, CodeResult } from './simulate'
+import { DEFAULT_COSTS, type CostModel } from './costs'
+import { DEFAULT_SIMULATE_OPTIONS, type BacktestTrade, type CodeResult } from './simulate'
 import {
   alignedReturns,
   annualizedReturn,
@@ -99,6 +100,13 @@ export interface BacktestReport {
     to: TradeDate
     dataSource: string
     capitalPerCode: number
+    /**
+     * 本次实际用的成本模型（2026-08-20 加）。**必填，不是可选** —— 它此前完全没记，
+     * 于是一份 `--slippage 0` 的跑（实测 −1.21% vs 出厂口径 −1.99%）在归档里
+     * **结构上认不出来**，而滑点占负期望的 69%（M2 §5.29）。
+     * 与 `capitalPerCode` 同一条理由：报告要能自己回答「这是哪套口径下的数」。
+     */
+    costs: CostModel
     /** 出厂参数是否仍未标定（ADR-0003）。true 时任何绩效数字都不得对外宣称 */
     unvalidatedParams: boolean
   }
@@ -242,6 +250,72 @@ export function attributeByRegime(
   })
 }
 
+export interface KnobDeviation {
+  /** 机器可读的旋钮名 —— 看板按它分类，别用文案去 match */
+  knob: 'capitalPerCode' | 'costs' | 'params'
+  /** 人读的一句：偏在哪、偏多少 */
+  detail: string
+}
+
+export interface KnobAudit {
+  deviations: KnobDeviation[]
+  /**
+   * **无法核对**的旋钮。目前只有一种情形：2026-08-20 之前的报告没记 `meta.costs`。
+   * 它与「没有偏离」是两件事，**不许合并** —— `noslip-train.json`（`--slippage 0`，
+   * −1.21% vs 出厂口径 −1.99%）就落在这一档里，把它当成出厂口径正是要防的事。
+   */
+  unverifiable: string[]
+}
+
+/**
+ * 这份报告是不是**出厂口径**下跑出来的 —— 三个旋钮逐个比。
+ *
+ * **为什么要有这个函数**：2026-08-20 发现迭代看板把 `cap-500000.json`（§5.44 候选 B 的
+ * 5× 资金实验跑）当「回测基线」显示了一整天 —— 1114 建仓 / 43.81% / 占用 3.61%，
+ * 而出厂那份是 1097 / 43.21% / 3.50%。挑选逻辑只看「最新 + 标的数 ≥ 200 + 含 trades」，
+ * 三个旋钮一个都不查，而**偏离方向不随机**：资金调大只会让 `unaffordable` 变少、
+ * 数字更好看，没有任何一处看起来像坏了。
+ *
+ * 判据放在这里而不是放在看板里，是为了**只有一个出处**：报告自己按它打 warning、
+ * 看板按它挑基线，两边照抄一份的症状是「报告说这是实验跑、看板说这是基线」。
+ */
+export function auditKnobs(meta: {
+  capitalPerCode: number
+  paramsFingerprint: string
+  /** 老报告没有这一列 ⇒ `undefined` = **未记录**，不是「等于出厂」 */
+  costs?: CostModel | undefined
+}): KnobAudit {
+  const deviations: KnobDeviation[] = []
+  const unverifiable: string[] = []
+
+  const factoryCapital = DEFAULT_SIMULATE_OPTIONS.capitalPerCode
+  if (meta.capitalPerCode !== factoryCapital) {
+    deviations.push({
+      knob: 'capitalPerCode',
+      detail: `每标的资金 ${meta.capitalPerCode}（出厂 ${factoryCapital}）`,
+    })
+  }
+
+  const factoryFingerprint = paramsFingerprint(DEFAULT_PARAMS)
+  if (meta.paramsFingerprint !== factoryFingerprint) {
+    deviations.push({
+      knob: 'params',
+      detail: `参数指纹 ${meta.paramsFingerprint}（出厂 ${factoryFingerprint}）`,
+    })
+  }
+
+  if (meta.costs === undefined) {
+    unverifiable.push('成本口径（2026-08-20 之前的报告没记 meta.costs）')
+  } else {
+    const diffs = (Object.keys(DEFAULT_COSTS) as (keyof CostModel)[])
+      .filter((key) => meta.costs?.[key] !== DEFAULT_COSTS[key])
+      .map((key) => `${key} ${meta.costs?.[key]}（出厂 ${DEFAULT_COSTS[key]}）`)
+    if (diffs.length > 0) deviations.push({ knob: 'costs', detail: diffs.join(' · ') })
+  }
+
+  return { deviations, unverifiable }
+}
+
 export interface AssembleInput {
   results: readonly CodeResult[]
   benchmarkByDate?: Map<TradeDate, number> | undefined
@@ -284,6 +358,20 @@ export function assembleReport(input: AssembleInput): BacktestReport {
   if (!input.benchmarkByDate || input.benchmarkByDate.size === 0) {
     warnings.push('缺少基准指数日线，超额收益与信息比率未计算（不以 0 代替）。')
   }
+  /*
+    非出厂口径的跑要在报告里自己说出来（2026-08-20）。与下面那两条池过滤 / 买不起
+    同一个 no-silent-caps 理由，但它更贵：那两条影响的是「这次跑了什么」，
+    这一条影响的是「这份数字能不能被当基线引用」。看板真踩过一次（auditKnobs 头注释）。
+  */
+  const knobs = auditKnobs(input.meta)
+  if (knobs.deviations.length > 0) {
+    warnings.push(
+      `**非出厂口径**：${knobs.deviations.map((d) => d.detail).join(' · ')}。` +
+        '这份绩效不可当基线引用，也不可与出厂口径的运行直接横向比较 —— ' +
+        '偏离方向通常不随机（调大 --capital 只会让「一手都买不起」变少、数字更好看）。'
+    )
+  }
+
   const poolBlocked = input.results.reduce((sum, r) => sum + r.poolBlocked, 0)
   if (poolBlocked > 0) {
     // 不写这一行就是 silent cap：「建仓数变少了」会被读成参数变严，而不是池被筛过
@@ -370,6 +458,18 @@ export function renderReport(report: BacktestReport): string {
   lines.push('─'.repeat(64))
   lines.push(`回测报告 · ${report.meta.from} → ${report.meta.to} · ${report.meta.codes.length} 只`)
   lines.push(`引擎 ${report.meta.engineVersion} · 数据源 ${report.meta.dataSource}`)
+  /*
+    口径行（2026-08-20 加）：`.txt` 归档此前不含资金与成本，于是一份实验跑与出厂跑
+    在归档里长得一模一样。判「能不能引用」要先能看见口径。
+    **费率刻意打原始小数而不是百分比**：`pct()` 保留两位小数，过户费 0.00001 会显示成
+    `0.00%` —— 与「这一项是 0」分不开，恰好废掉这一行的用途。原始小数还有一个好处：
+    与 `DEFAULT_COSTS` 里的字面量逐位可比。
+  */
+  const c = report.meta.costs
+  lines.push(
+    `每标的资金 ${report.meta.capitalPerCode} · 滑点 ${c.slippage} · 佣金 ${c.commissionRate}` +
+      `（下限 ${c.minCommission}）· 印花税 ${c.stampTaxRate} · 过户费 ${c.transferFeeRate}`
+  )
   if (report.meta.unvalidatedParams) {
     lines.push('⚠ 参数未标定（ADR-0003）：以下数字只可用于参数间比较，不得对外宣称。')
   }

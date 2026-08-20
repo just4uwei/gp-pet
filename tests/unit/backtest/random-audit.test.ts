@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { findBases, nearestInPool, regimeRuns, type RegimeRun } from '@backtest/random-audit'
-import { correlation, ranksOf } from '@backtest/ic-audit'
+import { andrewsLag, correlation, neweyWestVariance, ranksOf } from '@backtest/ic-audit'
 
 describe('块位移的吸附：nearestInPool', () => {
   it('目标就在池里时原样返回', () => {
@@ -185,5 +185,64 @@ describe('rank IC：平均秩与相关系数', () => {
     // 一侧全并列 ⇒ 无定义。给 0 会被读成「无关」，而事实是「算不出」
     expect(correlation([1, 1, 1, 1], [1, 2, 3, 4])).toBeNull()
     expect(correlation([1, 2], [2, 1])).toBeNull()
+  })
+})
+
+/**
+ * Newey-West 长期方差（M2 §5.47）。IC 的前瞻收益是**重叠**的（每天都算一次 h 日收益）
+ * ⇒ IC 序列在结构上带 MA(h−1) ⇒ 朴素 `sd/√T` 把交易日当独立样本，t 值虚高。
+ *
+ * 这几条钉的是**数学本身**，用手算得出来的例子 —— 这个函数错了不会报错，
+ * 只会给出一个「看起来很专业」的 t 值，而它是这一节唯一的产出。
+ */
+describe('Newey-West 长期方差', () => {
+  it('L = 0 时退化成 γ₀/T（即除 T 的方差，不是除 T−1）', () => {
+    const s = [1, 2, 3, 4, 5]
+    // mean 3；偏差 −2,−1,0,1,2；γ₀ = (4+1+0+1+4)/5 = 2 ⇒ Var(x̄) = 2/5
+    expect(neweyWestVariance(s, 0)).toBeCloseTo(2 / 5, 12)
+  })
+
+  it('正自相关会把方差放大 ⇒ t 变小（这就是这次调整的全部意义）', () => {
+    // 交替成块的正自相关序列
+    const s = [1, 1, 1, -1, -1, -1, 1, 1, 1, -1, -1, -1]
+    const naive = neweyWestVariance(s, 0)
+    const adjusted = neweyWestVariance(s, 2)
+    expect(naive).not.toBeNull()
+    expect(adjusted).not.toBeNull()
+    expect(adjusted as number).toBeGreaterThan(naive as number)
+  })
+
+  it('负自相关会把方差缩小 —— 调整不是单向变保守', () => {
+    const s = [1, -1, 1, -1, 1, -1, 1, -1]
+    const naive = neweyWestVariance(s, 0) as number
+    const adjusted = neweyWestVariance(s, 1) as number
+    expect(adjusted).toBeLessThan(naive)
+  })
+
+  it('Bartlett 权重保证非负；全常量序列给 null 而不是 0', () => {
+    // 零方差 ⇒ 算不出，不许用 0 冒充（约束 4 的精神）
+    expect(neweyWestVariance([2, 2, 2, 2], 2)).toBeNull()
+    expect(neweyWestVariance([1], 0)).toBeNull()
+    // L 超过序列长度时夹住，不越界读出 undefined
+    expect(neweyWestVariance([1, 2, 3], 99)).not.toBeNull()
+  })
+
+  it('Andrews(1991) 的滞后阶 ⌊4(T/100)^(2/9)⌋', () => {
+    // T=1140 ⇒ 4×11.4^(2/9) ≈ 6.87 ⇒ 6；T=354 ⇒ ≈5.30 ⇒ 5
+    expect(andrewsLag(1140)).toBe(6)
+    expect(andrewsLag(354)).toBe(5)
+    expect(andrewsLag(100)).toBe(4)
+    expect(andrewsLag(1)).toBe(0)
+  })
+
+  /*
+    顺序敏感性：这是加 NW 之前**隐性**的坑。`byDate` 的插入顺序由扫描顺序决定，
+    一只起始更早的票会把早期日子追加到尾部；IC 均值与五等分不受影响，
+    所以在加 NW 之前没有任何症状。打乱之后自协方差结构没了 ⇒ 数不一样。
+  */
+  it('对顺序敏感 —— 所以 icOf 必须先按日期排序', () => {
+    const ordered = [1, 1, 1, -1, -1, -1, 1, 1, 1, -1, -1, -1]
+    const shuffled = [1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1]
+    expect(neweyWestVariance(ordered, 2)).not.toBeCloseTo(neweyWestVariance(shuffled, 2) as number, 6)
   })
 })

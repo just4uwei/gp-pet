@@ -11,11 +11,14 @@ import {
   DISCLAIMERS,
   assembleReport,
   attributeByRegime,
+  auditKnobs,
   mergeEquity,
   performanceOf,
   renderReport,
   type PerformanceBlock,
 } from '@backtest/report'
+import { DEFAULT_COSTS } from '@backtest/costs'
+import { DEFAULT_SIMULATE_OPTIONS } from '@backtest/simulate'
 import {
   DEFAULT_SPLITS,
   calibrate,
@@ -27,7 +30,7 @@ import {
   type Split,
   type SplitRun,
 } from '@backtest/calibrate'
-import { DEFAULT_PARAMS } from '@core/params'
+import { DEFAULT_PARAMS, paramsFingerprint } from '@core/params'
 import type { BacktestTrade, CodeResult } from '@backtest/simulate'
 import type { Regime, TradeDate } from '@core/types'
 
@@ -189,15 +192,18 @@ describe('绩效块与分状态归因', () => {
 })
 
 describe('报告组装', () => {
+  // 刻意是**出厂口径**的 meta（真指纹 + 真成本 + 出厂资金）：这样「非出厂口径」那条告警
+  // 默认不出现，下面几条偏离用例才测得准。指纹写死一个假串会让每份报告都带那条告警
   const meta = {
-    engineVersion: '0.2.0-unvalidated+abcdef12',
-    paramsFingerprint: 'abcdef12',
+    engineVersion: `0.2.0-unvalidated+${paramsFingerprint(DEFAULT_PARAMS)}`,
+    paramsFingerprint: paramsFingerprint(DEFAULT_PARAMS),
     generatedAt: 0,
     codes: ['SH600000'],
     from: '2024-01-01',
     to: '2024-12-31',
     dataSource: 'fixtures:test',
-    capitalPerCode: 100_000,
+    capitalPerCode: DEFAULT_SIMULATE_OPTIONS.capitalPerCode,
+    costs: DEFAULT_COSTS,
   }
 
   it('免责声明固定三条，并标出参数未标定', () => {
@@ -241,6 +247,65 @@ describe('报告组装', () => {
   it('没有买不起的情形时不出这条告警', () => {
     const report = assembleReport({ results: [codeResult()], meta })
     expect(report.warnings.join(' ')).not.toContain('买不起')
+  })
+
+  /*
+    口径核对（2026-08-20）。踩过的事：迭代看板把 §5.44 候选 B 的 5× 资金实验跑当
+    「回测基线」显示了一整天（1114 建仓 / 43.81%，而出厂那份是 1097 / 43.21%）。
+    三个旋钮里 `costs` 此前**完全没记** ⇒ `--slippage 0` 的跑在归档里结构上认不出来。
+    钉三件事：出厂口径不出告警 · 每个旋钮偏离都出 · 未记录 ≠ 等于出厂。
+  */
+  describe('非出厂口径的核对（auditKnobs）', () => {
+    it('出厂口径不出这条告警', () => {
+      const report = assembleReport({ results: [codeResult()], meta })
+      expect(report.warnings.join(' ')).not.toContain('非出厂口径')
+      expect(auditKnobs(meta).deviations).toEqual([])
+      expect(auditKnobs(meta).unverifiable).toEqual([])
+    })
+
+    it('资金偏离出厂值会告警并带上两个数', () => {
+      const report = assembleReport({
+        results: [codeResult()],
+        meta: { ...meta, capitalPerCode: 500_000 },
+      })
+      const text = report.warnings.join(' ')
+      expect(text).toContain('非出厂口径')
+      expect(text).toContain('500000')
+      expect(text).toContain(String(DEFAULT_SIMULATE_OPTIONS.capitalPerCode))
+    })
+
+    it('滑点归零（--slippage 0）会被认出来 —— 这是此前完全测不到的那一种', () => {
+      const audit = auditKnobs({ ...meta, costs: { ...DEFAULT_COSTS, slippage: 0 } })
+      expect(audit.deviations.map((d) => d.knob)).toEqual(['costs'])
+      expect(audit.deviations[0]?.detail).toContain('slippage')
+    })
+
+    it('参数指纹不同（--params / 消融跑）会被认出来', () => {
+      const audit = auditKnobs({ ...meta, paramsFingerprint: 'deadbeef' })
+      expect(audit.deviations.map((d) => d.knob)).toEqual(['params'])
+    })
+
+    /*
+      这一条是整组里最重要的：2026-08-20 之前的报告都没有 `meta.costs`。
+      把「没记」判成「等于出厂」会让 `noslip-train.json`（−1.21% vs 出厂 −1.99%）
+      静默通过 —— 与「用 0 冒充未预热的指标值」是同一个错误方向（约束 4 的精神）。
+    */
+    it('没记成本的老报告落在 unverifiable，不算「没有偏离」', () => {
+      const audit = auditKnobs({
+        capitalPerCode: meta.capitalPerCode,
+        paramsFingerprint: meta.paramsFingerprint,
+      })
+      expect(audit.deviations).toEqual([])
+      expect(audit.unverifiable).toHaveLength(1)
+      expect(audit.unverifiable[0]).toContain('成本')
+    })
+
+    it('渲染出的报告带口径行（资金与四项费率）', () => {
+      const text = renderReport(assembleReport({ results: [codeResult()], meta }))
+      expect(text).toContain(String(DEFAULT_SIMULATE_OPTIONS.capitalPerCode))
+      expect(text).toContain('滑点')
+      expect(text).toContain('印花税')
+    })
   })
 
   it('抑制统计按次数降序', () => {
