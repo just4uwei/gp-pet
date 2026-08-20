@@ -18,6 +18,7 @@ import {
 } from '@backtest/costs'
 import {
   BARS_PER_YEAR,
+  alignedReturns,
   annualizedReturn,
   averageExposure,
   betaOf,
@@ -212,6 +213,32 @@ describe('绩效指标', () => {
     expect(0.2414 - 3.017).toBeCloseTo(-2.7756, 4)
     expect(ratioExcessReturn(0.05, null)).toBeNull()
     expect(ratioExcessReturn(0.05, -1)).toBeNull()
+  })
+
+  /**
+   * **严格配对**（`alignedReturns`）—— 这条守的是一个不报错的错。
+   *
+   * 旧写法是 `returnsOf(points,'equity')` 与 `returnsOf(points,'benchmark')` 各算一遍，
+   * 而它们各自会跳过自己缺值的那些期 ⇒ 基准列一有空洞，两个数组的**下标就错位**，
+   * 于是信息比率与 beta 拿「策略第 100 天 vs 基准第 103 天」在配对，且一个字都不报。
+   * 回测 fixture 里基准零空洞所以从没踩到，但**影子的基准列真的会缺**（真机 2/2 行 null）。
+   */
+  it('严格配对：基准列有空洞时两侧同步丢那一期，下标不许错位', () => {
+    const points = equity([100, 110, 121, 133.1, 146.41], [1, 1.1, null as unknown as number, 1.331, 1.4641])
+    // 中间那一行基准缺失 ⇒ 它前后两期都不能算（prev 或 now 缺一端都不行）
+    const { strategy, benchmark } = alignedReturns(points)
+    expect(strategy).toHaveLength(2)
+    expect(benchmark).toHaveLength(2)
+    strategy.forEach((r, i) => expect(r).toBeCloseTo(benchmark[i] ?? -1, 10))
+    // 对照：各算一遍会得到 4 和 2，长度都对不上，按下标配对就是错位
+    expect(returnsOf(points, 'equity')).toHaveLength(4)
+    expect(returnsOf(points, 'benchmark')).toHaveLength(2)
+  })
+
+  it('严格配对：整列缺基准时给两个空数组（下游据此给 null，不是 0）', () => {
+    const { strategy, benchmark } = alignedReturns(equity([100, 110, 121]))
+    expect(strategy).toEqual([])
+    expect(benchmark).toEqual([])
   })
 
   it('均值与样本标准差（除 n-1）', () => {

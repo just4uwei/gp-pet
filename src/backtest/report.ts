@@ -15,6 +15,7 @@ import { ENGINE_VERSION } from '../core/params'
 import type { Regime, SecCode, TradeDate } from '../core/types'
 import type { BacktestTrade, CodeResult } from './simulate'
 import {
+  alignedReturns,
   annualizedReturn,
   averageExposure,
   betaOf,
@@ -187,7 +188,9 @@ export function performanceOf(equity: readonly EquityPoint[], trades: readonly B
   const totalReturn = first > 0 ? last / first - 1 : 0
   const drawdown = maxDrawdown(equity)
   const strategyReturns = returnsOf(equity, 'equity')
-  const benchmarkReturns = returnsOf(equity, 'benchmark')
+  // 与基准比的那两个量（信息比率、beta）必须走**严格配对** —— 各算一遍再按下标塞
+  // 会在基准列有空洞时错位，而且不报错（`alignedReturns` 头注释里有实例）
+  const paired = alignedReturns(equity)
 
   const benchmarkStart = equity.find((p) => p.benchmark !== null)?.benchmark ?? null
   const benchmarkEnd = [...equity].reverse().find((p) => p.benchmark !== null)?.benchmark ?? null
@@ -208,9 +211,9 @@ export function performanceOf(equity: readonly EquityPoint[], trades: readonly B
     excessReturn: benchmarkReturn === null ? null : totalReturn - benchmarkReturn,
     excessReturnRatio: ratioExcessReturn(totalReturn, benchmarkReturn),
     informationRatio:
-      benchmarkReturns.length > 0 ? informationRatio(strategyReturns, benchmarkReturns) : null,
+      paired.benchmark.length > 0 ? informationRatio(paired.strategy, paired.benchmark) : null,
     exposure: averageExposure(trades, first, equity.length),
-    beta: betaOf(strategyReturns, benchmarkReturns),
+    beta: betaOf(paired.strategy, paired.benchmark),
     trades: summarizeTrades(trades),
     positions: groupPositions(trades),
   }

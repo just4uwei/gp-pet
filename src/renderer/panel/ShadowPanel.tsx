@@ -290,6 +290,13 @@ export function ShadowPanel({
           value={summary.exposure === null ? '—' : `${(summary.exposure * 100).toFixed(1)}%`}
           hint="缺这个数会把上面的对比读反"
         />
+        {/* beta 与占用率是同一个问题的两种量法（回测报告里也是这么并排印的，M2 §5.41 ①）。
+            null 是「算不出」而不是「与大盘无关」，所以显示成 — 而不是 0.00 */}
+        <Metric
+          label="beta"
+          value={summary.beta === null ? '—' : summary.beta.toFixed(3)}
+          hint="暴露的第二种量法，与左边互相印证"
+        />
         <Metric label="最大回撤" value={pct(summary.maxDrawdown)} valueClass="font-mono text-white/85" />
         {/* exactOptionalPropertyTypes 下 `hint={undefined}` 不合法，只能整条不传 */}
         {summary.seasoned ? (

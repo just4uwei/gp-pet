@@ -506,6 +506,12 @@ export interface ShadowSummary {
    * **和 `benchmarkReturn` 一起读**：基准是满仓的，缺这个数会把超额读反（M2 §5.13）
    */
   exposure: number | null
+  /**
+   * 市场 beta —— 「暴露」的第二种量法，与 `exposure` 互为交叉验证，且不含参数。
+   * 样本不足或基准列缺失时为 null（**不是 0**：0 的含义是「与大盘无关」）。
+   * ⚠ 刻意**没有** CAPM alpha 与日胜率，理由在 `backtest/metrics.ts` 的 `betaOf` 头注释。
+   */
+  beta: number | null
   barsPerYear: number
   /** 逐笔口径（一行 = 一次卖出）。看止损止盈规则本身 */
   trades: {

@@ -166,6 +166,36 @@ export function informationRatio(
   return (mean(excess) / sd) * Math.sqrt(BARS_PER_YEAR)
 }
 
+/**
+ * 策略与基准的**严格配对**日收益：只有 `prev`/`now` 两端的**两列都有值**时才算一期。
+ *
+ * **为什么不能各算一遍再往一起塞**：`returnsOf(points, 'equity')` 与
+ * `returnsOf(points, 'benchmark')` 各自会跳过自己缺值的那些期 ⇒ 基准列一有空洞，
+ * 两个数组的**下标就错位**，而 `informationRatio` / `betaOf` 都是按下标配对的 ——
+ * 算出来的是「策略第 100 天 vs 基准第 103 天」，而且不报错、只是给一个错的数。
+ *
+ * 回测里基准（沪深300 fixture）覆盖整个窗口、实测零空洞，所以这个坑一直没被踩到；
+ * 但**影子运行的基准列真的会缺**（2026-08-19 真机上 2/2 行都是 null，根因是应用内
+ * provider 不认识「指数无复权」）⇒ 那一侧必须严格配对。两处共用这一个函数。
+ */
+export function alignedReturns(points: readonly EquityPoint[]): {
+  strategy: number[]
+  benchmark: number[]
+} {
+  const strategy: number[] = []
+  const benchmark: number[] = []
+  for (let i = 1; i < points.length; i++) {
+    const prev = points[i - 1]
+    const now = points[i]
+    if (!prev || !now) continue
+    if (prev.benchmark === null || now.benchmark === null) continue
+    if (prev.equity <= 0 || prev.benchmark <= 0) continue
+    strategy.push(now.equity / prev.equity - 1)
+    benchmark.push(now.benchmark / prev.benchmark - 1)
+  }
+  return { strategy, benchmark }
+}
+
 /** 样本协方差（除 n−1，与 `sampleStdev` 同口径） */
 export function sampleCovariance(a: readonly number[], b: readonly number[]): number | null {
   const n = Math.min(a.length, b.length)

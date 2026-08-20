@@ -19,7 +19,9 @@
 
 import {
   BARS_PER_YEAR,
+  alignedReturns,
   annualizedReturn,
+  betaOf,
   groupPositions,
   maxDrawdown,
   mean,
@@ -94,6 +96,19 @@ export function summarize(input: SummaryInput): ShadowSummary {
       ? lastBenchmark / firstBenchmark - 1
       : null
 
+  /*
+    beta 与除法版超额（2026-08-20 加，与回测报告同口径 —— M2 §5.41）。
+
+    **为什么影子这边也要有**：这两个数回答的是「暴露多少」与「相对被动差多少」，
+    而影子迟早要跟回测的数字放在一起读。两边各写一份口径，「回测说赚、影子说亏」
+    到底是策略退化还是口径差异就会变成一个查不清的问题（`backtest/index.ts` 头注释那条边）。
+
+    ⚠ **必须走 `alignedReturns` 严格配对**：影子的基准列**真的会缺**
+    （2026-08-19 真机上 2/2 行都是 null），而各算一遍再按下标配对会静默错位。
+    这也是这两个字段与 `sharpe` 用不同输入的原因。
+  */
+  const paired = alignedReturns(points)
+
   // 逐日资金占用率：持仓市值 ÷ 当日净值的均值。这是精确值而不是回测里那个按建仓价的近似
   const exposure =
     bars > 0
@@ -141,6 +156,7 @@ export function summarize(input: SummaryInput): ShadowSummary {
     sharpe: sharpeRatio(strategyReturns),
     benchmarkReturn,
     exposure,
+    beta: betaOf(paired.strategy, paired.benchmark),
     barsPerYear: BARS_PER_YEAR,
     trades: {
       count: tradeStats.count,
@@ -215,6 +231,7 @@ export function emptyShadowSummary(engineVersion: string): ShadowSummary {
     sharpe: null,
     benchmarkReturn: null,
     exposure: null,
+    beta: null,
     barsPerYear: BARS_PER_YEAR,
     trades: {
       count: 0,
