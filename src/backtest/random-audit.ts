@@ -45,7 +45,7 @@
  * 不是「这套策略整体比随机好不好」。后者要连离场规则一起随机化，是另一个实验。
  */
 
-import { readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { normalizeCode, priceLimits } from '../core/code'
 import { toEpochDay } from '../core/date'
@@ -390,10 +390,56 @@ const TONE_LABEL: Record<Tone | 'NONE', string> = {
   NONE: '公告 无',
 }
 
+/*
+  ── 已知暴露的横截面分位（M2 §5.45，只分层不改交易）─────────────────────
+
+  问的是「我们那点 alpha 是不是某个已知暴露的影子」。两个维度：
+  **入场前涨幅**（短期反转 vs 动量）与**流通市值**（小市值/壳价值溢价）。
+
+  三条口径，都是刻意的：
+
+  1. **分位是当日横截面的，不是全样本的。** 绝对市值随大盘漂移八年、绝对涨幅随市况漂移，
+     拿全样本分位会把「2018 年的大票」和「2025 年的小票」排到一起。
+  2. **在信号那根（`entryIdx − 1`）上算**，与 regime 读取同一根 —— 成交那根的信息
+     在决策时还看不到。
+  3. **五等分写死**（§5.45 判据 3）。换分桶数重报就是调到好看为止。
+*/
+
+/** `Map<key, T[]>` 的 append —— 三个横截面表共用 */
+function push<T>(map: Map<TradeDate, T[]>, key: TradeDate, value: T): void {
+  const list = map.get(key)
+  if (list) list.push(value)
+  else map.set(key, [value])
+}
+
+/** 五等分标签。`rank` 从 0 计，`n` 是当天有数据的标的数 */
+function quintile(rank: number, n: number): string | null {
+  if (n < 5) return null
+  const q = Math.min(4, Math.floor((rank / n) * 5))
+  return `Q${q + 1}`
+}
+
+/** 逐日横截面排名 → 该标的的五等分档；值缺失的标的整体退出这一维度 */
+function crossSectionQuintiles(
+  byDate: Map<TradeDate, { code: SecCode; value: number }[]>
+): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const [date, rows] of byDate) {
+    const sorted = [...rows].sort((a, b) => a.value - b.value)
+    sorted.forEach((row, i) => {
+      const q = quintile(i, sorted.length)
+      if (q !== null) out.set(`${row.code}@${date}`, q)
+    })
+  }
+  return out
+}
+
 function stratumKeysOf(
   p: Position,
   announced: Tone | 'NONE' | null,
-  freq: { bucket: string; timeHalf: string; codeHalf: string } | null
+  freq: { bucket: string; timeHalf: string; codeHalf: string } | null,
+  /** 已知暴露的分位档（§5.45）。每一项为 null = 该建仓在这一维度上没有数据，**退出该维度** */
+  exposure: { prior5: string | null; prior20: string | null; floatCap: string | null }
 ): string[] {
   const band = scoreBand(p.entryScore)
   const sig = signalKey(p.entrySignals)
@@ -427,6 +473,11 @@ function stratumKeysOf(
       `频率 ${freq.bucket} · ${freq.codeHalf}`
     )
   }
+  // 已知暴露（§5.45）：只加**单维**分层。与 regime 交叉会让每桶掉到 30 笔以下，
+  // 而 minCount 会把它们全部滤掉 —— 那不是「没暴露」，是「没样本」，两者不能混
+  if (exposure.prior5 !== null) keys.push(`前5日涨幅 ${exposure.prior5}`)
+  if (exposure.prior20 !== null) keys.push(`前20日涨幅 ${exposure.prior20}`)
+  if (exposure.floatCap !== null) keys.push(`流通市值 ${exposure.floatCap}`)
   return keys
 }
 
@@ -631,7 +682,18 @@ export interface StratumRow {
     randomWeightedMean: number
     passiveMedianMean: number
     randomMedianMean: number
+    /** **加权口径**的配对胜率。窄分层上它会被单笔妖股支配，见下面那条 */
     pairedWinFraction: number
+    /**
+     * **中位口径**的配对胜率（2026-08-20 加，M2 §5.45）。
+     *
+     * ⚠ **窄分层上必须两个一起读，背离时以中位为准**（CLAUDE.md 读数纪律 2）。
+     * 实测：`流通市值 Q2`（368 次建仓）加权口径 84.5%，而中位口径下两组几乎相同
+     * （真实 −0.545% vs 随机 −0.532%）—— 那 84.5% 是一两笔极值撑起来的。
+     * 分层越窄，`weightedPnlPct` 越容易被单笔支配（先例：SZ002969 一笔 +325.8%
+     * 翻转过整组的符号，§5.21）。
+     */
+    pairedMedianWinFraction: number
   } | null
   randomWeightedMean: number
   randomWeightedSd: number
@@ -706,6 +768,8 @@ export interface RandomAuditPayload {
      */
     snapMedian: number | null
     snapP90: number | null
+    /** 有流通市值数据、因而进了市值分层的建仓数 / 总数（§5.45）。覆盖不全必须可见 */
+    capCovered: number | null
     warmup: number
     minCount: number
     positionsTotal: number
@@ -929,6 +993,15 @@ interface Options {
    */
   announceDays: number
   /**
+   * 流通市值目录（`fetch-liquidity.mjs` 的产物，`data/liquidity-em/`）。给了它就多出
+   * 「流通市值 Q1–Q5」这一维分层（§5.45）。**只分层，不改交易**。
+   *
+   * ⚠ 那份数据的 `floatShares` 是**逐月采样**反推的（东财 `f61` 换手率），
+   * 日度市值 = 该月股本 × 当日不复权价 ⇒ 月内粒度粗；但它**不是**「今日股本回推历史」
+   * 那个已被否的未来函数（信源台账 §2）。覆盖不到的建仓会被计数报出来。
+   */
+  liquidity?: string
+  /**
    * 按**股票层面**的公告年频率分四桶（Q1 最少 … Q4 最多），并交叉时间/代码前后半。
    *
    * ⚠ 与 `--announcements` 的分层**问的不是同一个问题**：那个是「这次建仓前有没有公告」
@@ -986,6 +1059,9 @@ const USAGE = `用法：
   --min-count <n>        细分层的最小建仓数，低于它不打印，默认 30
   --announcements <dir>  历史公告目录（fetch-announcements.mjs 的产物）。给了它就多出
                          「公告 有/无」及其与四个 regime 的交叉层。**只分层，不改交易**
+  --liquidity <dir>      流通市值目录（fetch-liquidity.mjs 的产物）。给了它就多出
+                         「流通市值 Q1–Q5」一维分层（当日横截面五等分，§5.45）。
+                         **只分层，不改交易**；覆盖不到的建仓会被计数报出来
   --announce-days <n>    公告窗口（自然日，含信号当天），默认 1
   --announce-freq        按**股票层面**公告年频率分四桶（控制上市时长），并交叉时间/代码前后半。
                          与 --announce-days 问的不是同一个问题：那个是时点，这个是股票属性
@@ -1057,6 +1133,9 @@ function parse(argv: readonly string[]): Options | 'help' {
         break
       case '--announcements':
         o.announcements = need()
+        break
+      case '--liquidity':
+        o.liquidity = need()
         break
       case '--announce-days':
         o.announceDays = Number(need())
@@ -1573,14 +1652,95 @@ export async function run(argv: readonly string[]): Promise<number> {
   // 分层键是**逐建仓**算出来的，一次建仓同时进多个层（总体 / 状态 / 得分档 / 子信号组合 / 交叉）。
   // 随机组按同一批建仓配对，所以每一层的随机基准都是「这一层里的那些票、那些持有跨度」——
   // 换句话说层与层之间的零点不同，**不同层的分位可以横比，绝对收益不可以**。
+  /*
+    ── 已知暴露的分位（§5.45）─────────────────────────────────────────────
+
+    池 = 这次加载的全部标的（`loaded`），也就是基线报告里那些票。分位在**当日横截面**上算，
+    只用**信号那根**（`entryIdx − 1`）及其之前的数据。
+
+    ⚠ 只对「真的有建仓的那些日期」建横截面 —— 全历史逐日排一遍是白算的（8 年 × 261 只），
+    而分位只在建仓那天被查。
+  */
+  const entryDates = new Set<TradeDate>()
+  for (const t of tasks) {
+    const bar = loaded.get(t.code)?.series.candles[t.entryIdx - 1]
+    if (bar) entryDates.add(bar.date)
+  }
+  const priorRows = new Map<TradeDate, { code: SecCode; value: number }[]>()
+  const prior20Rows = new Map<TradeDate, { code: SecCode; value: number }[]>()
+  const capRows = new Map<TradeDate, { code: SecCode; value: number }[]>()
+  /** 缺流动性文件、因而退出市值分层的建仓数。必须报出来（与 missingAnnouncements 同一处置） */
+  let missingCap = 0
+  const capByCode = new Map<SecCode, Map<TradeDate, number>>()
+  if (opts.liquidity !== undefined) {
+    for (const code of loaded.keys()) {
+      const file = join(opts.liquidity, `${code}.json`)
+      if (!existsSync(file)) continue
+      try {
+        const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
+          rows?: { date?: string; floatCap?: number | null }[]
+        }
+        const byDate = new Map<TradeDate, number>()
+        for (const row of parsed.rows ?? []) {
+          if (typeof row.date === 'string' && typeof row.floatCap === 'number' && row.floatCap > 0) {
+            byDate.set(row.date as TradeDate, row.floatCap)
+          }
+        }
+        if (byDate.size > 0) capByCode.set(code, byDate)
+      } catch {
+        // 坏文件当没有 —— 缺失会被计数报出来，不静默当成「小市值」
+      }
+    }
+    process.stderr.write(`市值分层：${capByCode.size}/${loaded.size} 只有流通市值数据
+`)
+  }
+  const priorReturn = (code: SecCode, idx: number, back: number): number | null => {
+    const candles = loaded.get(code)?.series.candles
+    const now = candles?.[idx]?.closeAdj
+    const then = candles?.[idx - back]?.closeAdj
+    if (now === undefined || then === undefined || then <= 0) return null
+    return now / then - 1
+  }
+  for (const [code, entry] of loaded) {
+    entry.series.candles.forEach((candle, i) => {
+      if (!entryDates.has(candle.date)) return
+      const p5 = priorReturn(code, i, 5)
+      if (p5 !== null) push(priorRows, candle.date, { code, value: p5 })
+      const p20 = priorReturn(code, i, 20)
+      if (p20 !== null) push(prior20Rows, candle.date, { code, value: p20 })
+      const cap = capByCode.get(code)?.get(candle.date)
+      if (cap !== undefined) push(capRows, candle.date, { code, value: cap })
+    })
+  }
+  const prior5Q = crossSectionQuintiles(priorRows)
+  const prior20Q = crossSectionQuintiles(prior20Rows)
+  const capQ = crossSectionQuintiles(capRows)
+
   const keysOf = new Map<Position, string[]>()
   for (const t of tasks) {
     const freq =
       t.freqBucket === null || t.timeHalf === null || t.codeHalf === null
         ? null
         : { bucket: t.freqBucket, timeHalf: t.timeHalf, codeHalf: t.codeHalf }
-    keysOf.set(t.position, stratumKeysOf(t.position, t.announced, freq))
+    const signalDate = loaded.get(t.code)?.series.candles[t.entryIdx - 1]?.date
+    const at = signalDate === undefined ? null : `${t.code}@${signalDate}`
+    const exposure = {
+      prior5: at === null ? null : prior5Q.get(at) ?? null,
+      prior20: at === null ? null : prior20Q.get(at) ?? null,
+      floatCap: at === null ? null : capQ.get(at) ?? null,
+    }
+    if (opts.liquidity !== undefined && exposure.floatCap === null) missingCap++
+    keysOf.set(t.position, stratumKeysOf(t.position, t.announced, freq, exposure))
   }
+  if (opts.liquidity !== undefined) {
+    // 覆盖不全必须可见（§5.45 口径边界 ②）：静默漏掉会让市值分层看起来是全样本的
+    process.stderr.write(
+      `市值分层覆盖：${tasks.length - missingCap}/${tasks.length} 次建仓` +
+        (missingCap > 0 ? `（⚠ ${missingCap} 次无市值数据，退出该维度）` : '') +
+        '\n'
+    )
+  }
+
   const strata: string[] = []
   const seenKey = new Set<string>()
   for (const t of tasks) {
@@ -1798,6 +1958,7 @@ export async function run(argv: readonly string[]): Promise<number> {
               .sort((a, b) => (a.regime < b.regime ? -1 : 1)),
       snapMedian: snapDistances.length === 0 ? null : quantile([...snapDistances].sort((a, b) => a - b), 0.5),
       snapP90: snapDistances.length === 0 ? null : quantile([...snapDistances].sort((a, b) => a - b), 0.9),
+      capCovered: opts.liquidity === undefined ? null : tasks.length - missingCap,
       warmup: opts.warmup,
       minCount: opts.minCount,
       positionsTotal: positions.length,
@@ -1833,6 +1994,12 @@ export async function run(argv: readonly string[]): Promise<number> {
                 pairedWinFraction:
                   r.shufPassiveWeighted.filter((v, i) => v > (r.randomWeighted[i] ?? Infinity))
                     .length / r.shufPassiveWeighted.length,
+                // 中位口径的同一个配对检验：抗单笔极值，窄分层上它才是可读的那个
+                pairedMedianWinFraction:
+                  r.shufPassiveMedian.length === 0
+                    ? 0
+                    : r.shufPassiveMedian.filter((v, i) => v > (r.randomMedian[i] ?? Infinity))
+                        .length / r.shufPassiveMedian.length,
               }
             : null,
         randomWeightedMean: mean(r.randomWeighted),
@@ -2005,7 +2172,7 @@ function renderText(p: RandomAuditPayload): string {
     lines.push('【打散跨度】剥掉 holdingBars 内生性之后的配对检验')
     lines.push('-'.repeat(W + 84))
     lines.push(
-      ['分层', '建仓', '真实入场·加权', '随机入场·加权', '真实入场·中位', '随机入场·中位', '真实赢的试验占比']
+      ['分层', '建仓', '真实入场·加权', '随机入场·加权', '真实入场·中位', '随机入场·中位', '配对胜率·加权', '配对胜率·中位']
         .map((h, i) => (i === 0 ? h.padEnd(W) : h.padStart(16)))
         .join('')
     )
@@ -2022,12 +2189,15 @@ function renderText(p: RandomAuditPayload): string {
           pct(sh.passiveMedianMean).padStart(16),
           pct(sh.randomMedianMean).padStart(16),
           pct(sh.pairedWinFraction).padStart(16),
+          pct(sh.pairedMedianWinFraction).padStart(16),
         ].join('')
       )
     }
     lines.push('')
-    lines.push('  同一次试验里两组用**同一个 span 置换**，所以「真实赢的试验占比」是逐试验配对的')
+    lines.push('  同一次试验里两组用**同一个 span 置换**，所以「配对胜率」是逐试验配对的')
     lines.push('  直接检验：50% ⇒ 入场与随机无异，接近 0% ⇒ 入场系统性更差。')
+    lines.push('  ⚠ **两个口径要一起读，背离时以中位为准**（CLAUDE.md 读数纪律 2）：加权口径在窄分层上')
+    lines.push('  会被单笔妖股支配 —— 实测「流通市值 Q2」加权 84.5%，而中位口径两组几乎相同（§5.45）。')
   }
 
   lines.push('')

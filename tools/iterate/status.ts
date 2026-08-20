@@ -176,7 +176,15 @@ interface AlphaSnapshot {
   /** 落点权重档（§5.43）。`runs` 与 `positions` 不是同一个零点，看板必须印出来 */
   blockWeight: 'runs' | 'positions' | null
   crossCode: boolean
-  byStratum: { label: string; count: number; paired: number | null; percentile: number }[]
+  byStratum: {
+    label: string
+    count: number
+    /** 加权口径的配对胜率。**窄分层与极值敏感** —— 与 `pairedMedian` 背离时以后者为准 */
+    paired: number | null
+    /** 中位口径的配对胜率（2026-08-20 加，M2 §5.45）。旧报告没有这个字段 ⇒ null */
+    pairedMedian: number | null
+    percentile: number
+  }[]
 }
 
 function latestAlpha(): Maybe<AlphaSnapshot> {
@@ -202,7 +210,7 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
           label: string
           realCount: number
           passivePercentile: number
-          shuffled: { pairedWinFraction: number } | null
+          shuffled: { pairedWinFraction: number; pairedMedianWinFraction?: number } | null
         }[]
       }
       if (!j.strata) continue
@@ -224,6 +232,7 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
             label: s.label,
             count: s.realCount,
             paired: s.shuffled?.pairedWinFraction ?? null,
+            pairedMedian: s.shuffled?.pairedMedianWinFraction ?? null,
             percentile: s.passivePercentile,
           })),
       })
@@ -824,15 +833,21 @@ function render(input: {
         `${a.matchRegime ? '同 regime' : '无条件'}${a.shuffleSpans ? ' · 打散跨度' : ' · ⚠ 未打散跨度'}）`
     )
     L.push('')
-    L.push('| 分层 | 建仓 | 配对胜率 | 被动分位 |')
-    L.push('|---|---|---|---|')
+    L.push('| 分层 | 建仓 | 配对胜率·加权 | **配对胜率·中位** | 被动分位 |')
+    L.push('|---|---|---|---|---|')
     for (const s of a.byStratum) {
       L.push(
-        `| ${s.label} | ${s.count} | ${s.paired === null ? '—' : pct(s.paired)} | ${pct(s.percentile)} |`
+        `| ${s.label} | ${s.count} | ${s.paired === null ? '—' : pct(s.paired)} | ` +
+          `${s.pairedMedian === null ? '—' : `**${pct(s.pairedMedian)}**`} | ${pct(s.percentile)} |`
       )
     }
     L.push('')
     L.push('> 50% = 与随机无异 · 接近 0% = 入场系统性更差 · 高于 50% = 有正 alpha。')
+    L.push(
+      '> ⚠ **两个口径背离时以中位为准**（读数纪律 2）：加权口径被少数大赢家托着 —— 实测 ' +
+        'ALL 加权 31.3% 而**中位 2.8%**、TREND_UP 加权 74.2% 而**中位 35.2%**（M2 §5.45）。' +
+        '中位列为「—」说明那份报告早于 2026-08-20，没有这个字段。'
+    )
     // 零分布的时间结构必须与数字一起印（§4.6）：只报数字不报口径，读的人无从判断
     // 这一栏是「已做时间聚集调整」还是「把成批发生的建仓当成独立样本算出来的」。
     if (a.crossCode) {
