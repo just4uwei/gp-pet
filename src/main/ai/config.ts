@@ -35,7 +35,13 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   model: '',
   // 一次解读要跑几十秒是常态；60s 是「还在生成」与「对面挂了」的分界
   timeoutMs: 60_000,
-  maxTokens: 1200,
+  /*
+    ⚠ 这个数是**思考链与正文共用**的额度，不是「正文最多多长」。推理模型先想几千
+    token 是常态，而思考先于正文生成 ⇒ 额度给小了，正文一个字都拿不到，症状是
+    client.ts 那条「对面只返回了思考过程，没有正文」。出厂曾是 1200（按 400 字正文
+    估的），在带思考链的模型上不够；4096 = 正文约 1000 + 给思考链留三千来 token。
+  */
+  maxTokens: 4096,
 }
 
 /**
@@ -64,7 +70,18 @@ const AiConfigSchema = z.object({
   model: z.string().trim().max(200),
   // 下限 5s：比这更短的超时会把正常的首字等待判成失败
   timeoutMs: z.number().int().min(5_000).max(600_000),
-  maxTokens: z.number().int().min(128).max(32_000),
+  /*
+    下限 2048，而且它**兼作一次性抬升**：额度是思考链与正文共用的（见默认值那条注释），
+    正文按 400 字算就要约 1000 token，Anthropic 协议下思考预算本身的下限又是 1024
+    ⇒ 比 2048 更小的值在推理模型上几乎必然「只有思考、没有正文」。
+    于是改动前存下的 1200 会被这条下限抬到默认值，**并在设置页留一条可见提示** ——
+    悄悄改掉用户填过的数是另一种坑，所以走既有的 repaired 通路而不是静默覆盖。
+  */
+  maxTokens: z
+    .number()
+    .int()
+    .min(2048, '低于 2048 时思考链会把额度吃光、正文一个字都没有')
+    .max(32_000),
 })
 
 const AiConfigFileSchema = AiConfigSchema.extend({

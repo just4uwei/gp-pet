@@ -249,7 +249,10 @@ export function AiSettings({
         </button>
       </Row>
 
-      <Row label="单次上限" hint="超时（秒）与最多生成的 token 数。解读控制在 400 字以内，1200 token 通常够">
+      <Row
+        label="单次上限"
+        hint="超时（秒）与单次 token 上限。这个上限是思考链与正文共用的，推理模型会先花掉一截 —— 给小了会变成「只有思考、没有正文」"
+      >
         <input
           type="number"
           min={5}
@@ -266,14 +269,16 @@ export function AiSettings({
         <span className="text-[11px] text-white/35">秒</span>
         <input
           type="number"
-          min={128}
+          min={2048}
           max={32000}
-          step={128}
+          step={512}
           className="w-20 rounded border border-white/15 bg-black/25 px-2 py-1 text-right font-mono text-xs outline-none focus:border-white/35"
           value={config.maxTokens}
           onChange={(e) => {
             const tokens = Number(e.target.value)
-            if (Number.isInteger(tokens) && tokens >= 128 && tokens <= 32_000) {
+            // 与 AiConfigSchema 的下限一致：发一个注定被 sanitize 退回的值，
+            // 用户看到的是一条「已回到默认值」而不是自己输入的数
+            if (Number.isInteger(tokens) && tokens >= 2048 && tokens <= 32_000) {
               patch({ maxTokens: tokens })
             }
           }}

@@ -13,7 +13,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { AI_CONFIG_FILE, AiConfigStore, sanitizeAiConfig } from '@main/ai/config'
+import { AI_CONFIG_FILE, AiConfigStore, DEFAULT_AI_CONFIG, sanitizeAiConfig } from '@main/ai/config'
 import type { SecretCrypto } from '@main/ai/types'
 
 const dirs: string[] = []
@@ -164,8 +164,39 @@ describe('AiConfigStore', () => {
     expect(view.enabled).toBe(true) // 好字段保留
     expect(view.model).toBe('glm-4-plus')
     expect(view.baseUrl).toBe('') // 坏字段回默认
-    expect(view.maxTokens).toBe(1200)
+    expect(view.maxTokens).toBe(DEFAULT_AI_CONFIG.maxTokens)
     expect(view.repaired).toHaveLength(2)
+  })
+
+  /**
+   * 出厂 maxTokens 曾是 1200，而那个额度是**思考链与正文共用**的 ⇒ 带思考链的模型上
+   * 常见结果是「只有思考、没有正文」（client.ts 那条报错）。下限抬到 2048 之后，
+   * 改动前存下的 1200 必须被抬到默认值 **且留下一条可见提示**：
+   * 悄悄改掉用户填过的数，与「给小了没有正文」是同一类查不清的问题。
+   */
+  it('改动前存下的 maxTokens = 1200 被抬到默认值，并留一条可见提示', () => {
+    const file = tempFile()
+    writeFileSync(
+      file,
+      JSON.stringify({
+        enabled: true,
+        baseUrl: 'https://api.deepseek.com/v1',
+        protocol: 'openai',
+        model: 'deepseek-chat',
+        timeoutMs: 60_000,
+        maxTokens: 1200,
+      }),
+      'utf8'
+    )
+    const view = new AiConfigStore(file, fakeCrypto()).load()
+
+    expect(view.maxTokens).toBe(DEFAULT_AI_CONFIG.maxTokens)
+    expect(view.repaired).toHaveLength(1)
+    expect(view.repaired[0]).toContain('maxTokens')
+    // 其余字段一个都不受影响
+    expect(view.enabled).toBe(true)
+    expect(view.model).toBe('deepseek-chat')
+    expect(view.timeoutMs).toBe(60_000)
   })
 })
 
@@ -198,7 +229,9 @@ describe('协议识别', () => {
         baseUrl: 'https://api.deepseek.com/v1',
         model: 'deepseek-chat',
         timeoutMs: 60_000,
-        maxTokens: 1200,
+        // 刻意用当前合法值：这条用例盯的是「缺 protocol 键要静默升级」，
+        // 掺一条 maxTokens 的修复提示会让 repaired 断言表达两件事
+        maxTokens: 4096,
       }),
       'utf8'
     )
