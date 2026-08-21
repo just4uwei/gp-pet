@@ -20,12 +20,13 @@ import type {
   AppSettings,
   EngineStatus,
   IntradaySeries,
+  NextDayPreview,
   ProviderHealth,
   QuoteTick,
   SignalEvidence,
   SignalRecord,
 } from '@shared/ipc-types'
-import type { SecCode } from '@core/types'
+import type { SecCode, TradeDate } from '@core/types'
 import type { Evaluation } from '@core/engine'
 import { parseCode } from '@core/code'
 import { withSensitivity } from '@core/params'
@@ -39,6 +40,7 @@ import {
   createMinuteCache,
   createTickPipeline,
   closeMsOf,
+  previewNextDay,
   settleDay,
   createWatchlistService,
   mergeIntraday,
@@ -148,6 +150,11 @@ export interface DataLayer {
    * 在别处快照式地持有它会一直用着旧参数（data-layer 里 `signals` 是 `let` 的理由）。
    */
   assess(code: SecCode): Evaluation | null
+  /**
+   * 「明日预览」：就地算一次 `date` 那天的收盘确认，答「明天准备买 / 卖 / 减什么」。
+   * **不落库、不推进影子、不发提醒**，边界见 `engine/preview.ts` 头注释。
+   */
+  previewNextDay(date: TradeDate): NextDayPreview
   /** 某只票里「今天买进、T+1 下今天卖不掉」的股数。没有就是 0 */
   lockedShares(code: SecCode): number
   dispose(): void
@@ -604,6 +611,38 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
 
     lockedShares(code) {
       return storage.trades.boughtSharesSince(code, shanghaiDayStartMs(now()))
+    },
+
+    /*
+      「明日预览」（`engine/preview.ts`）。摆在这一层的理由与 `assess` 相同：
+      只有它同时握着 `market`、当前那套参数（换灵敏度会重建引擎）与仓储。
+
+      **每次都新建一个引擎实例**，不复用 `signals` —— 那个的 `market.getContext`
+      会在尾部拼当日临时线，而预览要的恰恰是「D 的真实收盘线」。
+      与 `settleDay` 那条路同一个做法（settle.ts 边界 3）。
+
+      日期由调用方给（controller 用日报那一个 `reportSubjectDate`，一件事一个出处），
+      本层不判「今天是哪天」。
+    */
+    previewNextDay(date) {
+      return previewNextDay(date, {
+        market,
+        watchlist: storage.watchlist,
+        positions: storage.positions,
+        signals: storage.signals,
+        indicators: storage.indicators,
+        lookback: market.options.initialBars,
+        // 与 buildEngine / settleDay 那两处**必须成对**：`tick.at` 是 D 的收盘时刻，
+        // 于是引擎按 D 当天的日界去数买入 —— 漏传的症状是预览与明早的补跑结论不一致
+        lockedSharesOf: (code, sinceMs) => storage.trades.boughtSharesSince(code, sinceMs),
+        params: withSensitivity(settings.sensitivity),
+        closedAt: closeMsOf(date),
+        // 用户**真实**持仓，不是影子组合的 —— 这一屏答的是「我明天要交易什么」
+        holds: (code) => storage.positions.get(code) !== null,
+        // 覆盖率的判据：D 那根收盘线在不在库里。缺的要显式列出来，不靠 assess 返回 null 反推
+        hasClose: (code) => storage.klines.recentThrough(code, date, 1).at(-1)?.date === date,
+        log,
+      })
     },
 
     /*

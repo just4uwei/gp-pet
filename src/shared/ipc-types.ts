@@ -1166,6 +1166,54 @@ export interface DailyReportStock {
 }
 
 /** 「明日关注」的一项。**每一项都指回一个已经存在的东西**（见 DailyReport 头注释） */
+/**
+ * 「明日预览」一行：明天准备**买 / 卖 / 减**的一只票（`report:preview`）。
+ *
+ * ⚠ 它与 `DailyReportTomorrow` 不是一回事，**两者刻意分开**：
+ * `tomorrow` 那一节的纪律是「每一项都要指回一个**已经存在**的东西」（今日已落库的
+ * `NEXT_DAY_WATCH` 信号 / 观察点 / 持仓裁决），而预览是**就地算出来、不落库**的
+ * —— 它指不回去，并进那一节就破了那条纪律。
+ */
+export interface NextDayPreviewRow {
+  code: SecCode
+  name: string
+  /** 明天准备做什么。由方向 + 持仓状态推出（影子的 `toShadowAction`，唯一出处） */
+  action: 'BUY' | 'SELL' | 'REDUCE'
+  /** 引擎给的**方向**，与 `action` 不是一回事：「明日观察」在未持仓时才变成买 */
+  direction: GatedDirection
+  /** 归因：强制风控规则优先，其次该方向上最强的子信号 */
+  rule: string
+  /** 组合层得分 0..1。**不是「上涨概率」**，措辞纪律禁止那样叫 */
+  score: number
+  regime: Regime
+  level: AlertLevel
+  /** 当前是不是持有它 —— 决定了同一个方向会变成买还是卖 */
+  holding: boolean
+}
+
+/**
+ * 「明日预览」一屏（`report:preview`）。**盘后用户点按钮才算**，一次只读评估。
+ *
+ * 三条读法，缺一条就会读错：
+ *
+ * 1. **它不落库、不推进影子、不发提醒。** 权威记录只有一份 —— 次日盘前那次完整补跑。
+ *    明早那次会重算，**结论可能改口**（隔夜没有新信息，但那只缺线的票会补进来）。
+ * 2. **`holding` 按你自己的持仓算，不是影子组合的持仓** ⇒ **它不等于影子明天会挂的委托**。
+ * 3. **`status = 'UNAVAILABLE'` 时 `rows` 为空表示「算不出来」，不是「明天没有要做的」**
+ *    —— 当日收盘线一根都还没入库（盘中打开就是这样）。界面必须区分这两件事。
+ */
+export interface NextDayPreview {
+  /** 被预览的那个交易日（= 日报的 `date`，同一个出处 `reportSubjectDate`） */
+  date: TradeDate
+  status: 'READY' | 'UNAVAILABLE'
+  /**
+   * 覆盖率。**`missing` 必须显式列出来** —— 静默少几行会让
+   * 「明天没什么要做的」凭空成立（与 `report/environment.ts` 的 `breadth` 同一条）。
+   */
+  coverage: { total: number; withClose: number; missing: SecCode[] }
+  rows: NextDayPreviewRow[]
+}
+
 export interface DailyReportTomorrow {
   code: SecCode
   name: string
@@ -1373,6 +1421,16 @@ export interface IpcInvokeMap {
    * 而错的方式用户看不出来（见 controller.dailyReport 的头注释）。
    */
   'report:daily': () => DailyReport | null
+  /**
+   * 「明日预览」：就地算一次当日收盘确认，答「明天准备买 / 卖 / 减什么」。
+   *
+   * **用户点按钮才调** —— 它要为每只自选算一遍 320 根的全套指标，
+   * 不该跟着面板打开就烧一遍（与 `quote:intraday`「量由人决定」同一条）。
+   * 与那条不同的是它**不发网络请求**，只读本地日线。
+   *
+   * 数据层没起来时返回 null（「还没准备好」与「明天没有要做的」是两件事）。
+   */
+  'report:preview': () => NextDayPreview | null
   /**
    * 已经存在的日报评价。**纯读，不发起任何模型请求** ——
    * 打开页签就有东西看，而「要不要花这笔钱」始终是用户按按钮那一下才决定的。

@@ -39,6 +39,16 @@
  *    ⚠ 这条规则有一个**必须一起满足**的反向要求：它得能重新报警。
  *    一个只会说「等着」的规则比原来的误报更糟 —— 误报浪费一次排查，
  *    永久静默让真的复发再也不报。`tests/unit/tools/iterate-session.test.ts` 两条钉着。
+ * 5. **唯一被允许的手写输入是「条目」，不是「状态」**（2026-08-21 加）。
+ *    「登记在案的落地项」那一节的条目来自文档里的 `<!-- ITEM ... -->` 标记（人登记），
+ *    但**每条做没做由仓库判**（判据是「落地时必然出现的那个字符串」在不在）。
+ *    上面第 2 条要挡的是**手写状态**（「这个做完了」会静默过期）；手写意图不会过期。
+ *    ⚠ 这一节**不放宽第 1 条**：登记项不是策略候选，它们是**人已经论证过、
+ *    已经决定要做、只是还没做**的工程/判据项。判据与三态见 `./backlog.ts`。
+ *
+ *    加它的直接原因：2026-08-20 两轮学习任务长出四条可落地/可测试的结论，
+ *    归档进了 M2 与计划文档，**而没有任何一处会在第二天提醒任何人** ——
+ *    同一天还刚证过一次「写下一条纪律不等于装上一道闸门」（§5.44 的预注册当天被本工具违反）。
  *
  * ## 一个必须解决的问题：关键指标存在会消失的地方
  *
@@ -60,10 +70,25 @@ import { countByStatus, paramRows } from '@main/settings/params-view'
 import { createTradingCalendar, parseHolidayTable, type TradingCalendar } from '@main/scheduler/calendar'
 import { SHANGHAI_OFFSET_MS } from '@shared/time'
 import { dataFreshness, sinceFixLanded, type Freshness } from './session'
+import { itemState, parseBacklog, type BacklogItem, type ItemBucket, type ItemState } from './backlog'
 
 const ROOT = process.cwd()
 const REPORTS = join(ROOT, 'reports', 'calib')
 const BOARD = join(ROOT, 'docs', 'iteration', '看板.md')
+
+/**
+ * 扫 `<!-- ITEM ... -->` 的文档。**条目登记在它论证所在的那份文档里**，
+ * 所以这里只列「候选与决定」的两个出处 —— M2 是实验流水，不放条目
+ * （那会让同一件事有两个出处，而这个项目已经踩过一次：台账对、计划文档错）。
+ *
+ * ⚠ 一律写**正斜杠**：这几个串会原样印进看板（「登记在 `xxx:123`」），
+ * 用 `join()` 在 Windows 上会印成 `docs\notes\…` 而判据那一列是 `/` —— 同一份文档两种写法。
+ * 读文件时 `join(ROOT, path)` 照样吃正斜杠。
+ */
+const BACKLOG_DOCS = [
+  'docs/notes/下一阶段取舍与迭代计划.md',
+  'docs/notes/与机构量化系统的差距.md',
+] as const
 const HOLIDAYS = join(ROOT, 'resources', 'data', 'holidays.json')
 
 /** 读不到就是读不到 —— 不许退化成 0（见文件头纪律 3） */
@@ -597,6 +622,54 @@ function cleanDaysOf(r: RuntimeSnapshot): {
   }
 }
 
+// ── ④b 登记在案的落地项（人登记条目，仓库判状态；见 ./backlog.ts） ──────
+
+interface BacklogRow {
+  item: BacklogItem
+  state: ItemState
+}
+
+interface BacklogSnapshot {
+  rows: BacklogRow[]
+  errors: string[]
+}
+
+/** 读仓库里的一个文件，读不到给 `null`（不抛）—— `itemState` 的第三态靠它 */
+function readIfExists(path: string): string | null {
+  const abs = join(ROOT, path)
+  return existsSync(abs) ? readFileSync(abs, 'utf8') : null
+}
+
+/**
+ * 扫 `BACKLOG_DOCS` 里的条目并逐条问仓库「做没做」。
+ *
+ * 跨文档的 `id` 重复也要报 —— `parseBacklog` 只在单份文档内去重，
+ * 而两份文档里同一个 id 会让「该关掉哪一条」没有答案。
+ */
+function backlogState(): BacklogSnapshot {
+  const rows: BacklogRow[] = []
+  const errors: string[] = []
+  const seen = new Set<string>()
+  for (const doc of BACKLOG_DOCS) {
+    const text = readIfExists(doc)
+    if (text === null) {
+      errors.push(`读不到 ${doc} —— 这份文档里的条目全都看不见了`)
+      continue
+    }
+    const parsed = parseBacklog(text, doc)
+    errors.push(...parsed.errors)
+    for (const item of parsed.items) {
+      if (seen.has(item.id)) {
+        errors.push(`${item.file}:${item.line} id 跨文档重复：${item.id}`)
+        continue
+      }
+      seen.add(item.id)
+      rows.push({ item, state: itemState(item, readIfExists) })
+    }
+  }
+  return { rows, errors }
+}
+
 // ── ⑤ 规则驱动的任务清单 ─────────────────────────────────────────────
 
 type Bucket = '只能靠时间' | '现在就能做' | '等你拍板' | '明确不做'
@@ -849,6 +922,7 @@ function render(input: {
   budget: Maybe<number>
   runtime: Maybe<RuntimeSnapshot>
   taskList: Task[]
+  backlog: BacklogSnapshot
   at: string
 }): string {
   const L: string[] = []
@@ -1078,6 +1152,16 @@ function render(input: {
 
   L.push('## 今天该做什么')
   L.push('')
+  const backlog = input.backlog
+  const openRows = backlog.rows.filter((r) => r.state === 'OPEN')
+  const readyCount = openRows.filter((r) => r.item.bucket === '就绪').length
+  if (backlog.rows.length > 0) {
+    L.push(
+      `> 另有 **${backlog.rows.length}** 条登记在案的落地项（**${readyCount}** 条就绪），见下一节 —— ` +
+        '那些是已经论证过、只是还没做的。'
+    )
+    L.push('')
+  }
   const order: Bucket[] = ['只能靠时间', '现在就能做', '等你拍板', '明确不做']
   for (const bucket of order) {
     const items = input.taskList.filter((t) => t.bucket === bucket)
@@ -1091,13 +1175,75 @@ function render(input: {
     L.push('')
   }
 
+  L.push('## 登记在案的落地项')
+  L.push('')
+  L.push('> **条目由人登记，状态由仓库判。** 条目是文档里的 `<!-- ITEM -->` 标记')
+  L.push('> （登记在它论证所在的那一节），做没做由「判据那个字符串在不在仓库里」决定。')
+  L.push('> 关闭方式 = **删掉那行标记**。判据与三态见 `tools/iterate/backlog.ts`。')
+  L.push('')
+  if (backlog.rows.length === 0 && backlog.errors.length === 0) {
+    L.push('一条都没有登记。⚠ 这有两种成因，**别默认成前者**：真的没有待落地的东西，')
+    L.push('或者最近几轮的学习/实验结论根本没被登记（那正是这一节要防的事）。')
+    L.push('')
+  }
+  const bucketOrder: ItemBucket[] = ['就绪', '等条件', '等拍板', '不做']
+  for (const bucket of bucketOrder) {
+    const rows = openRows.filter((r) => r.item.bucket === bucket)
+    if (rows.length === 0) continue
+    L.push(`### ${bucket}`)
+    L.push('')
+    for (const { item } of rows) {
+      L.push(`- **${item.title}**（${item.kind} · 代价 ${item.cost}）`)
+      L.push(`  - 来源 ${item.source} · 登记在 \`${item.file}:${item.line}\``)
+      if (item.blockedBy !== null) L.push(`  - **等**：${item.blockedBy}`)
+      L.push(`  - 判据 \`${item.evidence.path}\` 里出现 \`${item.evidence.needle}\` ⇒ 算落地`)
+    }
+    L.push('')
+  }
+  const landed = backlog.rows.filter((r) => r.state === 'LANDED')
+  if (landed.length > 0) {
+    L.push('### ⚠ 证据显示已落地 —— 去把标记删掉')
+    L.push('')
+    L.push('条目还挂在文档里，而仓库里已经有那个字符串了。**清单只增不减就没人再看它。**')
+    L.push('')
+    for (const { item } of landed) {
+      L.push(
+        `- **${item.title}** —— \`${item.evidence.path}\` 里已有 \`${item.evidence.needle}\`；` +
+          `标记在 \`${item.file}:${item.line}\``
+      )
+    }
+    L.push('')
+  }
+  const unreadable = backlog.rows.filter((r) => r.state === 'UNREADABLE')
+  if (unreadable.length > 0) {
+    L.push('### ⚠ 判不了（判据文件读不到）')
+    L.push('')
+    L.push('**这是「不知道」，既不是「还没做」也不是「已经做了」** —— 路径写错了，或者那个文件被挪走了。')
+    L.push('')
+    for (const { item } of unreadable) {
+      L.push(`- **${item.title}** —— 读不到 \`${item.evidence.path}\`（标记在 \`${item.file}:${item.line}\`）`)
+    }
+    L.push('')
+  }
+  if (backlog.errors.length > 0) {
+    L.push('### ⚠ 登记不合格（这些条目没有被算进上面任何一组）')
+    L.push('')
+    L.push('**缺字段的条目关不掉，所以这里报出来而不是静默跳过。**')
+    L.push('')
+    for (const e of backlog.errors) L.push(`- ${e}`)
+    L.push('')
+  }
+
   L.push('---')
   L.push('')
   L.push('## 这份看板不做什么')
   L.push('')
   L.push('- **不提策略候选。** 授权边界（2026-08-15 拍板）：只报门槛达成情况，候选由人提。')
+  L.push('  ⚠ 上面那节**不是**例外：登记项是人已经论证过、已经决定要做的工程/判据项，')
+  L.push('  看板只负责不让它们烂掉，不负责发明它们。')
   L.push('- **不自动改代码。** 判定逻辑改动要走 docs/07 §3.6 的四条门槛，最后一步是人点头。')
   L.push('- **不记决策。** 那是计划文档 §1.1 的事 —— 一件事只有一个出处，两处会漂移。')
+  L.push('  同理**不记条目状态**：状态每次从仓库现算，看板里那几行是快照不是台账。')
   L.push('')
   return L.join('\n')
 }
@@ -1112,10 +1258,11 @@ async function main(): Promise<number> {
   const budget = testBudget()
   const runtime = await runtimeState()
   const taskList = tasks({ params, baseline, alpha, budget, runtime })
+  const backlog = backlogState()
   // 一律北京时间：`toISOString()` 给的是 UTC，而看板上那行看起来像本地钟 ——
   // 2026-08-17 15:11（北京）打成了「07:11」，那正是本项目一直在防的时区混读
   const at = shanghaiStamp(Date.now())
-  const text = render({ params, baseline, alpha, budget, runtime, taskList, at })
+  const text = render({ params, baseline, alpha, budget, runtime, taskList, backlog, at })
 
   process.stdout.write(text)
   if (write) {

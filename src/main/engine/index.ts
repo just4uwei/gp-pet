@@ -22,8 +22,10 @@ export {
   toSignalRecord,
 } from './signals'
 export type { SignalEngine, SignalEngineDeps, SignalOutcome, TickInfo } from './signals'
-export { closeMsOf, settleDay } from './settle'
+export { CLOSE_MINUTE, closeMsOf, settleDay } from './settle'
 export type { SettleDeps, SettleResult } from './settle'
+export { previewNextDay } from './preview'
+export type { NextDayPreviewDeps } from './preview'
 export { CLOSE_CATCHUP, MAINTENANCE_INTERVAL_MS, createTickPipeline } from './tick'
 export type { TickMetaStore, TickPipeline, TickPipelineDeps, TickState } from './tick'
 export { DEFAULT_GROUP, MAX_WATCH_ITEMS, createWatchlistService, toWatchItem } from './watchlist'

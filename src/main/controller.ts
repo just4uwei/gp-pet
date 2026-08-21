@@ -31,6 +31,7 @@ import type {
   ConfigTransferResult,
   DailyBar,
   DailyReport,
+  NextDayPreview,
   EngineStatus,
   EntryCheckView,
   IndicatorSnapshotView,
@@ -1600,13 +1601,7 @@ export class AppController {
       这一层只负责把它要的三样东西凑齐：北京日 / 今天开不开市 / 库里最后一天。
     */
     const now = Date.now()
-    const { date: today, minuteOfDay } = shanghaiTime(now)
-    const date = reportSubjectDate({
-      today,
-      todayIsOpen: layer.calendar.resolve(today).isOpen,
-      minuteOfDay,
-      lastDataDate: dates.sort().at(-1) ?? null,
-    })
+    const date = this.subjectDateOf(layer, dates, now)
     // 收盘线的「数据时刻」= 那天的北京 15:00。复用补跑那边的同一个函数，
     // 别在这里手写时区换算（`Date.parse('...T15:00')` 会按本机时区解析）
     const closeMs = closeMsOf(date)
@@ -1683,6 +1678,44 @@ export class AppController {
       dayStart,
       environment: buildEnvironment({ benchmark, industries: envTargets, bars, snapshots, closeMs }),
     })
+  }
+
+  /**
+   * 日报与「明日预览」**共用**的那一天。判据下沉在 `report/build.ts` 的 `reportSubjectDate`。
+   *
+   * 抽出来是因为它有两个调用方了 —— 各算一份的症状是「日报说 08-20、预览说 08-19」，
+   * 而那两屏就在同一个页签里，用户没有办法判断该信哪个。
+   */
+  private subjectDateOf(layer: DataLayer, dates: readonly TradeDate[], now: number): TradeDate {
+    const { date: today, minuteOfDay } = shanghaiTime(now)
+    return reportSubjectDate({
+      today,
+      todayIsOpen: layer.calendar.resolve(today).isOpen,
+      minuteOfDay,
+      lastDataDate: [...dates].sort().at(-1) ?? null,
+    })
+  }
+
+  /**
+   * 「明日预览」：盘后就地算一次当日收盘确认，答「明天准备买 / 卖 / 减什么」。
+   *
+   * 三条边界（**都在 `engine/preview.ts` 头注释里**，这里只说为什么它是独立一条通道）：
+   * 不落库、不推进影子、不发提醒 ⇒ 它**不是**日报的一节，
+   * 因为 `tomorrow` 那一节的纪律是「每一项都要指回一个已经存在的东西」，而预览指不回去。
+   *
+   * 日期与日报**同一个**（`subjectDateOf`）。评估范围是**全部自选**而不是
+   * 日报那份 `reportableItems` —— 「明天要交易什么」里，一只没持仓的行业 ETF
+   * 同样是可执行的候选（2026-08-18 放开了它们的持仓入口）。
+   */
+  nextDayPreview(): NextDayPreview | null {
+    const layer = this.data
+    if (!layer) return null
+    // 日期口径与日报严格一致：连 lastDataDate 都用同一份 reportableItems 算
+    const items = reportableItems(layer.watchlist.list(), INDUSTRY_ETF_GROUP)
+    const dates = items
+      .map((item) => layer.storage.klines.lastDate(item.code))
+      .filter((d): d is TradeDate => d !== null)
+    return layer.previewNextDay(this.subjectDateOf(layer, dates, Date.now()))
   }
 
   get unreadAlerts(): number {

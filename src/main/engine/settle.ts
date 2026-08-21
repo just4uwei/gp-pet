@@ -69,8 +69,14 @@ import type { MarketDataService } from './market-data'
 import { shanghaiToEpochMs } from '../providers/shared'
 import type { SecCode, TradeDate } from '@core/types'
 
-/** A 股收盘时刻（北京时间 15:00）在当天的第几分钟 —— 与 `SESSION_BOUNDS.close` 同一个数 */
-const CLOSE_MINUTE = 15 * 60
+/**
+ * A 股收盘时刻（北京时间 15:00）在当天的第几分钟 —— 与 `SESSION_BOUNDS.close` 同一个数。
+ *
+ * 导出是给 `./preview.ts` 用的：那条路要与补跑用**同一个** `minuteOfDay`，
+ * 各写一个数会让「预览」与「明早的补跑」落在 `T1_LATE_BUY` 窗口（890–910）的两侧
+ * —— 于是同一根 K 线一边给「买入」一边给「明日观察」，而没人看得出为什么。
+ */
+export const CLOSE_MINUTE = 15 * 60
 
 /**
  * `YYYY-MM-DD` → 那天**北京时间 15:00** 的 epoch ms。补跑落库行的 `created_at` 用它。

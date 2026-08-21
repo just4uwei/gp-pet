@@ -216,6 +216,10 @@ export function registerHandlers(controller: AppController): void {
   // 收盘日报（判据在 report/build.ts）。**它不是提醒**：不进 alert_log、不点状态点
   handle('report:daily', () => controller.dailyReport())
 
+  // 「明日预览」：就地算一次当日收盘确认。**用户点按钮才调** ——
+  // 每只票 320 根全套指标，不该跟着面板打开烧一遍。不落库、不推进影子、不发提醒
+  handle('report:preview', () => controller.nextDayPreview())
+
   // 已有的评价。**纯读不发请求** —— 打开页签不等于花钱（与 ai:explain 同一条纪律）
   handle('report:note', () => controller.reportNote())
 

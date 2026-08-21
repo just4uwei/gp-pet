@@ -23,7 +23,14 @@
  */
 
 import { useCallback, useEffect, useState } from 'react'
-import type { DailyReport, DailyReportStock, ReportEnvironment, ReportNoteView } from '@shared/ipc-types'
+import type {
+  DailyReport,
+  DailyReportStock,
+  NextDayPreview,
+  NextDayPreviewRow,
+  ReportEnvironment,
+  ReportNoteView,
+} from '@shared/ipc-types'
 import { reportTargetId } from '@shared/ai-target'
 import { shanghaiDate, shanghaiHhmmss, shanghaiMdHhmm } from '@shared/time'
 import type { TradeDate } from '@core/types'
@@ -371,6 +378,144 @@ function ReportNoteBlock({
   )
 }
 
+/** 明日预览的动作标签。与方向标签分开 —— 「明日观察」这个方向在未持仓时才变成「买」 */
+const ACTION_LABEL: Record<NextDayPreviewRow['action'], string> = {
+  BUY: '买',
+  SELL: '卖',
+  REDUCE: '减',
+}
+
+const ACTION_TONE: Record<NextDayPreviewRow['action'], string> = {
+  BUY: 'border-rose-400/40 bg-rose-400/10 text-rose-200',
+  SELL: 'border-amber-400/40 bg-amber-400/10 text-amber-200',
+  REDUCE: 'border-amber-400/40 bg-amber-400/10 text-amber-200',
+}
+
+/**
+ * 「明日预览」：盘后点一下，就地算一次当日收盘确认，答「明天准备买 / 卖 / 减什么」。
+ *
+ * ## 三处刻意的设计，改之前先读
+ *
+ * 1. **不并进上面那个「明日关注」** —— 那一节的纪律是「每一项都要指回一个**已经存在**
+ *    的东西」（今日已落库的信号 / 观察点 / 持仓裁决），而预览是就地算的、**不落库**，
+ *    它指不回去。并进去就把那条纪律破了。
+ * 2. **要点按钮才算**，不跟着页签打开就跑：它要为每只自选算一遍 320 根的全套指标。
+ *    与「分时图的量由人决定」同一条。
+ * 3. **`UNAVAILABLE` 与「空清单」必须显示成两件事**。前者是「今日收盘线还没入库，
+ *    算不出来」（盘中打开就是这样），后者是「明天确实没有要做的」——
+ *    把前者显示成后者，就是拿「不知道」冒充「没问题」。
+ */
+function NextDayPreviewBlock({ reportDate }: { reportDate: TradeDate }): React.JSX.Element {
+  const [preview, setPreview] = useState<NextDayPreview | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const run = useCallback((): void => {
+    setBusy(true)
+    void window.gp
+      .invoke('report:preview')
+      .then((next) => {
+        setPreview(next)
+        setError(null)
+      })
+      .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setBusy(false))
+  }, [])
+
+  return (
+    <section className="gp-card">
+      <div className="px-3 py-2">
+        <h2 className="flex items-baseline gap-2 text-sm text-white/70">
+          明日预览
+          <span className="text-[11px] text-white/30">盘后算一次 · 不落库</span>
+        </h2>
+        <p className="mt-0.5 text-[11px] leading-snug text-white/35">
+          按 {reportDate} 的收盘线就地跑一遍收盘确认，列出明天准备买 / 卖 / 减的票。
+          <span className="text-white/45">明早还会再算一次，结论可能改口</span>
+          —— 那一次才是入库的定论。
+        </p>
+        <button className="gp-btn mt-2" onClick={run} disabled={busy}>
+          {busy ? '正在算…' : preview === null ? '算明日预览' : '重新算'}
+        </button>
+      </div>
+
+      {error !== null ? (
+        <p className="border-t border-white/[0.06] px-3 py-3 text-xs text-rose-300">{error}</p>
+      ) : preview === null ? null : (
+        <div className="border-t border-white/[0.06]">
+          <p className="px-3 py-2 text-[11px] leading-snug text-white/35">
+            {preview.coverage.withClose}/{preview.coverage.total} 只已有 {preview.date} 的收盘线
+            {preview.coverage.missing.length > 0 ? (
+              <>
+                {' · '}
+                <span className="text-amber-200/70" title={preview.coverage.missing.join(' ')}>
+                  缺 {preview.coverage.missing.length} 只（
+                  {preview.coverage.missing.slice(0, 3).join('、')}
+                  {preview.coverage.missing.length > 3 ? '…' : ''}）
+                </span>
+              </>
+            ) : null}
+          </p>
+
+          {/* 「算不出来」与「没有要做的」是两件事，分两支写 */}
+          {preview.status === 'UNAVAILABLE' ? (
+            <p className="px-3 pb-3 text-sm text-amber-200/80">
+              {preview.date} 的收盘线一根都还没入库，<strong>算不出来</strong> ——
+              不是「明天没有要做的」。个股日线通常 15:05–15:30 发布，收盘后再来。
+            </p>
+          ) : preview.rows.length === 0 ? (
+            <p className="px-3 pb-3 text-sm text-white/40">明天没有准备交易的票。</p>
+          ) : (
+            <ul>
+              {preview.rows.map((row) => (
+                <li
+                  key={row.code}
+                  className="flex items-center gap-3 border-t border-white/[0.06] px-3 py-2 text-sm"
+                >
+                  <span
+                    className={`w-7 shrink-0 rounded border px-1 py-0.5 text-center text-[10px] ${ACTION_TONE[row.action]}`}
+                  >
+                    {ACTION_LABEL[row.action]}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="truncate">{row.name}</span>
+                    <span className="ml-2 font-mono text-xs text-white/35">{row.code}</span>
+                    {row.holding ? (
+                      <span className="ml-2 text-[10px] text-white/35">持仓</span>
+                    ) : null}
+                  </span>
+                  {/* 方向与动作分开显示：同一个「明日观察」在持仓时不会变成买 */}
+                  <span className="shrink-0 text-[11px] text-white/45">
+                    {DIRECTION_LABEL[row.direction] ?? row.direction}
+                  </span>
+                  <span
+                    className="shrink-0 truncate text-[11px] text-white/35"
+                    title={`归因：${row.rule}`}
+                  >
+                    {row.rule}
+                  </span>
+                  {/* 「得分」不叫概率也不叫胜率（措辞纪律） */}
+                  <span
+                    className="shrink-0 font-mono text-[11px] tabular-nums text-white/30"
+                    title="组合层得分，不是上涨概率"
+                  >
+                    {Math.round(row.score * 100)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <p className="border-t border-white/[0.06] px-3 py-2 text-[11px] leading-snug text-white/30">
+            这一屏按<strong>你自己的持仓</strong>算，所以它不等于影子运行明天会挂的委托
+            （那边用影子组合的持仓）。它不落库、不发提醒、不推进影子。
+          </p>
+        </div>
+      )}
+    </section>
+  )
+}
+
 export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.JSX.Element {
   const [report, setReport] = useState<DailyReport | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -612,6 +757,8 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
           </div>
         ) : null}
       </section>
+
+      <NextDayPreviewBlock reportDate={report.date} />
 
       {/*
         缺数据的提示**不放进上面那个折叠块** —— 它说的是「这份报告有几只是空的」，
