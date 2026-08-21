@@ -36,6 +36,11 @@ export interface EquityPoint {
   equity: number
   /** 基准指数归一化到同一起点的净值；缺基准时为 null */
   benchmark: number | null
+  /**
+   * 当日收盘持仓市值，元（2026-08-21 加）。**只有 `riskFreeAdjustedSharpe` 用它**，
+   * 缺省时那个数给 null 而不是退回「按满仓收 rf」—— 见那个函数的头注释。
+   */
+  positionValue?: number | undefined
 }
 
 export interface DrawdownResult {
@@ -148,6 +153,210 @@ export function sharpeRatio(returns: readonly number[]): number | null {
   const sd = sampleStdev(returns)
   if (returns.length < 2 || sd === 0) return null
   return (mean(returns) / sd) * Math.sqrt(BARS_PER_YEAR)
+}
+
+/**
+ * 无风险利率调整后的年化夏普：**只在实际投出去的那部分资金上收机会成本**。
+ *
+ * ```
+ * 超额_t = r_t − (rf / 243) · w_{t−1}          w = 上一日收盘持仓市值 / 净值
+ * ```
+ *
+ * ## 为什么不是「直接减 rf」（2026-08-21，用户拍板 rf = 2%）
+ *
+ * 直接减是**罚两次**。这套策略绝大多数时间空仓（出厂参数下逐日占用 3.50%），
+ * 而回测与影子**都不给现金计息** ⇒ 那 96.5% 的钱在账本里一分钱没赚，
+ * 再按满仓的标准扣掉整个 rf，扣的是一笔它从来没拿到过的收益。
+ * 「给现金按 rf 计息、再整体减 rf」与「只对持仓部分减 rf」在代数上恒等
+ * （`r + rf·(1−w) − rf = r − rf·w`），后者不用去动净值曲线，这一点很要紧 ——
+ * 真把利息累进净值里，六年下来的现金利息会把 `totalReturn` 从 −1.99% 抬成正数，
+ * 而那是货币基金赚的，不是策略赚的。**这个项目最不能产出的就是那种数字。**
+ *
+ * 实测量级（`cap-100000` 训练窗口，2026-08-21 重跑逐位复现基线后算的）：
+ * rf=0 给 **−0.412**，只对持仓收给 **−0.502**，而直接减给 **−2.888**
+ * —— 后者与前两者差 2.4 个夏普，全部来自这个 artifact。
+ * 差距这么大是因为分母被空仓稀释了约 24 倍（日标准差 0.05% vs 沪深300 1.24%），
+ * `rf/243` 占策略日标准差的 15.9%、占指数的 0.66% ⇒ **同一个 rf 对低暴露策略的
+ * 伤害是对指数的 25 倍**。这与「低暴露策略上 CAPM alpha 的符号由 Rf 决定」同源
+ * （M2 §5.41），那一条已经否掉了 alpha 当判据。
+ *
+ * `positionValue` 缺任意一期就返回 **null**：不知道占用就算不出这个数，
+ * 而退回「按满仓收」恰好是上面那个要防的双罚。`rf = 0` 时该项恒为 0，
+ * 直接走 `sharpeRatio` —— 于是老口径逐位不变。
+ *
+ * ⚠ `×√243` 的自相关问题这里**一模一样地存在**（见 `sharpeRatio`），rf 不改变它。
+ */
+export function riskFreeAdjustedSharpe(
+  points: readonly EquityPoint[],
+  annualRiskFree: number
+): number | null {
+  if (annualRiskFree === 0) return sharpeRatio(returnsOf(points, 'equity'))
+
+  const perBar = annualRiskFree / BARS_PER_YEAR
+  const excess: number[] = []
+  for (let i = 1; i < points.length; i++) {
+    const prev = points[i - 1]
+    const now = points[i]
+    if (!prev || !now || prev.equity <= 0) continue
+    if (prev.positionValue === undefined) return null
+    excess.push(now.equity / prev.equity - 1 - perBar * (prev.positionValue / prev.equity))
+  }
+  return sharpeRatio(excess)
+}
+
+/**
+ * Bartlett 核的 **HAC 长期协方差**（Newey & West 1987）：
+ *
+ * ```
+ * S_ab = γ₀^ab + Σ_{k=1..L} (1 − k/(L+1)) · (γ_k^ab + γ_k^ba)
+ * γ_k^ab = (1/T) · Σ_{t=k}^{T−1} (a_t − ā)(b_{t−k} − b̄)
+ * ```
+ *
+ * `a === b` 时退化成标量版 `γ₀ + 2Σ w_k γ_k`（`ic-audit.ts` 的 `neweyWestVariance`
+ * 就是它除以 `T`，那边**只留一层薄封装**，别在任何地方照抄第二份自协方差循环）。
+ *
+ * ⚠ **交叉项必须对称化**：`γ_k^ab ≠ γ_k^ba`（一个是 `a` 领先、一个是 `b` 领先），
+ * 只取一边算出来的矩阵不对称 ⇒ 二次型可能变负，而那会表现成一个「负方差」。
+ *
+ * ⚠ 两条与 `neweyWestVariance` 同源的读法：① `L` 是**滞后截断阶**不是带宽；
+ * ② `L = ⌊4(T/100)^(2/9)⌋` 那个经验规则归 **Andrews (1991)**，不归 NW (1987)。
+ *
+ * 除数用 `1/T`（NW 原式）而不是 `1/(T−1)`：这里估的是长期方差，不是样本方差。
+ * 序列必须**按时间排好**，顺序错了这个数没有意义。
+ */
+export function bartlettLongRunCovariance(
+  a: readonly number[],
+  b: readonly number[],
+  lag: number
+): number | null {
+  const T = Math.min(a.length, b.length)
+  if (T < 2) return null
+  const ma = mean(a.slice(0, T))
+  const mb = mean(b.slice(0, T))
+  const da = a.slice(0, T).map((v) => v - ma)
+  const db = b.slice(0, T).map((v) => v - mb)
+  // γ_k^ab：a 在 t、b 在 t−k
+  const gamma = (k: number): number => {
+    let sum = 0
+    for (let t = k; t < T; t++) sum += (da[t] ?? 0) * (db[t - k] ?? 0)
+    return sum / T
+  }
+  const gammaRev = (k: number): number => {
+    let sum = 0
+    for (let t = k; t < T; t++) sum += (db[t] ?? 0) * (da[t - k] ?? 0)
+    return sum / T
+  }
+  const L = Math.max(0, Math.min(lag, T - 1))
+  let out = gamma(0)
+  for (let k = 1; k <= L; k++) out += (1 - k / (L + 1)) * (gamma(k) + gammaRev(k))
+  return out
+}
+
+export interface SharpeHacResult {
+  /**
+   * 原始频率的夏普，**总体标准差口径（÷n）**。
+   *
+   * ⚠ 与 `sharpeRatio()` 的 `÷(n−1)` 差 `√(T/(T−1))`（T = 1456 时 0.03%）。
+   * 这里**必须**用总体口径：`lag = 0` 时逐位退回 `1 − γ₃·SR + ((γ₄−1)/4)·SR²`
+   * 这条嵌套恒等式是本函数唯一的正确性保证，而那个式子里的 `SR` 与 `γ₃/γ₄`
+   * 是同一套总体中心矩。换成 `n−1` 只会让自检差一点点 —— 那正是最糟的情形：
+   * 看起来像通过了。
+   */
+  sharpe: number
+  /** Lo (2002) 的 `V_GMM`。夏普估计量的方差是 `varTerm / T` */
+  varTerm: number
+  /** 同一份数据在 `lag = 0` 下的 `varTerm` = Mertens/Christie 的闭式（`sharpeVarianceTerm`） */
+  varTermIid: number
+  /** `varTerm / varTermIid` —— **自相关把夏普估计量的方差抬高了多少倍** */
+  varianceInflation: number
+  /** 实际用到的滞后截断阶（会被 `T−1` 夹住） */
+  lag: number
+  /** 原始频率的标准误 `√(varTerm / T)` */
+  standardError: number
+}
+
+/**
+ * **Lo (2002) 的夏普估计量方差**，允许序列相关与条件异方差（HAC）。
+ *
+ * 归属：**Lo, A. W.** (2002), *The Statistics of Sharpe Ratios*,
+ * **Financial Analysts Journal 58(4) 36–52**（原文 Appendix A 一手核对，M2 §5.50）。
+ *
+ * ```
+ * θ = (μ, σ²)   g(θ) = μ/σ   ∇g = (1/σ, −μ/(2σ³))′
+ * V_GMM = ∇g′ · S · ∇g     S = [r_t−μ, (r_t−μ)²−σ²] 的 HAC 长期协方差
+ * ```
+ *
+ * 展开就是这个函数在算的三项：
+ * `V = S₁₁/σ² − (μ/σ⁴)·S₁₂ + (μ²/4σ⁶)·S₂₂`。
+ *
+ * ## 归属链（**本仓库此前引错了一环**，M2 §5.50 易读错 ③）
+ *
+ * **Jobson & Korkie (1981)** 先给 IID 正态 → **Lo (2002)** 重述，并给出这里用的
+ * GMM/HAC 一般形式 → **Mertens (2002)** 是**对 Lo 的更正**（指出 Lo 那一段只在
+ * IID **正态**下成立，给出带 `γ₃/γ₄` 的闭式）→ **Christie (2005)** 在平稳遍历下用 GMM 推
+ * → **Opdyke (2007)** 证明 Christie 与 Mertens 是同一个式子。
+ *
+ * ⚠ **「Mertens 的闭式在平稳遍历下也成立」不等于「自相关已经处理了」**：
+ * 那个闭式用的是**同期**中心矩，而自相关只能从 `S` 的**长期**协方差进来 ——
+ * Lo 的实证部分之所以要跑 Newey–West（截断阶 m = 3 / 6）就是这个原因。
+ * 两句混读会得出「不用做了」这个相反的结论。
+ *
+ * ## ⚠ 它的前提（H1：平稳 + 遍历）在本项目数据上**不成立**，2026-08-21 实测
+ *
+ * [M2 §5.51](../../docs/notes/M2-偏差报告.md)：CUSUMSQ（κ₂ 口径）在**策略、基准同期、
+ * 基准 2005–2017 三条序列上一致拒绝方差恒定**，而那个检验实测偏保守（水平 2.5–3.5%）。
+ * ⇒ **`varianceInflation` 是「这个窗口上的平均值」，不是常数**：训练窗口全段 1.3208，
+ * 而等长三段是 1.09 / 1.56 / 1.18。**引用时必须带窗口**（「训练窗口上的 1.32」）。
+ *
+ * 它仍然可用，理由是这个量恰好是**最耐受**那种不平稳的：`VIF ≈ S₁₁/σ²` 是个比值，
+ * 分子分母同随局部方差缩放 ⇒ 尺度不变（三段极差 1.43×，而同期 σ 的极差是 2.30×）。
+ *
+ * 顺带一条机制：**基准自己的 VIF 是 0.9606（< 1，负自相关）**，而策略是 1.3208
+ * ⇒ 这个正自相关是**策略持仓结构**的（持仓平均 14 根），不是从市场继承的。
+ *
+ * ## 三条边界
+ *
+ * 1. **它不改任何夏普的点估计。** `performance.sharpe` 永久是 rf = 0 + `×√243`
+ *    （CLAUDE.md 写死），这个函数只答「那个数的标准误有多大」。
+ * 2. **`lag` 必须预承诺**，不许看着结果挑 —— 「调滞后阶到显著为止」是文献里
+ *    有记录的 p-hacking 通道（M2 §5.47）。
+ * 3. **传进来的必须是原始频率的收益**（日频）。年化过的收益会让 `SR²` 那一项
+ *    放大两个数量级。
+ */
+export function sharpeRatioHac(returns: readonly number[], lag: number): SharpeHacResult | null {
+  const T = returns.length
+  if (T < 2) return null
+  const mu = mean(returns)
+  // 总体口径（÷n）—— 见 `SharpeHacResult.sharpe` 的注释，嵌套自检要求如此
+  const m2 = returns.reduce((sum, v) => sum + (v - mu) ** 2, 0) / T
+  if (m2 <= 0) return null
+  const sigma = Math.sqrt(m2)
+
+  const dev = returns.map((v) => v - mu)
+  const sq = dev.map((d) => d * d - m2)
+
+  const varTermAt = (l: number): number | null => {
+    const s11 = bartlettLongRunCovariance(dev, dev, l)
+    const s12 = bartlettLongRunCovariance(dev, sq, l)
+    const s22 = bartlettLongRunCovariance(sq, sq, l)
+    if (s11 === null || s12 === null || s22 === null) return null
+    const v = s11 / m2 - (mu / (m2 * m2)) * s12 + ((mu * mu) / (4 * m2 * m2 * m2)) * s22
+    return v > 0 ? v : null
+  }
+
+  const effectiveLag = Math.max(0, Math.min(lag, T - 1))
+  const varTerm = varTermAt(effectiveLag)
+  const varTermIid = varTermAt(0)
+  if (varTerm === null || varTermIid === null) return null
+
+  return {
+    sharpe: mu / sigma,
+    varTerm,
+    varTermIid,
+    varianceInflation: varTerm / varTermIid,
+    lag: effectiveLag,
+    standardError: Math.sqrt(varTerm / T),
+  }
 }
 
 /** 信息比率：超额收益的年化均值 / 年化跟踪误差 */

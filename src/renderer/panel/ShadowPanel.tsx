@@ -64,6 +64,22 @@ function money(value: number): string {
   return value.toLocaleString('zh-CN', { maximumFractionDigits: 0 })
 }
 
+/**
+ * 夏普的显示值。交易日不够时给「样本不足」而不是数字 ——
+ * 这是刻意**不显示一个已经算出来的数**：`bars = 4` 时它是 12.58，
+ * 而那个量级在真实日频权益策略上不存在，印出来只会被读成绩效。
+ */
+function sharpeText(value: number | null, bars: number, minBars: number): string {
+  if (bars < minBars) return '样本不足'
+  return plain(value)
+}
+
+/** 恒返回字符串：`exactOptionalPropertyTypes` 下 `hint={undefined}` 不合法 */
+function sharpeHint(bars: number, minBars: number): string {
+  if (bars < minBars) return `只有 ${bars} 个交易日，不足 ${minBars} 个不给这个数`
+  return '×√243 假设日收益独立；这个长度仍判不出夏普（MinTRL 以年计）'
+}
+
 function tone(value: number): string {
   // A 股习惯：红涨绿跌
   if (value > 0) return 'text-rose-400'
@@ -304,7 +320,26 @@ export function ShadowPanel({
         ) : (
           <Metric label="年化" value={pct(summary.annualized)} hint="样本太短，仅算术外推" />
         )}
-        <Metric label="夏普（rf=0）" value={plain(summary.sharpe)} />
+        {/*
+          两个夏普**并排**，且各自把 rf 写在标签上 —— rf 是自由参数，脱开取值这个数
+          没有意义（回测那侧实测 rf=0 给 −0.412、rf=2% 给 −0.502）。
+          机会成本只按逐日持仓占用收，不是直接减：直接减会因为常年空仓罚两次
+          （见 `backtest/metrics.ts` 的 `riskFreeAdjustedSharpe`）。
+
+          交易日不够时显示「样本不足」而不是数字：4 个净值点能算出年化夏普 12.58
+          （其中一天全空仓、日收益率恰好 0），那个数唯一表达的是样本量。
+          阈值的性质见 `SHARPE_MIN_BARS` —— 它是展示阈值，真门槛以年计。
+        */}
+        <Metric
+          label="夏普（rf=0）"
+          value={sharpeText(summary.sharpe, summary.bars, summary.sharpeMinBars)}
+          hint={sharpeHint(summary.bars, summary.sharpeMinBars)}
+        />
+        <Metric
+          label={`夏普（rf=${(summary.riskFreeRate * 100).toFixed(0)}%）`}
+          value={sharpeText(summary.sharpeNet, summary.bars, summary.sharpeMinBars)}
+          hint="机会成本只按逐日持仓占用收，不是整体减 rf"
+        />
       </div>
 
       {/* ── 两个胜率口径 ────────────────────────────────────────── */}

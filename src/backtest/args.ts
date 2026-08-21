@@ -39,6 +39,13 @@ export interface CliOptions {
   grid?: string
   out?: string
   capital: number
+  /**
+   * 年化无风险利率，**只作用于报告里那个并排的 `sharpeNet`**（默认 0 ⇒ 不算、不打印）。
+   * 净值曲线、收益、回撤、Calmar 与 `sharpe` 一个都不受它影响 —— 所以带 `--rf` 的跑
+   * 仍然是出厂口径，`auditKnobs` 刻意不认它。为什么不真给现金计息：见
+   * `metrics.ts` 的 `riskFreeAdjustedSharpe` 头注释（会把 totalReturn 抬成正数）。
+   */
+  riskFree: number
   lookback: number
   warmup?: number
   costs: {
@@ -106,6 +113,8 @@ export const USAGE = `用法：
   --stamp-tax <率>       默认 0.001（仅卖出）
   --transfer-fee <率>    默认 0.00001（双边）
   --slippage <率>        默认 0.001
+  --rf <年化率>          无风险利率，只多打一行 sharpeNet（默认 0 = 不算）
+                         机会成本只按逐日持仓占用收，不动净值曲线
 
 输出：
   --out <file>           JSON 报告落盘路径
@@ -154,6 +163,7 @@ export function parseArgs(argv: readonly string[]): CliOptions | 'help' {
     to: '2099-12-31',
     benchmark: 'SH000300',
     capital: 100_000,
+    riskFree: 0,
     lookback: 320,
     costs: {},
     dropCapPct: 0,
@@ -224,6 +234,9 @@ export function parseArgs(argv: readonly string[]): CliOptions | 'help' {
         break
       case '--capital':
         options.capital = positiveNumber(key, requireValue(key, next))
+        break
+      case '--rf':
+        options.riskFree = positiveNumber(key, requireValue(key, next))
         break
       case '--lookback':
         options.lookback = positiveNumber(key, requireValue(key, next))

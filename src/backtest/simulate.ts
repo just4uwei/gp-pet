@@ -397,6 +397,11 @@ export function simulateCode(
       date: bar.date,
       equity: cash + shares * bar.closeAdj,
       benchmark: null,
+      // 逐日占用，只喂 riskFreeAdjustedSharpe。**不要拿它替换 `performance.exposure`**
+      // —— 那个是按建仓价的近似，换掉会让归档报告里同名字段前后不是一个数
+      // （auditKnobs 那条坑的形状）。两者实测确实不等：训练窗口上逐日精确 3.654%、
+      // 报告里那个近似 3.505%，近似偏小 0.15pp。
+      positionValue: shares * bar.closeAdj,
     })
 
     // ── ④ 收盘后判定信号（最后一根不判：没有下一根可成交，判了也只是幻觉） ──

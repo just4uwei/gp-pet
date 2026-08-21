@@ -25,6 +25,7 @@ import {
   maxDrawdown,
   ratioExcessReturn,
   returnsOf,
+  riskFreeAdjustedSharpe,
   sharpeRatio,
   summarizeTrades,
   type EquityPoint,
@@ -39,7 +40,17 @@ export interface PerformanceBlock {
   maxDrawdown: number
   drawdownBars: number
   drawdownRecoveryBars: number | null
+  /** 年化夏普，**恒为 rf = 0**。这个字段的口径从来没变过，老报告可以逐份横向比 */
   sharpe: number | null
+  /**
+   * 机会成本调整后的夏普（2026-08-21 加，`--rf` 默认 0 ⇒ 默认 null）。
+   *
+   * rf 只对**持仓那部分**收（`riskFreeAdjustedSharpe` 头注释讲了为什么不是直接减：
+   * 直接减是罚两次，实测差 2.4 个夏普）。它**只改这一个字段** —— 净值曲线、
+   * 收益、回撤、Calmar 一个都不动，所以带 `--rf` 的跑仍然可以当基线引用。
+   * `rf` 的取值在 `meta.riskFree`，**引用这个数必须带上它**（自由参数，同 DSR 的 N）。
+   */
+  sharpeNet: number | null
   /** 基准缺失时为 null —— 不用 0 冒充「无超额」 */
   benchmarkReturn: number | null
   /** **减法版**超额 `Rp − Rm`。历史上所有引用都是这个口径，所以它留着不动 */
@@ -107,6 +118,12 @@ export interface BacktestReport {
      * 与 `capitalPerCode` 同一条理由：报告要能自己回答「这是哪套口径下的数」。
      */
     costs: CostModel
+    /**
+     * 本次 `performance.sharpeNet` 用的年化无风险利率（2026-08-21 加，出厂 0）。
+     * 老报告没有这一列 ⇒ `undefined`，而那**不是**「未记录」的那一档：
+     * `sharpeNet` 也一起缺，`sharpe` 又恒是 rf=0 ⇒ 没有可被读错的数。
+     */
+    riskFree?: number | undefined
     /** 出厂参数是否仍未标定（ADR-0003）。true 时任何绩效数字都不得对外宣称 */
     unvalidatedParams: boolean
   }
@@ -162,35 +179,51 @@ export function mergeEquity(
   const dates = [...new Set(results.flatMap((r) => r.equity.map((p) => p.date)))].sort()
   const cursors = results.map(() => 0)
   const lastValues = results.map((r) => (r.equity.length > 0 ? r.equity[0]?.equity ?? 0 : 0))
+  // 持仓市值与净值走**同一套前值填充**：停牌期间那部分仓位确实还在
+  const lastPositions = results.map((r) => r.equity[0]?.positionValue)
   const out: EquityPoint[] = []
   let benchmarkBase: number | null = null
 
   for (const date of dates) {
     let total = 0
+    let positionTotal = 0
+    // 只要有一只缺这一列，整条曲线的占用就不可信 ⇒ 整份不给
+    let positionsKnown = true
     for (let k = 0; k < results.length; k++) {
       const points = results[k]?.equity ?? []
       let cursor = cursors[k] ?? 0
       while (cursor < points.length && (points[cursor]?.date ?? '') <= date) {
         lastValues[k] = points[cursor]?.equity ?? lastValues[k] ?? 0
+        lastPositions[k] = points[cursor]?.positionValue
         cursor++
       }
       cursors[k] = cursor
       total += lastValues[k] ?? 0
+      const held = lastPositions[k]
+      if (held === undefined) positionsKnown = false
+      else positionTotal += held
     }
 
     const raw = benchmarkByDate?.get(date)
     if (raw !== undefined && benchmarkBase === null && raw > 0) benchmarkBase = raw
-    out.push({
+    const point: EquityPoint = {
       date,
       equity: total,
       benchmark: raw !== undefined && benchmarkBase !== null && benchmarkBase > 0 ? raw / benchmarkBase : null,
-    })
+    }
+    if (positionsKnown) point.positionValue = positionTotal
+    out.push(point)
   }
 
   return out
 }
 
-export function performanceOf(equity: readonly EquityPoint[], trades: readonly BacktestTrade[]): PerformanceBlock {
+export function performanceOf(
+  equity: readonly EquityPoint[],
+  trades: readonly BacktestTrade[],
+  /** 年化无风险利率，只作用于 `sharpeNet`。默认 0 ⇒ 与改动前逐位相同 */
+  riskFree = 0
+): PerformanceBlock {
   const first = equity[0]?.equity ?? 0
   const last = equity[equity.length - 1]?.equity ?? 0
   const totalReturn = first > 0 ? last / first - 1 : 0
@@ -215,6 +248,7 @@ export function performanceOf(equity: readonly EquityPoint[], trades: readonly B
     drawdownBars: drawdown.durationBars,
     drawdownRecoveryBars: drawdown.recoveryBars,
     sharpe: sharpeRatio(strategyReturns),
+    sharpeNet: riskFree === 0 ? null : riskFreeAdjustedSharpe(equity, riskFree),
     benchmarkReturn,
     excessReturn: benchmarkReturn === null ? null : totalReturn - benchmarkReturn,
     excessReturnRatio: ratioExcessReturn(totalReturn, benchmarkReturn),
@@ -325,7 +359,7 @@ export interface AssembleInput {
 export function assembleReport(input: AssembleInput): BacktestReport {
   const equity = mergeEquity(input.results, input.benchmarkByDate)
   const trades = input.results.flatMap((r) => r.trades)
-  const performance = performanceOf(equity, trades)
+  const performance = performanceOf(equity, trades, input.meta.riskFree ?? 0)
 
   const suppressions = new Map<string, number>()
   for (const result of input.results) {
@@ -498,6 +532,14 @@ export function renderReport(report: BacktestReport): string {
   // 与折间 t 那处同一个病，只是夏普不参与任何门槛（排名口径是 Calmar），所以按 §4.6 的
   // 「立刻」档处理 —— **如实标注，不改算法**。要改得上 Newey-West/Lo，那是单独一次改动。
   lines.push(`  夏普 ${num(p.sharpe)}（rf = 0，×√243 未做自相关调整 ⇒ 偏大，§4.6）`)
+  // rf ≠ 0 时**并排**打印，绝不替换上面那一行：两个数差得很远（实测 −0.412 vs −0.502），
+  // 只给一个会让「引用的是哪个口径」重新变成猜的。rf 的取值必须跟在数字后面（自由参数）
+  if (p.sharpeNet !== null && report.meta.riskFree !== undefined) {
+    lines.push(
+      `  夏普 ${num(p.sharpeNet)}（rf = ${pct(report.meta.riskFree)}，机会成本只按逐日持仓占用收 —— ` +
+        `直接减 rf 会因为常年空仓而罚两次，见 riskFreeAdjustedSharpe）`
+    )
+  }
   lines.push(
     `  卖出 ${p.trades.count} 笔  逐笔胜率 ${pct(p.trades.winRate)}  盈亏比 ${num(
       p.trades.profitFactor

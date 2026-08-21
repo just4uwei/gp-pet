@@ -373,6 +373,7 @@ function block(overrides: { annualized?: number | null; maxDrawdown?: number; tr
     drawdownBars: 5,
     drawdownRecoveryBars: 10,
     sharpe: 1,
+    sharpeNet: null,
     benchmarkReturn: null,
     excessReturn: null,
     excessReturnRatio: null,

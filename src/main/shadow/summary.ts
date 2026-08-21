@@ -26,6 +26,7 @@ import {
   maxDrawdown,
   mean,
   returnsOf,
+  riskFreeAdjustedSharpe,
   sharpeRatio,
   summarizeTrades,
   type EquityPoint,
@@ -36,6 +37,27 @@ import type { ShadowOrder, ShadowPosition, ShadowTrade } from './portfolio'
 
 /** 影子运行「成熟」所需的自然日数。docs/07 §2.3：满 3 个月前不对绩效做正面宣称 */
 export const SEASONING_DAYS = 90
+
+/**
+ * `sharpeNet` 用的年化无风险利率（2026-08-21 用户拍板 2%，A 股语境的货币基金档）。
+ *
+ * 它**是一个自由参数**，所以两条纪律跟着它走：① 界面上取值必须跟数字一起出现
+ * （`riskFreeRate` 进 `ShadowSummary` 就是为这个）；② 机会成本只按逐日持仓占用收，
+ * 不是直接减 —— 影子与回测都不给现金计息，直接减会罚两次，实测在回测那侧
+ * 差 2.4 个夏普（见 `riskFreeAdjustedSharpe` 头注释）。
+ */
+export const RISK_FREE_RATE = 0.02
+
+/**
+ * 夏普至少要有这么多个交易日才给数值，否则显示「样本不足」。
+ *
+ * **20 是一个展示阈值，不是统计阈值** —— 真正的门槛是 MinTRL，而它以**年**计
+ * （年化夏普 0.5 要 11 年、0.3 要 30 年，M2 §5.49）⇒ 任何按天设的线都拦不住
+ * 「这个数还不能承重」。它只拦最离谱的那一档：2026-08-21 真机上 4 个净值点
+ * （其中一天全空仓、日收益率恰好 0.0000%）算出年化夏普 **12.58**，而世界上最好的
+ * 基金常年是 2–3。那个数唯一表达的是样本量，印出来只会被读成绩效。
+ */
+export const SHARPE_MIN_BARS = 20
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -75,6 +97,8 @@ export function summarize(input: SummaryInput): ShadowSummary {
     date: row.date,
     equity: row.equity,
     benchmark: row.benchmark,
+    // 影子这一侧的占用是**逐日精确值**（账本里就有），比回测那个按建仓价的近似准
+    positionValue: row.positionValue,
   }))
 
   const bars = points.length
@@ -154,6 +178,9 @@ export function summarize(input: SummaryInput): ShadowSummary {
     annualized: annualizedReturn(totalReturn, bars),
     maxDrawdown: drawdown.maxDrawdown,
     sharpe: sharpeRatio(strategyReturns),
+    sharpeNet: riskFreeAdjustedSharpe(points, RISK_FREE_RATE),
+    riskFreeRate: RISK_FREE_RATE,
+    sharpeMinBars: SHARPE_MIN_BARS,
     benchmarkReturn,
     exposure,
     beta: betaOf(paired.strategy, paired.benchmark),
@@ -229,6 +256,9 @@ export function emptyShadowSummary(engineVersion: string): ShadowSummary {
     annualized: null,
     maxDrawdown: 0,
     sharpe: null,
+    sharpeNet: null,
+    riskFreeRate: RISK_FREE_RATE,
+    sharpeMinBars: SHARPE_MIN_BARS,
     benchmarkReturn: null,
     exposure: null,
     beta: null,

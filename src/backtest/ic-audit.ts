@@ -55,6 +55,7 @@ import { CONTINUOUS_MINUTES } from '../core/session'
 import type { EngineContext, SecCode, TradeDate } from '../core/types'
 import { USAGE, parseArgs, type CliOptions } from './args'
 import { openFixtureSource, openSqliteSource, sentimentSeries, type LoadedSeries } from './data'
+import { bartlettLongRunCovariance } from './metrics'
 
 /** 与 cli.ts / crosssec-audit.ts 同一份实现（那两处也各有一份，改动要一起改） */
 function defaultDbPath(): string {
@@ -145,22 +146,17 @@ export interface IcResult {
  *
  * 序列**必须按时间排好**再传进来：自协方差按相邻位置算，顺序错了这个数就没有意义。
  * 返回 null 的两种情形：样本不足，或方差非正（全部并列会走到）。
+ *
+ * ⚠ **只是一层薄封装**（2026-08-21 起）：自协方差循环住在
+ * `metrics.ts` 的 `bartlettLongRunCovariance`，那边还要给 Lo (2002) 的夏普方差
+ * 算 2×2 的协方差矩阵（M2 §5.50）。**别在这里照抄回来** —— 两份实现漂移的症状是
+ * 「IC 的 t 与夏普的标准误各自都说得通、但不是同一个 HAC 口径」，事后分不清哪个对。
  */
 export function neweyWestVariance(series: readonly number[], lag: number): number | null {
   const T = series.length
   if (T < 2) return null
-  const mean = series.reduce((s, v) => s + v, 0) / T
-  const dev = series.map((v) => v - mean)
-  // γ₀ 用 1/T（与 NW 原式一致），不是 1/(T−1)：这里估的是长期方差不是样本方差
-  const gamma = (k: number): number => {
-    let sum = 0
-    for (let i = k; i < T; i++) sum += (dev[i] ?? 0) * (dev[i - k] ?? 0)
-    return sum / T
-  }
-  let lrv = gamma(0)
-  const L = Math.max(0, Math.min(lag, T - 1))
-  for (let k = 1; k <= L; k++) lrv += 2 * (1 - k / (L + 1)) * gamma(k)
-  if (!(lrv > 0)) return null
+  const lrv = bartlettLongRunCovariance(series, series, lag)
+  if (lrv === null || !(lrv > 0)) return null
   return lrv / T
 }
 

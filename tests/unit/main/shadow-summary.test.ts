@@ -164,6 +164,47 @@ describe('组合口径', () => {
   })
 
   /**
+   * 两个夏普口径（2026-08-21）。真机上 4 个净值点算出年化夏普 12.58 —— 那个数
+   * 唯一表达的是样本量。这里守的是**口径不许只给一个**，以及 rf 只对持仓收。
+   */
+  it('两个夏普并排给出，且 rf 的取值一起带出去（自由参数不许脱开取值引用）', () => {
+    const summary = summarize(
+      base({
+        equity: [
+          { date: '2026-01-05', cash: 900_000, positionValue: 100_000, equity: 1_000_000, benchmark: null },
+          { date: '2026-01-06', cash: 900_000, positionValue: 104_000, equity: 1_004_000, benchmark: null },
+          { date: '2026-01-07', cash: 900_000, positionValue: 102_000, equity: 1_002_000, benchmark: null },
+          { date: '2026-01-08', cash: 900_000, positionValue: 108_000, equity: 1_008_000, benchmark: null },
+        ],
+      })
+    )
+    expect(summary.riskFreeRate).toBeGreaterThan(0)
+    expect(summary.sharpe).not.toBeNull()
+    expect(summary.sharpeNet).not.toBeNull()
+    // 收了机会成本 ⇒ 必须比 rf=0 那个低，但因为只对持仓（约 10%）收，差距很小
+    expect(summary.sharpeNet!).toBeLessThan(summary.sharpe!)
+  })
+
+  it('全程空仓时两个夏普相同 —— 没投出去的钱不承担机会成本（不许罚两次）', () => {
+    const idle = summarize(
+      base({
+        equity: equity([
+          ['2026-01-05', 1_000_000, null],
+          ['2026-01-06', 1_000_400, null],
+          ['2026-01-07', 1_000_200, null],
+        ]),
+      })
+    )
+    expect(idle.sharpeNet).toBe(idle.sharpe)
+  })
+
+  it('样本阈值随汇总一起下发 —— 渲染层不许自己写一个数', () => {
+    const summary = summarize(base({ equity: equity([['2026-01-05', 1_000_000, null]]) }))
+    expect(summary.sharpeMinBars).toBeGreaterThan(1)
+    expect(summary.bars).toBeLessThan(summary.sharpeMinBars)
+  })
+
+  /**
    * beta（2026-08-20 加）—— 与回测报告同口径（M2 §5.41 ①），它与 `exposure` 是
    * 「暴露多少」的两种量法。这里守两件事：**基准缺失时给 null 而不是 0**
    * （0 的含义是「与大盘无关」，与「算不出」是两件事），

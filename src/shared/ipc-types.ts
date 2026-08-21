@@ -498,7 +498,19 @@ export interface ShadowSummary {
   /** 交易日不足时为 null */
   annualized: number | null
   maxDrawdown: number
+  /** 年化夏普，rf = 0（与回测报告的 `performance.sharpe` 同口径） */
   sharpe: number | null
+  /**
+   * 机会成本调整后的夏普，rf = `riskFreeRate`（2026-08-21 加）。
+   * 机会成本**只按逐日持仓占用收** —— 直接减 rf 会因为常年空仓而罚两次，
+   * 理由在 `backtest/metrics.ts` 的 `riskFreeAdjustedSharpe` 头注释。
+   * 两个必须**并排**显示：只给一个会让「引用的是哪个口径」变成猜的。
+   */
+  sharpeNet: number | null
+  /** `sharpeNet` 用的年化无风险利率。自由参数 ⇒ 界面上必须跟着数字一起出现 */
+  riskFreeRate: number
+  /** 交易日少于这个数时，UI 显示「样本不足」而不是夏普的数值 */
+  sharpeMinBars: number
   /** 同期沪深300 归一化收益；两端缺基准时为 null */
   benchmarkReturn: number | null
   /**

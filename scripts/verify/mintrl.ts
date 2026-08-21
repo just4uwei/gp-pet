@@ -30,8 +30,9 @@
  *    拿样本内夏普代进去是循环论证；本脚本因此**只喂假设值**，见下面那条。
  * 3. **平方反比**：`∝ (SR̂ − SR*)⁻²`。边缘一小，年数就爆炸。
  * 4. **它假设观测独立**，而我们的日收益不独立（持仓平均 14 根、同池标的同涨同跌）
- *    ⇒ **真实需要的比算出来的更长**。脚本给一个 Newey-West 的方差膨胀因子当**量级参考**，
- *    标着「不是口径」—— 夏普方差的自相关修正要走 Lo (2002)，那是另一次学习任务。
+ *    ⇒ **真实需要的比算出来的更长**。§4 给出方差膨胀因子 ——
+ *    **2026-08-21 起那是正式口径**（`sharpeRatioHac`，Lo 2002 的 `V_GMM`，M2 §5.50），
+ *    此前是「均值上的 NW」当近似参考，实测两者只差 0.6–0.9%。
  *
  * ## ⚠ 这个脚本**不判**任何既有结果显不显著
  *
@@ -42,6 +43,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { neweyWestVariance } from '../../src/backtest/ic-audit'
+import { sharpeRatioHac } from '../../src/backtest/metrics'
 import {
   BARS_PER_YEAR,
   mean,
@@ -186,25 +188,32 @@ function main(): void {
     `- \`SR*\`=0 ⇒ **${years(minTrl(etfSr, 0, measured))} 年** · \`SR*\`=基准 ⇒ **${years(minTrl(etfSr, srBenchDaily, measured))} 年**`,
   )
 
-  console.log('\n## 4. 自相关的方差膨胀（**量级参考，不是口径**）\n')
+  console.log('\n## 4. 自相关的方差膨胀\n')
   const iidVar = Math.pow(sampleStdev(rets), 2) / rets.length
   const lagAndrews = Math.floor(4 * Math.pow(rets.length / 100, 2 / 9))
   const holding = rep.performance.trades?.avgHoldingBars
   const lagHolding = holding !== undefined ? Math.max(1, Math.round(holding) - 1) : lagAndrews
+  console.log('| 滞后阶 | **夏普方差 VIF**（Lo 2002，口径） | 均值 VIF（旧的近似参考） |')
+  console.log('|---|---|---|')
   for (const [name, lag] of [
-    [`Andrews (1991) ⌊4(T/100)^(2/9)⌋`, lagAndrews],
-    [`持仓期 ⌊avgHoldingBars⌋−1`, lagHolding],
+    [`Andrews (1991) ⌊4(T/100)^(2/9)⌋ L=${lagAndrews}`, lagAndrews],
+    [`持仓期 ⌊avgHoldingBars⌋−1 L=${lagHolding}`, lagHolding],
   ] as const) {
     const nw = neweyWestVariance(rets, lag)
-    const vif = nw === null ? null : nw / iidVar
+    const meanVif = nw === null ? null : nw / iidVar
+    const hac = sharpeRatioHac(rets, lag)
     console.log(
-      `- ${name}：L = ${lag} ⇒ VIF = **${vif === null ? '—' : vif.toFixed(3)}**` +
-        (vif === null ? '' : `（年数 ×${vif.toFixed(2)}）`),
+      `| ${name} | **${hac === null ? '—' : hac.varianceInflation.toFixed(3)}**` +
+        `${hac === null ? '' : `（年数 ×${hac.varianceInflation.toFixed(2)}）`}` +
+        ` | ${meanVif === null ? '—' : meanVif.toFixed(3)} |`,
     )
   }
   console.log(
-    `\n> ⚠ HAC 作用在**均值**上，而夏普方差的自相关修正要走 Lo (2002) 的口径 ——` +
-      `所以这两个数只说明「量级会被抬高多少」，**不许当门槛**。`,
+    `\n> **2026-08-21 起这一节是口径，不再是「量级参考」**（M2 §5.50）：夏普方差的 VIF 由` +
+      ` \`sharpeRatioHac\`（Lo 2002 的 \`V_GMM\`，HAC 长期协方差）直接算出。` +
+      `\n> 旧的「均值 VIF」那一列留着是因为它**当时判对了** —— 两者实测只差 0.6–0.9%，` +
+      `根因是日频下 \`SR_日 ≈ 0\` 让 \`S₁₁/σ²\` 独自支配 \`V_GMM\`。` +
+      `\n> ⚠ 这个 VIF **仍然不是写回门槛**（门槛判的是逐折配对 Δ），它只作用在 MinTRL 的年数上。`,
   )
 }
 

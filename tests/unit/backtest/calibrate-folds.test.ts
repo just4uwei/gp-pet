@@ -48,6 +48,7 @@ function block(annualized: number | null, trades = 50): PerformanceBlock {
     drawdownBars: 5,
     drawdownRecoveryBars: null,
     sharpe: 1,
+    sharpeNet: null,
     benchmarkReturn: null,
     excessReturn: null,
     excessReturnRatio: null,

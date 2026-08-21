@@ -21,12 +21,15 @@ import {
   alignedReturns,
   annualizedReturn,
   averageExposure,
+  bartlettLongRunCovariance,
   betaOf,
+  sharpeRatioHac,
   informationRatio,
   maxDrawdown,
   ratioExcessReturn,
   mean,
   returnsOf,
+  riskFreeAdjustedSharpe,
   sampleStdev,
   sharpeRatio,
   summarizeTrades,
@@ -304,6 +307,136 @@ describe('绩效指标', () => {
    * 平均资金占用率存在的意义是让「超额收益」可读：基准满仓、策略多数时间空仓。
    * 实测出厂参数下这个数只有 4.15%，而超额是 −8.17pp —— 两个数必须一起看（M2 §5.13）。
    */
+  /**
+   * 无风险利率调整后的夏普（2026-08-21）。盯的是「不许罚两次」这一条：
+   * 这套策略常年空仓、现金在账本里不计息，所以 rf 只能对**持仓那部分**收。
+   */
+  describe('riskFreeAdjustedSharpe', () => {
+    /** 带逐日持仓市值的净值曲线 */
+    const withPositions = (
+      values: readonly number[],
+      positions: readonly number[]
+    ): EquityPoint[] =>
+      values.map((value, i) => ({
+        date: `2024-01-${String(i + 1).padStart(2, '0')}` as TradeDate,
+        equity: value,
+        benchmark: null,
+        positionValue: positions[i] ?? 0,
+      }))
+
+    it('rf = 0 时与 sharpeRatio 逐位相同 —— 老口径不许被这次改动碰到', () => {
+      const points = withPositions([100, 101, 100.5, 102], [0, 50, 50, 80])
+      expect(riskFreeAdjustedSharpe(points, 0)).toBe(sharpeRatio(returnsOf(points, 'equity')))
+    })
+
+    it('全程空仓时 rf 一分钱都不收：占用为 0 ⇒ 与 rf = 0 相同', () => {
+      // 这一条就是「不许罚两次」的最纯形式：没投出去的钱不承担机会成本
+      const idle = withPositions([100, 100.5, 100.2, 101], [0, 0, 0, 0])
+      expect(riskFreeAdjustedSharpe(idle, 0.02)).toBe(riskFreeAdjustedSharpe(idle, 0))
+    })
+
+    it('满仓时等于「整体减 rf」—— 两种口径只在低占用下分叉', () => {
+      const full = withPositions([100, 101, 100.5, 102], [100, 101, 100.5, 102])
+      const naive = returnsOf(full, 'equity').map((r) => r - 0.02 / BARS_PER_YEAR)
+      expect(riskFreeAdjustedSharpe(full, 0.02)).toBeCloseTo(sharpeRatio(naive) ?? 0, 12)
+    })
+
+    it('低占用下比「整体减 rf」高得多，且仍低于 rf = 0', () => {
+      const values = [100, 100.4, 100.2, 100.9]
+      const light = withPositions(values, [3.5, 3.5, 3.5, 3.5])
+      const adjusted = riskFreeAdjustedSharpe(light, 0.02) ?? 0
+      const naive =
+        sharpeRatio(returnsOf(light, 'equity').map((r) => r - 0.02 / BARS_PER_YEAR)) ?? 0
+      const plain = riskFreeAdjustedSharpe(light, 0) ?? 0
+      expect(adjusted).toBeGreaterThan(naive)
+      expect(adjusted).toBeLessThan(plain)
+    })
+
+    it('缺 positionValue 时给 null，绝不退回「按满仓收」—— 那正是要防的双罚', () => {
+      const noPositions: EquityPoint[] = [100, 101, 102].map((value, i) => ({
+        date: `2024-01-0${i + 1}` as TradeDate,
+        equity: value,
+        benchmark: null,
+      }))
+      expect(riskFreeAdjustedSharpe(noPositions, 0.02)).toBeNull()
+      // 但 rf = 0 时该项恒为 0，不需要占用 ⇒ 照样能算
+      expect(riskFreeAdjustedSharpe(noPositions, 0)).not.toBeNull()
+    })
+  })
+
+  /**
+   * 夏普方差的自相关修正（Lo 2002，2026-08-21，M2 §5.50）。
+   *
+   * 这一组的第一条是**唯一的正确性保证**：`lag = 0` 时 `V_GMM` 必须逐位退回
+   * `1 − γ₃·SR + ((γ₄−1)/4)·SR²`（Mertens/Christie 的闭式，`scripts/verify/stats.ts`
+   * 里那个已经被 PSR/DSR/MinTRL 三处用着的函数）。这里刻意**不 import** 那个函数、
+   * 而是就地把闭式再写一遍 —— 两边同一个实现的话，这条自检就退化成 `x === x`。
+   */
+  describe('sharpeRatioHac（Lo 2002 的 V_GMM）', () => {
+    /** 就地算总体中心矩下的闭式，不复用被测代码的任何一行 */
+    const closedForm = (xs: readonly number[]): number => {
+      const n = xs.length
+      const m = xs.reduce((s, v) => s + v, 0) / n
+      const cm = (k: number): number => xs.reduce((s, v) => s + (v - m) ** k, 0) / n
+      const sr = m / Math.sqrt(cm(2))
+      const skew = cm(3) / cm(2) ** 1.5
+      const kurt = cm(4) / cm(2) ** 2
+      return 1 - skew * sr + ((kurt - 1) / 4) * sr * sr
+    }
+
+    const series = [0.012, -0.004, 0.031, -0.019, 0.007, 0.022, -0.011, 0.005, 0.017, -0.026]
+
+    it('lag = 0 时逐位等于 Mertens/Christie 的闭式', () => {
+      const got = sharpeRatioHac(series, 0)
+      expect(got).not.toBeNull()
+      expect(got!.varTerm).toBeCloseTo(closedForm(series), 12)
+      expect(got!.varTermIid).toBeCloseTo(closedForm(series), 12)
+      expect(got!.varianceInflation).toBeCloseTo(1, 12)
+    })
+
+    it('正自相关把方差抬上去，负自相关压下来 —— VIF 的方向不许反', () => {
+      // 段块式：连续同号 ⇒ 正自相关
+      const persistent = [0.01, 0.012, 0.011, 0.013, -0.01, -0.012, -0.011, -0.013, 0.01, 0.012, 0.011, 0.013]
+      // 逐期交替 ⇒ 负自相关
+      const alternating = [0.01, -0.01, 0.011, -0.011, 0.012, -0.012, 0.01, -0.01, 0.011, -0.011, 0.012, -0.012]
+      expect(sharpeRatioHac(persistent, 3)!.varianceInflation).toBeGreaterThan(1)
+      expect(sharpeRatioHac(alternating, 3)!.varianceInflation).toBeLessThan(1)
+    })
+
+    it('滞后阶被 T−1 夹住，且 lag 为负按 0 处理', () => {
+      expect(sharpeRatioHac(series, 999)!.lag).toBe(series.length - 1)
+      expect(sharpeRatioHac(series, -5)!.lag).toBe(0)
+    })
+
+    it('标准误 = √(varTerm / T)，样本不足或零波动给 null', () => {
+      const got = sharpeRatioHac(series, 2)!
+      expect(got.standardError).toBeCloseTo(Math.sqrt(got.varTerm / series.length), 12)
+      expect(sharpeRatioHac([0.01], 0)).toBeNull()
+      expect(sharpeRatioHac([0.01, 0.01, 0.01], 0)).toBeNull()
+    })
+
+    /**
+     * 交叉项 `S₁₂` 必须对称化（`γ_k^ab + γ_k^ba`）：只取一边，矩阵就不对称，
+     * 二次型可能变负 —— 症状是一个「负方差」。
+     */
+    it('bartlettLongRunCovariance 对两个参数对称', () => {
+      const a = [1, 2, 3, 4, 5, 4, 3, 2]
+      const b = [2, 1, 4, 3, 6, 3, 4, 1]
+      expect(bartlettLongRunCovariance(a, b, 3)).toBeCloseTo(
+        bartlettLongRunCovariance(b, a, 3) ?? NaN,
+        12
+      )
+    })
+
+    it('bartlettLongRunCovariance 在 lag = 0 上就是总体方差（除 T）', () => {
+      const a = [1, 2, 3, 4, 5]
+      const m = 3
+      const want = a.reduce((s, v) => s + (v - m) ** 2, 0) / a.length
+      expect(bartlettLongRunCovariance(a, a, 0)).toBeCloseTo(want, 12)
+      expect(bartlettLongRunCovariance([1], [1], 0)).toBeNull()
+    })
+  })
+
   describe('平均资金占用率', () => {
     it('满仓一整段 = 1', () => {
       expect(averageExposure([{ entryPrice: 10, shares: 1000, holdingBars: 100 }], 10000, 100)).toBeCloseTo(1, 10)

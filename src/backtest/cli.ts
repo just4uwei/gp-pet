@@ -297,6 +297,9 @@ async function runBacktest(options: CliOptions): Promise<number> {
         // 与 runSimulation 里传给 simulateCode 的是同一个 resolveCosts —— 报告记的必须
         // 是**实际用的**那套，不是出厂那套（否则 --slippage 0 的跑在归档里认不出来）
         costs: resolveCosts(options),
+        // 只在真的给了 --rf 时才写这一列：写个 0 进去会让老报告与新报告长得一样，
+        // 而它们的区别恰恰是「这份有没有算过 sharpeNet」
+        ...(options.riskFree === 0 ? {} : { riskFree: options.riskFree }),
       },
     })
     if (options.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)
