@@ -12,6 +12,7 @@ import { AlertRepo } from './repositories/alert'
 import { CalendarRepo } from './repositories/calendar'
 import { ProviderHealthRepo } from './repositories/health'
 import { IndicatorRepo } from './repositories/indicator'
+import { IndustryHistoryRepo } from './repositories/industry'
 import { KlineRepo } from './repositories/kline'
 import { MetaRepo } from './repositories/meta'
 import { PositionRepo } from './repositories/position'
@@ -45,6 +46,11 @@ export interface Storage {
   /** 收盘日报的 AI 评价：一天一条，同样不进裁剪（见 010_report_note.sql） */
   readonly reportNotes: ReportNoteRepo
   readonly announcements: AnnouncementRepo
+  /**
+   * 行业分类的逐日留痕（014）。**唯一一个「今天不做就永久少一天」的缺口** ——
+   * 数据源只给当前行业名，拿它回标历史是未来函数。不进裁剪。
+   */
+  readonly industries: IndustryHistoryRepo
   readonly meta: MetaRepo
   close(): void
 }
@@ -67,6 +73,7 @@ export function createStorage(db: Database): Storage {
     aiExplains: new AiExplainRepo(db),
     reportNotes: new ReportNoteRepo(db),
     announcements: new AnnouncementRepo(db),
+    industries: new IndustryHistoryRepo(db),
     meta: new MetaRepo(db),
     close: () => db.close(),
   }

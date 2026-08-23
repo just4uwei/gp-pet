@@ -458,6 +458,12 @@ interface RuntimeSnapshot {
   alertsWithGate: number
   shadowPoints: number
   /**
+   * 行业留痕（014）攒了多少 —— **这一条与其余计数性质不同**：
+   * 它是唯一「今天不记就永久少一天」的数据（数据源只给当前行业名，
+   * 回标历史是未来函数）。所以它必须每天可见，**沉默 = 永久损失**。
+   */
+  industry: { codes: number; rows: number; firstDate: string | null } | null
+  /**
    * 每个有 signal 的交易日重启过几次（`null` = 日志读不到）。
    * **M3 的「自用一周」只数 0 那一档** —— 理由见 `restartsByDay`。
    */
@@ -581,6 +587,20 @@ async function runtimeState(): Promise<Maybe<RuntimeSnapshot>> {
       alerts: one('SELECT COUNT(*) FROM alert_log'),
       alertsWithGate: one('SELECT COUNT(*) FROM alert_log WHERE would_block IS NOT NULL'),
       shadowPoints: one('SELECT COUNT(*) FROM shadow_equity'),
+      // 014 是新表：老库上还不存在 ⇒ 拿不到就是 null（「读不到」不是「0」）
+      industry: (() => {
+        try {
+          const row = db
+            .prepare(
+              `SELECT COUNT(DISTINCT code) codes, COUNT(*) rows, MIN(observed_date) first
+                 FROM industry_history`
+            )
+            .get() as { codes: number; rows: number; first: string | null }
+          return { codes: row.codes, rows: row.rows, firstDate: row.first }
+        } catch {
+          return null
+        }
+      })(),
       restarts: tradeDates.map((date) => ({ date, boots: restarts.get(date) ?? null })),
       latestSignalDate,
       latestAlertDate,
@@ -1078,6 +1098,26 @@ function render(input: {
     L.push(
       `| ${r.tradeDays} | ${r.signals} | ${r.confirmed} | ${r.alerts} | ${r.alertsWithGate} | ${r.shadowPoints} |`
     )
+    L.push('')
+    /*
+      行业留痕单独一行，**不并进上面那张表** —— 它与那几个计数性质不同：
+      那些是「系统跑出来的记录」，重跑还能有；这一条是**攒出来的**，
+      数据源只给当前行业名、回标历史是未来函数 ⇒ **今天沉默 = 永久少一天**。
+    */
+    if (r.industry === null) {
+      L.push('> ⚠ **行业留痕：读不到**（`industry_history` 表不存在 —— 库还没升到 014）。')
+    } else if (r.industry.rows === 0) {
+      L.push(
+        '> ⚠ **行业留痕：一行都没有。** 它是唯一「今天不记就永久少一天」的数据' +
+          '（源只给当前行业名，回标历史是未来函数）⇒ 沉默不是没事，是在丢东西。'
+      )
+    } else {
+      L.push(
+        `> 行业留痕：**${r.industry.codes} 只 / ${r.industry.rows} 行**，` +
+          `自 ${r.industry.firstDate} 起。只在行业名变化时写行，所以行数少是正常的；` +
+          `**只只数不涨才是问题**。`
+      )
+    }
     L.push('')
     /*
       逐日列重启次数。**这不是运维信息，是判据的有效性** ——

@@ -15,6 +15,7 @@ import {
   toWatchItem,
   type WatchlistStore,
 } from '@main/engine'
+import type { IndustryStore } from '@main/engine/watchlist'
 import type { ProviderRegistry } from '@main/providers'
 import type { WatchEntry } from '@main/storage/repositories/watchlist'
 
@@ -141,6 +142,156 @@ describe('createWatchlistService', () => {
     expect(item.name).toBe('浦发银行')
     expect(item.industry).toBe('银行')
     expect(item.group).toBe(DEFAULT_GROUP)
+  })
+
+  /**
+   * 降级链会把 `industry` 静默吃掉（2026-08-22 真机 79/79 全空的根因）：
+   * eastmoney 的 profile 端点间歇性失败 → 降级到腾讯 → 腾讯**结构上不提供** industry
+   * → 拿到一个「有名字、没行业」的 profile → `fromProvider = true` → 刷新报「成功」。
+   *
+   * 这一组钉的是**修法本身的三条边界** —— 每一条写反了都会变成另一个缺陷：
+   *   · 只在 `degraded` 时重试（主源自己给了空行业 ⇒ 再问一次是白费预算）；
+   *   · 只在存量也没有时重试（拿到过一次就被 COALESCE 保住，ETF 这类不该每轮多打一次）；
+   *   · 只重试一次。
+   */
+  describe('industry 字段级重试（降级链会静默吃掉它）', () => {
+    /** 可控 degraded 与调用计数的 registry */
+    function flakyRegistry(
+      results: readonly SecProfile[],
+      degraded: readonly boolean[]
+    ): { registry: Pick<ProviderRegistry, 'fetchProfile'>; calls: () => number } {
+      let n = 0
+      return {
+        calls: () => n,
+        registry: {
+          fetchProfile: async (code) => {
+            const value = results[Math.min(n, results.length - 1)] ?? profileOf(code, '占位')
+            const isDegraded = degraded[Math.min(n, degraded.length - 1)] ?? false
+            n += 1
+            return { value, provider: 'tencent', degraded: isDegraded, attempts: [] }
+          },
+        },
+      }
+    }
+
+    it('降级且行业缺失 ⇒ 重试一次，补上的行业会被采用', async () => {
+      const repo = store()
+      const code = 'SH600000' as SecCode
+      const { registry, calls } = flakyRegistry(
+        [profileOf(code, '浦发银行'), profileOf(code, '浦发银行', '银行')],
+        [true, false]
+      )
+      const service = createWatchlistService({ repo, registry, now: () => 1 })
+
+      const item = await service.add('600000')
+
+      expect(calls()).toBe(2)
+      expect(item.industry).toBe('银行')
+    })
+
+    it('**没降级**时不重试 —— 主源自己说没有，再问一次是白费预算', async () => {
+      const repo = store()
+      const code = 'SH600000' as SecCode
+      const { registry, calls } = flakyRegistry([profileOf(code, '银行ETF')], [false])
+      const service = createWatchlistService({ repo, registry, now: () => 1 })
+
+      const item = await service.add('600000')
+
+      expect(calls()).toBe(1)
+      expect(item.industry).toBeUndefined()
+    })
+
+    it('存量已有行业时不重试 —— COALESCE 已经保住它了', async () => {
+      const repo = store()
+      const code = 'SH600000' as SecCode
+      repo.add(profileOf(code, '浦发银行', '银行'), DEFAULT_GROUP, 1)
+      const { registry, calls } = flakyRegistry([profileOf(code, '浦发银行')], [true])
+      const service = createWatchlistService({ repo, registry, now: () => 1 })
+
+      await service.add('600000')
+
+      expect(calls()).toBe(1)
+    })
+
+    it('重试也没拿到就算了，只重试一次', async () => {
+      const repo = store()
+      const code = 'SH600000' as SecCode
+      const { registry, calls } = flakyRegistry([profileOf(code, '浦发银行')], [true])
+      const service = createWatchlistService({ repo, registry, now: () => 1 })
+
+      const item = await service.add('600000')
+
+      expect(calls()).toBe(2)
+      expect(item.name).toBe('浦发银行')
+      expect(item.industry).toBeUndefined()
+    })
+  })
+
+  describe('行业留痕', () => {
+    /** IndustryHistoryRepo 的最小替身 */
+    function tracer(): { store: IndustryStore; rows: Array<[SecCode, string, string]> } {
+      const rows: Array<[SecCode, string, string]> = []
+      const seen = new Map<SecCode, string>()
+      return {
+        rows,
+        store: {
+          record(code, date, industry) {
+            if (seen.get(code) === industry) return 'UNCHANGED'
+            const first = !seen.has(code)
+            seen.set(code, industry)
+            rows.push([code, date, industry])
+            return first ? 'FIRST' : 'CHANGE'
+          },
+        },
+      }
+    }
+
+    it('添加时就记一次 —— 不然历史要等到第一次休市维护才开始', async () => {
+      const repo = store()
+      const t = tracer()
+      const service = createWatchlistService({
+        repo,
+        registry: registryOf((code) => Promise.resolve(profileOf(code, '浦发银行', '银行'))),
+        industries: t.store,
+        // 北京时区 2026-08-22 10:00
+        now: () => Date.parse('2026-08-22T02:00:00Z'),
+      })
+
+      await service.add('600000')
+
+      expect(t.rows).toEqual([['SH600000', '2026-08-22', '银行']])
+    })
+
+    it('没有行业时一个字都不写', async () => {
+      const repo = store()
+      const t = tracer()
+      const service = createWatchlistService({
+        repo,
+        registry: registryOf((code) => Promise.resolve(profileOf(code, '浦发银行'))),
+        industries: t.store,
+        now: () => Date.parse('2026-08-22T02:00:00Z'),
+      })
+
+      await service.add('600000')
+
+      expect(t.rows).toEqual([])
+    })
+
+    it('刷新时也记 —— 这才是逐日累积的那条路', async () => {
+      const repo = store()
+      const t = tracer()
+      repo.add(profileOf('SH600000' as SecCode, '浦发银行'), DEFAULT_GROUP, 1)
+      const service = createWatchlistService({
+        repo,
+        registry: registryOf((code) => Promise.resolve(profileOf(code, '浦发银行', '银行'))),
+        industries: t.store,
+        now: () => Date.parse('2026-08-22T02:00:00Z'),
+      })
+
+      await service.refreshProfiles()
+
+      expect(t.rows).toEqual([['SH600000', '2026-08-22', '银行']])
+    })
   })
 
   it('重复添加是幂等更新：不占新名额，保留原分组', async () => {

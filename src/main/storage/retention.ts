@@ -35,6 +35,14 @@ export interface RetentionPolicy {
   announcementDays: number
 }
 
+/**
+ * ⚠ **`industry_history`（014）刻意不在这里出现，也不要「顺手」加进来。**
+ *
+ * 它与影子账本同一档：**无法重建**。数据源只给**当前**行业名，
+ * 拿它回标历史是未来函数 ⇒ 那些日子是一天天攒出来的，删掉就买不回来。
+ * 而且它天生就小（只在行业名变化时写一行），没有裁剪的动机。
+ */
+
 export const DEFAULT_RETENTION: RetentionPolicy = {
   klineBars: 1500,
   indicatorBars: 500,

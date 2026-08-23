@@ -313,6 +313,9 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
     repo: storage.watchlist,
     positions: storage.positions,
     registry,
+    // 行业留痕（014）。**这一条每晚接一天就永久少一天** —— 数据源只给当前行业名，
+    // 拿它回标历史是未来函数，所以历史只能从接上的那天起攒
+    industries: storage.industries,
     now,
     log: (m) => log.info(m),
   })
