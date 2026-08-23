@@ -127,6 +127,14 @@ export interface IcResult {
   lagAndrews: number
   /** 五等分（按当日得分排名）各组前瞻收益的**中位数** */
   quintileMedians: (number | null)[]
+  /**
+   * **逐日 IC 序列**（2026-08-22 加）。此前只落聚合量，而 §5.51 六处假设里
+   * **唯一没测到的恰好是唯一承重主判据的那一处** -- rank IC 的 NW `t` 的平稳性
+   * 测不了，因为归档数据上做不了分段矩与 CUSUMSQ。
+   * ⚠ **落盘之后不要顺手重算 §5.47 的 `t`** -- 那是移动球门；新序列的用途是
+   * **下一次预注册**里测它的平稳性（M2 §5.51 判 3）。
+   */
+  dailyIc: { date: TradeDate; ic: number }[]
 }
 
 /**
@@ -216,6 +224,7 @@ const median = (values: readonly number[]): number | null => {
  */
 export function icOf(byDate: Map<TradeDate, Row[]>, horizon: number): IcResult {
   const ics: number[] = []
+  const dailyIc: { date: TradeDate; ic: number }[] = []
   const quintiles: number[][] = [[], [], [], [], []]
   /*
     **必须按日期排序再算**（2026-08-20 加）。`byDate` 的插入顺序由 `collect` 的扫描
@@ -225,13 +234,16 @@ export function icOf(byDate: Map<TradeDate, Row[]>, horizon: number): IcResult {
     所以这个坑在加 NW 之前是隐性的。
   */
   const byDateSorted = [...byDate.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-  for (const [, rows] of byDateSorted) {
+  for (const [date, rows] of byDateSorted) {
     const usable = rows.filter((r) => r.fwd.has(horizon))
     if (usable.length < MIN_CROSS_SECTION) continue
     const scores = usable.map((r) => r.score)
     const fwds = usable.map((r) => r.fwd.get(horizon) ?? 0)
     const ic = correlation(ranksOf(scores), ranksOf(fwds))
-    if (ic !== null) ics.push(ic)
+    if (ic !== null) {
+      ics.push(ic)
+      dailyIc.push({ date, ic })
+    }
     // 五等分：按得分的平均秩切。并列多的时候各桶大小会不均，那是事实不是 bug
     const ranks = ranksOf(scores)
     ranks.forEach((rank, i) => {
@@ -260,6 +272,7 @@ export function icOf(byDate: Map<TradeDate, Row[]>, horizon: number): IcResult {
     tNwAndrews: tOf(lagAndrewsL),
     lagAndrews: lagAndrewsL,
     quintileMedians: quintiles.map((q) => median(q)),
+    dailyIc,
   }
 }
 

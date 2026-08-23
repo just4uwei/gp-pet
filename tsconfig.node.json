@@ -6,6 +6,7 @@
     "src/core/**/*",
     "src/shared/**/*",
     "src/backtest/**/*",
+    "scripts/**/*.ts",
     "tools/**/*.ts",
     "tests/**/*",
     "electron.vite.config.ts",

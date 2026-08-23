@@ -206,6 +206,91 @@ describe('报告组装', () => {
     costs: DEFAULT_COSTS,
   }
 
+  /*
+    预热占窗口（2026-08-22，M2 §5.52）。`abl-valid-base` 那次踩的坑：
+    `--from 2024-01-01` 无段前历史 ⇒ 18 个月里前 15 个月净值一动不动，
+    而报告上只显示「建仓 34 / 夏普 1.19」，看起来完全正常。
+    这三条钉的是「什么时候该说」「什么时候别乱说」，以及那个越界边界。
+  */
+  describe('预热占窗口告警', () => {
+    /** 前 `idle` 根不动、之后每根都动的净值曲线 */
+    const curve = (total: number, idle: number): CodeResult['equity'] =>
+      Array.from({ length: total }, (_, i) => ({
+        date: `2024-${String(Math.floor(i / 28) + 1).padStart(2, '0')}-${String((i % 28) + 1).padStart(2, '0')}`,
+        equity: i < idle ? 100_000 : 100_000 + (i - idle + 1) * 100,
+        benchmark: null,
+      }))
+
+    it('预热占 > 80% ⇒ 强告警，点名首个净值变动日', () => {
+      const report = assembleReport({
+        results: [codeResult({ equity: curve(100, 90) })],
+        meta,
+      })
+      const text = report.warnings.join(' ')
+      expect(text).toContain('预热占窗口 90%')
+      expect(text).toContain('绩效数字不可用')
+      expect(text).toContain('第 91/100 根')
+    })
+
+    it('预热占 50–80% ⇒ 弱告警（评估期偏短，但不说数字不可用）', () => {
+      const report = assembleReport({
+        results: [codeResult({ equity: curve(100, 60) })],
+        meta,
+      })
+      const text = report.warnings.join(' ')
+      expect(text).toContain('预热占窗口 60%')
+      expect(text).toContain('评估期偏短')
+      expect(text).not.toContain('绩效数字不可用')
+    })
+
+    it('正常预热（20%）不告警 —— 300 根预热 + 1157 根评估是合法形状，不许误报', () => {
+      const report = assembleReport({
+        results: [codeResult({ equity: curve(100, 20) })],
+        meta,
+      })
+      expect(report.warnings.join(' ')).not.toContain('预热占窗口')
+    })
+
+    it('整段一次没动过时不越界 —— 不许印出「第 101/100 根」', () => {
+      const report = assembleReport({
+        results: [codeResult({ equity: curve(100, 100), trades: [] })],
+        meta,
+      })
+      const text = report.warnings.join(' ')
+      expect(text).toContain('预热占窗口 100%')
+      expect(text).toContain('整段净值一次都没动过')
+      expect(text).not.toMatch(/第 \d+\/100 根/)
+    })
+  })
+
+  /*
+    显著性门槛与 HAC 标准误（M2 §5.48/§5.50）。两个都**与策略无关**——
+    门槛只由 T 与高阶矩决定。钉这一条是因为「只印不当门槛」这个定位很容易被
+    下一个人读成「过不了这条线就不写回」，而写回门槛判的是逐折配对 Δ。
+  */
+  it('显著性门槛只由窗口长度决定，与策略收益无关', () => {
+    const equity = Array.from({ length: 300 }, (_, i) => ({
+      date: `2024-${String(Math.floor(i / 28) + 1).padStart(2, '0')}-${String((i % 28) + 1).padStart(2, '0')}`,
+      equity: 100_000 + Math.sin(i / 3) * 500 + i * 10,
+      benchmark: null,
+    }))
+    const good = assembleReport({ results: [codeResult({ equity })], meta })
+    // 同一条曲线整体放大收益 ⇒ 夏普变了，门槛不该跟着变
+    const scaled = equity.map((p, i) => ({ ...p, equity: 100_000 + (p.equity - 100_000) * 3 + i * 50 }))
+    const better = assembleReport({ results: [codeResult({ equity: scaled })], meta })
+
+    expect(good.performance.sharpeThreshold).not.toBeNull()
+    expect(good.performance.sharpe).not.toBe(better.performance.sharpe)
+    // 门槛只随 T 与高阶矩动；两条曲线 T 相同、形状相近 ⇒ 门槛应当很接近
+    expect(good.performance.sharpeThreshold!).toBeCloseTo(better.performance.sharpeThreshold!, 1)
+  })
+
+  it('样本太短时门槛给 null，不用 0 冒充', () => {
+    const report = assembleReport({ results: [codeResult()], meta })
+    // codeResult 默认只有 2 个净值点 ⇒ 1 个收益率 ⇒ 算不出
+    expect(report.performance.sharpeThreshold).toBeNull()
+  })
+
   it('免责声明固定三条，并标出参数未标定', () => {
     const report = assembleReport({ results: [codeResult()], meta })
     expect(report.disclaimers).toEqual([...DISCLAIMERS])
@@ -401,6 +486,8 @@ function block(overrides: { annualized?: number | null; maxDrawdown?: number; tr
       payoffRatio: 1.4,
       reduced: 12,
     },
+    sharpeThreshold: null,
+    sharpeSeHac: null,
   }
 }
 

@@ -16,6 +16,7 @@ import type { Regime, SecCode, TradeDate } from '../core/types'
 import { DEFAULT_COSTS, type CostModel } from './costs'
 import { DEFAULT_SIMULATE_OPTIONS, type BacktestTrade, type CodeResult } from './simulate'
 import {
+  BARS_PER_YEAR,
   alignedReturns,
   annualizedReturn,
   averageExposure,
@@ -27,11 +28,14 @@ import {
   returnsOf,
   riskFreeAdjustedSharpe,
   sharpeRatio,
+  sharpeRatioHac,
+  sharpeSignificanceThreshold,
   summarizeTrades,
   type EquityPoint,
   type PositionStats,
   type TradeStats,
 } from './metrics'
+import { andrewsLag } from './ic-audit'
 
 export interface PerformanceBlock {
   bars: number
@@ -85,6 +89,17 @@ export interface PerformanceBlock {
    * 用户体验到的是「我按提醒买了一次，最后赚没赚」，那是建仓级（M2 §5.18）。
    */
   positions: PositionStats
+  /**
+   * PSR 框架下的显著性门槛：**这个窗口长度下年化夏普 ≥ X 才算 95% 显著**
+   *（`SR*`=0，单侧，M2 §5.48/§5.49）。**只由 `T` 与高阶矩决定、与策略无关** ⇒
+   * 调不动、不重判任何既有结果、**不当门槛**（只印）。T 不足或肥尾过重时 null。
+   */
+  sharpeThreshold: number | null
+  /**
+   * 夏普的 **HAC 年化标准误**（Lo 2002 的 `V_GMM`，M2 §5.50）。与 `sharpe` 配合：
+   * `|t| = sharpe / sharpeSeHac`。它**不参与任何门槛**，只是把「不显著」写成一个数。
+   */
+  sharpeSeHac: number | null
 }
 
 export interface RegimeAttribution {
@@ -258,6 +273,13 @@ export function performanceOf(
     beta: betaOf(paired.strategy, paired.benchmark),
     trades: summarizeTrades(trades),
     positions: groupPositions(trades),
+    // 显著性门槛与 HAC 标准误（M2 §5.48–§5.50）。两个都与策略无关、都不当门槛、
+    // 只把「不显著」写成一个数。HAC 滞后阶用 Andrews 规则（预承诺，不挑）。
+    sharpeThreshold: sharpeSignificanceThreshold(strategyReturns),
+    sharpeSeHac: (() => {
+      const hac = sharpeRatioHac(strategyReturns, andrewsLag(strategyReturns.length))
+      return hac === null ? null : hac.standardError * Math.sqrt(BARS_PER_YEAR)
+    })(),
   }
 }
 
@@ -439,6 +461,47 @@ export function assembleReport(input: AssembleInput): BacktestReport {
     )
   }
 
+  /*
+    预热占窗口比（2026-08-22，M2 §5.52）。`abl-valid-base` 那次踩的坑：
+    `--from 2024-01-01` 无段前历史 ⇒ 18 个月里前 15 个月净值一动不动（建仓 34 次），
+    而 CLAUDE.md 那条「跑验证窗口必须带段前历史」里写的「34 次」就是拿它写的 -- 一天后又被挑回来用。
+    没有这道闸门，报告上只显示「建仓 34 / 夏普 1.19」，看起来完全正常。
+    判据：首个净值变动日占全长的比例。> 50% 告警，> 80% 强告警。
+    300 根预热 + 1157 根评估 ⇒ 20% ⇒ 不会误报合法的预热。
+  */
+  if (equity.length > 2) {
+    const initial = equity[0]?.equity ?? 0
+    if (initial > 0) {
+      let firstChange = equity.length
+      for (let i = 1; i < equity.length; i++) {
+        if (Math.abs((equity[i]?.equity ?? 0) - initial) > 0.01) {
+          firstChange = i
+          break
+        }
+      }
+      const idleFraction = firstChange / equity.length
+      const idlePct = (idleFraction * 100).toFixed(0)
+      // firstChange === equity.length ⇒ 整段净值一次都没动过（一笔都没成交）。
+      // 这时没有「首个变动日」可报，硬取下标会越界成「第 360/359 根」
+      const neverTraded = firstChange >= equity.length
+      const where = neverTraded
+        ? '**整段净值一次都没动过**'
+        : `首个净值变动日在 ${equity[firstChange]?.date ?? '未知'}，即第 ${firstChange + 1}/${equity.length} 根`
+      if (idleFraction > 0.8) {
+        warnings.push(
+          `⚠ **预热占窗口 ${idlePct}%**（${where}）-- 评估期被预热段严重侵蚀，` +
+            `绩效数字不可用（M2 §5.52）。` +
+            `最可能的原因：\`--from\` 起点在预热段内或之后，需要带段前历史重跑。`
+        )
+      } else if (idleFraction > 0.5) {
+        warnings.push(
+          `预热占窗口 ${idlePct}%（${where}）-- ` +
+            `评估期偏短、标准误偏大。若 \`--from\` 起点在预热段内，需带段前历史重跑（M2 §5.52）。`
+        )
+      }
+    }
+  }
+
   return {
     meta: { ...input.meta, unvalidatedParams: ENGINE_VERSION.includes('unvalidated') },
     disclaimers: [...DISCLAIMERS],
@@ -538,6 +601,26 @@ export function renderReport(report: BacktestReport): string {
     lines.push(
       `  夏普 ${num(p.sharpeNet)}（rf = ${pct(report.meta.riskFree)}，机会成本只按逐日持仓占用收 —— ` +
         `直接减 rf 会因为常年空仓而罚两次，见 riskFreeAdjustedSharpe）`
+    )
+  }
+  /*
+    显著性门槛与 HAC 标准误（2026-08-22，M2 §5.48/§5.49/§5.50）。
+    两个都**与策略无关、都调不动**：门槛只由 T 与高阶矩决定，标准误只由这条曲线决定。
+    **只印不当门槛** —— 写回门槛判的是逐折配对 Δ，不是单条曲线的夏普（§5.48 判据 1）。
+    印它是因为「这个窗口本来就短到测不出任何东西」是读绩效之前该知道的事。
+    老报告没有这两个字段 ⇒ undefined ⇒ 整行不印（不用 0 或「—」冒充）。
+  */
+  if (p.sharpeThreshold !== null && p.sharpeThreshold !== undefined) {
+    const parts = [`本窗口显著性门槛 年化夏普 ≥ ${num(p.sharpeThreshold)}（PSR 95%，SR*=0）`]
+    if (p.sharpeSeHac !== null && p.sharpeSeHac !== undefined) {
+      const t = p.sharpe === null ? null : p.sharpe / p.sharpeSeHac
+      parts.push(
+        `HAC 标准误 ±${num(p.sharpeSeHac)}${t === null ? '' : ` ⇒ |t| ${num(Math.abs(t))}`}`
+      )
+    }
+    lines.push(`  ${parts.join('  ·  ')}`)
+    lines.push(
+      `    └ 两个数都与策略无关、调不动，**只印不当门槛**（写回门槛判的是逐折配对 Δ）`
     )
   }
   lines.push(

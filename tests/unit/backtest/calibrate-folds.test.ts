@@ -76,6 +76,8 @@ function block(annualized: number | null, trades = 50): PerformanceBlock {
       payoffRatio: 1.4,
       reduced: 5,
     },
+    sharpeThreshold: null,
+    sharpeSeHac: null,
   }
 }
 

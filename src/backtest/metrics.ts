@@ -129,6 +129,60 @@ export function sampleStdev(values: readonly number[]): number {
   return Math.sqrt(variance)
 }
 
+/** 总体偏度 `γ₃ = m₃/m₂^{3/2}`（÷n，与 `sharpeRatioHac` 的总体口径一致） */
+export function skewness(values: readonly number[]): number {
+  const n = values.length
+  if (n === 0) return 0
+  const m = mean(values)
+  const m2 = values.reduce((s, v) => s + (v - m) ** 2, 0) / n
+  const m3 = values.reduce((s, v) => s + (v - m) ** 3, 0) / n
+  return m2 > 0 ? m3 / m2 ** 1.5 : 0
+}
+
+/** 皮尔逊峰度 `γ₄ = m₄/m₂²`（÷n，正态 = 3，不是超额峰度） */
+export function pearsonKurtosis(values: readonly number[]): number {
+  const n = values.length
+  if (n === 0) return 0
+  const m = mean(values)
+  const m2 = values.reduce((s, v) => s + (v - m) ** 2, 0) / n
+  const m4 = values.reduce((s, v) => s + (v - m) ** 4, 0) / n
+  return m2 > 0 ? m4 / (m2 * m2) : 0
+}
+
+/**
+ * PSR 框架下的显著性门槛：**这个窗口长度下，年化夏普 ≥ X 才算 95% 显著**
+ * （`SR*` = 0，单侧）。**只由 `T` 与高阶矩决定、与策略的实际夏普无关** -- 调不动，
+ * 不重判任何既有结果，**只印不当门槛**（M2 §5.48 判据 1）。
+ *
+ * 解 `PSR(SR,0,T,γ₃,γ₄) = 0.95` -- 它是 `SR` 的二次方程
+ * （`varTerm = 1 − γ₃·SR + ((γ₄−1)/4)·SR²` 里 `SR` 最高 2 次）：
+ *
+ * ```
+ * a·SR² + b·SR + c = 0
+ * a = (T−1) − Z²·(γ₄−1)/4
+ * b = Z²·γ₃
+ * c = −Z²          Z = normInv(0.95) = 1.6449
+ * ```
+ *
+ * 取正根。T 不足或肥尾过重（`a ≤ 0`）时返回 null -- 这种窗口里谈显著性没有意义。
+ */
+export function sharpeSignificanceThreshold(returns: readonly number[]): number | null {
+  const T = returns.length
+  if (T < 3) return null
+  const skew = skewness(returns)
+  const kurt = pearsonKurtosis(returns)
+  const z = 1.6449 // normInv(0.95) 单侧
+  const z2 = z * z
+  const a = T - 1 - (z2 * (kurt - 1)) / 4
+  const b = z2 * skew
+  const c = -z2
+  if (a <= 0) return null
+  const disc = b * b - 4 * a * c
+  if (disc < 0) return null
+  const srDailyThreshold = (-b + Math.sqrt(disc)) / (2 * a)
+  return srDailyThreshold * Math.sqrt(BARS_PER_YEAR)
+}
+
 export function annualizedReturn(totalReturn: number, bars: number): number | null {
   if (bars <= 0) return null
   const years = bars / BARS_PER_YEAR

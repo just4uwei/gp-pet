@@ -69,6 +69,8 @@ interface Row {
   high: number
   low: number
   close: number
+  /** 聚宽数据字典页不展示成交量，但 fixture 里有 -- DMI 不读它，PriceSeries 要这个键存在 */
+  volume?: number
 }
 
 /** 聚宽数据字典页上的示例返回值 */
@@ -161,9 +163,11 @@ for (const exp of EXPECTED) {
     continue
   }
 
+  const opens = rows.map((r) => r.open)
   const closes = rows.map((r) => r.close)
   const highs = rows.map((r) => r.high)
   const lows = rows.map((r) => r.low)
+  const volumes = rows.map((r) => r.volume ?? 0)
   const tag = exp.adjusted ? '（聚宽那一组是前复权，价位对不上是正常的）' : ''
 
   process.stdout.write(
@@ -197,7 +201,7 @@ for (const exp of EXPECTED) {
     `    └ 柱口径（与日期无关）：2×(DIF−DEA) = ${(2 * (difE - deaE)).toPrecision(12)}  vs 聚宽给的柱 ${exp.macd[2].toPrecision(12)} ⇒ ✓ 与我们一致\n`
   )
 
-  const d = dmi({ high: highs, low: lows, close: closes }, 14)
+  const d = dmi({ open: opens, high: highs, low: lows, close: closes, volume: volumes }, 14)
   const simple = atrSimple(rows, i, 14)
   process.stdout.write(line('ATR', d.atr[i] ?? null, exp.atr[1], '← 我们是 Wilder(TR)/14') + '\n')
   process.stdout.write(
