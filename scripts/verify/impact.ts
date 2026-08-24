@@ -49,11 +49,10 @@
  *   选中（量能子信号 / 带宽扩张），用当日会让参与率系统性偏低。当日口径并列报作对照。
  * - 拿不到 `σ` / `ADV` 的建仓**显式计入 missing，不当 0**（约束 4）。
  */
-import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { correlation, ranksOf } from '../../src/backtest/ic-audit'
-import { sampleStdev } from '../../src/backtest/metrics'
+import { bps, loadEntries, median, pct, quantile, type Entry } from './entries'
 
 const CALIB_DIR = join(process.cwd(), 'reports', 'calib')
 const HISTORY_DIR = join(process.cwd(), 'data', 'history')
@@ -73,66 +72,6 @@ const ASSUMED_SLIPPAGE = 0.001
  * ⇒ 这个 `Y` 只是「什么前因子能在 10% 参与率上复现他们的观测」，跨 2.7 个数量级外推要打折。
  */
 const ALMGREN_Y = 0.6
-/** 回看窗口：ADV 与 σ 都用入场日之前这么多根 */
-const LOOKBACK = 20
-
-interface TradeRow {
-  code: string
-  entryDate: string
-  shares: number
-  entryPriceRaw: number
-}
-
-interface Report {
-  meta: { engineVersion: string; from: string; to: string; capitalPerCode: number }
-  trades: TradeRow[]
-}
-
-interface Candle {
-  date: string
-  close: number
-  closeAdj: number
-  volume: number
-}
-
-const median = (xs: readonly number[]): number => quantile(xs, 0.5)
-
-function quantile(xs: readonly number[], p: number): number {
-  if (xs.length === 0) return Number.NaN
-  const sorted = [...xs].sort((a, b) => a - b)
-  const idx = (sorted.length - 1) * p
-  const lo = Math.floor(idx)
-  const hi = Math.ceil(idx)
-  const a = sorted[lo]
-  const b = sorted[hi]
-  if (a === undefined || b === undefined) return Number.NaN
-  return a + (b - a) * (idx - lo)
-}
-
-function loadCandles(code: string): Candle[] | null {
-  try {
-    const raw = readFileSync(join(HISTORY_DIR, `${code}.json`), 'utf8')
-    const parsed = JSON.parse(raw) as { candles?: Candle[] }
-    return parsed.candles ?? null
-  } catch {
-    return null
-  }
-}
-
-interface Entry {
-  code: string
-  date: string
-  /** 模拟里真的下到市场上的金额（元，不复权价） */
-  qSim: number
-  /** 名义资金（元）—— 真实资金口径 */
-  qNominal: number
-  /** 入场日之前 20 根的日成交额中位数（元） */
-  adv: number
-  /** 当日成交额（元），对照口径 */
-  advSameDay: number
-  /** 入场日之前 20 根的已实现日波动 */
-  sigma: number
-}
 
 /** 平方根冲击：`I = Y·σ·(Q/ADV)^exp` */
 const impactOf = (q: number, adv: number, sigma: number, y: number, exp: number): number =>
@@ -142,80 +81,12 @@ const impactOf = (q: number, adv: number, sigma: number, y: number, exp: number)
 const criticalMultiple = (impact1x: number, exp: number): number =>
   (ASSUMED_SLIPPAGE / impact1x) ** (1 / exp)
 
-function pct(x: number): string {
-  return `${(x * 100).toFixed(4)}%`
-}
-function bps(x: number): string {
-  return `${(x * 10000).toFixed(2)} bp`
-}
-
 function main(): number {
-  const report = JSON.parse(readFileSync(join(CALIB_DIR, 'cap-100000.json'), 'utf8')) as Report
-  const nominal = report.meta.capitalPerCode
+  const { report, entries, total, missing, missingCodes } = loadEntries(
+    join(CALIB_DIR, 'cap-100000.json'),
+    HISTORY_DIR
+  )
 
-  // 建仓 = 按 (code, entryDate) 分组求和 shares —— 回撤减仓会把一次建仓拆成多行
-  const grouped = new Map<string, { code: string; date: string; shares: number; priceRaw: number }>()
-  for (const t of report.trades) {
-    const key = `${t.code}:${t.entryDate}`
-    const prev = grouped.get(key)
-    if (prev) prev.shares += t.shares
-    else grouped.set(key, { code: t.code, date: t.entryDate, shares: t.shares, priceRaw: t.entryPriceRaw })
-  }
-
-  const candleCache = new Map<string, Candle[] | null>()
-  const entries: Entry[] = []
-  const missing = { noFixture: 0, noBar: 0, shortHistory: 0, zeroAdv: 0, zeroSigma: 0 }
-  const missingCodes = new Set<string>()
-
-  for (const g of grouped.values()) {
-    if (!candleCache.has(g.code)) candleCache.set(g.code, loadCandles(g.code))
-    const candles = candleCache.get(g.code) ?? null
-    if (!candles) {
-      missing.noFixture++
-      missingCodes.add(g.code)
-      continue
-    }
-    const i = candles.findIndex((c) => c.date === g.date)
-    if (i < 0) {
-      missing.noBar++
-      continue
-    }
-    if (i < LOOKBACK + 1) {
-      missing.shortHistory++
-      continue
-    }
-
-    const window = candles.slice(i - LOOKBACK, i) // 入场日之前 20 根，不含当日
-    const amounts = window.map((c) => c.volume * c.close).filter((a) => a > 0)
-    if (amounts.length < LOOKBACK) {
-      missing.zeroAdv++
-      continue
-    }
-    const rets: number[] = []
-    for (let k = i - LOOKBACK; k < i; k++) {
-      const prev = candles[k - 1]
-      const cur = candles[k]
-      if (!prev || !cur || prev.closeAdj <= 0 || cur.closeAdj <= 0) continue
-      rets.push(Math.log(cur.closeAdj / prev.closeAdj))
-    }
-    const sigma = rets.length >= LOOKBACK - 1 ? sampleStdev(rets) : Number.NaN
-    if (!Number.isFinite(sigma) || sigma <= 0) {
-      missing.zeroSigma++
-      continue
-    }
-    const sameDay = candles[i]
-    entries.push({
-      code: g.code,
-      date: g.date,
-      qSim: g.shares * g.priceRaw,
-      qNominal: nominal,
-      adv: median(amounts),
-      advSameDay: sameDay ? sameDay.volume * sameDay.close : Number.NaN,
-      sigma,
-    })
-  }
-
-  const total = grouped.size
   console.log('# 平方根冲击律：常数比例滑点在多大资金上失效')
   console.log('')
   console.log(`来源报告 cap-100000.json（${report.meta.engineVersion} · ${report.meta.from} → ${report.meta.to}）`)
