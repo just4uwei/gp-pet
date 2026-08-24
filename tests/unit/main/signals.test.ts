@@ -300,6 +300,56 @@ describe('落库与去重', () => {
     expect(short.rows.length).toBe(1)
     expect(short.rows[0]?.evidence.verdicts.map((v) => v.rule)).toContain('INSUFFICIENT_DATA')
   })
+
+  /**
+   * 真机缺陷的回归（M2 §5.56）：**`A → 什么都没发生 → A` 只能落一行。**
+   *
+   * 原先「NONE 且无裁决」那一支会把 `persistedSignature` 覆盖成「什么都没发生」的签名，
+   * 而它**自己不落行** ⇒ 回到 A 时比出来「变了」⇒ 再落一行**逐字段完全相同**的。
+   * 真机实测：签名修复之后仍有 206 / 408 个相邻对如此，`SH601933` 一天 73 行只有 3 种签名。
+   *
+   * ⚠ **为什么必须是这种「同一个引擎实例、换行情」的写法**：这个缺陷在
+   * `signalSignature()` 里**看不见** —— 那个纯函数一直是对的，有用例钉着（上面那两条）。
+   * 坏的是**用它的状态机**，而状态只存在于跨轮的 `persistedSignature` 里。
+   * §5.56 的预测记分就错在这上面：「函数有用例钉着」被当成了「这条路径可靠」。
+   */
+  it('A → 什么都没发生 → A：只落一行（去重记忆不许被不落行的那一轮擦掉）', () => {
+    const signalCandles = goldenCrossBreakout().candles // 给一条真信号
+    const quietCandles = buildCandles(chopCloses(320)) // 方向 NONE、零裁决，且根数足够（不触发 INSUFFICIENT_DATA）
+    const h = harness()
+    let source = signalCandles
+
+    const deps: SignalEngineDeps = {
+      ...h.deps,
+      market: {
+        getContext: (code) => {
+          const candles = code === 'SH000300' ? buildCandles(chopCloses(300)) : source
+          return {
+            code,
+            candles,
+            provisional: false,
+            snapshot: null,
+            stale: false,
+            storedThrough: candles[candles.length - 1]?.date ?? null,
+          }
+        },
+        snapshotOf: () => null,
+      },
+    }
+
+    const engine = createSignalEngine(deps)
+
+    engine.run(TICK)
+    expect(h.rows.length).toBe(1) // A 落一行
+
+    source = quietCandles
+    engine.run({ ...TICK, at: TICK.at + 30_000 })
+    expect(h.rows.length).toBe(1) // 「什么都没发生」不落行 —— 这一条原先也是过的
+
+    source = signalCandles
+    engine.run({ ...TICK, at: TICK.at + 60_000 })
+    expect(h.rows.length).toBe(1) // ← 原先是 2：回到同一条信号又落了一行完全相同的
+  })
 })
 
 describe('指标缓存与确认轮', () => {

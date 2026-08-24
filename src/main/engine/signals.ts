@@ -267,8 +267,18 @@ export function createSignalEngine(deps: SignalEngineDeps): SignalEngine {
 
     // 方向为 NONE 且没有任何风控裁决：没有可记录的事件。
     // 「今天什么都没发生」不该在 signal 表里占 800 行
+    //
+    // ⚠ **这一支不覆盖上一次已落库的签名**（2026-08-24 修，M2 §5.56）。
+    // 原先它 `persistedSignature.set(...)` 了一下，于是「有信号 → 什么都没发生 →
+    // 同一个信号」这个来回，每次**回来**都落一行新的 —— 因为去重记忆已经被
+    // 中间那一轮改写成了「什么都没发生」，而那一轮**自己不落行**。
+    // 症状是表里连续两行**逐字段完全相同**（连 `score` / `price_at` 都一样），
+    // 看起来像去重压根没生效：真机实测签名修复之后仍有 **206 / 408** 个相邻对如此
+    // （`SH601933` 2026-08-21 一天 73 行、全天只有 3 种签名），按观测流回放 −46%。
+    //
+    // 而这里**本来就不需要记**：这一支的去重由下面那条 return 自己完成
+    // （NONE 且无裁决 ⇒ 无论 map 里存着什么都不落行），存进去只有害处。
     if (evaluation.gated.direction === 'NONE' && evaluation.gated.verdicts.length === 0) {
-      persistedSignature.set(code, { signature, id: previous?.id ?? '' })
       return { persisted: false, id: previous?.id ?? null }
     }
 
