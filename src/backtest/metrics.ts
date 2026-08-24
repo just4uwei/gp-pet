@@ -518,6 +518,65 @@ export function ratioExcessReturn(totalReturn: number, benchmarkReturn: number |
   return (1 + totalReturn) / benchmarkGrowth - 1
 }
 
+export interface SameRiskPassive {
+  /** 混合权重 `w = σ_p/σ_m` —— 基准占这么多，其余持现（0 息） */
+  weight: number
+  /** 参照组合的复利收益 */
+  referenceReturn: number
+  /** `GH1 = R_p − R_{基准@σ_p}`，正 = 主动择时赢了同风险的被动持有 */
+  gh1: number
+}
+
+/**
+ * **同风险的被动持有**（池外参照）：把**基准**与现金按每日恒定权重混到 `σ` 等于组合的 `σ`，
+ * 再比收益。`GH1 = R_p − R_{基准@σ_p}`。
+ *
+ * 归属：**Graham & Harvey**, JFE 42 (1996) 397–421 / FAJ 53 (1997) 54–66。
+ *
+ * ## 为什么报告里非要有它
+ *
+ * 报告原有的两个「超额」都是跟**满仓**基准比的，而我们平均占用只有 3.5%
+ * ⇒ 那个比较回答不了「这些钱换成被动持有会怎样」（[差距文档 §2.2](../../docs/notes/与机构量化系统的差距.md)
+ * 曾把它列为**优先级最高的真空**）。实测两句同时为真且**符号相反**：
+ * 训练窗口除法版超额 **+16.75pp**、GH1 **−1.71pp**（M2 §5.52）。
+ * ⇒ **引用「超额」时这两个必须一起给**，报告因此把它们打在相邻的行上。
+ *
+ * ## ⚠ 匹配口径按 σ，这是 2026-08-24 拍板的（不是每次挑）
+ *
+ * 另一个候选是「按平均资金占用匹配」（`w = exposure`），而它**能翻符号** ——
+ * 单指数那份 σ 匹配给 −16.40pp、占用匹配给 **+0.72pp**。
+ * 与零点定义 / 加权口径 / DSR 的 `N` / MinTRL 的 `SR*` 同一形状：**自由度必须预承诺**。
+ * 选 σ 的理由是它用**净值本身**，而 `averageExposure` 的头注释自己就写着
+ * 「是持仓规模的近似，不适合再往下做精细归因」。
+ * 占用匹配仍可在 `scripts/verify/outside-pool.ts` 里看，那是调研工具、不进报告。
+ *
+ * ## ⚠ 三处不许顺手改
+ *
+ * 1. **必须走 `alignedReturns` 严格配对**：两条收益率各算一遍再按下标塞会错位
+ *    （基准列一有空洞就是「策略第 100 天 vs 基准第 103 天」，**不报错、只给错数**）。
+ * 2. **参照是每日恒定权重（constant mix）**，`∏(1 + w·r_m) − 1` ——
+ *    **绝不能用线性近似 `w × R_m`**：两者实测最大差 **16.81pp**，
+ *    而且符号由**基准方向**决定（主项是复利的凸性，不是波动拖累）。
+ * 3. **现金按 0 计息**（与 `sharpe` 的 rf = 0、与「回测不给现金计息」一致）。
+ *    真给现金计息会让六年的利息把 `totalReturn` 从负抬成正，而那是货币基金赚的。
+ *
+ * 基准缺失、或两条序列配不出 2 期以上、或基准无波动时给 null —— 不用 0 冒充。
+ */
+export function sameRiskPassive(points: readonly EquityPoint[]): SameRiskPassive | null {
+  const { strategy, benchmark } = alignedReturns(points)
+  if (strategy.length < 2 || benchmark.length < 2) return null
+  const sdStrategy = sampleStdev(strategy)
+  const sdBenchmark = sampleStdev(benchmark)
+  if (sdBenchmark === 0) return null
+  const weight = sdStrategy / sdBenchmark
+  let referenceGrowth = 1
+  for (const r of benchmark) referenceGrowth *= 1 + weight * r
+  let strategyGrowth = 1
+  for (const r of strategy) strategyGrowth *= 1 + r
+  const referenceReturn = referenceGrowth - 1
+  return { weight, referenceReturn, gh1: strategyGrowth - 1 - referenceReturn }
+}
+
 export interface TradeStats {
   count: number
   wins: number

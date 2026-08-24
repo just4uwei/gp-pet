@@ -462,6 +462,7 @@ function block(overrides: { annualized?: number | null; maxDrawdown?: number; tr
     benchmarkReturn: null,
     excessReturn: null,
     excessReturnRatio: null,
+    sameRiskPassive: null,
     informationRatio: null,
     exposure: 0.2,
     beta: null,

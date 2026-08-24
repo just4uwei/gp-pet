@@ -27,12 +27,14 @@ import {
   ratioExcessReturn,
   returnsOf,
   riskFreeAdjustedSharpe,
+  sameRiskPassive,
   sharpeRatio,
   sharpeRatioHac,
   sharpeSignificanceThreshold,
   summarizeTrades,
   type EquityPoint,
   type PositionStats,
+  type SameRiskPassive,
   type TradeStats,
 } from './metrics'
 import { andrewsLag } from './ic-audit'
@@ -65,6 +67,17 @@ export interface PerformanceBlock {
    * 除法 −69.10% = 净值只有被动的 30.9%）。**引用超额时用这个**，两个并存是刻意的。
    */
   excessReturnRatio: number | null
+  /**
+   * **同风险参照**：`GH1 = R_p − R_{基准@σ_p}`（Graham & Harvey 1996/1997，2026-08-24 加）。
+   * 上面那两个「超额」都是跟**满仓**基准比的，而我们平均占用只有 3.5%
+   * ⇒ 它们回答不了「这些钱换成被动持有会怎样」（差距文档 §2.2 那个真空）。
+   *
+   * ⚠ **引用超额时必须与 `excessReturnRatio` 一起给**：两句同时为真且**符号相反**
+   * （训练窗口 +16.75pp vs **−1.71pp**，M2 §5.52）。
+   * 匹配口径**按 σ**，2026-08-24 拍板、**不许每次挑**（占用匹配能翻符号）——
+   * 理由与另一个候选的代价在 `metrics.ts` 的 `sameRiskPassive` 头注释。
+   */
+  sameRiskPassive: SameRiskPassive | null
   informationRatio: number | null
   /**
    * 平均资金占用率 0..1。**读 `excessReturn` 之前先读它**：基准是满仓的，
@@ -267,6 +280,7 @@ export function performanceOf(
     benchmarkReturn,
     excessReturn: benchmarkReturn === null ? null : totalReturn - benchmarkReturn,
     excessReturnRatio: ratioExcessReturn(totalReturn, benchmarkReturn),
+    sameRiskPassive: sameRiskPassive(equity),
     informationRatio:
       paired.benchmark.length > 0 ? informationRatio(paired.strategy, paired.benchmark) : null,
     exposure: averageExposure(trades, first, equity.length),
@@ -584,6 +598,18 @@ export function renderReport(report: BacktestReport): string {
   lines.push(
     `  基准 ${pct(p.benchmarkReturn)}  超额 ${pct(p.excessReturn)}（除法 ${pct(p.excessReturnRatio)}）` +
       `  信息比率 ${num(p.informationRatio)}`
+  )
+  /*
+    同风险参照（GH1）**必须紧贴上面那行超额** —— 它们符号相反且两句都对：
+    训练窗口除法版 +16.75pp 而 GH1 **−1.71pp**（M2 §5.52）。分开打印就会有人只引用一个。
+    ⚠ 这一行答的是「同样的风险换成买指数会怎样」，上面那行答的是「跟满仓指数比」。
+    匹配口径按 σ（2026-08-24 拍板，不许每次挑；理由见 `metrics.sameRiskPassive`）。
+  */
+  const srp = p.sameRiskPassive
+  lines.push(
+    srp === null
+      ? '  同风险参照 —（基准缺失或配对不足，不用 0 冒充）'
+      : `  同风险参照 GH1 ${pct(srp.gh1)}（基准权重 ${pct(srp.weight)} 混现金 ⇒ 参照 ${pct(srp.referenceReturn)}）`
   )
   // 超额与占用率必须相邻打印：基准满仓、策略多数时间空仓，只看超额会把「没投钱」读成「策略差」。
   // beta 跟在同一行是因为它答的是同一个问题（暴露多少），只是量法不同、且不含参数。

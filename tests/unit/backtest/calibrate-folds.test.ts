@@ -52,6 +52,7 @@ function block(annualized: number | null, trades = 50): PerformanceBlock {
     benchmarkReturn: null,
     excessReturn: null,
     excessReturnRatio: null,
+    sameRiskPassive: null,
     informationRatio: null,
     exposure: 0.04,
     beta: null,

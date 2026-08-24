@@ -44,7 +44,13 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { BARS_PER_YEAR, alignedReturns, mean, sampleStdev } from '../../src/backtest/metrics'
+import {
+  BARS_PER_YEAR,
+  alignedReturns,
+  mean,
+  sameRiskPassive,
+  sampleStdev,
+} from '../../src/backtest/metrics'
 
 const CALIB_DIR = join(process.cwd(), 'reports', 'calib')
 
@@ -129,7 +135,17 @@ function analyze(name: string, label: string, evalFrom?: string): void {
   )
 
   // ---- GH1：两个匹配口径 ----
+  // ⚠ σ 匹配那一档 2026-08-24 起**进了报告**（`metrics.sameRiskPassive`）⇒ 这里做一次
+  // 交叉自检，防止调研工具与报告分叉。占用匹配仍然只在这个工具里（拍板没选它）。
   const wSigma = sdP / sdM
+  const fromMetrics = sameRiskPassive(points)
+  if (fromMetrics !== null) {
+    const dw = Math.abs(fromMetrics.weight - wSigma)
+    const dg = Math.abs(fromMetrics.gh1 - (rP - mixedReturn(benchmark, wSigma)))
+    console.log(
+      `\n> 自检｜与报告口径（\`metrics.sameRiskPassive\`）差：w ${dw.toExponential(2)} · GH1 ${dg.toExponential(2)}`
+    )
+  }
   const rows: Array<[string, number]> = [['σ 匹配（GH1 原口径）`w = σ_p/σ_m`', wSigma]]
   if (exposure !== null) rows.push(['占用匹配（§2.2 要的那个）`w = exposure`', exposure])
 

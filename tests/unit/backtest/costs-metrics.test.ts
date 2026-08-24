@@ -27,6 +27,7 @@ import {
   informationRatio,
   maxDrawdown,
   ratioExcessReturn,
+  sameRiskPassive,
   mean,
   returnsOf,
   riskFreeAdjustedSharpe,
@@ -216,6 +217,44 @@ describe('绩效指标', () => {
     expect(0.2414 - 3.017).toBeCloseTo(-2.7756, 4)
     expect(ratioExcessReturn(0.05, null)).toBeNull()
     expect(ratioExcessReturn(0.05, -1)).toBeNull()
+  })
+
+  /**
+   * **同风险参照（GH1）** —— 三条各守一件事，别合并：
+   * ① σ 匹配的权重真的按 `σ_p/σ_m` 算；
+   * ② 参照是**每日恒定权重**的复利，**不是**线性近似 `w × R_m`（实测两者能差 16.81pp，
+   *    且符号由基准方向决定 —— 这是 M2 §5.52 里 P5 被证伪的那一条）；
+   * ③ 基准缺失/配对不足给 null，不用 0 冒充（0 会被读成「与被动持有打平」）。
+   */
+  it('GH1：权重按 σ 匹配、参照走恒定权重复利而非线性近似', () => {
+    // 策略日收益恰好是基准的一半 ⇒ σ_p/σ_m = 0.5，而参照就是「一半基准 + 一半现金」
+    const benchmarkRets = [0.03, -0.02, 0.04, -0.01, 0.02]
+    let bench = 1
+    const benchLevels = [1, ...benchmarkRets.map((r) => (bench *= 1 + r))]
+    let strat = 100
+    const stratLevels = [100, ...benchmarkRets.map((r) => (strat *= 1 + r * 0.5))]
+    const result = sameRiskPassive(equity(stratLevels, benchLevels))
+    expect(result).not.toBeNull()
+    expect(result!.weight).toBeCloseTo(0.5, 10)
+    // 策略与参照在这个构造下逐日相同 ⇒ GH1 恰好 0（这是真的「打平」，不是算不出）
+    expect(result!.gh1).toBeCloseTo(0, 12)
+    // ② 恒定权重复利 ≠ 线性近似：基准整段是负的，两者必然不等
+    const down = [0.05, -0.10, -0.08, 0.02, -0.06]
+    let d = 1
+    const downLevels = [1, ...down.map((r) => (d *= 1 + r))]
+    let s2 = 100
+    const s2Levels = [100, ...down.map((r) => (s2 *= 1 + r * 0.5))]
+    const onDown = sameRiskPassive(equity(s2Levels, downLevels))
+    const linear = 0.5 * ((downLevels[downLevels.length - 1] ?? 1) - 1)
+    expect(onDown).not.toBeNull()
+    expect(onDown!.referenceReturn).not.toBeCloseTo(linear, 4)
+  })
+
+  it('GH1：基准缺失或配对不足给 null（0 会被读成「与被动持有打平」）', () => {
+    expect(sameRiskPassive(equity([100, 110, 121]))).toBeNull()
+    expect(sameRiskPassive(equity([100, 110], [1, 1.1]))).toBeNull()
+    // 基准无波动 ⇒ σ_m = 0 ⇒ 权重除零，算不出
+    expect(sameRiskPassive(equity([100, 110, 121], [1, 1, 1]))).toBeNull()
   })
 
   /**
