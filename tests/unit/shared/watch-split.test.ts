@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { splitWatchItems, watchTabOf } from '@shared/watch-split'
+import { canReorderWatch, reorderWatchItems, splitWatchItems, watchTabOf } from '@shared/watch-split'
 import { INDUSTRY_ETFS } from '@shared/industry-etf'
 import type { SecCode } from '@core/types'
 
@@ -92,5 +92,132 @@ describe('splitWatchItems', () => {
 
   it('空列表给两个空数组', () => {
     expect(splitWatchItems([])).toEqual({ stock: [], etf: [] })
+  })
+})
+
+/**
+ * 拖动排序（2026-08-24）。渲染层没有测试，所以「能不能拖」「拖到哪」全钉在这里。
+ */
+describe('reorderWatchItems', () => {
+  const row = (code: string, hasPosition = false): { code: SecCode; hasPosition: boolean } => ({
+    code: code as SecCode,
+    hasPosition,
+  })
+  const codes = (rows: readonly { code: SecCode }[] | null): string[] | null =>
+    rows ? rows.map((r) => r.code) : null
+
+  // A B C D 四只同段（都在个股屏、都无持仓）
+  const four = [row('SH600000'), row('SZ000001'), row('SZ300750'), row('SH601318')]
+
+  it('往下拖：落在目标之后', () => {
+    expect(codes(reorderWatchItems(four, 'SH600000' as SecCode, 'SZ300750' as SecCode))).toEqual([
+      'SZ000001',
+      'SZ300750',
+      'SH600000',
+      'SH601318',
+    ])
+  })
+
+  it('往上拖：落在目标之前', () => {
+    expect(codes(reorderWatchItems(four, 'SH601318' as SecCode, 'SZ000001' as SecCode))).toEqual([
+      'SH600000',
+      'SH601318',
+      'SZ000001',
+      'SZ300750',
+    ])
+  })
+
+  /**
+   * 这一条是落点语义的锚：拖到相邻那一行上，必须与点一次上移/下移**逐位相同**。
+   * 「一律插在目标之前」的写法会让往下拖一格变成原地不动 —— 表现是「拖了没反应」。
+   */
+  it('拖到相邻一行 = 上移/下移一次', () => {
+    expect(codes(reorderWatchItems(four, 'SH600000' as SecCode, 'SZ000001' as SecCode))).toEqual([
+      'SZ000001',
+      'SH600000',
+      'SZ300750',
+      'SH601318',
+    ])
+    expect(codes(reorderWatchItems(four, 'SZ000001' as SecCode, 'SH600000' as SecCode))).toEqual([
+      'SZ000001',
+      'SH600000',
+      'SZ300750',
+      'SH601318',
+    ])
+  })
+
+  it('跨持仓边界一律拒绝 —— 持仓优先是派生的事实，不是能拖出来的状态', () => {
+    const items = [row('SH600000', true), row('SZ000001'), row('SZ300750')]
+    expect(reorderWatchItems(items, 'SZ300750' as SecCode, 'SH600000' as SecCode)).toBeNull()
+    expect(reorderWatchItems(items, 'SH600000' as SecCode, 'SZ000001' as SecCode)).toBeNull()
+  })
+
+  it('跨屏一律拒绝：股票拖不到 ETF 屏里去', () => {
+    const items = [row('SH600000'), row('SH512800')]
+    expect(reorderWatchItems(items, 'SH600000' as SecCode, 'SH512800' as SecCode)).toBeNull()
+  })
+
+  it('拖回自己、或代码不在列表里 → null', () => {
+    expect(reorderWatchItems(four, 'SH600000' as SecCode, 'SH600000' as SecCode)).toBeNull()
+    expect(reorderWatchItems(four, 'SH600000' as SecCode, 'SH999999' as SecCode)).toBeNull()
+  })
+
+  /**
+   * 只重排那一段占的下标，别的行一个都不挪 —— 否则「在 ETF 屏拖一下」会把
+   * 个股屏的顺序也搅了，而用户在另一屏上根本看不到自己改了什么。
+   */
+  it('只动本段：另一屏与另一段的行原地不动', () => {
+    const items = [
+      row('SH600000'), // 个股·无持仓
+      row('SH512800'), // ETF·无持仓
+      row('SZ000001', true), // 个股·持仓
+      row('SZ300750'), // 个股·无持仓
+      row('SZ159755'), // ETF·无持仓
+      row('SH601318'), // 个股·无持仓
+    ]
+    // 把 SH601318 拖到 SH600000 上（同段：个股·无持仓）
+    expect(codes(reorderWatchItems(items, 'SH601318' as SecCode, 'SH600000' as SecCode))).toEqual([
+      'SH601318',
+      'SH512800', // 另一屏，下标没动
+      'SZ000001', // 另一段，下标没动
+      'SH600000',
+      'SZ159755', // 另一屏，下标没动
+      'SZ300750',
+    ])
+  })
+
+  it('新顺序过一遍 splitWatchItems 就是屏上看到的样子', () => {
+    const items = [row('SH600000', true), row('SZ000001'), row('SZ300750'), row('SH601318')]
+    const next = reorderWatchItems(items, 'SH601318' as SecCode, 'SZ000001' as SecCode)
+    expect(next).not.toBeNull()
+    expect(splitWatchItems(next ?? []).stock.map((r) => r.code)).toEqual([
+      'SH600000', // 持仓仍然在最前
+      'SH601318',
+      'SZ000001',
+      'SZ300750',
+    ])
+  })
+
+  it('不改入参', () => {
+    const snapshot = four.map((r) => r.code)
+    reorderWatchItems(four, 'SH600000' as SecCode, 'SH601318' as SecCode)
+    expect(four.map((r) => r.code)).toEqual(snapshot)
+  })
+})
+
+describe('canReorderWatch', () => {
+  const row = (code: string, hasPosition = false): { code: SecCode; hasPosition: boolean } => ({
+    code: code as SecCode,
+    hasPosition,
+  })
+
+  it('同段可以，跨段/自己/缺失都不行', () => {
+    expect(canReorderWatch(row('SH600000'), row('SZ000001'))).toBe(true)
+    expect(canReorderWatch(row('SH512800'), row('SZ159755'))).toBe(true)
+    expect(canReorderWatch(row('SH600000'), row('SH512800'))).toBe(false)
+    expect(canReorderWatch(row('SH600000'), row('SZ000001', true))).toBe(false)
+    expect(canReorderWatch(row('SH600000'), row('SH600000'))).toBe(false)
+    expect(canReorderWatch(row('SH600000'), undefined)).toBe(false)
+    expect(canReorderWatch(undefined, row('SH600000'))).toBe(false)
   })
 })

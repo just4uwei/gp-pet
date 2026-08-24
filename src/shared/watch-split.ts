@@ -24,6 +24,16 @@
  * 2. 调用方的上移/下移必须按**段**禁用，不是按整屏。`move()` 交换的是全局 `sortOrder`，
  *    而这里每次都会重新把持仓提到前面 —— 跨段交换之后显示顺序**一点变化都没有**，
  *    表现就是「点了没反应」。
+ *
+ * ## 拖动排序（2026-08-24）也受第 2 条约束，只是必须**拒绝**而不是禁用
+ *
+ * 上移/下移能靠 `disabled` 把跨段那一步堵在按钮上；拖动没有这个位置可用 ——
+ * 鼠标可以落在任何一行上。所以判据挪进 `reorderWatchItems()`：
+ * 同段才给新顺序，跨段（跨屏 或 跨持仓边界）一律返回 `null`。
+ *
+ * **不许把跨段拖动实现成「拖过去就当持仓/非持仓处理」** —— 段是从
+ * `hasPosition` 派生的事实，不是用户能排的东西；让它跟着拖动走，等于让
+ * 「这只票有没有持仓」变成一个可以拖出来的状态。
  */
 
 import { splitCode } from '@core/code'
@@ -58,4 +68,67 @@ export function splitWatchItems<T extends SplittableWatchItem>(
   }
   const held = (rows: T[]): T[] => rows.sort((a, b) => Number(b.hasPosition) - Number(a.hasPosition))
   return { stock: held(stock), etf: held(etf) }
+}
+
+/**
+ * 一行所在的「段」= 屏 × 有无持仓。**同段才能互换位置**，因为 `splitWatchItems`
+ * 每次都会重新按这两件事分组，跨段换到的位置在下一次渲染里就被排回去了。
+ */
+export function watchSegmentOf(item: SplittableWatchItem): string {
+  return `${watchTabOf(item.code)}:${item.hasPosition ? 'HELD' : 'FREE'}`
+}
+
+/** 两行能不能互换位置（拖动的落点判据）。同一行也算不能 —— 拖回原处什么都不该发生 */
+export function canReorderWatch(
+  a: SplittableWatchItem | undefined,
+  b: SplittableWatchItem | undefined
+): boolean {
+  if (!a || !b || a.code === b.code) return false
+  return watchSegmentOf(a) === watchSegmentOf(b)
+}
+
+/**
+ * 把 `fromCode` 那一行挪到 `toCode` **当前占的那一格**，返回新的全局顺序
+ * （= 要写回 `sort_order` 的那份）。跨段或找不到时返回 `null`，调用方什么都不做。
+ *
+ * 三件事值得写下来：
+ *
+ * 1. **落点语义是「占掉目标那一格」**，于是往下拖会落在目标**之后**、往上拖落在目标
+ *    **之前** —— 与上移/下移按钮在相邻两行上的行为逐位一致（有用例钉着）。
+ *    换成「一律插在目标之前」的话，往下拖一格会变成原地不动，表现是「拖了没反应」。
+ *
+ * 2. **只重排那一段在全局数组里原本占的那些下标**，别的行一个都不挪。
+ *    段内相对顺序就是屏上看到的顺序（`splitWatchItems` 段内保序），所以把新的段内
+ *    序列按原下标写回去，屏上看到的就是拖动后的样子 —— 不需要在这里再模拟一次分屏。
+ *
+ * 3. 不改入参。调用方会先 `setItems(next)` 抢一步显示，落库失败再由 reload 纠正。
+ */
+export function reorderWatchItems<T extends SplittableWatchItem>(
+  items: readonly T[],
+  fromCode: SecCode,
+  toCode: SecCode
+): T[] | null {
+  const from = items.find((item) => item.code === fromCode)
+  const to = items.find((item) => item.code === toCode)
+  if (!canReorderWatch(from, to) || !from || !to) return null
+
+  const segment = watchSegmentOf(from)
+  const slots: number[] = []
+  items.forEach((item, index) => {
+    if (watchSegmentOf(item) === segment) slots.push(index)
+  })
+
+  const seq = slots.map((index) => items[index] as T)
+  const at = seq.indexOf(from)
+  const target = seq.indexOf(to)
+  if (at < 0 || target < 0) return null
+  seq.splice(at, 1)
+  // 用**移除前**的目标下标插入：往下拖时它已经因为移除左移了一格 ⇒ 落在目标之后
+  seq.splice(target, 0, from)
+
+  const next = [...items]
+  slots.forEach((index, i) => {
+    next[index] = seq[i] as T
+  })
+  return next
 }

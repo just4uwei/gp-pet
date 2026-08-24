@@ -40,7 +40,13 @@ import { watchMarkOf } from '@shared/watch-mark'
 import { T_HINT_LABEL, T_HINT_TITLE } from '@shared/intraday-t'
 import { SHANGHAI_OFFSET_MS, shanghaiDayStartMs, shanghaiMdHhmm } from '@shared/time'
 import { INDUSTRY_ETF_GROUP, INDUSTRY_ETFS } from '@shared/industry-etf'
-import { splitWatchItems, watchTabOf, type WatchTab } from '@shared/watch-split'
+import {
+  canReorderWatch,
+  reorderWatchItems,
+  splitWatchItems,
+  watchTabOf,
+  type WatchTab,
+} from '@shared/watch-split'
 import type { SecCode } from '@core/types'
 import { AlertLog } from './AlertLog'
 import { BrandMark } from './BrandMark'
@@ -296,9 +302,16 @@ function WatchRow({
   last,
   removable = true,
   highlight = false,
+  dragging = false,
+  dimmed = false,
+  dropEdge = null,
   innerRef,
   onRemove,
   onMove,
+  onDragStart,
+  onDragOver,
+  onDragEnd,
+  onDrop,
   onOpen,
   onEditStop,
 }: {
@@ -317,10 +330,24 @@ function WatchRow({
   removable?: boolean
   /** 刚添加进来的那一行：上层要滚到它，并短暂高亮让人看见它落在哪 */
   highlight?: boolean
+  /** 正被拖着的就是这一行 */
+  dragging?: boolean
+  /**
+   * 拖动进行中，而这一行**不是合法落点**（不同段）。灰下去而不是插一条提示 ——
+   * 提示条会在拖动开始那一刻把整列表推下去一行，拖着的目标跟着跑。
+   */
+  dimmed?: boolean
+  /** 落点指示线画在这一行的哪一边（拖动方向决定），不是落点就传 null */
+  dropEdge?: 'TOP' | 'BOTTOM' | null
   /** 上层用来 `scrollIntoView` 的把手。只给 `highlight` 那一行装 */
   innerRef?: (el: HTMLLIElement | null) => void
   onRemove: (code: SecCode) => void
   onMove: (code: SecCode, delta: number) => void
+  onDragStart: (code: SecCode) => void
+  /** 拖到这一行上。返回 false 表示不接受（上层按段判），此时不许 preventDefault */
+  onDragOver: (code: SecCode) => boolean
+  onDragEnd: () => void
+  onDrop: (code: SecCode) => void
   /** 打开详情抽屉。`tab` 决定落在哪一页 */
   onOpen: (code: SecCode, tab: StockTab) => void
   /**
@@ -350,10 +377,53 @@ function WatchRow({
     */
     <li
       ref={innerRef}
-      className={`border-b border-l-2 border-b-white/[0.06] transition-colors last:border-b-0 hover:bg-white/[0.02] ${
+      /*
+        整行可拖（不只把手）—— 把手只是让人看得见这件事能做。
+        `select-none` 是必需的：不加的话按住往下拖会先选中一片文字，
+        浏览器把它当成「拖选文本」，行本身反而不动。
+
+        落点指示线是一条**绝对定位的 2px 条**（所以这里要 `relative`），
+        不是 border、不是底色：这一行的 `border-b` / `border-l` 与三选一的底色
+        都已经有确定含义（见下面那段注释），再往里挤会把「持仓」「刚添加」两个标记压掉。
+      */
+      draggable
+      onDragStart={(event) => {
+        // Chromium 下不设 data 也能拖，但设了才有标准的 move 光标
+        event.dataTransfer.effectAllowed = 'move'
+        event.dataTransfer.setData('text/plain', item.code)
+        onDragStart(item.code)
+      }}
+      onDragOver={(event) => {
+        // 不接受就**不 preventDefault**：drop 事件因此根本不会来，
+        // 光标也变成禁止符 —— 拒绝这件事不需要额外写一行代码去挡
+        if (!onDragOver(item.code)) {
+          event.dataTransfer.dropEffect = 'none'
+          return
+        }
+        event.preventDefault()
+        event.dataTransfer.dropEffect = 'move'
+      }}
+      onDrop={(event) => {
+        event.preventDefault()
+        onDrop(item.code)
+      }}
+      onDragEnd={onDragEnd}
+      className={`relative border-b border-l-2 border-b-white/[0.06] transition-colors select-none last:border-b-0 hover:bg-white/[0.02] ${
         item.hasPosition ? 'border-l-sky-400/60' : 'border-l-transparent'
-      } ${highlight ? 'bg-sky-400/15' : item.hasPosition ? 'bg-sky-400/[0.03]' : ''}`}
+      } ${highlight ? 'bg-sky-400/15' : item.hasPosition ? 'bg-sky-400/[0.03]' : ''} ${
+        dragging ? 'opacity-40' : dimmed ? 'opacity-25' : ''
+      }`}
     >
+      {/* `pointer-events-none` 是必需的：它盖在行上，会吃掉 dragover ⇒ 落点一闪就没 */}
+      {dropEdge ? (
+        <span
+          aria-hidden
+          className={`pointer-events-none absolute inset-x-0 h-0.5 bg-sky-400 ${
+            dropEdge === 'TOP' ? 'top-0' : 'bottom-0'
+          }`}
+        />
+      ) : null}
+
       <div className="flex items-center gap-3 px-3 py-2 text-sm">
         {/*
           整行是打开详情的按钮。上移/下移/移除三个小按钮在它外面 ——
@@ -419,6 +489,17 @@ function WatchRow({
           >
             仓
           </button>
+          {/*
+            拖动把手。**它自己不带 `draggable`** —— 整行才是被拖的东西，
+            把手只负责说「这行能拖」并给 grab 光标。给它单独加 draggable 的话，
+            从把手起手拖的是这个 span，拖影只有一个小图标，看着像拖丢了。
+          */}
+          <span
+            className="cursor-grab px-1 leading-none active:cursor-grabbing"
+            title="按住拖动排序。持仓与非持仓各自成段，不能拖到另一段里去"
+          >
+            ⠿
+          </span>
           <button
             className="px-1 hover:text-white/80 disabled:opacity-25"
             disabled={first}
@@ -851,6 +932,24 @@ export function App(): React.JSX.Element {
   )
 
   /**
+   * 落库新顺序。**先动 UI 再落库**（落库失败由 reload 纠正回来）——
+   * 上移/下移与拖动共用这一处，两处各写一份的症状是「一种方式排得住、另一种排不住」。
+   */
+  const persistOrder = useCallback(
+    (next: WatchItem[]): void => {
+      setItems(next)
+      void window.gp
+        .invoke(
+          'watchlist:reorder',
+          next.map((item) => item.code)
+        )
+        .then(() => reload())
+        .catch((err: unknown) => setError(errorText(err)))
+    },
+    [reload]
+  )
+
+  /**
    * 上移/下移。
    *
    * ⚠ `delta` 是**在当前 tab 这一屏里**的位移，不是全局列表里的。
@@ -872,16 +971,46 @@ export function App(): React.JSX.Element {
       if (!itemA || !itemB) return
       next[a] = itemB
       next[b] = itemA
-      setItems(next) // 先动 UI，落库失败再由 reload 纠正回来
-      void window.gp
-        .invoke(
-          'watchlist:reorder',
-          next.map((item) => item.code)
-        )
-        .then(() => reload())
-        .catch((err: unknown) => setError(errorText(err)))
+      persistOrder(next)
     },
-    [items, reload]
+    [items, persistOrder]
+  )
+
+  /**
+   * 拖动排序（2026-08-24）。
+   *
+   * 判据全在 `@shared/watch-split`（纯函数、有用例）：同段才认，落点是「占掉目标那一格」。
+   * 这里只管三件事 —— 记住正在拖谁、把落点算成一条线、放手时落库。
+   *
+   * ⚠ **`dragOver` 里绝不能无条件 setState**：dragover 每几十毫秒就来一次，
+   * 每次都 setState 会让这一列表在拖动全程持续重渲染（同一屏上还挂着每 30 秒
+   * 一跳的行情推送）。所以同一个落点直接返回原对象。
+   */
+  const [drag, setDrag] = useState<{ code: SecCode; over: SecCode | null } | null>(null)
+
+  const dragOver = useCallback(
+    (code: SecCode): boolean => {
+      if (!drag) return false
+      const ok = canReorderWatch(
+        items.find((item) => item.code === drag.code),
+        items.find((item) => item.code === code)
+      )
+      if (!ok) return false
+      setDrag((prev) => (!prev || prev.over === code ? prev : { ...prev, over: code }))
+      return true
+    },
+    [drag, items]
+  )
+
+  const drop = useCallback(
+    (code: SecCode): void => {
+      const from = drag?.code
+      setDrag(null)
+      if (!from) return
+      const next = reorderWatchItems(items, from, code)
+      if (next) persistOrder(next)
+    },
+    [drag, items, persistOrder]
   )
 
   const onTransfer = useCallback(
@@ -916,6 +1045,15 @@ export function App(): React.JSX.Element {
   */
   const split = useMemo(() => splitWatchItems(items), [items])
   const visibleWatch = watchTab === 'ETF' ? split.etf : split.stock
+
+  /*
+    拖动中的两个派生量。`dragAt` 是被拖那一行在**当前屏**里的下标 ——
+    往下拖把线画在目标下沿、往上拖画在上沿，与 `reorderWatchItems` 的落点语义
+    （占掉目标那一格）对得上。被拖的那只可能不在这一屏（拖着切了 tab），
+    那时 `dragAt < 0`，一条线都不画。
+  */
+  const dragItem = drag ? items.find((item) => item.code === drag.code) : undefined
+  const dragAt = drag ? visibleWatch.findIndex((item) => item.code === drag.code) : -1
 
   /*
     刚添加的那一行：滚到它并短暂高亮。
@@ -1166,9 +1304,20 @@ export function App(): React.JSX.Element {
                   // **按项判断而不是按屏** —— 同一屏里用户自己加的 ETF 照常可删
                   removable={item.group !== INDUSTRY_ETF_GROUP}
                   highlight={pendingFocus === item.code}
+                  dragging={drag?.code === item.code}
+                  // 不是合法落点就灰下去。判据与 onDragOver 那道拒绝**同一个函数**，
+                  // 各写一份的症状是「看着能放，放下去没反应」
+                  dimmed={!!drag && drag.code !== item.code && !canReorderWatch(dragItem, item)}
+                  dropEdge={
+                    drag?.over === item.code && dragAt >= 0 ? (dragAt < i ? 'BOTTOM' : 'TOP') : null
+                  }
                   {...(pendingFocus === item.code ? { innerRef: (el) => (focusRef.current = el) } : {})}
                   onRemove={remove}
                   onMove={(code, delta) => move(code, delta, visibleWatch)}
+                  onDragStart={(code) => setDrag({ code, over: null })}
+                  onDragOver={dragOver}
+                  onDragEnd={() => setDrag(null)}
+                  onDrop={drop}
                   onOpen={openDrawer}
                   onEditStop={openStopEditor}
                 />
