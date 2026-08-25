@@ -22,9 +22,7 @@ describe('parseWatchSuggestions', () => {
   it('抽出一条完整建议', () => {
     expect(parseWatchSuggestions(GOOD)).toEqual([
       {
-        metric: 'PRICE',
-        op: 'LTE',
-        threshold: 8.2,
+        conditions: [{ metric: 'PRICE', op: 'LTE', threshold: 8.2 }],
         meaning: 'INVALIDATE',
         // 「说明」里带空格也要完整取到 —— 取到行尾为止
         note: '跌破 20 日均线支撑',
@@ -40,7 +38,19 @@ metric=adx op=GTE threshold=25 meaning=CONFIRM
 </观察点建议>`
     const out = parseWatchSuggestions(text)
     expect(out).toHaveLength(2)
-    expect(out[1]?.metric).toBe('rsi')
+    expect(out[1]?.conditions).toEqual([{ metric: 'rsi', op: 'GTE', threshold: 70 }])
+  })
+
+  /**
+   * **不带 `组` 的行为逐位不变**（回归护栏）。组合条件是 2026-08-25 加的，
+   * 而绝大多数解读仍然只给一条 —— 那条路径上多一个字都不该变。
+   */
+  it('不带「组」的两行仍是两条各自独立的建议，每条一个条件', () => {
+    const out = parseWatchSuggestions(`<观察点建议>
+metric=PRICE op=LTE threshold=8.2
+metric=rsi op=GTE threshold=70
+</观察点建议>`)
+    expect(out.map((s) => s.conditions.length)).toEqual([1, 1])
   })
 
   // ── 容错：以下每一条都必须返回空数组，且不抛错 ──────────────────
@@ -96,7 +106,8 @@ metric=adx op=GTE threshold=25 meaning=CONFIRM
 
   it('op / meaning 大小写不敏感', () => {
     const out = parseWatchSuggestions('<观察点建议>\nmetric=rsi op=gte threshold=70 meaning=confirm\n</观察点建议>')
-    expect(out[0]).toMatchObject({ op: 'GTE', meaning: 'CONFIRM' })
+    expect(out[0]?.conditions[0]?.op).toBe('GTE')
+    expect(out[0]?.meaning).toBe('CONFIRM')
   })
 
   it('meaning 缺省时按 INVALIDATE —— 第四段问的本来就是「判断错了会怎样」', () => {
@@ -106,7 +117,92 @@ metric=adx op=GTE threshold=25 meaning=CONFIRM
 
   it('负数阈值也接受（MACD DIF 可以是负的）', () => {
     const out = parseWatchSuggestions('<观察点建议>\nmetric=dif op=LTE threshold=-0.15\n</观察点建议>')
-    expect(out[0]?.threshold).toBeCloseTo(-0.15)
+    expect(out[0]?.conditions[0]?.threshold).toBeCloseTo(-0.15)
+  })
+})
+
+/**
+ * 组合条件（`组=`，2026-08-25）。
+ *
+ * 同一个 `组` 的行合成**一个**观察点，条件之间是「且」。没写 `组` 的行各自成条 ——
+ * 那条回归护栏在上面那个 describe 里。
+ */
+describe('组合条件（组=）', () => {
+  const block = (body: string): string => `<观察点建议>\n${body}\n</观察点建议>`
+
+  it('同组两行 → 一条建议两个条件，meaning 与说明取第一行的', () => {
+    const out = parseWatchSuggestions(
+      block(`metric=PRICE op=LTE threshold=8.2 meaning=INVALIDATE 组=1 说明=跌破均线支撑
+metric=rsi op=LTE threshold=30 meaning=CONFIRM 组=1 说明=后面这句会被忽略`)
+    )
+    expect(out).toHaveLength(1)
+    expect(out[0]?.conditions).toEqual([
+      { metric: 'PRICE', op: 'LTE', threshold: 8.2 },
+      { metric: 'rsi', op: 'LTE', threshold: 30 },
+    ])
+    // 一个观察点只有一个语义：让第二行改它，用户会在表单里看到一个他没读过的结论
+    expect(out[0]?.meaning).toBe('INVALIDATE')
+    expect(out[0]?.note).toBe('跌破均线支撑')
+  })
+
+  it('两个组 = 两条建议；组与非组可以混着写', () => {
+    const out = parseWatchSuggestions(
+      block(`metric=PRICE op=LTE threshold=8.2 组=a
+metric=rsi op=LTE threshold=30 组=a
+metric=adx op=GTE threshold=25`)
+    )
+    expect(out.map((s) => s.conditions.length)).toEqual([2, 1])
+  })
+
+  it('组内超过 3 条 → 多的**丢弃**，不另起一条建议（另起会把「且」拆成两个独立观察点）', () => {
+    const out = parseWatchSuggestions(
+      block(`metric=PRICE op=LTE threshold=8.2 组=1
+metric=rsi op=LTE threshold=30 组=1
+metric=adx op=GTE threshold=25 组=1
+metric=ma20 op=LTE threshold=9 组=1`)
+    )
+    expect(out).toHaveLength(1)
+    expect(out[0]?.conditions).toHaveLength(3)
+  })
+
+  it('超过两个组时后面的整组丢掉', () => {
+    const out = parseWatchSuggestions(
+      block(`metric=PRICE op=LTE threshold=8.2 组=1
+metric=rsi op=LTE threshold=30 组=2
+metric=adx op=GTE threshold=25 组=3`)
+    )
+    expect(out).toHaveLength(2)
+  })
+
+  it('组里有一行 metric 不在白名单 → 只丢那一行，组存活', () => {
+    const out = parseWatchSuggestions(
+      block(`metric=PRICE op=LTE threshold=8.2 组=1
+metric=北向资金 op=GTE threshold=5 组=1`)
+    )
+    expect(out).toHaveLength(1)
+    expect(out[0]?.conditions).toEqual([{ metric: 'PRICE', op: 'LTE', threshold: 8.2 }])
+  })
+
+  /**
+   * 与「metric 不在白名单」同一处置：一个**永远不会命中**的建议比没有建议糟得多 ——
+   * 它看起来完全正常，用户会确认下去，然后一直等一个不会来的提醒。
+   */
+  it('组内条件自相矛盾（≤8.2 且 ≥9）→ 整组丢弃', () => {
+    const out = parseWatchSuggestions(
+      block(`metric=PRICE op=LTE threshold=8.2 组=1
+metric=PRICE op=GTE threshold=9 组=1`)
+    )
+    expect(out).toEqual([])
+  })
+
+  it('判断行照样套到每个组上', () => {
+    const out = parseWatchSuggestions(
+      block(`判断=下跌
+metric=PRICE op=LTE threshold=8.2 组=1
+metric=rsi op=LTE threshold=30 组=1`)
+    )
+    expect(out[0]?.verdict).toBe('DOWN')
+    expect(out[0]?.conditions).toHaveLength(2)
   })
 })
 

@@ -801,6 +801,23 @@ export interface AiExplainRecord {
  */
 export type WatchVerdict = 'UP' | 'DOWN' | 'RANGE'
 
+/**
+ * 观察点的**一个**触发条件（2026-08-25 起一个观察点可以挂 1–3 个）。
+ *
+ * 多个条件之间只有「**且**」一种关系，且判据是「**同一轮同时成立**」——
+ * 不是「a 先成立记下来、b 后成立才触发」。后者是另一个功能（先 a 后 b），
+ * 它需要每条一列命中时刻，还需要一条「a 后来不成立了要不要清零」的新判据。
+ *
+ * 「或」不在这里表达：任一成立就触发时写成两个各自命中、各自提醒的观察点 ——
+ * 那本来就是这个功能之前的行为。
+ */
+export interface WatchCondition {
+  /** `PRICE` 或指标键（白名单见 src/main/watch/metrics.ts） */
+  metric: string
+  op: 'LTE' | 'GTE'
+  threshold: number
+}
+
 export interface WatchPointView {
   id: string
   code: SecCode
@@ -808,10 +825,8 @@ export interface WatchPointView {
   /** 来源信号 id。命中提醒复用它当 alert_log 的外键 */
   signalId: string
   source: 'AI_SUGGESTED' | 'USER_EDITED'
-  /** `PRICE` 或指标键（白名单见 src/main/watch/metrics.ts） */
-  metric: string
-  op: 'LTE' | 'GTE'
-  threshold: number
+  /** 触发条件，**至少一条**。多条 = 全部同时成立才算命中 */
+  conditions: WatchCondition[]
   /** 命中意味着什么：原判断失效，还是得到确认 */
   meaning: 'INVALIDATE' | 'CONFIRM'
   note?: string
@@ -827,11 +842,12 @@ export interface WatchPointView {
   expiresAt: number
   status: 'ACTIVE' | 'HIT' | 'EXPIRED' | 'CANCELED'
   hitAt?: number
-  hitValue?: number
+  /** 命中时各条件的实际值，**与 `conditions` 同序同长** */
+  hitValues?: number[]
   /**
-   * 非空 = 创建时的引擎版本与当前不一致，且这是个**指标类**观察点 ——
+   * 非空 = 创建时的引擎版本与当前不一致，且**至少有一个条件是指标类** ——
    * 换过灵敏度后 rsi 周期一类的东西变了，同一个阈值不再是同一件事。
-   * PRICE 类不受影响，所以这里恒为空。
+   * 全是 PRICE 时不受影响，那种情况下这里恒为空。
    */
   staleEngineVersion?: string
 }
@@ -839,9 +855,8 @@ export interface WatchPointView {
 /** 新建观察点的入参。数值一律由用户确认后传入 —— 模型的建议只是表单预填值 */
 export interface WatchPointDraft {
   signalId: string
-  metric: string
-  op: 'LTE' | 'GTE'
-  threshold: number
+  /** 1–`MAX_WATCH_CONDITIONS` 条，全部同时成立才算命中 */
+  conditions: WatchCondition[]
   meaning: 'INVALIDATE' | 'CONFIRM'
   note?: string
   verdict?: WatchVerdict
@@ -857,9 +872,8 @@ export interface WatchPointDraft {
  * 抽不到就是空数组 —— 那时表单留空让用户自己填，功能仍然可用。
  */
 export interface WatchSuggestion {
-  metric: string
-  op: 'LTE' | 'GTE'
-  threshold: number
+  /** 一条建议可以含多个条件（模型用 `组=` 标出来的那些），全部同时成立才算命中 */
+  conditions: WatchCondition[]
   meaning: 'INVALIDATE' | 'CONFIRM'
   note?: string
   /** 归一化后的方向结论。整条解读只有一个，同一块里的每条建议都带上它 */

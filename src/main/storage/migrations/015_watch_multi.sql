@@ -1,0 +1,37 @@
+-- 015_watch_multi · 观察点支持组合条件（a 且 b）
+--
+-- 迁移只前进不回退。改这里等于改已发布用户的库 —— 一律新增 016_xxx.sql，不要编辑本文件。
+--
+-- ## 为什么要加这两列
+--
+-- 在这之前一个观察点只有**一个**条件（metric/op/threshold 三列）。而 AI 解读里
+-- 「如果判断错了会先看到什么」那一段给出的失效条件经常是复合的 ——
+-- 「跌破 8.20 **且** RSI 回到 30 以下」。只能挑一条确认的后果是：
+-- 单挑价格 → 提醒偏早（噪音）；单挑 RSI → 提醒偏晚；两条都建 → 变成两个各自
+-- 独立命中的观察点，语义与「且」**相反**。
+--
+--   conditions  JSON 数组 [{metric,op,threshold}, …]，1–3 条，NULL = 迁移之前的旧行
+--   hit_values  JSON 数组，与 conditions **同序同长**，NULL = 旧行（用 hit_value 那一列）
+--
+-- ## ⚠ metric / op / threshold / hit_value 那四列对新行只是镜像，**不是判据**
+--
+-- 它们是 NOT NULL，所以新行照写 conditions[0] / hit_values[0]。但**直接读它们会把
+-- 一个「a 且 b」的观察点读成只盯 a —— 也就是读成一个更宽松的条件**，而那是个
+-- 静默的错误方向（该等的时候提前触发）。所有读取一律走 WatchPointRepo：
+-- 它负责把新旧两种行统一成 conditions 数组，conditions 解析不出来才回落到那三列。
+--
+-- ## 为什么是 JSON 列而不是子表 watch_condition
+--
+-- 条件从不参与 SQL 查询（每轮全量取 ACTIVE 的行、在内存里逐条比）。而子表会再添
+-- 两处外键删除顺序，这张表已经因为外键顺序踩过两次（见 watch-repo.test.ts 头注释：
+-- 「不是理论风险，是点一下删除就崩」）。
+--
+-- ## 语义边界（与 003_watch.sql 那条「它不是什么」并列）
+--
+-- 多条件之间**只有「且」**，判据是**同一轮同时成立** —— 不是「a 先成立记下来、
+-- b 后成立才触发」。后者是另一个功能，它需要每条一列命中时刻，还需要一条
+-- 「a 后来不成立了要不要清零」的新判据。同时成立没有隐藏状态、重启不丢东西。
+-- 「或」不在这张表里表达：任一成立就触发的写成两个观察点，各自命中各自提醒。
+
+ALTER TABLE watch_point ADD COLUMN conditions TEXT;  -- JSON 数组；NULL = 旧行
+ALTER TABLE watch_point ADD COLUMN hit_values TEXT;  -- JSON 数组；NULL = 旧行

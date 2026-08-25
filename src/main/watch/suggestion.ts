@@ -15,16 +15,26 @@
  * ```
  * <观察点建议>
  * 判断=上涨
- * metric=PRICE op=LTE threshold=8.20 meaning=INVALIDATE 说明=跌破 20 日均线支撑
+ * metric=PRICE op=LTE threshold=8.20 meaning=INVALIDATE 组=1 说明=跌破 20 日均线支撑
+ * metric=rsi op=LTE threshold=30 组=1
  * </观察点建议>
  * ```
  *
  * `判断` 是**块级**字段（一条解读只有一个方向结论），解析出来后应用到该块的全部建议上。
  * 它与其余字段一样是可选的：给不出就没有，不影响观察点本身能不能建。
+ *
+ * ## 组合条件（`组`，2026-08-25）
+ *
+ * 同一个 `组` 的行合成**一个**观察点，多个条件之间是「且」（同一轮全部成立才命中）。
+ * **不写 `组` 的行各自成为一个观察点** —— 于是所有既有格式的输出行为逐位不变，
+ * 这条是回归护栏，`watch-suggestion.test.ts` 有用例钉着。
+ *
+ * 「或」刻意没有对应写法：任一成立就触发的东西写成两条不带 `组` 的建议，
+ * 它们各自命中、各自提醒 —— 那本来就是这个功能之前的行为。
  */
 
-import type { WatchSuggestion } from '@shared/ipc-types'
-import { isWatchMetric } from './metrics'
+import type { WatchCondition, WatchSuggestion } from '@shared/ipc-types'
+import { MAX_WATCH_CONDITIONS, impossibleConditions, isWatchMetric } from './metrics'
 
 /** 最多接受两条 —— 提示词也这么要求。多了是模型在灌，不是在建议 */
 const MAX_SUGGESTIONS = 2
@@ -65,7 +75,16 @@ function field(line: string, key: string): string | null {
   return value === undefined || value === '' ? null : value
 }
 
-function parseLine(line: string): WatchSuggestion | null {
+/** 一行解析出来的东西：一个条件 + 它所属的组 + 该行顺带给的语义字段 */
+interface ParsedLine {
+  /** `组=` 的值。null = 没写，这一行自成一个观察点 */
+  group: string | null
+  condition: WatchCondition
+  meaning: 'INVALIDATE' | 'CONFIRM'
+  note?: string
+}
+
+function parseLine(line: string): ParsedLine | null {
   const metric = field(line, 'metric')
   const op = field(line, 'op')
   const threshold = field(line, 'threshold')
@@ -85,15 +104,14 @@ function parseLine(line: string): WatchSuggestion | null {
   const upperMeaning = (meaning ?? 'INVALIDATE').toUpperCase()
   const resolved = upperMeaning === 'CONFIRM' ? 'CONFIRM' : 'INVALIDATE'
 
-  const suggestion: WatchSuggestion = {
-    metric,
-    op: upperOp,
-    threshold: value,
+  const parsed: ParsedLine = {
+    group: field(line, '组') ?? field(line, 'group'),
+    condition: { metric, op: upperOp, threshold: value },
     meaning: resolved,
   }
   const note = field(line, '说明') ?? field(line, 'note')
-  if (note !== null) suggestion.note = note.slice(0, 200)
-  return suggestion
+  if (note !== null) parsed.note = note.slice(0, 200)
+  return parsed
 }
 
 export function parseWatchSuggestions(text: string): WatchSuggestion[] {
@@ -114,17 +132,43 @@ export function parseWatchSuggestions(text: string): WatchSuggestion[] {
   }
   const verdict = verdictText === undefined ? null : normalizeVerdict(verdictText)
 
-  const out: WatchSuggestion[] = []
-  for (const line of lines) {
-    if (out.length >= MAX_SUGGESTIONS) break
-    if (line === '' || /^判断\s*=/.test(line)) continue
+  /*
+    按出现顺序聚合。key 用 `组` 的值；没写 `组` 的每行自成一组（用一个不可能与
+    组名相撞的键），所以**不带 `组` 的既有格式行为逐位不变**。
+
+    组内的 `meaning` / `说明` 取**第一条解析成功**的行 —— 后面的行写了也忽略：
+    一个观察点只有一个语义，让第二行去改它会让用户在表单里看到一个他没读过的结论。
+  */
+  const groups = new Map<string, WatchSuggestion>()
+  lines.forEach((line, index) => {
+    if (line === '' || /^判断\s*=/.test(line)) return
     const parsed = parseLine(line)
-    if (parsed === null) continue
-    if (verdictText !== undefined) parsed.verdictText = verdictText
-    if (verdict !== null) parsed.verdict = verdict
-    out.push(parsed)
-  }
-  return out
+    if (parsed === null) return
+
+    // 前缀区分两个命名空间：`组=solo:1` 这种写法也撞不上没写 `组` 的行
+    const key = parsed.group === null ? `solo:${index}` : `g:${parsed.group}`
+    const existing = groups.get(key)
+    if (existing !== undefined) {
+      // 超出上限的条件**丢弃而不是另起一条** —— 另起会把一个「且」拆成两个独立观察点，
+      // 语义正好相反
+      if (existing.conditions.length < MAX_WATCH_CONDITIONS) existing.conditions.push(parsed.condition)
+      return
+    }
+    if (groups.size >= MAX_SUGGESTIONS) return
+
+    const suggestion: WatchSuggestion = {
+      conditions: [parsed.condition],
+      meaning: parsed.meaning,
+    }
+    if (parsed.note !== undefined) suggestion.note = parsed.note
+    if (verdictText !== undefined) suggestion.verdictText = verdictText
+    if (verdict !== null) suggestion.verdict = verdict
+    groups.set(key, suggestion)
+  })
+
+  // 自相矛盾的组**整组丢弃**，与「metric 不在白名单」同一处置：
+  // 一个永远不会命中的建议比没有建议糟 —— 用户会确认它，然后一直等
+  return [...groups.values()].filter((item) => impossibleConditions(item.conditions).length === 0)
 }
 
 /**

@@ -6,7 +6,7 @@
  */
 
 import type { SecCode } from '@core/types'
-import type { WatchPointView, WatchVerdict } from '@shared/ipc-types'
+import type { WatchCondition, WatchPointView, WatchVerdict } from '@shared/ipc-types'
 import type { Database } from '../db'
 
 /** 落库行（主进程内部用）。与 `WatchPointView` 的差别是没有 `name` 与派生字段 */
@@ -15,9 +15,8 @@ export interface WatchPointRow {
   code: SecCode
   signalId: string
   source: WatchPointView['source']
-  metric: string
-  op: WatchPointView['op']
-  threshold: number
+  /** **至少一条**。多条 = 同一轮全部成立才算命中（015_watch_multi.sql） */
+  conditions: WatchCondition[]
   meaning: WatchPointView['meaning']
   note?: string
   /** 建点时那条解读的方向结论（005_watch_verdict.sql）。归不了类时缺省，那不是错误 */
@@ -28,7 +27,8 @@ export interface WatchPointRow {
   expiresAt: number
   status: WatchPointView['status']
   hitAt?: number
-  hitValue?: number
+  /** 命中时各条件的实际值，与 `conditions` 同序同长 */
+  hitValues?: number[]
 }
 
 interface Row {
@@ -39,6 +39,7 @@ interface Row {
   metric: string
   op: string
   threshold: number
+  conditions: string | null
   meaning: string
   note: string | null
   verdict: string | null
@@ -49,6 +50,49 @@ interface Row {
   status: string
   hit_at: number | null
   hit_value: number | null
+  hit_values: string | null
+}
+
+/**
+ * `conditions` 列 → 条件数组。**绝不抛**：解析不出来（旧行、坏 JSON、缺字段）
+ * 一律返回 null，由调用方回落到 metric/op/threshold 那三列。
+ * 一行坏数据不该让整个观察点列表打不开。
+ */
+function parseConditions(raw: string | null): WatchCondition[] | null {
+  if (raw === null || raw === '') return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed) || parsed.length === 0) return null
+    const out: WatchCondition[] = []
+    for (const item of parsed) {
+      if (typeof item !== 'object' || item === null) return null
+      const { metric, op, threshold } = item as Record<string, unknown>
+      if (typeof metric !== 'string' || metric === '') return null
+      if (op !== 'LTE' && op !== 'GTE') return null
+      if (typeof threshold !== 'number' || !Number.isFinite(threshold)) return null
+      out.push({ metric, op, threshold })
+    }
+    return out
+  } catch {
+    return null
+  }
+}
+
+/** `hit_values` 列 → 数值数组。同样绝不抛；长度对不上时按缺失处理（少说好过编数） */
+function parseHitValues(raw: string | null): number[] | null {
+  if (raw === null || raw === '') return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return null
+    const out: number[] = []
+    for (const item of parsed) {
+      if (typeof item !== 'number' || !Number.isFinite(item)) return null
+      out.push(item)
+    }
+    return out.length === 0 ? null : out
+  } catch {
+    return null
+  }
 }
 
 function toRow(row: Row): WatchPointRow {
@@ -57,9 +101,10 @@ function toRow(row: Row): WatchPointRow {
     code: row.code,
     signalId: row.signal_id,
     source: row.source as WatchPointRow['source'],
-    metric: row.metric,
-    op: row.op as WatchPointRow['op'],
-    threshold: row.threshold,
+    // 015 之前的行没有 conditions 列 —— 回落到那三列，读出来就是一条条件
+    conditions: parseConditions(row.conditions) ?? [
+      { metric: row.metric, op: row.op as WatchCondition['op'], threshold: row.threshold },
+    ],
     meaning: row.meaning as WatchPointRow['meaning'],
     engineVersion: row.engine_version,
     createdAt: row.created_at,
@@ -71,34 +116,45 @@ function toRow(row: Row): WatchPointRow {
   if (row.verdict !== null) out.verdict = row.verdict as WatchVerdict
   if (row.verdict_text !== null) out.verdictText = row.verdict_text
   if (row.hit_at !== null) out.hitAt = row.hit_at
-  if (row.hit_value !== null) out.hitValue = row.hit_value
+  const hitValues = parseHitValues(row.hit_values) ?? (row.hit_value === null ? null : [row.hit_value])
+  if (hitValues !== null) out.hitValues = hitValues
   return out
 }
 
-const COLUMNS = `id, code, signal_id, source, metric, op, threshold, meaning, note,
+const COLUMNS = `id, code, signal_id, source, metric, op, threshold, conditions, meaning, note,
                  verdict, verdict_text,
-                 engine_version, created_at, expires_at, status, hit_at, hit_value`
+                 engine_version, created_at, expires_at, status, hit_at, hit_value, hit_values`
 
 export class WatchPointRepo {
   constructor(private readonly db: Database) {}
 
+  /**
+   * 落一行。
+   *
+   * **`metric` / `op` / `threshold` 那三列写的是 `conditions[0]` 的镜像**：它们是
+   * NOT NULL、留着是为了旧版本的行照常可读。⚠ 它们**不是判据** —— 直接读会把
+   * 「a 且 b」读成只盯 a（更宽松），见 015_watch_multi.sql 头注释。
+   */
   insert(row: WatchPointRow): void {
+    const first = row.conditions[0]
+    if (first === undefined) throw new Error('观察点至少要有一个条件')
     this.db
       .prepare(
         `INSERT INTO watch_point
-           (id, code, signal_id, source, metric, op, threshold, meaning, note,
+           (id, code, signal_id, source, metric, op, threshold, conditions, meaning, note,
             verdict, verdict_text,
-            engine_version, created_at, expires_at, status, hit_at, hit_value)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            engine_version, created_at, expires_at, status, hit_at, hit_value, hit_values)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         row.id,
         row.code,
         row.signalId,
         row.source,
-        row.metric,
-        row.op,
-        row.threshold,
+        first.metric,
+        first.op,
+        first.threshold,
+        JSON.stringify(row.conditions),
         row.meaning,
         row.note ?? null,
         row.verdict ?? null,
@@ -108,7 +164,8 @@ export class WatchPointRepo {
         row.expiresAt,
         row.status,
         row.hitAt ?? null,
-        row.hitValue ?? null
+        row.hitValues?.[0] ?? null,
+        row.hitValues === undefined ? null : JSON.stringify(row.hitValues)
       )
   }
 
@@ -157,15 +214,20 @@ export class WatchPointRepo {
     )
   }
 
-  /** 命中。`WHERE status = 'ACTIVE'` 是幂等闸门：同一轮跑两次不会重复记 */
-  markHit(id: string, at: number, value: number): boolean {
+  /**
+   * 命中。`WHERE status = 'ACTIVE'` 是幂等闸门：同一轮跑两次不会重复记。
+   *
+   * `values` 与该点的 `conditions` 同序同长（组合条件下每条都成立才会走到这里）。
+   * `hit_value` 那一列同样只是 `values[0]` 的镜像。
+   */
+  markHit(id: string, at: number, values: readonly number[]): boolean {
     return (
       this.db
         .prepare(
-          `UPDATE watch_point SET status = 'HIT', hit_at = ?, hit_value = ?
+          `UPDATE watch_point SET status = 'HIT', hit_at = ?, hit_value = ?, hit_values = ?
            WHERE id = ? AND status = 'ACTIVE'`
         )
-        .run(at, value, id).changes > 0
+        .run(at, values[0] ?? null, JSON.stringify(values), id).changes > 0
     )
   }
 

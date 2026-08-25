@@ -8,11 +8,27 @@
  *
  * 措辞上刻意不说「AI 推荐」而说「建议值，请自行核对」：这几个数没有任何回测依据，
  * 与 `params.ts` 里那些标定过的东西不是一回事（后者也只标定过一项）。
+ *
+ * ## 组合条件（2026-08-25）
+ *
+ * 一个观察点可以挂 1–3 个条件，**同一轮全部成立**才提醒。界面上那句话必须写出来 ——
+ * 「且」与「或」在这里差一个提醒该不该来，而用户没有别的地方能看出软件用的是哪个。
+ * 「或」不在这个表单里：那种情况建两个观察点，各自命中各自提醒。
  */
 
 import { useState } from 'react'
 import type { SecCode } from '@core/types'
-import type { WatchPointDraft, WatchSuggestion, WatchVerdict } from '@shared/ipc-types'
+import type {
+  WatchCondition,
+  WatchPointDraft,
+  WatchSuggestion,
+  WatchVerdict,
+} from '@shared/ipc-types'
+import {
+  MAX_WATCH_CONDITIONS,
+  conditionsText,
+  impossibleConditions,
+} from '@shared/watch-metrics'
 
 /** 与 src/main/watch/metrics.ts 的白名单一致。那边是判定用的，这边是给人选的 */
 const METRICS: { value: string; label: string }[] = [
@@ -39,6 +55,16 @@ const METRICS: { value: string; label: string }[] = [
 
 const FIELD =
   'rounded border border-white/15 bg-black/25 px-2 py-1 text-[11px] outline-none focus:border-white/35'
+
+/**
+ * 表单里的一行条件。阈值存**字符串**：输入过程中的 `""` / `"8."` 都是合法中间态，
+ * 提前 `Number()` 会让光标跳、让减号打不出来。提交时才转数。
+ */
+interface ConditionRow {
+  metric: string
+  op: 'LTE' | 'GTE'
+  threshold: string
+}
 
 /**
  * 方向结论的可选值。空串 = 不填。
@@ -72,9 +98,12 @@ export function WatchPointForm({
   onError: (message: string) => void
 }): React.JSX.Element {
   const first = suggestions[0]
-  const [metric, setMetric] = useState(first?.metric ?? 'PRICE')
-  const [op, setOp] = useState<'LTE' | 'GTE'>(first?.op ?? 'LTE')
-  const [threshold, setThreshold] = useState(first === undefined ? '' : String(first.threshold))
+  // 阈值是**字符串**状态：输入中的 "8." / "" 不该被 Number() 提前吃掉
+  const [rows, setRows] = useState<ConditionRow[]>(() =>
+    first === undefined
+      ? [{ metric: 'PRICE', op: 'LTE', threshold: '' }]
+      : first.conditions.map((c) => ({ metric: c.metric, op: c.op, threshold: String(c.threshold) }))
+  )
   const [meaning, setMeaning] = useState<'INVALIDATE' | 'CONFIRM'>(first?.meaning ?? 'INVALIDATE')
   const [note, setNote] = useState(first?.note ?? '')
   const [verdict, setVerdict] = useState<'' | WatchVerdict>(first?.verdict ?? '')
@@ -84,28 +113,38 @@ export function WatchPointForm({
 
   // 记住预填值，用来判断用户有没有改过 —— 改过要记成 USER_EDITED
   const [prefill] = useState(() => ({
-    metric: first?.metric ?? 'PRICE',
-    op: first?.op ?? 'LTE',
-    threshold: first === undefined ? '' : String(first.threshold),
+    rows: JSON.stringify(
+      first === undefined
+        ? [{ metric: 'PRICE', op: 'LTE', threshold: '' }]
+        : first.conditions.map((c) => ({ metric: c.metric, op: c.op, threshold: String(c.threshold) }))
+    ),
     verdict: (first?.verdict ?? '') as '' | WatchVerdict,
   }))
 
-  const value = Number(threshold)
-  const valid = threshold.trim() !== '' && Number.isFinite(value)
-  const edited =
-    metric !== prefill.metric ||
-    op !== prefill.op ||
-    threshold.trim() !== prefill.threshold ||
-    verdict !== prefill.verdict
+  const conditions: WatchCondition[] = rows.map((row) => ({
+    metric: row.metric,
+    op: row.op,
+    threshold: Number(row.threshold),
+  }))
+  const filled = rows.every(
+    (row) => row.threshold.trim() !== '' && Number.isFinite(Number(row.threshold))
+  )
+  // 可证明永不同时成立的那几条（同一指标上 ≤ a 且 ≥ b 且 b > a）。
+  // **挡在确认之前**：那样的观察点看起来完全正常，用户会一直等一个不会来的提醒
+  const impossible = filled ? impossibleConditions(conditions) : []
+  const valid = filled && impossible.length === 0
+  const edited = JSON.stringify(rows) !== prefill.rows || verdict !== prefill.verdict
+
+  const setRow = (index: number, patch: Partial<ConditionRow>): void => {
+    setRows((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)))
+  }
 
   const submit = (): void => {
     if (!valid) return
     setBusy(true)
     const draft: WatchPointDraft = {
       signalId,
-      metric,
-      op,
-      threshold: value,
+      conditions,
       meaning,
       days: Number(days) || 28,
       // 抽取失败时（没有预填）一律算用户填的
@@ -137,30 +176,80 @@ export function WatchPointForm({
         {first === undefined
           ? '模型这次没给出具体数值，请自己填。'
           : '下面是模型的建议值，请自行核对后再确认 —— 它没有任何回测依据。'}
-        条件成立时会提醒你一次，然后这个观察点就结束了。
+        {rows.length > 1 ? '这些条件' : '条件'}
+        {rows.length > 1 ? <span className="text-white/55">同时成立</span> : '成立'}
+        时会提醒你一次，然后这个观察点就结束了。
       </p>
 
-      <div className="flex flex-wrap items-center gap-1.5">
-        <select className={FIELD} value={metric} onChange={(e) => setMetric(e.target.value)}>
-          {METRICS.map((item) => (
-            <option key={item.value} value={item.value}>
-              {item.label}
-            </option>
-          ))}
-        </select>
+      {rows.map((row, index) => (
+        <div key={index} className="mb-1.5 flex flex-wrap items-center gap-1.5">
+          {index > 0 ? <span className="text-[11px] text-white/45">且</span> : null}
 
-        <select className={FIELD} value={op} onChange={(e) => setOp(e.target.value as 'LTE' | 'GTE')}>
-          <option value="LTE">跌破 / 低于</option>
-          <option value="GTE">升破 / 高于</option>
-        </select>
+          <select
+            className={FIELD}
+            value={row.metric}
+            onChange={(e) => setRow(index, { metric: e.target.value })}
+          >
+            {METRICS.map((item) => (
+              <option key={item.value} value={item.value}>
+                {item.label}
+              </option>
+            ))}
+          </select>
 
-        <input
-          className={`${FIELD} w-20 text-right font-mono`}
-          value={threshold}
-          placeholder="阈值"
-          onChange={(e) => setThreshold(e.target.value)}
-        />
+          <select
+            className={FIELD}
+            value={row.op}
+            onChange={(e) => setRow(index, { op: e.target.value as 'LTE' | 'GTE' })}
+          >
+            <option value="LTE">跌破 / 低于</option>
+            <option value="GTE">升破 / 高于</option>
+          </select>
+
+          <input
+            className={`${FIELD} w-20 text-right font-mono ${
+              impossible.includes(index) ? 'border-rose-400/50' : ''
+            }`}
+            value={row.threshold}
+            placeholder="阈值"
+            onChange={(e) => setRow(index, { threshold: e.target.value })}
+          />
+
+          {rows.length > 1 ? (
+            <button
+              className="text-[10px] text-white/30 hover:text-rose-300"
+              onClick={() => setRows((prev) => prev.filter((_, i) => i !== index))}
+            >
+              删除
+            </button>
+          ) : null}
+        </div>
+      ))}
+
+      <div className="mb-1.5 flex items-center gap-2">
+        <button
+          className="text-[10px] text-sky-200/70 hover:text-sky-200 disabled:text-white/20"
+          disabled={rows.length >= MAX_WATCH_CONDITIONS}
+          onClick={() => setRows((prev) => [...prev, { metric: 'PRICE', op: 'LTE', threshold: '' }])}
+        >
+          + 再加一个条件（且）
+        </button>
+        <span className="text-[10px] text-white/25">
+          最多 {MAX_WATCH_CONDITIONS} 条；「任一成立就提醒」请分开建两个观察点
+        </span>
       </div>
+
+      {/*
+        永不同时成立的组合挡在这里。措辞点名那几条，别只说「条件有误」——
+        用户要知道是哪两行打架
+      */}
+      {impossible.length > 0 ? (
+        <p className="mb-1.5 rounded border border-rose-400/30 bg-rose-500/[0.07] px-2 py-1 text-[10px] leading-snug text-rose-100/80">
+          这些条件不可能同时成立：
+          {conditionsText(impossible.map((i) => conditions[i]).filter((c) => c !== undefined))}
+          。改一下阈值，或者把它们拆成两个观察点。
+        </p>
+      ) : null}
 
       <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
         <select
@@ -223,10 +312,8 @@ export function WatchPointForm({
           取消
         </button>
         {valid ? (
-          <span className="ml-auto text-[10px] text-white/30">
-            {METRICS.find((m) => m.value === metric)?.label}
-            {op === 'LTE' ? ' ≤ ' : ' ≥ '}
-            <span className="font-mono">{value}</span>
+          <span className="ml-auto text-right text-[10px] text-white/30">
+            {conditionsText(conditions)}
           </span>
         ) : null}
       </div>

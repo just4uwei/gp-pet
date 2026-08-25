@@ -278,9 +278,7 @@ describe('观察点命中（P2 续）', () => {
       code: 'SH600000' as SecCode,
       signalId: 'sig-source',
       source: 'AI_SUGGESTED' as const,
-      metric: 'PRICE',
-      op: 'LTE' as const,
-      threshold: 8.2,
+      conditions: [{ metric: 'PRICE', op: 'LTE' as const, threshold: 8.2 }],
       meaning: 'INVALIDATE' as const,
       note: '跌破 20 日均线支撑',
       engineVersion: '0.2.6-unvalidated',
@@ -288,7 +286,7 @@ describe('观察点命中（P2 续）', () => {
       expiresAt: AT + 86_400_000,
       status: 'ACTIVE' as const,
     },
-    value: 8.15,
+    values: [8.15],
     name: '浦发银行',
     price: 8.15,
     changePct: -2.1,
@@ -323,6 +321,31 @@ describe('观察点命中（P2 续）', () => {
     const confirm = { ...hit, point: { ...hit.point, meaning: 'CONFIRM' as const } }
     const [item] = buildAlerts([], { at: AT, watchHits: [confirm] })
     expect(item?.payload.headline).toContain('观察条件已满足')
+  })
+
+  /**
+   * 组合条件必须**整句**说出来。只报其中一条的症状是用户以为软件提前触发了 ——
+   * 而他没有别的地方能看出那条提醒对应的是两个条件。
+   */
+  it('组合条件的文案含「且」，并逐条给出实际值', () => {
+    const multi = {
+      ...hit,
+      point: {
+        ...hit.point,
+        conditions: [
+          { metric: 'PRICE', op: 'LTE' as const, threshold: 8.2 },
+          { metric: 'rsi', op: 'LTE' as const, threshold: 30 },
+        ],
+      },
+      values: [8.15, 28.5],
+    }
+    const [item] = buildAlerts([], { at: AT, watchHits: [multi] })
+    expect(item?.payload.headline).toContain('且')
+    expect(item?.payload.headline).toContain('RSI 跌破 30')
+    expect(item?.payload.reasons[0]).toContain('28.5')
+    // 级别与方向不因条件多了而变
+    expect(item?.candidate.level).toBe('L2')
+    expect(item?.candidate.direction).toBe('NONE')
   })
 
   it('命中排在信号之前：用户亲自设的东西优先于引擎自己发现的', () => {

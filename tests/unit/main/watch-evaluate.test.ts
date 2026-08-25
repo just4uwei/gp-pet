@@ -10,6 +10,9 @@
  *      `rsi <= 30` 的观察点在预热期**全部命中**。
  *   3. **边界取等**。用户说「跌破 8.20」，正好 8.20 应当算到了。
  *   4. **命中优先于过期**。同一轮里既到期又命中时算命中 —— 那一刻条件确实成立了。
+ *
+ * 组合条件（a 且 b）把第 2 条推得更严：**任何一条取不到值，整点就不命中**。
+ * 把「取不到」当成立会让组合条件比单条件**更容易**误报，方向恰恰是反的。
  */
 
 import { describe, expect, it } from 'vitest'
@@ -64,9 +67,7 @@ function point(overrides: Partial<WatchPointRow> = {}): WatchPointRow {
     code: CODE,
     signalId: 'sig-1',
     source: 'AI_SUGGESTED',
-    metric: 'PRICE',
-    op: 'LTE',
-    threshold: 9,
+    conditions: [{ metric: 'PRICE', op: 'LTE', threshold: 9 }],
     meaning: 'INVALIDATE',
     engineVersion: '0.2.6-unvalidated',
     createdAt: AT - 86_400_000,
@@ -110,15 +111,20 @@ describe('metricValue', () => {
   })
 })
 
+/** 单条件的语法糖：多数用例只关心「价格 ≤ 9」这种一条的情况 */
+function one(metric: string, op: 'LTE' | 'GTE', threshold: number): Pick<WatchPointRow, 'conditions'> {
+  return { conditions: [{ metric, op, threshold }] }
+}
+
 describe('evaluateWatchPoints', () => {
   it('价格跌到阈值 → 命中，并带上当时的值', () => {
     const { hits, expired } = evaluateWatchPoints({
-      points: [point({ metric: 'PRICE', op: 'LTE', threshold: 9 })],
+      points: [point(one('PRICE', 'LTE', 9))],
       outcomes: [outcome({ close: 8.8 })],
       at: AT,
     })
     expect(hits).toHaveLength(1)
-    expect(hits[0]?.value).toBe(8.8)
+    expect(hits[0]?.values).toEqual([8.8])
     expect(hits[0]?.name).toBe('浦发银行')
     expect(expired).toHaveLength(0)
   })
@@ -126,18 +132,18 @@ describe('evaluateWatchPoints', () => {
   it('实时报价比 K 线新：报价已跌破就算命中，即使收盘价还没到', () => {
     const quotes = new Map([[CODE, { last: 8.5, changePct: -3 }]])
     const { hits } = evaluateWatchPoints({
-      points: [point({ threshold: 9 })],
+      points: [point(one('PRICE', 'LTE', 9))],
       outcomes: [outcome({ close: 10 })],
       quotes,
       at: AT,
     })
     expect(hits).toHaveLength(1)
-    expect(hits[0]?.value).toBe(8.5)
+    expect(hits[0]?.values).toEqual([8.5])
   })
 
   it('**未预热的指标绝不命中** —— 否则 rsi<=30 的观察点会在预热期全部误报', () => {
     const { hits, expired } = evaluateWatchPoints({
-      points: [point({ metric: 'rsi', op: 'LTE', threshold: 30 })],
+      points: [point(one('rsi', 'LTE', 30))],
       outcomes: [outcome({ rsi: null })],
       at: AT,
     })
@@ -148,7 +154,7 @@ describe('evaluateWatchPoints', () => {
 
   it('到期未命中 → 记为过期（这本身就是「没兑现」这个结论）', () => {
     const { hits, expired } = evaluateWatchPoints({
-      points: [point({ threshold: 5, expiresAt: AT - 1 })],
+      points: [point({ ...one('PRICE', 'LTE', 5), expiresAt: AT - 1 })],
       outcomes: [outcome({ close: 10 })],
       at: AT,
     })
@@ -158,7 +164,7 @@ describe('evaluateWatchPoints', () => {
 
   it('同一轮既到期又命中 → **算命中**，那一刻条件确实成立了', () => {
     const { hits, expired } = evaluateWatchPoints({
-      points: [point({ threshold: 9, expiresAt: AT - 1 })],
+      points: [point({ ...one('PRICE', 'LTE', 9), expiresAt: AT - 1 })],
       outcomes: [outcome({ close: 8.5 })],
       at: AT,
     })
@@ -178,7 +184,7 @@ describe('evaluateWatchPoints', () => {
 
   it('非 ACTIVE 的一律跳过 —— 已命中的不会被重复记', () => {
     const { hits } = evaluateWatchPoints({
-      points: [point({ status: 'HIT', threshold: 9 }), point({ status: 'CANCELED', threshold: 9 })],
+      points: [point({ status: 'HIT' }), point({ status: 'CANCELED' })],
       outcomes: [outcome({ close: 8 })],
       at: AT,
     })
@@ -188,10 +194,88 @@ describe('evaluateWatchPoints', () => {
   it('GTE 方向：升破阈值才命中', () => {
     const base = { outcomes: [outcome({ close: 11 })], at: AT }
     expect(
-      evaluateWatchPoints({ ...base, points: [point({ op: 'GTE', threshold: 10.5 })] }).hits
+      evaluateWatchPoints({ ...base, points: [point(one('PRICE', 'GTE', 10.5))] }).hits
     ).toHaveLength(1)
     expect(
-      evaluateWatchPoints({ ...base, points: [point({ op: 'GTE', threshold: 11.5 })] }).hits
+      evaluateWatchPoints({ ...base, points: [point(one('PRICE', 'GTE', 11.5))] }).hits
     ).toHaveLength(0)
+  })
+})
+
+/**
+ * 组合条件（a 且 b）。判据只有一条：**同一轮全部成立**。
+ *
+ * 「一条成立、另一条取不到」那个用例是这一组里最要紧的 —— 如果 null 被当成成立，
+ * 组合条件会比单条件**更容易**误报，而用户加第二个条件的本意恰恰是想更严。
+ */
+describe('evaluateWatchPoints · 组合条件', () => {
+  const both = {
+    conditions: [
+      { metric: 'PRICE' as const, op: 'LTE' as const, threshold: 9 },
+      { metric: 'rsi' as const, op: 'LTE' as const, threshold: 30 },
+    ],
+  }
+
+  it('两条都成立 → 命中，values 与 conditions **同序**', () => {
+    const { hits } = evaluateWatchPoints({
+      points: [point(both)],
+      outcomes: [outcome({ close: 8.8, rsi: 28.5 })],
+      at: AT,
+    })
+    expect(hits).toHaveLength(1)
+    expect(hits[0]?.values).toEqual([8.8, 28.5])
+  })
+
+  it('只成立一条 → 不命中（「且」不是「或」）', () => {
+    const priceOnly = evaluateWatchPoints({
+      points: [point(both)],
+      outcomes: [outcome({ close: 8.8, rsi: 55 })],
+      at: AT,
+    })
+    expect(priceOnly.hits).toHaveLength(0)
+
+    const rsiOnly = evaluateWatchPoints({
+      points: [point(both)],
+      outcomes: [outcome({ close: 12, rsi: 28.5 })],
+      at: AT,
+    })
+    expect(rsiOnly.hits).toHaveLength(0)
+  })
+
+  it('**一条成立、另一条指标未预热（null）→ 不命中**', () => {
+    const { hits, expired } = evaluateWatchPoints({
+      points: [point(both)],
+      outcomes: [outcome({ close: 8.8, rsi: null })],
+      at: AT,
+    })
+    expect(hits).toHaveLength(0)
+    // 取不到值不算「没兑现」，还没到期就继续盯
+    expect(expired).toHaveLength(0)
+  })
+
+  it('三条组合照常命中', () => {
+    const { hits } = evaluateWatchPoints({
+      points: [
+        point({
+          conditions: [
+            { metric: 'PRICE', op: 'LTE', threshold: 9 },
+            { metric: 'rsi', op: 'LTE', threshold: 30 },
+            { metric: 'ma20', op: 'GTE', threshold: 8 },
+          ],
+        }),
+      ],
+      outcomes: [outcome({ close: 8.8, rsi: 28.5, ma20: 9.1 })],
+      at: AT,
+    })
+    expect(hits[0]?.values).toEqual([8.8, 28.5, 9.1])
+  })
+
+  it('条件为空的行**恒不成立** —— 「没有条件所以随便什么都算」是最糟的失败方向', () => {
+    const { hits } = evaluateWatchPoints({
+      points: [point({ conditions: [] })],
+      outcomes: [outcome({ close: 8.8 })],
+      at: AT,
+    })
+    expect(hits).toHaveLength(0)
   })
 })

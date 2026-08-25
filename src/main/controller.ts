@@ -133,7 +133,13 @@ import { SHADOW_KEYS } from './storage/repositories/shadow'
 import { pruneAll, vacuum } from './storage/retention'
 import { isQuiet, quietUntil, type QuietPreset } from './util/quiet'
 import { evaluateWatchPoints, type WatchHit } from './watch/evaluate'
-import { isWatchMetric } from './watch/metrics'
+import {
+  MAX_WATCH_CONDITIONS,
+  conditionsText,
+  hitValuesText,
+  impossibleConditions,
+  isWatchMetric,
+} from './watch/metrics'
 import { applyTrade, isTradeError, replayTrades, t1SellNotice } from './trades/ledger'
 import { splitCode } from '@core/code'
 import type { TradeRow } from './storage/repositories/trade'
@@ -150,8 +156,9 @@ const DEFAULT_WATCH_DAYS = 28
 /**
  * 落库行 → 渲染层视图。
  *
- * `staleEngineVersion` 只对**指标类**给：换过灵敏度之后 rsi 周期一类的东西变了，
- * 同一个阈值不再是同一件事。而 PRICE 是不复权现价，与引擎参数无关，不该报警。
+ * `staleEngineVersion` 只在**有指标类条件**时给：换过灵敏度之后 rsi 周期一类的
+ * 东西变了，同一个阈值不再是同一件事。而 PRICE 是不复权现价，与引擎参数无关，
+ * 全是价格条件的观察点不该报警。
  */
 function toWatchPointView(
   row: WatchPointRow,
@@ -164,9 +171,7 @@ function toWatchPointView(
     name: nameOf(row.code),
     signalId: row.signalId,
     source: row.source,
-    metric: row.metric,
-    op: row.op,
-    threshold: row.threshold,
+    conditions: row.conditions,
     meaning: row.meaning,
     createdAt: row.createdAt,
     expiresAt: row.expiresAt,
@@ -176,8 +181,9 @@ function toWatchPointView(
   if (row.verdict !== undefined) view.verdict = row.verdict
   if (row.verdictText !== undefined) view.verdictText = row.verdictText
   if (row.hitAt !== undefined) view.hitAt = row.hitAt
-  if (row.hitValue !== undefined) view.hitValue = row.hitValue
-  if (row.metric !== 'PRICE' && row.engineVersion !== currentEngineVersion) {
+  if (row.hitValues !== undefined) view.hitValues = row.hitValues
+  const hasIndicator = row.conditions.some((condition) => condition.metric !== 'PRICE')
+  if (hasIndicator && row.engineVersion !== currentEngineVersion) {
     view.staleEngineVersion = row.engineVersion
   }
   return view
@@ -1288,15 +1294,18 @@ export class AppController {
 
       // markHit 带 `status = 'ACTIVE'` 条件，是幂等闸门：盘后会跑好几轮，
       // 少了它同一个观察点会被反复记成命中
-      const hits = result.hits.filter((hit) => repo.markHit(hit.point.id, ctx.at, hit.value))
+      const hits = result.hits.filter((hit) => repo.markHit(hit.point.id, ctx.at, hit.values))
       for (const point of result.expired) {
         if (repo.markExpired(point.id)) {
           // 过期**不发气泡**：到期未兑现是个结论，但一天几十条「你那个猜错了」是骚扰
-          log.info(`[watch] ${point.code} 观察点到期未命中（${point.metric} ${point.op} ${point.threshold}）`)
+          log.info(`[watch] ${point.code} 观察点到期未命中（${conditionsText(point.conditions)}）`)
         }
       }
       for (const hit of hits) {
-        log.info(`[watch] ${hit.point.code} 命中：${hit.point.metric} ${hit.point.op} ${hit.point.threshold}，实际 ${hit.value}`)
+        log.info(
+          `[watch] ${hit.point.code} 命中：${conditionsText(hit.point.conditions)}，` +
+            `实际 ${hitValuesText(hit.point.conditions, hit.values)}`
+        )
       }
       return hits
     } catch (error) {
@@ -1315,11 +1324,27 @@ export class AppController {
     ))
   }
 
-  /** 新建。数值一律是**用户确认过**的 —— 模型的建议只走到表单预填那一步 */
+  /**
+   * 新建。数值一律是**用户确认过**的 —— 模型的建议只走到表单预填那一步。
+   *
+   * 校验在这里再做一遍而不是只靠表单：draft 是从 IPC 进来的，表单只是它的一个调用方。
+   * 「永不成立的组合」与 metric 白名单同一处置 —— 那样的观察点看起来完全正常，
+   * 用户会一直等它。
+   */
   createWatchPoint(draft: WatchPointDraft): WatchPointView {
     const layer = this.requireData()
-    if (!isWatchMetric(draft.metric)) throw new Error(`不支持盯这个指标：${draft.metric}`)
-    if (!Number.isFinite(draft.threshold)) throw new Error('阈值必须是一个数')
+    const conditions = draft.conditions ?? []
+    if (conditions.length === 0) throw new Error('至少要有一个条件')
+    if (conditions.length > MAX_WATCH_CONDITIONS) {
+      throw new Error(`一个观察点最多 ${MAX_WATCH_CONDITIONS} 个条件`)
+    }
+    for (const condition of conditions) {
+      if (!isWatchMetric(condition.metric)) throw new Error(`不支持盯这个指标：${condition.metric}`)
+      if (!Number.isFinite(condition.threshold)) throw new Error('阈值必须是一个数')
+    }
+    if (impossibleConditions(conditions).length > 0) {
+      throw new Error(`这些条件不可能同时成立：${conditionsText(conditions)}`)
+    }
 
     const evidence = layer.explainSignal(draft.signalId)
     if (!evidence) throw new Error('来源信号已不在库中，无法挂观察点')
@@ -1333,9 +1358,7 @@ export class AppController {
       code: record.code,
       signalId: draft.signalId,
       source: draft.edited === true ? ('USER_EDITED' as const) : ('AI_SUGGESTED' as const),
-      metric: draft.metric,
-      op: draft.op,
-      threshold: draft.threshold,
+      conditions,
       meaning: draft.meaning,
       ...(draft.note === undefined || draft.note === '' ? {} : { note: draft.note.slice(0, 500) }),
       // 方向结论：表单里可选可改。**归不了类就没有**，这里不做任何猜测式补全 ——
@@ -1350,7 +1373,7 @@ export class AppController {
       status: 'ACTIVE' as const,
     }
     layer.storage.watchPoints.insert(row)
-    log.info(`[watch] 新增：${row.code} ${row.metric} ${row.op} ${row.threshold}（${days} 天，${row.source}）`)
+    log.info(`[watch] 新增：${row.code} ${conditionsText(row.conditions)}（${days} 天，${row.source}）`)
     this.onStateChanged()
     return toWatchPointView(row, layer.signals.engineVersion, () => record.name)
   }
@@ -1376,10 +1399,9 @@ export class AppController {
     if (!row) return true
 
     const name = layer.storage.watchlist.get(row.code)?.profile.name ?? row.code
-    const arrow = row.op === 'LTE' ? '≤' : '≥'
     const confirmed = await confirmDestructive(this.windows.panelWindow.browserWindow, {
       title: '移除观察点',
-      message: `不再盯 ${name} 的「${row.metric} ${arrow} ${row.threshold}」？`,
+      message: `不再盯 ${name} 的「${conditionsText(row.conditions)}」？`,
       detail:
         '这一行会被直接删掉，不是标记成已取消 —— 当时为什么设它、判断的是什么方向，' +
         '都一并消失，找不回来。\n\n' +
@@ -1390,7 +1412,7 @@ export class AppController {
     if (!confirmed) return false
 
     layer.storage.watchPoints.remove(id)
-    log.info(`[watch] 移除：${row.code} ${row.metric} ${row.op} ${row.threshold}`)
+    log.info(`[watch] 移除：${row.code} ${conditionsText(row.conditions)}`)
     this.onStateChanged()
     return true
   }

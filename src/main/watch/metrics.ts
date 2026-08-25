@@ -14,7 +14,16 @@
 
 // 中文标签住在 `@shared/watch-metrics`（渲染层也要用同一份，别在这里再抄一张表）。
 // 白名单留在本文件：它是「本地算不算得出来」的判据，要与 snapshotOfIndicators() 的键名成对。
-export { METRIC_LABELS, PRICE_METRIC, metricLabel } from '../../shared/watch-metrics'
+export {
+  METRIC_LABELS,
+  PRICE_METRIC,
+  MAX_WATCH_CONDITIONS,
+  metricLabel,
+  conditionText,
+  conditionsText,
+  hitValuesText,
+  impossibleConditions,
+} from '../../shared/watch-metrics'
 import { PRICE_METRIC } from '../../shared/watch-metrics'
 
 /**

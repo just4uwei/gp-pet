@@ -21,6 +21,7 @@ import alertGate011 from './011_alert_gate.sql?raw'
 import announcement012 from './012_announcement.sql?raw'
 import shadowJournal013 from './013_shadow_journal.sql?raw'
 import industryHistory014 from './014_industry_history.sql?raw'
+import watchMulti015 from './015_watch_multi.sql?raw'
 
 export interface Migration {
   version: number
@@ -43,6 +44,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 12, name: '012_announcement', sql: announcement012 },
   { version: 13, name: '013_shadow_journal', sql: shadowJournal013 },
   { version: 14, name: '014_industry_history', sql: industryHistory014 },
+  { version: 15, name: '015_watch_multi', sql: watchMulti015 },
 ]
 
 export const LATEST_SCHEMA_VERSION = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0)

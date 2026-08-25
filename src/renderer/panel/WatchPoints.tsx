@@ -18,14 +18,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { WatchPointView } from '@shared/ipc-types'
 import { shanghaiMdHhmm } from '@shared/time'
-// 标签表与主进程共用一份（@shared/watch-metrics）—— 两处各抄一张会静默分叉
-import { METRIC_LABELS } from '@shared/watch-metrics'
-
-
-function conditionText(point: WatchPointView): string {
-  const metric = METRIC_LABELS[point.metric] ?? point.metric
-  return `${metric} ${point.op === 'LTE' ? '跌破' : '升破'} ${point.threshold}`
-}
+// 标签表与格式化都与主进程共用一份（@shared/watch-metrics）—— 各抄一张会静默分叉
+import { conditionsText, hitValuesText } from '@shared/watch-metrics'
 
 function dayText(ms: number): string {
   const days = Math.ceil(ms / (24 * 60 * 60 * 1000))
@@ -63,10 +57,19 @@ function Row({
       <div className="flex items-baseline gap-2">
         <span className="truncate text-sm">{point.name}</span>
         <span className="font-mono text-xs text-white/35">{point.code}</span>
-        <span className="ml-auto shrink-0 font-mono text-sm text-sky-200/90">
-          {conditionText(point)}
+        {/*
+          组合条件会长，所以这里**换行而不是截断**：条件被截掉等于这份列表在说谎
+          （用户会以为软件盯的是更宽松的那一半）
+        */}
+        <span className="ml-auto text-right font-mono text-sm text-sky-200/90">
+          {conditionsText(point.conditions)}
         </span>
       </div>
+      {point.conditions.length > 1 ? (
+        <p className="mt-0.5 text-[10px] text-white/30">
+          这 {point.conditions.length} 条<span className="text-white/50">同时</span>成立才提醒
+        </p>
+      ) : null}
 
       <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[11px] text-white/40">
         {point.verdict !== undefined ? (
@@ -92,7 +95,7 @@ function Row({
           <>
             <span>·</span>
             <span className="text-rose-200/80">
-              {timeText(point.hitAt)} 命中，当时 {point.hitValue}
+              {timeText(point.hitAt)} 命中，当时 {hitValuesText(point.conditions, point.hitValues)}
             </span>
           </>
         ) : null}

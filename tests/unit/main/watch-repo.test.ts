@@ -70,9 +70,7 @@ function point(overrides: Partial<WatchPointRow> = {}): WatchPointRow {
     code: CODE,
     signalId: 'sig-1',
     source: 'AI_SUGGESTED',
-    metric: 'PRICE',
-    op: 'LTE',
-    threshold: 8.2,
+    conditions: [{ metric: 'PRICE', op: 'LTE', threshold: 8.2 }],
     meaning: 'INVALIDATE',
     engineVersion: '0.2.6-unvalidated',
     createdAt: NOW,
@@ -99,7 +97,10 @@ describe('WatchPointRepo', () => {
     seed()
     storage.watchPoints.insert(point())
     const row = storage.watchPoints.get('w1')
-    expect(row).toMatchObject({ code: CODE, metric: 'PRICE', op: 'LTE', threshold: 8.2 })
+    expect(row).toMatchObject({
+      code: CODE,
+      conditions: [{ metric: 'PRICE', op: 'LTE', threshold: 8.2 }],
+    })
     expect(row).not.toHaveProperty('note')
     expect(row).not.toHaveProperty('hitAt')
   })
@@ -120,11 +121,63 @@ describe('WatchPointRepo', () => {
   it('markHit 是幂等的：第二次返回 false，不覆盖命中时刻', () => {
     seed()
     storage.watchPoints.insert(point())
-    expect(storage.watchPoints.markHit('w1', NOW, 8.15)).toBe(true)
-    expect(storage.watchPoints.markHit('w1', NOW + 60_000, 8.0)).toBe(false)
+    expect(storage.watchPoints.markHit('w1', NOW, [8.15])).toBe(true)
+    expect(storage.watchPoints.markHit('w1', NOW + 60_000, [8.0])).toBe(false)
     const row = storage.watchPoints.get('w1')
     expect(row?.hitAt).toBe(NOW)
-    expect(row?.hitValue).toBe(8.15)
+    expect(row?.hitValues).toEqual([8.15])
+  })
+
+  /**
+   * 组合条件（015_watch_multi）。JSON 列存全量，旧的 metric/op/threshold 三列写
+   * `conditions[0]` 的镜像 —— **那三列不是判据**，直接读会把「a 且 b」读成只盯 a。
+   */
+  it('多条件 round-trip，且旧三列写的是第一条的镜像', () => {
+    seed()
+    storage.watchPoints.insert(
+      point({
+        conditions: [
+          { metric: 'PRICE', op: 'LTE', threshold: 8.2 },
+          { metric: 'rsi', op: 'LTE', threshold: 30 },
+        ],
+      })
+    )
+    expect(storage.watchPoints.get('w1')?.conditions).toEqual([
+      { metric: 'PRICE', op: 'LTE', threshold: 8.2 },
+      { metric: 'rsi', op: 'LTE', threshold: 30 },
+    ])
+
+    storage.watchPoints.markHit('w1', NOW, [8.15, 28.5])
+    expect(storage.watchPoints.get('w1')?.hitValues).toEqual([8.15, 28.5])
+  })
+
+  /**
+   * **015 之前落的行照常可读。** 那些行的 conditions / hit_values 是 NULL，
+   * 读回来必须是一条条件 —— 少了这条回落，升级后用户的观察点会整片变成空条件，
+   * 而空条件在判定里恒不成立（一声不响地不再提醒）。
+   */
+  it('旧行（conditions 为 NULL）读回来是单条件', () => {
+    seed()
+    storage.watchPoints.insert(point())
+    // 模拟 015 之前的行：把新列清掉，只留那三列
+    storage.db
+      .prepare(`UPDATE watch_point SET conditions = NULL, hit_values = NULL WHERE id = 'w1'`)
+      .run()
+    expect(storage.watchPoints.get('w1')?.conditions).toEqual([
+      { metric: 'PRICE', op: 'LTE', threshold: 8.2 },
+    ])
+
+    storage.db.prepare(`UPDATE watch_point SET hit_value = 8.15 WHERE id = 'w1'`).run()
+    expect(storage.watchPoints.get('w1')?.hitValues).toEqual([8.15])
+  })
+
+  it('conditions 列是坏 JSON 时回落到那三列，**不抛** —— 一行坏数据不该让列表打不开', () => {
+    seed()
+    storage.watchPoints.insert(point())
+    storage.db.prepare(`UPDATE watch_point SET conditions = '{oops' WHERE id = 'w1'`).run()
+    expect(storage.watchPoints.get('w1')?.conditions).toEqual([
+      { metric: 'PRICE', op: 'LTE', threshold: 8.2 },
+    ])
   })
 
   it('过期只对 ACTIVE 生效', () => {

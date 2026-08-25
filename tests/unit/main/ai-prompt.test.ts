@@ -60,6 +60,17 @@ describe('AI_SYSTEM_PROMPT', () => {
   it('允许预测，但与依据、失效条件绑在一起（用户已确认的取舍）', () => {
     expect(AI_SYSTEM_PROMPT).toContain('允许给方向性判断')
   })
+
+  /**
+   * 组合条件（2026-08-25）。**「别用组表达或」那句必须在** ——
+   * 把「任一成立」写成一个组，判定会变成「全部成立」，症状是提醒该来的时候不来，
+   * 而少发的错误用户发现不了。
+   */
+  it('教会模型写组合条件，并点名不许拿它表达「或」', () => {
+    expect(AI_SYSTEM_PROMPT).toContain('组=')
+    expect(AI_SYSTEM_PROMPT).toContain('同一时刻全部成立')
+    expect(AI_SYSTEM_PROMPT).toContain('不要用 `组` 表达「或」')
+  })
 })
 
 describe('AI_USER_SUFFIX', () => {

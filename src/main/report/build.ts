@@ -36,6 +36,7 @@ import type {
 } from '@shared/ipc-types'
 import type { Candle, GatedDirection, SecCode, Snapshot, TradeDate } from '@core/types'
 import { SESSION_BOUNDS } from '@core/session'
+import { conditionsText } from '@shared/watch-metrics'
 
 export interface BuildReportInput {
   date: TradeDate
@@ -340,7 +341,9 @@ export function buildDailyReport(input: BuildReportInput): DailyReport {
         code: item.code,
         name: item.name,
         kind: 'WATCH_POINT',
-        note: `仍在盯：${point.metric} ${point.op === 'LTE' ? '跌破' : '升破'} ${point.threshold}`,
+        // 走共用的格式化函数：这里此前打印的是**裸键名**（`bollMid` 而不是「布林中轨」），
+        // 与提醒文案、观察点列表三处各说各的
+        note: `仍在盯：${conditionsText(point.conditions)}`,
         // 观察点的时刻用**建立时刻**：它是「用户什么时候让我盯的」。
         // 不用 expiresAt（那是未来）、也不用 hitAt（ACTIVE 的还没命中）
         at: point.createdAt,

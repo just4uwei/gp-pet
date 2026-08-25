@@ -47,7 +47,7 @@ import type { AlertLevel, GatedDirection, Regime, SecCode } from '@core/types'
 import type { SignalEvidence, SignalRecord, WatchPointView } from '@shared/ipc-types'
 import { WATCH_MARK_LABEL, type WatchMark } from '@shared/watch-mark'
 import { pinnedSignal, type SignalGroup } from '@shared/signal-group'
-import { metricLabel } from '@shared/watch-metrics'
+import { conditionsText, hitValuesText } from '@shared/watch-metrics'
 import { shanghaiHhmm } from '@shared/time'
 
 const DIRECTION_LABEL: Record<GatedDirection, string> = {
@@ -350,7 +350,6 @@ export function CountChips({ group }: { group: SignalGroup<SignalRecord> }): Rea
  * `INVALIDATE` 写「你设的失效条件已出现」，**不许写成「快卖」**（措辞纪律）。
  */
 function WatchHitRow({ hit }: { hit: WatchPointView }): React.JSX.Element {
-  const opLabel = hit.op === 'LTE' ? '跌破' : '升破'
   return (
     <div className="flex items-start gap-3 py-0.5">
       <span className="shrink-0 rounded border border-sky-400/40 bg-sky-400/10 px-1.5 py-0.5 text-[11px] text-sky-200">
@@ -361,14 +360,11 @@ function WatchHitRow({ hit }: { hit: WatchPointView }): React.JSX.Element {
           {hit.meaning === 'INVALIDATE' ? '你设的失效条件已出现' : '你设的观察条件已满足'}
         </span>
         <span className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-white/45">
-          <span>
-            {metricLabel(hit.metric)}
-            {opLabel} {hit.threshold}
-          </span>
-          {hit.hitValue !== undefined ? (
+          <span>{conditionsText(hit.conditions)}</span>
+          {hit.hitValues !== undefined ? (
             <>
               <span>·</span>
-              <span className="font-mono">实际 {hit.hitValue}</span>
+              <span className="font-mono">实际 {hitValuesText(hit.conditions, hit.hitValues)}</span>
             </>
           ) : null}
           {hit.hitAt !== undefined ? (

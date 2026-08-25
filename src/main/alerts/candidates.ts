@@ -25,7 +25,7 @@ import type { AlertLevel, GatedDirection, SecCode, SubSignal } from '@core/types
 import type { AlertPayload } from '@shared/ipc-types'
 import type { InvalidationNotice, SignalOutcome } from '../engine/signals'
 import type { WatchHit } from '../watch/evaluate'
-import { metricLabel } from '../watch/metrics'
+import { conditionsText, hitValuesText } from '../watch/metrics'
 import type { AlertCandidate, AlertTrack } from './dispatcher'
 
 const LEVELS: readonly AlertLevel[] = ['L1', 'L2', 'L3']
@@ -169,14 +169,14 @@ function invalidationAlert(
  */
 function watchHitAlert(hit: WatchHit, at: number): PreparedAlert {
   const { point } = hit
-  const opLabel = point.op === 'LTE' ? '跌破' : '升破'
-  const subject = `${metricLabel(point.metric)}${opLabel} ${point.threshold}`
+  // 组合条件用「且」连起来整句说 —— 只报其中一条会让用户以为软件提前触发了
+  const subject = conditionsText(point.conditions)
   const headline =
     point.meaning === 'INVALIDATE'
       ? `你设的失效条件已出现：${subject}`
       : `你设的观察条件已满足：${subject}`
 
-  const reasons = [`当前 ${metricLabel(point.metric)} ${hit.value}`]
+  const reasons = [`当前 ${hitValuesText(point.conditions, hit.values)}`]
   if (point.note !== undefined && point.note !== '') reasons.push(point.note)
   reasons.push(
     point.meaning === 'INVALIDATE'
