@@ -161,7 +161,7 @@ function main(): void {
   const slipModel = pos.map((p) => slip * (p.buyNotional + p.sellNotional))
   const stamp = pos.map((p) => DEFAULT_COSTS.stampTaxRate * p.sellNotional)
   const transfer = pos.map((p) => DEFAULT_COSTS.transferFeeRate * (p.buyNotional + p.sellNotional))
-  const commission = pos.map((p, i) => (fees[i] ?? 0) - (stamp[i] ?? 0) - (transfer[i] ?? 0))
+  const commission = pos.map((_p, i) => (fees[i] ?? 0) - (stamp[i] ?? 0) - (transfer[i] ?? 0))
 
   console.log('## 1. 每次建仓的期望，与成本的三块\n')
   console.log('| 项 | 均值（元/建仓） | 中位 | 占 \\|期望\\| |')
@@ -178,7 +178,7 @@ function main(): void {
   row('　└ 印花税（卖出单边）', stamp)
   row('　└ 过户费', transfer)
   row('滑点（模型式）', slipModel)
-  const totalCost = pos.map((p, i) => (fees[i] ?? 0) + (slipModel[i] ?? 0))
+  const totalCost = pos.map((_p, i) => (fees[i] ?? 0) + (slipModel[i] ?? 0))
   row('**成本合计**', totalCost)
   console.log(
     `\n⇒ **成本归零后的原始边缘 = ${yuan(expect + mean(totalCost))} 元/建仓**` +
@@ -283,7 +283,7 @@ function main(): void {
 
   // ── 4. 「ETF 化」的算术上限 ──
   console.log('\n## 4. 换成场内基金（免印花税与过户费）能省多少\n')
-  const saved = pos.map((p, i) => (stamp[i] ?? 0) + (transfer[i] ?? 0))
+  const saved = pos.map((_p, i) => (stamp[i] ?? 0) + (transfer[i] ?? 0))
   console.log(
     `印花税 + 过户费 = **${yuan(mean(saved))}** 元/建仓 = 负期望的 **${pctOf(mean(saved) / Math.abs(expect))}**` +
       '（isFundBoard 已经在做这件事，见 costs.ts）'
