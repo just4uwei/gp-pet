@@ -52,12 +52,19 @@ import { join } from 'node:path'
 import { DEFAULT_COSTS, type CostModel } from './costs'
 import { BARS_PER_YEAR, mean, sampleStdev } from './metrics'
 
-/** 预注册的三个数，**不许在本文件里做成可搜索的网格** —— 那正是这个实验要避开的东西 */
-const VOL_WINDOW = 20
-const REBALANCE_EVERY = 5
-const SIGMA_TARGET = 0.15
+/**
+ * 预注册的三个数，**不许在本文件里做成可搜索的网格** —— 那正是这个实验要避开的东西。
+ *
+ * **导出是为了不让第二个实验（论证 §11.4 的保险命题，`scripts/verify/vol-insurance.ts`）
+ * 在别处照抄一份。** 抄一份的症状是「两个实验说的是同一条规则，而某天有人改了其中一个的
+ * 常量」—— 那时两份结论再也对不上，而没有任何东西会报错。
+ * ⚠ 它们**仍然不许被搜索**：`σ_target = 15%` 在 §5 已经预注册过一次（论证 §8 的「不许做的」）。
+ */
+export const VOL_WINDOW = 20
+export const REBALANCE_EVERY = 5
+export const SIGMA_TARGET = 0.15
 
-interface Bar {
+export interface Bar {
   date: string
   closeAdj: number | null
   close: number
@@ -117,11 +124,24 @@ function maxDrawdownOf(equity: readonly number[]): number {
  * @param returns  逐日标的收益率，与 `weights` 同序
  * @param weights  逐日**已生效**的仓位（调用方保证它只用了 t−1 及以前的信息）
  */
-function simulate(
+export function simulate(
   returns: readonly number[],
   weights: readonly number[],
   costs: CostModel
 ): ArmResult {
+  return simulatePath(returns, weights, costs).result
+}
+
+/**
+ * 与 `simulate` 同一份计算，**额外把净值与逐日收益带出来**（2026-08-25 为论证 §11.4 那个
+ * 逐崩盘事件分解加的）。`simulate` 现在是它的包装 —— 两处各算一遍净值会让「事件里的回撤」
+ * 与「整段的回撤」出自两套代码，而那正是这个分解唯一要比的东西。
+ */
+export function simulatePath(
+  returns: readonly number[],
+  weights: readonly number[],
+  costs: CostModel
+): { equity: number[]; daily: number[]; result: ArmResult } {
   const rate = oneWayRate(costs)
   const equity: number[] = [1]
   const daily: number[] = []
@@ -157,21 +177,80 @@ function simulate(
   const sharpe = daily.length < 2 || sd === 0 ? null : (mean(daily) / sd) * Math.sqrt(BARS_PER_YEAR)
   const maxDrawdown = maxDrawdownOf(equity)
   return {
-    totalReturn,
-    annualized,
-    maxDrawdown,
-    sharpe,
-    // 回撤为 0 时不给 Infinity —— 与 calibrate.ts 的 calmar() 同一条守卫
-    calmar: annualized === null ? null : maxDrawdown <= 0 ? null : annualized / maxDrawdown,
-    exposure: mean(weights),
-    rebalances,
-    turnover,
-    costPaid,
-    bars,
+    equity,
+    daily,
+    result: {
+      totalReturn,
+      annualized,
+      maxDrawdown,
+      sharpe,
+      // 回撤为 0 时不给 Infinity —— 与 calibrate.ts 的 calmar() 同一条守卫
+      calmar: annualized === null ? null : maxDrawdown <= 0 ? null : annualized / maxDrawdown,
+      exposure: mean(weights),
+      rebalances,
+      turnover,
+      costPaid,
+      bars,
+    },
   }
 }
 
-function loadBars(fixtures: string, code: string): Bar[] {
+/**
+ * 逐日收益率（`closeAdj` 优先，首根为 null）。抽出来给第二个实验共用。
+ */
+export function returnsOfBars(bars: readonly Bar[]): (number | null)[] {
+  const px = bars.map((b) => b.closeAdj ?? b.close)
+  return bars.map((_, i) => {
+    const now = px[i]
+    const prev = px[i - 1]
+    if (i === 0 || now === undefined || prev === undefined || prev <= 0) return null
+    return now / prev - 1
+  })
+}
+
+/**
+ * 把「哪些根参与」变成两条腿的逐日收益与仓位。
+ *
+ * **这里是那条不许被抄第二遍的规则本身**：仓位由**上一根收盘**的已实现波动算出
+ * （窗口 `rets[i-VOL_WINDOW .. i-1]`，**不含今天** —— 同日生效就是未来函数），
+ * 每 `REBALANCE_EVERY` 根调一次，`w = min(1, σ_target/σ)`。
+ *
+ * @param indices 参与计算的下标（按时间升序）。段前历史要留在 `rets` 里做预热，
+ *                但**不要**放进 `indices` —— 否则那段会被计进净值。
+ */
+export function volTargetLegs(
+  rets: readonly (number | null)[],
+  indices: readonly number[]
+): { used: number[]; returns: number[]; volWeights: number[]; passiveWeights: number[] } {
+  const used: number[] = []
+  const returns: number[] = []
+  const volWeights: number[] = []
+  const passiveWeights: number[] = []
+  let current = 0
+  let sinceRebalance = REBALANCE_EVERY // 第一根就调一次仓，两条腿同时建仓
+  for (const i of indices) {
+    const r = rets[i]
+    if (r === null || r === undefined) continue
+    const sample: number[] = []
+    for (let k = i - VOL_WINDOW; k <= i - 1; k++) {
+      const v = rets[k]
+      if (v !== null && v !== undefined) sample.push(v)
+    }
+    if (sinceRebalance >= REBALANCE_EVERY && sample.length === VOL_WINDOW) {
+      const sigma = sampleStdev(sample) * Math.sqrt(BARS_PER_YEAR)
+      current = sigma <= 0 ? 1 : Math.min(1, SIGMA_TARGET / sigma)
+      sinceRebalance = 0
+    }
+    sinceRebalance++
+    used.push(i)
+    returns.push(r)
+    volWeights.push(current)
+    passiveWeights.push(1)
+  }
+  return { used, returns, volWeights, passiveWeights }
+}
+
+export function loadBars(fixtures: string, code: string): Bar[] {
   const raw: unknown = JSON.parse(readFileSync(join(fixtures, `${code}.json`), 'utf8'))
   const list = Array.isArray(raw) ? raw : (raw as { candles?: unknown[] }).candles
   if (!Array.isArray(list)) throw new Error(`${code}.json 里没有 candles`)
@@ -193,13 +272,7 @@ function runWindow(bars: readonly Bar[], window: Window, costs: CostModel): Wind
   // 判定日：窗口内的每一根。仓位由**该根收盘**算出、从**下一根**的收益开始生效。
   // 段前历史照喂（用来预热 20 日波动），只是不在那段上计净值 —— 与 calibrate 的
   // warmupForSplit 同一条纪律：不喂段前历史会让 W2 的头 20 根凭空少掉。
-  const px = bars.map((b) => b.closeAdj ?? b.close)
-  const rets: (number | null)[] = bars.map((_, i) => {
-    const now = px[i]
-    const prev = px[i - 1]
-    if (i === 0 || now === undefined || prev === undefined || prev <= 0) return null
-    return now / prev - 1
-  })
+  const rets = returnsOfBars(bars)
 
   const inWindow: number[] = []
   for (let i = 0; i < bars.length; i++) {
@@ -210,30 +283,8 @@ function runWindow(bars: readonly Bar[], window: Window, costs: CostModel): Wind
   const end = inWindow[inWindow.length - 1]
   if (start === undefined || end === undefined) throw new Error(`${window.name} 窗口内没有 K 线`)
 
-  const windowReturns: number[] = []
-  const volWeights: number[] = []
-  const passiveWeights: number[] = []
-  let current = 0
-  let sinceRebalance = REBALANCE_EVERY // 第一根就调一次仓，两条腿同时建仓
-  for (const i of inWindow) {
-    const r = rets[i]
-    if (r === null || r === undefined) continue
-    // 仓位来自**上一根收盘**的已实现波动：窗口是 rets[i-VOL_WINDOW .. i-1]，不含今天
-    const sample: number[] = []
-    for (let k = i - VOL_WINDOW; k <= i - 1; k++) {
-      const v = rets[k]
-      if (v !== null && v !== undefined) sample.push(v)
-    }
-    if (sinceRebalance >= REBALANCE_EVERY && sample.length === VOL_WINDOW) {
-      const sigma = sampleStdev(sample) * Math.sqrt(BARS_PER_YEAR)
-      current = sigma <= 0 ? 1 : Math.min(1, SIGMA_TARGET / sigma)
-      sinceRebalance = 0
-    }
-    sinceRebalance++
-    windowReturns.push(r)
-    volWeights.push(current)
-    passiveWeights.push(1)
-  }
+  // 规则本身住在 volTargetLegs（第二个实验共用同一份，见它的头注释）
+  const { returns: windowReturns, volWeights, passiveWeights } = volTargetLegs(rets, inWindow)
 
   return {
     window,
