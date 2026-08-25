@@ -34,6 +34,29 @@
  * 3. 二手源常把 `F1` 与夏普当同向的 —— 那是两个目标。
  * 4. 本项目的「副模型」是**一条规则**不是模型（1675 次建仓训练分类器是过拟合机器）。
  *
+ * ## 2026-08-25：**逐次建仓配对 Δ 的聚类标准误已算**（第 6 节）
+ *
+ * 上面那一轮的产出是「②③ 对**出场类改动**结构上不设约束」⇒
+ * [docs/07 §3.6a](../../docs/07-回测与验证方案.md) 把这一类的主判据换成了
+ * **逐次建仓的配对 Δ**。理由是个前提检查：§3.6 把配对 Δ 排除掉是因为
+ * 「逻辑改动会改变交易的集合」，而出场类改动**恰好不改变它**（实测共有建仓 97.99–99.27%）
+ * ⇒ 那个前提成立，于是可以按 `(code, entryDate)` 逐次配 `pnl`。
+ *
+ * **聚类单位是时间，不是建仓。** `stdev(Δ)/√n` 的 `√n` 只在配对相互独立时成立，
+ * 而同一段行情里的建仓成批发生、共享市场 beta（与折间那件事同源，
+ * 见 `src/backtest/calibrate.ts` 的 `clusteredStderrOf` 头注释）。
+ * 本节复用**同一个** CR1 实现，报两档聚类：
+ *
+ * * **建仓月**（G ≈ 窗口月数）—— 与 `audit:random` 的块位移同一个时间单位（§5.36）；
+ * * **时间片**（G = 3，窗口等分三段）—— 与 §3.1 折单元的时间片同一个单位，**最保守**。
+ *
+ * 朴素 `t` 照印但标着**未调整上界**（同 `PairedDelta.t` 的纪律），门槛沿用 `|Δ|/stderr ≥ 2`。
+ *
+ * ⚠ **三处别读错**：① 配对 Δ 是**条件在共有集合上**的量 —— 新增/消失的建仓不进分子也不进分母，
+ * 所以必须并排看第 3 节那两个数（集合变了多少）；② **它不是 alpha** ——
+ * 测的是「同一批建仓换一个出场规则」，一个字都不含「入场值不值得」；
+ * ③ Δ 的单位是**元/建仓**（`capitalPerCode` 固定 10 万），正号 = 候选更好。
+ *
  * ## 边界
  *
  * **只读已有报告**，不跑模拟、不改引擎、不改门槛。窗口不同的报告不参与比较
@@ -41,6 +64,8 @@
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+
+import { pairedDelta } from '../../src/backtest/calibrate'
 
 const DIR = join(process.cwd(), 'reports', 'calib')
 
@@ -54,6 +79,16 @@ interface Report {
   meta: { engineVersion: string; from: string; to: string; codes: number; capitalPerCode?: number }
   performance: { totalReturn: number; positions?: number; trades?: number }
   trades: Trade[]
+}
+
+/** 窗口等分三段中的哪一段（`时间片` 聚类用，与 §3.1 折单元的时间片同一个单位） */
+function sliceOf(date: string, from: string, to: string): string {
+  const a = Date.parse(from)
+  const b = Date.parse(to)
+  const x = Date.parse(date)
+  if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(x) || b <= a) return 'T?'
+  const k = Math.min(2, Math.max(0, Math.floor((3 * (x - a)) / (b - a))))
+  return `T${k + 1}`
 }
 
 /** 一次**建仓** = (code, entryDate) → 组内 `pnl` 之和（回撤减仓会把一次建仓拆成两三行） */
@@ -247,6 +282,122 @@ function main(): void {
   console.log(
     '\n⚠ **绩效那两列只用来看方向，不许单独引用** —— §5.30/§5.31 的判据是训练窗口 Calmar 与' +
       '验证窗口一致性，不是区间收益（「少做」会机械地改善绩效，这正是门槛② 要防的事）。'
+  )
+
+  // ---------- 6. 出场类改动的主判据：逐次建仓配对 Δ（docs/07 §3.6a） ----------
+  console.log('\n## 6. 出场类改动的主判据：逐次建仓配对 Δ（docs/07 §3.6a）\n')
+
+  console.log('### 6.1 先分类：这次改动是哪一类（判据是两个数，不是命名）\n')
+  console.log('| 候选 | 集合变动 (新增+消失)/N₀ | 结局变动 pnl 变了/共有 | 形状（描述性，不是门槛） |')
+  console.log('|---|---|---|---|')
+  for (const r of rows) {
+    const name = r.name.split(' — ')[0] as string
+    const dropped = N0 - r.kept
+    const setMoved = (r.added + dropped) / N0
+    const fateMoved = r.pnlChanged / Math.max(1, r.kept)
+    const shape =
+      fateMoved >= 10 * setMoved ? '**出场型**' : setMoved >= fateMoved ? '**过滤型**' : '混合型'
+    console.log(`| ${name} | ${pct(setMoved)} | ${pct(fateMoved)} | ${shape} |`)
+  }
+  console.log(
+    '\n⇒ **出场型**（集合几乎不动、结局大量改变）才能用下面那个配对 Δ；' +
+      '**过滤型**用 §3.6 的原四条。混合型按两套**取严**，不许自选一套。' +
+      '\n⚠ 这三个标签是**描述性**的（比的是两个变动率的相对大小，没有绝对阈值）—— ' +
+      '它替代不了论证，只是让「靠命名判断」这条路走不通。'
+  )
+
+  console.log('\n### 6.2 ③′ 每次建仓的期望：胜率与盈亏比必须并排看\n')
+  console.log('| 候选 | 建仓 | 建仓级胜率 | 盈亏比 | **期望（元/建仓）** | 与基线比 |')
+  console.log('|---|---|---|---|---|---|')
+  const shapeOf = (pos: Map<string, number>): { p: number; ratio: number; mean: number } => {
+    const vals = [...pos.values()]
+    const wins = vals.filter((v) => v > 0)
+    const losses = vals.filter((v) => v <= 0)
+    const avgWin = wins.length > 0 ? wins.reduce((a, b) => a + b, 0) / wins.length : 0
+    const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((a, b) => a + b, 0) / losses.length) : 0
+    return {
+      p: vals.length > 0 ? wins.length / vals.length : Number.NaN,
+      ratio: avgLoss > 0 ? avgWin / avgLoss : Number.NaN,
+      mean: vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : Number.NaN,
+    }
+  }
+  const baseShape = shapeOf(basePos)
+  console.log(
+    `| **基线** | ${N0} | ${pct(baseShape.p)} | ${baseShape.ratio.toFixed(3)} | ` +
+      `**${baseShape.mean.toFixed(1)}** | — |`
+  )
+  for (const r of rows) {
+    const name = r.name.split(' — ')[0] as string
+    const rep = load(name)
+    if (!rep) continue
+    const s = shapeOf(positionsOf(rep))
+    const d = s.mean - baseShape.mean
+    console.log(
+      `| ${name} | ${r.n} | ${pct(s.p)} | ${s.ratio.toFixed(3)} | **${s.mean.toFixed(1)}** | ` +
+        `${d >= 0 ? '+' : ''}${d.toFixed(1)} |`
+    )
+  }
+  console.log(
+    '\n⇒ **③′ 卡的是最后那一列不降**（= 胜率 × 盈亏比的合成量）。' +
+      '只看胜率会被「拿盈亏比换胜率」机械满足（§5.31：关回撤减仓胜率 +7.9pp、盈亏比 1.11→0.91）。' +
+      '\n⚠ 期望是**全集**上的（含新增/消失的建仓），与下面那个**共有集合**上的配对 Δ 不是同一个数。'
+  )
+
+  console.log('\n### 6.3 配对 Δ 与聚类标准误（门槛 `|Δ|/stderr ≥ 2`）\n')
+  console.log(
+    '| 候选 | 配对数 | Δ 均值（元/建仓） | Δ>0 | 朴素 t（**未调整上界**） | ' +
+      'CR1·建仓月 t（G） | CR1·时间片 t（G） | 过门槛？ |'
+  )
+  console.log('|---|---|---|---|---|---|---|---|')
+  for (const r of rows) {
+    const name = r.name.split(' — ')[0] as string
+    const rep = load(name)
+    if (!rep) continue
+    const pos = positionsOf(rep)
+    const keys = [...basePos.keys()].filter((k) => pos.has(k)).sort()
+    const cand = keys.map((k) => pos.get(k) ?? null)
+    const inc = keys.map((k) => basePos.get(k) ?? null)
+    const entryDateOf = (k: string): string => k.split('|')[1] ?? ''
+    const byMonth = pairedDelta(cand, inc, keys.map((k) => entryDateOf(k).slice(0, 7)))
+    const bySlice = pairedDelta(
+      cand,
+      inc,
+      keys.map((k) => sliceOf(entryDateOf(k), base.meta.from, base.meta.to))
+    )
+    if (!byMonth || !bySlice) {
+      console.log(`| ${name} | 0 | — | — | — | — | — | ⚠ 配不上 |`)
+      continue
+    }
+    const tm = byMonth.clusteredT
+    const ts = bySlice.clusteredT
+    // 门槛按**两档里 t 最小的那个**判（= 最保守），不许挑好看的那一个。
+    //
+    // ⚠ 2026-08-25 实测推翻了「G 越小越保守」这个直觉：G=3 那一档给出的 t **反而更大**
+    // （4.68 vs 2.33）。CR1 的 meat 是**簇内残差和**的平方 —— 簇均值恰好都靠近总均值时
+    // 它就比朴素式子还小，而 G=3 时这件事完全可能是巧合。少簇 CR1 本身也不可靠
+    // （常见建议是把临界值从 1.96 换成 t_{G−1}，G=3 时约 4.30 ⇒ 那一档按 2 判是错的）。
+    // ⇒ G=3 只当**诊断**用，门槛落在 min(两档)。
+    const ts2 = tm === null || ts === null ? null : Math.min(tm, ts)
+    const passes = ts2 !== null && ts2 >= 2
+    console.log(
+      `| ${name} | ${byMonth.cells} | ${byMonth.mean >= 0 ? '+' : ''}${byMonth.mean.toFixed(1)} | ` +
+        `${byMonth.wins} | ${byMonth.t === null ? '—' : byMonth.t.toFixed(2)} | ` +
+        `${tm === null ? '—' : tm.toFixed(2)}（${byMonth.clusters ?? '—'}） | ` +
+        `${ts === null ? '—' : ts.toFixed(2)}（${bySlice.clusters ?? '—'}） | ` +
+        `${passes ? `**过**（min ${ts2?.toFixed(2)}）` : `不过（min ${ts2 === null ? '—' : ts2.toFixed(2)}）`} |`
+    )
+  }
+  console.log(
+    '\n**门槛落在两档里 t 最小的那个**（= 最保守），不许挑好看的那一个 ——' +
+      '两个聚类定义都站得住时挑一个等于给自己加一个自由度（同「零点定义」那族，docs/07 §3.6 ⑤）。' +
+      '\n⚠ **「G 越小越保守」这个直觉是错的**（2026-08-25 实测）：G=3 那一档的 t 反而更大。' +
+      'CR1 的 meat 是**簇内残差和**的平方，簇均值恰好都靠近总均值时它比朴素式子还小 ——' +
+      '而 G=3 时这完全可能是巧合。少簇 CR1 的临界值也不是 2（常见建议是换成 `t_{G−1}`，' +
+      'G=3 时约 4.30）⇒ **那一档只当诊断，主档是建仓月**。' +
+      '\n⚠ **Δ 显著为正 ≠ 这个改动该采纳**：它只说「同一批建仓的结局真的变好了」，' +
+      '而 Calmar 说的是路径。两者能反向 —— 关掉固定止损就是这个形状（期望 +111 元/建仓，' +
+      '而 §5.30 判它没过红线）。出场类改动仍要过 ① 论证与红线，' +
+      '**新门槛只作用于下一次改动**，回头重判已报实验就是移动球门。'
   )
 }
 

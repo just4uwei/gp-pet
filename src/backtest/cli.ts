@@ -300,6 +300,13 @@ async function runBacktest(options: CliOptions): Promise<number> {
         // 只在真的给了 --rf 时才写这一列：写个 0 进去会让老报告与新报告长得一样，
         // 而它们的区别恰恰是「这份有没有算过 sharpeNet」
         ...(options.riskFree === 0 ? {} : { riskFree: options.riskFree }),
+        // 池维度**无条件写**（与 costs 同一条：有条件写会让「未记录」与「没过滤」分不开）
+        pool: {
+          delisted: options.delisted ?? null,
+          liquidity: options.liquidity ?? null,
+          dropCapPct: options.dropCapPct,
+          dropAmountPct: options.dropAmountPct,
+        },
       },
     })
     if (options.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)

@@ -258,6 +258,14 @@ interface AlphaSnapshot {
   /** 落点权重档（§5.43）。`runs` 与 `positions` 不是同一个零点，看板必须印出来 */
   blockWeight: 'runs' | 'positions' | null
   crossCode: boolean
+  /**
+   * 基线口径的核对结论，由 `audit:random` 从 `--baseline` 那份**继承**下来
+   * （2026-08-25，计划 §4.9）。`null` = 那份报告早于这个字段 ⇒ **认不出来**，
+   * 既不是「出厂口径」也不是「偏离」—— 与基线那一侧的 `unverifiable` 同一档。
+   */
+  knobs: { deviations: string[]; unverifiable: string[] } | null
+  /** 因口径偏离被跳过的 alpha 报告（点名，否则「为什么显示的是旧那份」没有答案） */
+  skipped: { file: string; why: string }[]
   byStratum: {
     label: string
     count: number
@@ -275,6 +283,9 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
     .filter((f) => f.startsWith('random') && f.endsWith('.json'))
     .map((f) => ({ f, mtime: statSync(join(REPORTS, f)).mtimeMs }))
     .sort((a, b) => b.mtime - a.mtime)
+  // 与基线那一侧同一条纪律：口径偏离的报告跳过并**点名**（计划 §4.9）。
+  // alpha 是主判据 ⇒ 拿一份非出厂口径的 alpha 拍板比基线错更贵
+  const skipped: { file: string; why: string }[] = []
   for (const { f } of files) {
     try {
       const j = JSON.parse(readFileSync(join(REPORTS, f), 'utf8')) as {
@@ -287,6 +298,7 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
           blockCoverage?: number | null
           blockWeight?: 'runs' | 'positions' | null
           crossCode?: boolean
+          knobs?: { deviations?: string[]; unverifiable?: string[] }
         }
         strata?: {
           label: string
@@ -296,9 +308,22 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
         }[]
       }
       if (!j.strata) continue
+      const knobs =
+        j.meta?.knobs === undefined
+          ? null
+          : {
+              deviations: j.meta.knobs.deviations ?? [],
+              unverifiable: j.meta.knobs.unverifiable ?? [],
+            }
+      if (knobs !== null && knobs.deviations.length > 0) {
+        skipped.push({ file: f, why: knobs.deviations.join(' · ') })
+        continue
+      }
       const core = ['ALL', 'TREND_UP', 'RANGE', 'TRANSITION']
       return known({
         file: f,
+        knobs,
+        skipped,
         engineVersion: j.meta?.engineVersion ?? '—',
         matchRegime: j.meta?.matchRegime === true,
         shuffleSpans: j.strata.some((s) => s.shuffled !== null),
@@ -1042,6 +1067,25 @@ function render(input: {
       L.push(
         `> ⚠ **这份 alpha 是 ${a.engineVersion} 的，当前引擎是 ${params.engineVersion}** —— ` +
           '它描述的不是当前代码。alpha 是主判据，版本错了比基线版本错更糟。'
+      )
+    }
+    /*
+      口径三态（2026-08-25，计划 §4.9）。alpha 报告此前只记 `--baseline` 的**路径**，
+      于是一份跑在非出厂口径基线上的 alpha 在归档里认不出来 —— 而 alpha 是主判据。
+      `knobs` 缺失是第三态「**认不出来**」，不许读成「出厂口径」。
+    */
+    if (a.knobs === null) {
+      L.push(
+        '> ⚠ **这份 alpha 的基线口径无法核对**（报告早于 2026-08-25，没有继承 `capitalPerCode` /' +
+          ' `costs`）⇒ 只能手工去看 `meta.baseline` 那份。重跑一次就会带上这一列。'
+      )
+    } else if (a.knobs.unverifiable.length > 0) {
+      L.push(`> ⚠ 基线口径**部分无法核对**：${a.knobs.unverifiable.join(' · ')}（「未记录」≠「等于出厂」）。`)
+    }
+    if (a.skipped.length > 0) {
+      L.push(
+        `> ⓘ 为挑出**出厂口径**，跳过了 ${a.skipped.length} 份更新的 alpha 报告：` +
+          a.skipped.map((s) => `\`${s.file}\` — ${s.why}`).join(' · ')
       )
     }
   } else {

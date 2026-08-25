@@ -152,6 +152,28 @@ export interface BacktestReport {
      * `sharpeNet` 也一起缺，`sharpe` 又恒是 rf=0 ⇒ 没有可被读错的数。
      */
     riskFree?: number | undefined
+    /**
+     * **池维度**（2026-08-25 加，计划 §4.9）：这份报告跑在哪个标的池上 ——
+     * `--delisted` / `--liquidity` / `--drop-cap-pct` / `--drop-amount-pct` 的取值。
+     *
+     * 此前 `meta` 里完全没有它，于是「这份用的是哪个池」只能靠文件名与 `codes.length`
+     * 猜（**252 vs 261 就是这么来的**）。而池会改变绝对绩效：补进退市股是 −0.13pp
+     * （M2 §5.26），CLAUDE.md 因此要求「引用绝对绩效必须说明是哪个池子」——
+     * 那条纪律原先没有任何东西执行它。
+     *
+     * ⚠ 老报告没有这一列 ⇒ `undefined` = **未记录**，不是「没过滤」。
+     * ⚠ **池维度刻意不进 `auditKnobs`**：`--delisted` 是刻意的对照跑（两个池不合并，
+     * 否则「含退市 vs 不含退市」这个对照再也做不出来），把它判成「非出厂口径」
+     * 会让看板把那一族报告整批跳过。过滤那一侧已经由 `poolBlocked` 告警挡着。
+     */
+    pool?:
+      | {
+          delisted: string | null
+          liquidity: string | null
+          dropCapPct: number
+          dropAmountPct: number
+        }
+      | undefined
     /** 出厂参数是否仍未标定（ADR-0003）。true 时任何绩效数字都不得对外宣称 */
     unvalidatedParams: boolean
   }
@@ -581,6 +603,21 @@ export function renderReport(report: BacktestReport): string {
     `每标的资金 ${report.meta.capitalPerCode} · 滑点 ${c.slippage} · 佣金 ${c.commissionRate}` +
       `（下限 ${c.minCommission}）· 印花税 ${c.stampTaxRate} · 过户费 ${c.transferFeeRate}`
   )
+  /*
+    池维度那一行（2026-08-25 加，计划 §4.9）。与上面那条口径行同一个理由，只是它管的是
+    「跑在哪个标的池上」—— 补进退市股会改绝对绩效（−0.13pp，§5.26），而此前
+    `codes.length` 是唯一的线索（252 vs 261 就是这么来的）。
+    **未记录与「没过滤」必须分开**：`undefined` 时这一行整条不印，不许印成「无过滤」。
+  */
+  const pool = report.meta.pool
+  if (pool !== undefined) {
+    const parts = [
+      `退市清单 ${pool.delisted ?? '无'}`,
+      `流动性目录 ${pool.liquidity ?? '无'}`,
+      `过滤 市值后 ${pct(pool.dropCapPct)} / 成交额后 ${pct(pool.dropAmountPct)}`,
+    ]
+    lines.push(`标的池 ${parts.join(' · ')}`)
+  }
   if (report.meta.unvalidatedParams) {
     lines.push('⚠ 参数未标定（ADR-0003）：以下数字只可用于参数间比较，不得对外宣称。')
   }

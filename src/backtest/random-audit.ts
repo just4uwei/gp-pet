@@ -63,6 +63,7 @@ import {
   type CostModel,
 } from './costs'
 import { openFixtureSource, openSqliteSource, type DataSource, type LoadedSeries } from './data'
+import { auditKnobs } from './report'
 
 /** 与 simulate.ts 的 MAX_DEFER_BARS 同源：连续跌停超过这个天数就当作卖不掉 */
 const MAX_DEFER_BARS = 5
@@ -144,6 +145,8 @@ interface BaselineReport {
     from: TradeDate
     to: TradeDate
     capitalPerCode: number
+    /** 老基线报告（2026-08-20 之前）没有这一列 ⇒ `undefined` = **未记录**，不是「等于出厂」 */
+    costs?: CostModel | undefined
   }
   trades: ReportTrade[]
 }
@@ -717,6 +720,22 @@ export interface RandomAuditPayload {
     codes: number
     from: TradeDate
     to: TradeDate
+    /**
+     * **继承基线口径**（2026-08-25 加，计划 §4.9）：每标的资金与成本模型照抄
+     * `--baseline` 那份报告的 `meta`，并当场跑一次 `auditKnobs()`。
+     *
+     * 修的是什么：此前这份 payload 只记 `baseline` 路径 ⇒ 拿一份**非出厂口径**的报告
+     * 跑出来的 alpha 报告，在归档里**结构上认不出来**（看板已经因为同一个形状把一份
+     * 5× 资金的实验跑当成基线显示了一整天，见 `report.ts` 的 `auditKnobs` 头注释）。
+     * **而 alpha 是主判据，错得比基线错更贵。**
+     *
+     * ⚠ `costs` 为 `undefined` 是「**未记录**」那一档（老基线没有这一列），
+     * 不是「等于出厂」—— 判据交给 `auditKnobs`，这里不猜。
+     */
+    capitalPerCode: number
+    costs: CostModel | null
+    /** `auditKnobs()` 的结论，随报告一起存档 ⇒ 事后不必再去找那份基线 */
+    knobs: { deviations: string[]; unverifiable: string[] }
     trials: number
     seed: number
     matchRegime: boolean
@@ -1205,7 +1224,22 @@ export async function run(argv: readonly string[]): Promise<number> {
   // 而不是「全部落进『公告 无』」（后者会让读表的人以为数据加载了但一条都没命中）
   const announceDays = opts.announcements === undefined ? null : loadAnnouncements(opts.announcements)
   const capital = report.meta.capitalPerCode
-  const costs: CostModel = DEFAULT_COSTS
+  /*
+    **成本模型继承基线**（2026-08-25，计划 §4.9）。以前这里写死 `DEFAULT_COSTS`，
+    而真实那一臂的 `pnl` 是**基线报告按它自己的成本模型**算出来的 ⇒ 拿一份
+    `--slippage 0` 的基线跑 alpha，真实臂不付滑点、随机臂付 10 bp，
+    **差价被算进了 alpha**（方向固定：让真实组看起来更好）。滑点占负期望 69%（§5.29），
+    所以这不是一个小口子。
+
+    基线没记 `costs`（2026-08-20 之前的报告）时只能退回出厂值 —— 但那一档由
+    `auditKnobs` 报成「**无法核对**」并打进 payload，不许静默当成「等于出厂」。
+  */
+  const baselineKnobs = auditKnobs({
+    capitalPerCode: report.meta.capitalPerCode,
+    paramsFingerprint: report.meta.paramsFingerprint,
+    costs: report.meta.costs,
+  })
+  const costs: CostModel = report.meta.costs ?? DEFAULT_COSTS
 
   const source: DataSource = opts.fixtures
     ? openFixtureSource(opts.fixtures, { from: report.meta.from, to: report.meta.to })
@@ -1931,6 +1965,12 @@ export async function run(argv: readonly string[]): Promise<number> {
       codes: report.meta.codes.length,
       from: report.meta.from,
       to: report.meta.to,
+      capitalPerCode: report.meta.capitalPerCode,
+      costs: report.meta.costs ?? null,
+      knobs: {
+        deviations: baselineKnobs.deviations.map((d) => d.detail),
+        unverifiable: [...baselineKnobs.unverifiable],
+      },
       trials: opts.trials,
       seed: opts.seed,
       matchRegime: opts.matchRegime,
@@ -2041,6 +2081,24 @@ function renderText(p: RandomAuditPayload): string {
   lines.push(`基线报告   ${m.baseline}`)
   lines.push(`引擎版本   ${m.engineVersion}（指纹 ${m.paramsFingerprint}）`)
   lines.push(`标的 / 区间 ${m.codes} 只 · ${m.from} → ${m.to}`)
+  /*
+    口径行**每次都印**（2026-08-25，计划 §4.9）。与零分布结构那一行同一个理由：
+    有条件地印，等于让「没印」重新变成一种可能，而这份报告答的是主判据。
+  */
+  lines.push(
+    `口径       每标的资金 ${m.capitalPerCode} · 成本 ${
+      m.costs === null ? '**基线未记录 ⇒ 随机臂按出厂值定价**' : '继承基线'
+    }`
+  )
+  if (m.knobs.deviations.length > 0) {
+    lines.push(
+      `⚠ 非出厂口径   ${m.knobs.deviations.join(' · ')}` +
+        ' ⇒ 这份 alpha 不可与出厂口径的运行横向比较，也不可当基线引用'
+    )
+  }
+  if (m.knobs.unverifiable.length > 0) {
+    lines.push(`⚠ 无法核对   ${m.knobs.unverifiable.join(' · ')}（「未记录」≠「等于出厂」）`)
+  }
   lines.push(
     `配对       ${m.positionsPaired}/${m.positionsTotal} 次建仓（跳过 ${m.skipped}）· ` +
       `${m.trials} 次试验 · seed=${m.seed}`
