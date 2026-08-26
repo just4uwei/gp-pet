@@ -350,10 +350,17 @@ export interface SharpeHacResult {
  * IID **正态**下成立，给出带 `γ₃/γ₄` 的闭式）→ **Christie (2005)** 在平稳遍历下用 GMM 推
  * → **Opdyke (2007)** 证明 Christie 与 Mertens 是同一个式子。
  *
+ * ⚠ **Mertens (2002) 与 Memmel (2003) 是两个人两篇文章**（名字差一个字母）：
+ * 前者更正**单条**夏普的方差（就是这个函数），后者更正**两条之差**的
+ * （见 `sharpeDiffHac`）。混起来会以为这一处已经把两件事都做了。
+ *
  * ⚠ **「Mertens 的闭式在平稳遍历下也成立」不等于「自相关已经处理了」**：
  * 那个闭式用的是**同期**中心矩，而自相关只能从 `S` 的**长期**协方差进来 ——
  * Lo 的实证部分之所以要跑 Newey–West（截断阶 m = 3 / 6）就是这个原因。
  * 两句混读会得出「不用做了」这个相反的结论。
+ * **这一条 2026-08-26 拿到了外部佐证**：Ledoit & Wolf (2008) 的 Remark 3.1 明说
+ * Opdyke 的时间序列公式**是错的** ——「因为它们等价于 IID 情形的公式」。
+ * ⇒ 上面那句不是保守措辞，是文献里有人专门指出过的错误（M2 §5.60 易读错 ③）。
  *
  * ## ⚠ 它的前提（H1：平稳 + 遍历）在本项目数据上**不成立**，2026-08-21 实测
  *
@@ -411,6 +418,180 @@ export function sharpeRatioHac(returns: readonly number[], lag: number): SharpeH
     lag: effectiveLag,
     standardError: Math.sqrt(varTerm / T),
   }
+}
+
+export interface SharpeDiffResult {
+  /** 两条腿各自的原始频率夏普（总体口径 ÷n，与 `sharpeRatioHac` 一致） */
+  sharpeA: number
+  sharpeB: number
+  /** `sharpeA − sharpeB`（原始频率） */
+  delta: number
+  /** 两条腿收益的皮尔逊相关 —— 这个数就是「朴素口径高估多少」的主因 */
+  rho: number
+  /** 配对样本数 */
+  bars: number
+  /** 实际用到的滞后截断阶 */
+  lag: number
+  /** LW (2008) Eq. (5) 的标准误（原始频率），`lag` 档 */
+  standardError: number
+  /** 同一份数据 `lag = 0` 档 —— 即 Jobson–Korkie / Memmel 那一档 */
+  standardErrorIid: number
+  /**
+   * **朴素合成 SE**：`√(SE_A² + SE_B²)`，两条腿各自的 Lo (2002) SE 平方相加。
+   *
+   * ⚠ 它**只在两条腿独立时**才对（例如 §5.51 ③ 那张不相交子段的表）。
+   * 同期两条策略上它系统性偏大 —— 留在结果里就是为了让这个倍数可见。
+   */
+  naiveCombinedSe: number
+  /** `naiveCombinedSe / standardError` —— 朴素口径高估的倍数 */
+  naiveRatio: number
+  /** `delta / standardError` */
+  z: number
+  /** 双侧 p 值 `2Φ(−|z|)` */
+  pValue: number
+}
+
+/**
+ * **两条相关收益序列的夏普之差的标准误**（HAC 口径）。
+ *
+ * 归属：**Jobson & Korkie (1981)**（IID 正态）→ **Memmel (2003)**（更正它的渐近方差，
+ * *Finance Letters* 1:21–23）→ **Ledoit, O. & Wolf, M.** (2008), *Robust performance
+ * hypothesis testing with the Sharpe ratio*, **Journal of Empirical Finance 15(4) 850–859**
+ * —— 本函数实现的是 LW 原文 §3 与 §3.1（一手核对，M2 §5.60）。
+ *
+ * ```
+ * θ = (μ_a, μ_b, γ_a, γ_b)′        γ = E[r²]（**未中心化**二阶矩，LW 的记法）
+ * Δ = f(θ) = a/√(c−a²) − b/√(d−b²)                                    ← 原文 Eq. (2)
+ * ∇f = ( c/(c−a²)^1.5 , −d/(d−b²)^1.5 , −a/2·(c−a²)^-1.5 , b/2·(d−b²)^-1.5 )′  ← Eq. (4)
+ * SE(Δ̂) = √( ∇f′ Ψ̂ ∇f / T )                                           ← Eq. (5)
+ * Ψ = [r_ta−μ_a, r_tb−μ_b, r²_ta−γ_a, r²_tb−γ_b]′ 的 4×4 HAC 长期协方差
+ * ```
+ *
+ * 与 `sharpeRatioHac`（Lo 2002）是**同一个结构在两条腿上的版本** —— 矩向量都是
+ * `(r, r²)`，都走 `bartlettLongRunCovariance`。所以两者必须放在一起，
+ * 各写一份的症状是「单腿说 SE 0.03、两腿说 0.05」而没人判得出哪个对。
+ *
+ * ## 为什么必须有它：朴素合成 SE 在相关的两条腿上系统性偏大
+ *
+ * `√(SE_A² + SE_B²)` 隐含 `Cov = 0`。两条高度相关的曲线（消融对照、目标化 vs 满仓、
+ * ETF vs 个股）上协方差项很大且为正 ⇒ 差值的真实方差远小于它
+ * ⇒ **朴素口径会把「测得出的差别」判成「测不出」**，方向**不保守**。
+ * 实测倍数见 M2 §5.60。
+ *
+ * ## 三条边界
+ *
+ * 1. **它不改任何夏普的点估计**（同 `sharpeRatioHac` 的边界 1）。
+ * 2. **`lag` 必须预承诺**，不许看着结果挑（p-hacking 通道，M2 §5.47）。
+ * 3. **两条腿必须是同一批时点的配对收益**。各算各的再按下标塞会错位
+ *    —— 与 `alignedReturns` 头注释那条是同一个坑，这里长度不等直接截到短的那条
+ *    **不足以**保证配对，调用方得先对齐。
+ *
+ * ⚠ **LW 原文推荐的是预白化 QS 核 + 自举**，本实现用的是 Bartlett 核 + Andrews 滞后阶
+ * （与项目其余 HAC 处一致）。原文明说 HAC 推断在中小样本上**偏自由**（拒真过多）
+ * ⇒ 显著的结论要留余量，`p` 刚过 0.05 的不许承重。
+ *
+ * ⚠ `T/(T−4)` 那个小样本自由度修正是 LW 的规格（Lo 那边没有）。T = 2000 时它是
+ * 1.002，量级可忽略，留着是为了与原文逐条对得上。
+ */
+export function sharpeDiffHac(
+  a: readonly number[],
+  b: readonly number[],
+  lag: number
+): SharpeDiffResult | null {
+  const T = Math.min(a.length, b.length)
+  if (T < 5) return null
+  const ra = a.slice(0, T)
+  const rb = b.slice(0, T)
+  const muA = mean(ra)
+  const muB = mean(rb)
+  /*
+    总体口径（÷T），与 `sharpeRatioHac` 一致 —— 自检要求两处同口径。
+    ⚠ **方差必须用中心化和算，不许写成 `γ − μ²`**：后者在常数序列上是灾难性相消，
+    实测给出 1e-20 量级的「正方差」⇒ `varB <= 0` 这道闸门放行，夏普算出 3.8e7
+    （用例「零波动给 null」当场变红）。`γ` 反过来由 `var + μ²` 得到 —— LW 的坐标
+    要的是未中心化二阶矩，但**估它的路径**可以是稳的那一条。
+  */
+  const varA = ra.reduce((s, v) => s + (v - muA) ** 2, 0) / T
+  const varB = rb.reduce((s, v) => s + (v - muB) ** 2, 0) / T
+  /*
+    ⚠ 闸门是**相对**的，不是 `> 0`：常数序列上 `Σ(v−μ)²` 只是**接近** 0
+    （`mean([0.01 × 12])` 落在 0.01 的最后一位之外）⇒ 绝对闸门会放行一个 1e-36
+    的「方差」，夏普算出 3.8e7。零波动必须给 null，不许给一个天文数字。
+  */
+  // ⚠ 用 reduce 求最大值，不许写 `Math.max(...xs)` —— 20 万个参数会爆调用栈
+  const floorOf = (xs: readonly number[]): number =>
+    (1e-9 * xs.reduce((m, v) => Math.max(m, Math.abs(v)), Number.MIN_VALUE)) ** 2
+  if (varA <= floorOf(ra) || varB <= floorOf(rb)) return null
+  const gammaA = varA + muA * muA
+  const gammaB = varB + muB * muB
+
+  const gradient = [
+    gammaA / varA ** 1.5,
+    -gammaB / varB ** 1.5,
+    (-muA / 2) * varA ** -1.5,
+    (muB / 2) * varB ** -1.5,
+  ]
+  const y = [
+    ra.map((v) => v - muA),
+    rb.map((v) => v - muB),
+    ra.map((v) => v * v - gammaA),
+    rb.map((v) => v * v - gammaB),
+  ]
+
+  const quadraticAt = (l: number): number | null => {
+    let sum = 0
+    for (let i = 0; i < 4; i++) {
+      for (let j = 0; j < 4; j++) {
+        const s = bartlettLongRunCovariance(y[i] ?? [], y[j] ?? [], l)
+        if (s === null) return null
+        sum += (gradient[i] ?? 0) * (gradient[j] ?? 0) * s
+      }
+    }
+    // LW 的小样本自由度修正（估了 4 个参数）
+    return (sum * T) / (T - 4)
+  }
+
+  const effectiveLag = Math.max(0, Math.min(lag, T - 1))
+  const q = quadraticAt(effectiveLag)
+  const qIid = quadraticAt(0)
+  if (q === null || qIid === null || q <= 0 || qIid <= 0) return null
+
+  const hacA = sharpeRatioHac(ra, effectiveLag)
+  const hacB = sharpeRatioHac(rb, effectiveLag)
+  const cov = sampleCovariance(ra, rb)
+  const sdA = Math.sqrt(varA)
+  const sdB = Math.sqrt(varB)
+  const se = Math.sqrt(q / T)
+  const naive =
+    hacA === null || hacB === null
+      ? Number.NaN
+      : Math.sqrt(hacA.standardError ** 2 + hacB.standardError ** 2)
+  const delta = muA / sdA - muB / sdB
+  const z = delta / se
+  return {
+    sharpeA: muA / sdA,
+    sharpeB: muB / sdB,
+    delta,
+    // 样本协方差是 ÷(n−1)，这里配 sampleStdev 口径算相关（相关系数对口径不敏感）
+    rho: cov === null ? Number.NaN : cov / (sampleStdev(ra) * sampleStdev(rb)),
+    bars: T,
+    lag: effectiveLag,
+    standardError: se,
+    standardErrorIid: Math.sqrt(qIid / T),
+    naiveCombinedSe: naive,
+    naiveRatio: naive / se,
+    z,
+    pValue: 2 * (1 - normalCdf(Math.abs(z))),
+  }
+}
+
+/** 标准正态 c.d.f.（Abramowitz–Stegun 26.2.17，绝对误差 < 7.5e-8） */
+function normalCdf(x: number): number {
+  const t = 1 / (1 + 0.2316419 * Math.abs(x))
+  const d = 0.3989422804014327 * Math.exp((-x * x) / 2)
+  const p =
+    d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+  return x >= 0 ? 1 - p : p
 }
 
 /** 信息比率：超额收益的年化均值 / 年化跟踪误差 */

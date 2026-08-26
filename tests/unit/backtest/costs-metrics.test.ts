@@ -23,6 +23,7 @@ import {
   averageExposure,
   bartlettLongRunCovariance,
   betaOf,
+  sharpeDiffHac,
   sharpeRatioHac,
   informationRatio,
   maxDrawdown,
@@ -473,6 +474,99 @@ describe('绩效指标', () => {
       const want = a.reduce((s, v) => s + (v - m) ** 2, 0) / a.length
       expect(bartlettLongRunCovariance(a, a, 0)).toBeCloseTo(want, 12)
       expect(bartlettLongRunCovariance([1], [1], 0)).toBeNull()
+    })
+  })
+
+  /**
+   * **两条相关曲线的夏普之差**（Jobson & Korkie 1981 → Memmel 2003 →
+   * **Ledoit & Wolf 2008**，M2 §5.60）。
+   *
+   * 第一条是这里的正确性保证：`lag = 0` 时，实现必须等于**就地另写一遍**的
+   * `∇f′Ψ̂∇f · T/(T−4) / T` —— 那份就地实现**不碰** `bartlettLongRunCovariance`，
+   * 直接用 `y_t` 的样本协方差（`lag = 0` 时两者本就该相等），所以它是一条独立路径
+   * 而不是 `x === x`。
+   *
+   * ⚠ **代数恒等式那一条不在这里**（在 `scripts/verify/sharpe-diff.ts` 的自检 ①）：
+   * 「`∇f′Ψ∇f` = Memmel 闭式 `2 − 2ρ + ½SR_a² + ½SR_b² − ρ²·SR_a·SR_b`」
+   * 是 **`Ψ` 取解析形式时**的恒等式，随手写的十几个数**样本高阶矩不满足二元正态**
+   * ⇒ 拿它去比会差几个百分点，而那正是「看起来像通过了」的那一档。
+   * 那条自检还顺带证伪了网上流传的两种写法（差 0.03–0.12% 与 11 倍）。
+   */
+  describe('sharpeDiffHac（Jobson–Korkie → Memmel → Ledoit–Wolf 2008）', () => {
+    const a = [0.012, -0.004, 0.031, -0.019, 0.007, 0.022, -0.011, 0.005, 0.017, -0.026, 0.009, -0.003]
+    const b = [0.009, -0.002, 0.026, -0.014, 0.004, 0.019, -0.013, 0.002, 0.021, -0.022, 0.006, 0.001]
+
+    /** 就地组装 LW Eq. (2)/(4)/(5)，不复用被测代码的任何一行 */
+    const byHand = (xs: readonly number[], ys: readonly number[]): number => {
+      const T = xs.length
+      const avg = (v: readonly number[]): number => v.reduce((s, x) => s + x, 0) / T
+      const muA = avg(xs)
+      const muB = avg(ys)
+      const gA = avg(xs.map((v) => v * v))
+      const gB = avg(ys.map((v) => v * v))
+      const vA = gA - muA * muA
+      const vB = gB - muB * muB
+      const grad = [gA / vA ** 1.5, -gB / vB ** 1.5, -muA / 2 / vA ** 1.5, muB / 2 / vB ** 1.5]
+      const y = [
+        xs.map((v) => v - muA),
+        ys.map((v) => v - muB),
+        xs.map((v) => v * v - gA),
+        ys.map((v) => v * v - gB),
+      ]
+      let q = 0
+      for (let i = 0; i < 4; i++) {
+        for (let j = 0; j < 4; j++) {
+          let s = 0
+          for (let t = 0; t < T; t++) s += (y[i]?.[t] ?? 0) * (y[j]?.[t] ?? 0)
+          q += (grad[i] ?? 0) * (grad[j] ?? 0) * (s / T)
+        }
+      }
+      return (q * T) / (T - 4) / T // = SE²
+    }
+
+    it('lag = 0 时等于就地组装的 ∇f′Ψ∇f（含 LW 的 T/(T−4) 修正）', () => {
+      const got = sharpeDiffHac(a, b, 0)
+      expect(got).not.toBeNull()
+      expect(got!.standardError ** 2).toBeCloseTo(byHand(a, b), 14)
+      expect(got!.standardErrorIid).toBeCloseTo(got!.standardError, 14)
+    })
+
+    it('Δ 与 z 反号、SE 与 ρ 不变 —— 换个次序问同一个问题', () => {
+      const ab = sharpeDiffHac(a, b, 2)!
+      const ba = sharpeDiffHac(b, a, 2)!
+      expect(ba.delta).toBeCloseTo(-ab.delta, 14)
+      expect(ba.z).toBeCloseTo(-ab.z, 12)
+      expect(ba.standardError).toBeCloseTo(ab.standardError, 14)
+      expect(ba.rho).toBeCloseTo(ab.rho, 14)
+      expect(ba.pValue).toBeCloseTo(ab.pValue, 12)
+    })
+
+    /**
+     * 这一条钉的是这个函数**存在的理由**：朴素合成 SE（两条单腿平方相加）
+     * 隐含 `Cov = 0`，两条腿越相关它越偏大 ⇒ 会把测得出的差别判成测不出，
+     * 方向**不保守**。实测非崩盘段那对是 3.48 倍（M2 §5.60）。
+     */
+    it('正相关让真实 SE 小于朴素合成，负相关让它更大 —— 朴素口径对两边都是瞎的', () => {
+      const tight = sharpeDiffHac(a, b, 0)!
+      expect(tight.rho).toBeGreaterThan(0.9)
+      expect(tight.naiveRatio).toBeGreaterThan(2)
+      /*
+        镜像第二条腿（`b' = 2μ_b − b`）：均值与方差一字不改、`ρ` **精确翻号**。
+        ⇒ 同一对边际分布下，只有相关方向变了，而真实 SE 必须朝相反方向走。
+        （倒序**不行** —— 这两条序列倒过来仍高度相关，第一版就是这么红的。）
+      */
+      const muB = b.reduce((s, v) => s + v, 0) / b.length
+      const mirrored = sharpeDiffHac(a, b.map((v) => 2 * muB - v), 0)!
+      expect(mirrored.rho).toBeCloseTo(-tight.rho, 12)
+      expect(mirrored.naiveRatio).toBeLessThan(1)
+      expect(mirrored.standardError).toBeGreaterThan(tight.standardError)
+    })
+
+    it('样本不足或零波动给 null；滞后阶被 T−1 夹住、负数按 0 处理', () => {
+      expect(sharpeDiffHac([0.01, 0.02], [0.01, 0.02], 0)).toBeNull()
+      expect(sharpeDiffHac(a, a.map(() => 0.01), 0)).toBeNull()
+      expect(sharpeDiffHac(a, b, 999)!.lag).toBe(a.length - 1)
+      expect(sharpeDiffHac(a, b, -3)!.lag).toBe(0)
     })
   })
 

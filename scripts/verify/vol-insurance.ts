@@ -36,7 +36,7 @@
  * **不重判 §8**（新判据只用于本轮的新分解）。
  */
 import { andrewsLag, neweyWestVariance } from '../../src/backtest/ic-audit'
-import { BARS_PER_YEAR, mean, sampleStdev } from '../../src/backtest/metrics'
+import { BARS_PER_YEAR, mean, sampleStdev, sharpeDiffHac } from '../../src/backtest/metrics'
 import { DEFAULT_COSTS } from '../../src/backtest/costs'
 import {
   REBALANCE_EVERY,
@@ -349,16 +349,36 @@ function main(): void {
     `\n逐日配对（${volCalm} 个非崩盘交易日）：**年化拖累 ${pct(dragAnnual)}** ± ${pct(seAnnual)}` +
       `（Newey-West，滞后 ${lag}）· 门槛 ≤ ${pct(PREMIUM_CAP)}`
   )
+  /*
+    夏普那半条的标准误：**Ledoit & Wolf (2008)** 的 `∇f′Ψ∇f`（M2 §5.60 学的口径）。
+    2026-08-26 之前这里只报 Δ 并注明「没有严格标准误」—— 现在有了。
+    ⚠ 它**不翻转判据 B**：B 已经在**拖累**那一半上不通过（16.50% vs 门槛 3%），
+    夏普这半条无论算出什么都改变不了那个裁决，也不许拿去重读 §8。
+  */
+  const volCalmDaily = volPath.daily.filter((_, i) => !inEvent[i])
+  const pasCalmDaily = pasPath.daily.filter((_, i) => !inEvent[i])
+  const diff = sharpeDiffHac(volCalmDaily, pasCalmDaily, andrewsLag(volCalmDaily.length))
+  const ann = Math.sqrt(BARS_PER_YEAR)
   console.log(
     `非崩盘段夏普：满仓 ${num(sharpePasCalm)} · 目标化 ${num(sharpeVolCalm)} · ` +
-      `Δ ${num(sharpeVolCalm === null || sharpePasCalm === null ? null : sharpeVolCalm - sharpePasCalm)}`
+      `Δ ${num(sharpeVolCalm === null || sharpePasCalm === null ? null : sharpeVolCalm - sharpePasCalm)}` +
+      (diff === null
+        ? ''
+        : ` **± ${num(diff.standardError * ann)}**（Ledoit–Wolf 2008，滞后 ${diff.lag}）· ` +
+          `ρ = ${num(diff.rho)} · z = ${num(diff.z)} · p = ${num(diff.pValue)}` +
+          `\n⇒ 朴素合成 SE（两条单腿平方相加）是 ±${num(diff.naiveCombinedSe * ann)}，` +
+          `**高估 ${num(diff.naiveRatio, 2)} 倍** —— 这就是「两腿高度相关」那句话的量级`)
   )
   const bPass = dragAnnual <= PREMIUM_CAP
   console.log(`\n⇒ **判据 B ${bPass ? '通过' : '不通过'}**（拖累门槛那一半）`)
   console.log(
-    '⚠ 夏普那半条**没有严格的标准误**：两条腿高度相关 ⇒ 差值的方差远小于单腿的，' +
-      '拿单腿的 SE 当参照会让这一半**更容易通过**（方向对 B 有利，不是保守）。' +
-      '所以这里只报 Δ 与拖累的配对检验，夏普那半条按「量级上有没有变差」看，**不当门槛判**。'
+    '⚠ 夏普那半条**仍然不当门槛判**（预注册里它就不是门槛，写的是「夏普不显著变差」的定性话）。' +
+      '有了标准误只是让它可读 —— 而实测它' +
+      (diff === null || Math.abs(diff.z) >= 2 ? '' : '**不显著**') +
+      '：即使把 SE 从朴素口径收窄到正确口径，' +
+      `\`z\` 也只有 ${num(diff?.z ?? null)}。⇒ 「夏普不显著变差」这半条**成立**，` +
+      '但它成立的方式是「**测不出差别**」而不是「有改善」。' +
+      `判据 B 的裁决仍由拖累那一半定，而它是 ${pct(dragAnnual)} vs 门槛 ${pct(PREMIUM_CAP)}。`
   )
 
   console.log('\n## 结论\n')
