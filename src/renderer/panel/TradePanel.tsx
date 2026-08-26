@@ -30,9 +30,17 @@
  * - 持仓卡上显示「其中 N 股今日买入」。不说的话用户会按全仓去挂单，然后被券商拒掉。
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { SecCode } from '@core/types'
-import type { PositionView, QuoteTick, TradeLedger, TradePreview, TradeView } from '@shared/ipc-types'
+import type {
+  PositionView,
+  QuoteTick,
+  TradeDecisionOption,
+  TradeLedger,
+  TradePreview,
+  TradeView,
+} from '@shared/ipc-types'
+import { shanghaiDate, shanghaiHhmm, shanghaiMdHhmm, shanghaiMsFrom } from '@shared/time'
 import { EntryCheckCard } from './EntryCheckCard'
 import { StopFloorForm, StopFloorNotice } from './StopFloorForm'
 
@@ -60,20 +68,15 @@ function money(value: number): string {
   return `${value > 0 ? '+' : ''}${value.toFixed(2)}`
 }
 
-function dateText(ms: number): string {
-  const d = new Date(ms)
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
+/*
+  时刻一律走 `shared/time.ts` 的北京口径（CLAUDE.md 的展示层纪律）。
 
-/** `<input type="date">` 要的 yyyy-MM-dd，本地时区 */
-function dateValue(ms: number): string {
-  return dateText(ms)
-}
-
-function parseDate(text: string, fallback: number): number {
-  const parsed = new Date(`${text}T12:00:00`).getTime()
-  return Number.isFinite(parsed) ? parsed : fallback
-}
+  这里原先有一份 `dateText`（`getFullYear()`/`getMonth()`）与一个
+  `parseDate`（`new Date('...T12:00:00')`）—— 两个都按**宿主本地时区**。
+  在 UTC+8 上恰好对，在本机（UTC+7）上无害（同一个北京日），但在极西时区上
+  会整整差一天，而 `TradeRepo.boughtSharesSince` 拿它去卡 T+1 卖出锁定
+  ⇒ 昨天的买入被算成今天的，多锁一天。2026-08-26 一起改掉（016 头注释）。
+*/
 
 /**
  * 输入框里的字符串 → 正数或 `undefined`。
@@ -112,7 +115,17 @@ export function TradePanel({
    * 免得看起来像软件在劝他别卖（见下面那段注释）。
    */
   stopIntent?: boolean
-  onSubmit: (draft: { side: 'BUY' | 'SELL'; price: number; shares: number; tradedAt: number; note?: string }) => void
+  onSubmit: (draft: {
+    side: 'BUY' | 'SELL'
+    price: number
+    shares: number
+    tradedAt: number
+    /** 真实成交时刻。**用户没填时不带这个键** —— 主进程落 NULL，不拿 `tradedAt` 顶替 */
+    tradedAtExact?: number
+    /** 照哪条提醒做的。没选时不带这个键 */
+    signalId?: string
+    note?: string
+  }) => void
   onRemove: (id: string) => void
   /** 止损确认/撤销之后把新的持仓视图交回上层（账本里那份要跟着换） */
   onStopChanged: (next: PositionView | null) => void
@@ -122,7 +135,11 @@ export function TradePanel({
   const [side, setSide] = useState<'BUY' | 'SELL'>('BUY')
   const [price, setPrice] = useState('')
   const [shares, setShares] = useState('')
-  const [tradedAt, setTradedAt] = useState(() => dateValue(Date.now()))
+  const [tradedAt, setTradedAt] = useState(() => shanghaiDate(Date.now()))
+  /** 成交时刻（`HH:mm`）。**空串 = 不知道**，提交时整个键不带 —— 落 NULL 而不是 12:00 */
+  const [tradedTime, setTradedTime] = useState('')
+  /** 照哪条提醒做的。空串 = 未关联（默认），**程序不猜**（2026-08-26 拍板） */
+  const [signalId, setSignalId] = useState('')
   const [note, setNote] = useState('')
   // 带着「要改止损线」的意图进来时直接展开表单（见 stopIntent 的注释）
   const [stopFormOpen, setStopFormOpen] = useState(stopIntent)
@@ -136,6 +153,48 @@ export function TradePanel({
    */
   const intentPrice = positiveOrUndefined(price)
   const intentShares = positiveOrUndefined(shares)
+
+  /**
+   * 成交日与真实成交时刻。**日**永远算得出（非法日期退到今天）；
+   * **时刻只在用户真填了的时候才有**，`shanghaiMsFrom` 判非法时给 null，
+   * 而 null 一路传下去就是「不带这个键」⇒ 落 NULL。
+   */
+  const tradedAtMs = shanghaiMsFrom(tradedAt) ?? Date.now()
+  const tradedAtExact = tradedTime === '' ? null : shanghaiMsFrom(tradedAt, tradedTime)
+
+  /**
+   * 「照哪条提醒做的」候选。切票或换成交日时重取一次 —— 换日不会改候选集合，
+   * 但会改「当天唯一」那个标记，而标记算在渲染里，所以只依赖 `code`。
+   */
+  const [decisions, setDecisions] = useState<TradeDecisionOption[]>([])
+  useEffect(() => {
+    let cancelled = false
+    void window.gp
+      .invoke('trade:decisionOptions', { code })
+      .then((rows) => {
+        if (!cancelled) setDecisions(rows)
+      })
+      .catch(() => {
+        if (!cancelled) setDecisions([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [code])
+
+  // 换票时把关联清掉：上一只票的提醒挂到这一只上是纯粹的错误
+  useEffect(() => setSignalId(''), [code])
+
+  /**
+   * 成交当天**恰好只有一条**提醒时，把它标出来并给一键关联。
+   *
+   * ⚠ **标出来但不预选**（2026-08-26 拍板）：预选等于把「当天只有一条」这个巧合
+   * 当成了因果 —— 用户完全可能是看了行情自己决定的，与那条提醒无关。
+   */
+  const soleOfDay = useMemo(() => {
+    const sameDay = decisions.filter((d) => shanghaiDate(d.at) === tradedAt)
+    return sameDay.length === 1 ? sameDay[0] : undefined
+  }, [decisions, tradedAt])
 
   /**
    * 试算。数值填全之前不发请求（`null` = 还没得算，不是「算不出来」）。
@@ -155,7 +214,7 @@ export function TradePanel({
     }
     let cancelled = false
     void window.gp
-      .invoke('trade:preview', { code, side, price: p, shares: n, tradedAt: parseDate(tradedAt, Date.now()) })
+      .invoke('trade:preview', { code, side, price: p, shares: n, tradedAt: tradedAtMs })
       .then((result) => {
         if (!cancelled) setPreview(result)
       })
@@ -175,12 +234,17 @@ export function TradePanel({
       side,
       price: Number(price),
       shares: Math.trunc(Number(shares)),
-      tradedAt: parseDate(tradedAt, Date.now()),
+      tradedAt: tradedAtMs,
+      // 没填就整个键不带 —— 主进程据此落 NULL（「不知道分钟」不许被写成 12:00）
+      ...(tradedAtExact === null ? {} : { tradedAtExact }),
+      ...(signalId === '' ? {} : { signalId }),
       ...(note.trim() === '' ? {} : { note: note.trim() }),
     })
     setPrice('')
     setShares('')
     setNote('')
+    setTradedTime('')
+    setSignalId('')
   }
 
   const last = quote?.last
@@ -331,7 +395,55 @@ export function TradePanel({
             value={tradedAt}
             onChange={(e) => setTradedAt(e.target.value)}
           />
+          <input
+            className={`${FIELD} w-20 font-mono`}
+            type="time"
+            value={tradedTime}
+            title="真实成交时刻（可留空）。留空就是「不记得」—— 不会被当成中午 12 点"
+            onChange={(e) => setTradedTime(e.target.value)}
+          />
+          <button
+            type="button"
+            className="rounded border border-white/15 px-1.5 py-1 text-[10px] text-white/45 hover:border-white/35 hover:text-white/70"
+            title="按现在的北京时间填上"
+            onClick={() => {
+              setTradedAt(shanghaiDate(Date.now()))
+              setTradedTime(shanghaiHhmm(Date.now()))
+            }}
+          >
+            刚刚成交
+          </button>
         </div>
+
+        {/*
+          「照哪条提醒做的」。默认未关联，**程序不猜**（见 controller.decisionOptions 的边界 1）。
+          当天恰好只有一条时把它标出来并给一键关联 —— 标出来但不预选。
+        */}
+        {decisions.length > 0 ? (
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            <select
+              className={`${FIELD} min-w-0 flex-1`}
+              value={signalId}
+              onChange={(e) => setSignalId(e.target.value)}
+            >
+              <option value="">照哪条提醒做的？（可空）</option>
+              {decisions.map((d) => (
+                <option key={d.signalId} value={d.signalId}>
+                  {`${shanghaiMdHhmm(d.at)} · ${d.direction} · ${d.level}${d.shown ? '' : '（未弹气泡）'} · ¥${d.priceAt.toFixed(3)}`}
+                </option>
+              ))}
+            </select>
+            {soleOfDay !== undefined && signalId !== soleOfDay.signalId ? (
+              <button
+                type="button"
+                className="shrink-0 rounded border border-sky-400/40 px-1.5 py-1 text-[10px] text-sky-200/80 hover:border-sky-400/70"
+                onClick={() => setSignalId(soleOfDay.signalId)}
+              >
+                当天只有这一条 · 就是它
+              </button>
+            ) : null}
+          </div>
+        ) : null}
 
         <input
           className={`${FIELD} mt-1.5 w-full`}
@@ -403,7 +515,24 @@ export function TradePanel({
                 key={trade.id}
                 className="flex items-baseline gap-2 border-b border-white/[0.06] py-1.5 text-[11px] last:border-b-0"
               >
-                <span className="shrink-0 font-mono text-white/35">{dateText(trade.tradedAt)}</span>
+                {/* 有真实成交时刻就显示到分钟；没有就只给日期 —— 「不知道」不许被画成 00:00 */}
+                <span className="shrink-0 font-mono text-white/35">
+                  {trade.tradedAtExact === undefined
+                    ? shanghaiDate(trade.tradedAt)
+                    : shanghaiMdHhmm(trade.tradedAtExact)}
+                </span>
+                {trade.signalId !== undefined ? (
+                  <span
+                    className="shrink-0 rounded border border-sky-400/30 px-1 py-px text-[10px] text-sky-200/70"
+                    title={
+                      trade.decisionAt === undefined || trade.decisionPrice === undefined
+                        ? '照一条提醒做的'
+                        : `照 ${shanghaiMdHhmm(trade.decisionAt)} 那条提醒做的（当时 ¥${trade.decisionPrice.toFixed(3)}）`
+                    }
+                  >
+                    照提醒
+                  </span>
+                ) : null}
                 <span className={`shrink-0 rounded border px-1 py-px text-[10px] ${SIDE_TONE[trade.side]}`}>
                   {SIDE_LABEL[trade.side]}
                 </span>

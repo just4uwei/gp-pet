@@ -93,6 +93,13 @@ export function registerHandlers(controller: AppController): void {
     })
   )
 
+  handle('trade:decisionOptions', (_event, query) =>
+    controller.decisionOptions({
+      code: normalizeCode(query.code),
+      ...(query.limit === undefined ? {} : { limit: query.limit }),
+    })
+  )
+
   handle('trade:add', (_event, draft) =>
     controller.addTrade({ ...draft, code: normalizeCode(draft.code) })
   )

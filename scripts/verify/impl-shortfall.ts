@@ -34,6 +34,9 @@
  *    IS 是「从决策到最终结果」的整个差距、**含未成交部分**。
  *    ⇒ 我们的 `--slippage 0.001` 只是 `C_i`、`trade.costs` 只是 `C_e`
  *    ⇒ **`C_d` 与 `C_o` 从来没量过**。
+ *    **2026-08-26（016）之后**：`C_d` 的**字段**齐了（`traded_at_exact` +
+ *    用户指认的 `decision_at`/`decision_price`），但**数据要等新的成交攒起来**；
+ *    真实那一侧的 `C_i` **永远不会有**（缺下单时价，见第 5 节）。
  * 2. **`C_o` 才是对 L0 系统最要紧的一项**：「想买但没买」也是成本 ——
  *    对「提醒 → 人决策」的形态，它对应**用户没有照提醒执行的那些信号**。
  * 3. **决策价 vs 到达价**常被混用。本脚本**写死用「信号那根 K 线的收盘价」**当决策价。
@@ -68,6 +71,11 @@ interface TradeRow {
   shares: number
   price: number
   traded_at: number
+  /** 016 加的四列。**null = 不知道**（016 之前的行全是 null，不猜不回填） */
+  traded_at_exact: number | null
+  signal_id: string | null
+  decision_at: number | null
+  decision_price: number | null
 }
 
 interface JournalRow {
@@ -87,7 +95,28 @@ function main(): void {
   console.log('# 执行滑移：Perold (1988) 落到真机数据（M2 §5.53）\n')
 
   // ---------- 1. 两边各有什么 ----------
-  const trades = db.prepare('select code,side,shares,price,traded_at from trade_log order by traded_at').all() as unknown as TradeRow[]
+  const cols = (t: string): string[] =>
+    (db.prepare(`select name from pragma_table_info('${t}')`).all() as unknown as Array<{ name: string }>).map(
+      (r) => r.name
+    )
+  const tradeCols = cols('trade_log')
+  /*
+    ⚠ **按列自适应，不许直接 SELECT 那四列。** 这个脚本读的是**用户的实时库**，
+    而 016 要等应用真启一次才迁移 —— 写死列名的话，一个还没升级的库会让整个
+    诊断脚本崩在第一条查询上。缺列时四个字段一律当 null（= 「不知道」，与
+    016 之后那些没填的行同一档），下面的覆盖率自然报 0。
+  */
+  const has016 = tradeCols.includes('traded_at_exact')
+  const extra = has016 ? ',traded_at_exact,signal_id,decision_at,decision_price' : ''
+  const trades = (
+    db.prepare(`select code,side,shares,price,traded_at${extra} from trade_log order by traded_at`).all() as unknown as TradeRow[]
+  ).map((row) => ({
+    ...row,
+    traded_at_exact: row.traded_at_exact ?? null,
+    signal_id: row.signal_id ?? null,
+    decision_at: row.decision_at ?? null,
+    decision_price: row.decision_price ?? null,
+  }))
   const journal = db
     .prepare('select trade_date,kind,code,action,shares,price,rule,score from shadow_journal order by trade_date,seq')
     .all() as unknown as JournalRow[]
@@ -95,6 +124,35 @@ function main(): void {
 
   // 08-13 那批 side='OPENING' 是**补录建仓**，不是照信号动手 ⇒ 不算决策
   const decisions = trades.filter((t) => t.side !== 'OPENING')
+
+  /*
+    ---------- 0. 覆盖率：这份数据现在能支撑到哪一步 ----------
+
+    016（2026-08-26）之前所有行的四列都是 NULL，**不猜不回填** ⇒ 这一段
+    在相当长一段时间里会是 0/N。**那不是故障，是它该显示的样子** ——
+    把它印出来是为了让「还没攒够」与「接错了」在同一屏上分得开：
+    接错了的症状是新录的成交也进不了分子。
+  */
+  const withExact = decisions.filter((t) => t.traded_at_exact !== null).length
+  const withSignal = decisions.filter((t) => t.signal_id !== null).length
+  console.log('## 0. 覆盖率（016 之后录入的成交才可能有）\n')
+  console.log('| 项 | 覆盖 | 它解锁什么 |')
+  console.log('|---|---|---|')
+  console.log(
+    `| 真实成交时刻 \`traded_at_exact\` | **${withExact}/${decisions.length}** | ` +
+      '决策 → 成交按**分钟**对齐（否则只能按日，而按日会静默丢样本：' +
+      '§5.53 实测 13:04 的信号 vs 假时刻 13:00，差 4 分钟整对配不上） |'
+  )
+  console.log(
+    `| 提醒关联 \`signal_id\` | **${withSignal}/${decisions.length}** | ` +
+      '决策价与决策时刻**由用户指认**，不再靠「取成交前最近一条」去猜 |'
+  )
+  console.log(
+    '\n⚠ **`C_i`（冲击）仍然测不了，别把 016 读成「IS 四项齐了」** —— ' +
+      '拆 `C_d`/`C_i` 需要**下单时价**（arrival price），而用户不会记录' +
+      '「几点挂的单 vs 几点成交」。016 给到的是另外两样：按分钟对齐 + 样本不再静默丢。\n' +
+      '⚠ **`C_o` 也还算不出**，但卡的东西换了：不再是缺字段，而是**缺带关联的成交**。\n'
+  )
 
   console.log('## 1. 两边各有什么\n')
   console.log(
@@ -132,12 +190,15 @@ function main(): void {
       '> （「发现某个量有两个合法口径，下一步就问它们能不能符号相反」）当场用在自己身上：\n' +
       '> ① **预注册写死的那个**：信号那根 K 线的**收盘价**；\n' +
       '> ② `signal.price_at`：**引擎判定那一刻真正看到的价**（盘中信号 ⇒ 它不是收盘价）。\n' +
-      '> 真实那一侧 `C_d` 与 `C_i` **分不开**（缺成交时刻与 signal 关联，见 §5 那张清单）⇒ 合并成「决策→成交」。'
+      '> 真实那一侧 `C_d` 与 `C_i` **仍然分不开**（缺**下单时价**，016 也给不了）⇒ 合并成「决策→成交」。\n' +
+      '> **来源**那一列是 016 之后才有的：`指认` = 用户在表单里选了是照哪条提醒做的（`decision_*` 快照）·\n' +
+      '> `推测` = 老行，只能取「成交之前最近的一条信号」。**两者不可混着读** —— 推测那一档\n' +
+      '> 可能挂到一条用户根本没看见的信号上。'
   )
   console.log(
-    '\n| 标的 | 决策日 | 决策价①收盘 | 决策价②price_at | 真实成交/日 | **真实(①)** | **真实(②)** | 影子成交/日 | **影子(①)** | **影子(②)** |'
+    '\n| 标的 | 来源 | 决策日 | 决策价①收盘 | 决策价②price_at | 真实成交/日 | **真实(①)** | **真实(②)** | 影子成交/日 | **影子(①)** | **影子(②)** |'
   )
-  console.log('|---|---|---|---|---|---|---|---|---|---|')
+  console.log('|---|---|---|---|---|---|---|---|---|---|---|')
 
   const lastSignalBefore = db.prepare(
     `select date(created_at/1000,'unixepoch','+8 hours') d, price_at
@@ -150,22 +211,32 @@ function main(): void {
     const shadow = fills.find((r) => r.code === code)
     if (real === undefined || shadow === undefined || shadow.price === null) continue
 
-    const sig = lastSignalBefore.get(code, real.traded_at) as
-      | { d: string; price_at: number | null }
-      | undefined
-    const decisionDate = sig?.d ?? null
+    /*
+      决策那一侧优先用**用户指认**的（016 的 `decision_*` 快照）——
+      只有老行才退回「取成交之前最近一条信号」这种推测。
+      两者在同一张表里必须能被区分，所以多一列「来源」：把推测当指认读，
+      等于把一条用户根本没看见的信号当成他的决策依据。
+    */
+    const claimed = real.decision_at !== null && real.decision_price !== null
+    const sig = claimed
+      ? undefined
+      : (lastSignalBefore.get(code, real.traded_at) as { d: string; price_at: number | null } | undefined)
+    const decisionDate = claimed
+      ? new Date(real.decision_at ?? 0).toISOString().slice(0, 10)
+      : sig?.d ?? null
     const dRow =
       decisionDate === null ? undefined : (closeOf.get(code, decisionDate) as { close: number } | undefined)
     const pClose = dRow?.close ?? null
-    const pAt = sig?.price_at ?? null
+    const pAt = claimed ? real.decision_price : sig?.price_at ?? null
 
-    const realDate = new Date(real.traded_at).toISOString().slice(0, 10)
+    // 有真实成交时刻就用它 —— 假的 12:00 会让「同一天」以外的比较全部偏掉
+    const realDate = new Date(real.traded_at_exact ?? real.traded_at).toISOString().slice(0, 10)
     const fmt = (v: number | null): string => (v === null ? '—' : v.toFixed(4))
     const bp = (fill: number, ref: number | null): string =>
       ref === null || ref <= 0 ? '—' : `${((fill / ref - 1) * 1e4).toFixed(1)} bp`
 
     console.log(
-      `| ${code} | ${decisionDate ?? '—'} | ${fmt(pClose)} | ${fmt(pAt)} | ` +
+      `| ${code} | ${claimed ? '**指认**' : '推测'} | ${decisionDate ?? '—'} | ${fmt(pClose)} | ${fmt(pAt)} | ` +
         `${real.price.toFixed(4)} / ${realDate} | **${bp(real.price, pClose)}** | **${bp(real.price, pAt)}** | ` +
         `${shadow.price.toFixed(4)} / ${shadow.trade_date} | **${bp(shadow.price, pClose)}** | **${bp(shadow.price, pAt)}** |`
     )
@@ -219,28 +290,24 @@ function main(): void {
 
   // ---------- 5. 要算全 IS 还缺什么 ----------
   console.log('\n## 5. 要算全 `IS` 还缺什么（这一节是本轮的主要交付物）\n')
-  const cols = (t: string): string[] =>
-    (db.prepare(`select name from pragma_table_info('${t}')`).all() as unknown as Array<{ name: string }>).map(
-      (r) => r.name
-    )
-  const tradeCols = cols('trade_log')
   console.log('| 分量 | 需要什么 | 有没有 |')
   console.log('|---|---|---|')
   console.log(
-    `| \`C_d\` 延迟 | 决策时刻 + 下单时刻 | ⚠ **半个**：决策日可从 \`signal\` 推，但 ` +
-      `\`trade_log.traded_at\` 存的是**本机 12:00**（不是真实成交时刻）⇒ 只能按**日**算 |`
+    `| \`C_d\` 延迟 | 决策时刻 + 成交时刻 | ${tradeCols.includes('traded_at_exact') ? `✅ **字段有了**（016）：\`traded_at_exact\` 精确到分钟、\`decision_at\` 由用户指认。**但要等数据攒起来** —— 现在 ${withExact}/${decisions.length} |` : '⚠ **半个**：决策日可从 `signal` 推，但 `trade_log.traded_at` 存的是**本机 12:00** ⇒ 只能按**日**算 |'}`
   )
   console.log(
-    `| \`C_i\` 冲击 | 下单时的市价 | ❌ **没有** ⇒ 与 \`C_d\` 分不开（第 3 节因此合并） |`
+    `| \`C_i\` 冲击 | **下单时价**（arrival price） | ❌ **永远不会有** ⇒ 与 \`C_d\` 分不开（第 3 节因此合并）。` +
+      `用户不会记录「几点挂的单 vs 几点成交」，016 也给不了这个 |`
   )
   console.log(
     `| \`C_e\` 显性 | 手续费税费 | ✅ **有**（\`trades/ledger.ts\` 复用 \`backtest/costs.ts\`）${tradeCols.includes('fee') ? '，且落在 `trade_log.fee`' : '，但**没落进 `trade_log`**'} |`
   )
   console.log(
-    `| \`C_o\` 机会 | 「想买但没买」的股数与期末价 | ❌ **口径未定** —— 用户没动手的信号算不算「想买」？那是产品判断 |`
+    `| \`C_o\` 机会 | 「想买但没买」的股数与期末价 | ⚠ **口径已定、数据没到**：2026-08-24 拍板选 ②` +
+      `「只算 L3 强制类」（\`trades/ledger.ts\` 头注释）；卡的已经不是字段，而是**带关联的成交**（${withSignal}/${decisions.length}） |`
   )
   console.log(
-    `| 全部 | 成交与**哪一条信号**关联 | ❌ \`trade_log\` 无 \`signal_id\`（现有列：${tradeCols.join(', ')}） |`
+    `| 全部 | 成交与**哪一条信号**关联 | ${tradeCols.includes('signal_id') ? `✅ **有了**（016 的 \`signal_id\`，由用户指认、程序不猜）` : `❌ \`trade_log\` 无 \`signal_id\``}（现有列：${tradeCols.join(', ')}） |`
   )
 
   db.close()

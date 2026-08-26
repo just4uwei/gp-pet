@@ -15,7 +15,16 @@ export interface TradeRow {
   id: string
   code: SecCode
   side: TradeSideRow
+  /** 成交**日**（表单里选的日期，存成北京 12:00）。**不是**真实成交时刻 */
   tradedAt: number
+  /** 真实成交时刻（含分钟，016）。**undefined = 不知道**，不是 0（约束 4） */
+  tradedAtExact?: number
+  /** 照哪条提醒做的（016）。undefined = 未关联，**不是「没有提醒」** */
+  signalId?: string
+  /** 决策时刻的冗余快照 —— `signal` 会被裁剪，账本不会（016 头注释） */
+  decisionAt?: number
+  /** 决策价 = `signal.price_at`，同样是冗余快照 */
+  decisionPrice?: number
   price: number
   shares: number
   fee: number
@@ -30,6 +39,10 @@ interface Row {
   code: string
   side: string
   traded_at: number
+  traded_at_exact: number | null
+  signal_id: string | null
+  decision_at: number | null
+  decision_price: number | null
   price: number
   shares: number
   fee: number
@@ -52,22 +65,34 @@ function toRow(row: Row): TradeRow {
   // exactOptionalPropertyTypes：没有就不要这个键，而不是塞 undefined
   if (row.realized !== null) out.realized = row.realized
   if (row.note !== null) out.note = row.note
+  if (row.traded_at_exact !== null) out.tradedAtExact = row.traded_at_exact
+  if (row.signal_id !== null) out.signalId = row.signal_id
+  if (row.decision_at !== null) out.decisionAt = row.decision_at
+  if (row.decision_price !== null) out.decisionPrice = row.decision_price
   return out
 }
 
-const COLUMNS = `id, code, side, traded_at, price, shares, fee, realized, note, created_at`
+const COLUMNS =
+  `id, code, side, traded_at, traded_at_exact, signal_id, decision_at, decision_price, ` +
+  `price, shares, fee, realized, note, created_at`
 
 export class TradeRepo {
   constructor(private readonly db: Database) {}
 
   insert(row: TradeRow): void {
     this.db
-      .prepare(`INSERT INTO trade_log (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .prepare(`INSERT INTO trade_log (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         row.id,
         row.code,
         row.side,
         Math.round(row.tradedAt),
+        // ⚠ 缺省一律落 NULL，**不许拿 tradedAt 顶替** —— 那是把「不知道分钟」
+        // 写成「中午 12 点成交」，而 IS 分解会把它当真实时刻用（016 头注释）
+        row.tradedAtExact === undefined ? null : Math.round(row.tradedAtExact),
+        row.signalId ?? null,
+        row.decisionAt === undefined ? null : Math.round(row.decisionAt),
+        row.decisionPrice ?? null,
         row.price,
         Math.trunc(row.shares),
         row.fee,

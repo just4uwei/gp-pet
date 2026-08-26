@@ -51,6 +51,7 @@ import type {
   ShadowTradeView,
   SignalEvidence,
   SignalRecord,
+  TradeDecisionOption,
   TradeDraft,
   TradeLedger,
   TradePreview,
@@ -140,7 +141,7 @@ import {
   impossibleConditions,
   isWatchMetric,
 } from './watch/metrics'
-import { applyTrade, isTradeError, replayTrades, t1SellNotice } from './trades/ledger'
+import { applyTrade, isTradeError, replayTrades, resolveDecision, t1SellNotice } from './trades/ledger'
 import { splitCode } from '@core/code'
 import type { TradeRow } from './storage/repositories/trade'
 import type { WatchPointRow } from './storage/repositories/watch'
@@ -206,6 +207,11 @@ function toTradeLogView(row: TradeRow): TradeView {
   }
   if (row.realized !== undefined) view.realized = row.realized
   if (row.note !== undefined) view.note = row.note
+  // 016 那四列：缺省就是缺省，别在这一层补默认值（约束 4）
+  if (row.tradedAtExact !== undefined) view.tradedAtExact = row.tradedAtExact
+  if (row.signalId !== undefined) view.signalId = row.signalId
+  if (row.decisionAt !== undefined) view.decisionAt = row.decisionAt
+  if (row.decisionPrice !== undefined) view.decisionPrice = row.decisionPrice
   return view
 }
 
@@ -1123,12 +1129,32 @@ export class AppController {
 
     const now = Date.now()
     const tradedAt = draft.tradedAt ?? now
+    /*
+      「照哪条提醒做的」这个关联：**主进程不采信渲染层送来的任何快照**。
+      拿 id 回 `signal` 表查 —— 查不到或 code 对不上就**报错**（不静默落 NULL：
+      静默的话用户以为关联上了，而 IS 那边永远少一个样本，两边都看不出来）；
+      查得到就用**库里的** created_at / price_at 填快照（016 头注释：不加外键，所以要冗余存）。
+    */
+    const resolved = resolveDecision({
+      signalId: draft.signalId,
+      code,
+      signal:
+        draft.signalId === undefined || draft.signalId === ''
+          ? null
+          : layer.storage.signals.get(draft.signalId),
+    })
+    if ('error' in resolved) throw new Error(resolved.error)
+    const decision = resolved.decision
     layer.storage.db.transaction(() => {
       layer.storage.trades.insert({
         id: randomUUID(),
         code,
         side: draft.side,
         tradedAt,
+        // 缺省一律不落 —— 「不知道分钟」不许被写成「中午 12 点成交」
+        ...(draft.tradedAtExact === undefined ? {} : { tradedAtExact: draft.tradedAtExact }),
+        ...(draft.signalId === undefined || draft.signalId === '' ? {} : { signalId: draft.signalId }),
+        ...(decision === null ? {} : { decisionAt: decision.at, decisionPrice: decision.price }),
         price: draft.price,
         shares: Math.trunc(draft.shares),
         fee: outcome.fee,
@@ -1152,6 +1178,33 @@ export class AppController {
     if (t1 !== null) log.info(`[trade] ${code} 这笔卖出触发 T+1 提示：${t1}`)
     this.onStateChanged()
     return this.tradeLedger(code)
+  }
+
+  /**
+   * 「这笔是照哪条提醒做的」那个下拉的选项。**只读，不发网络请求。**
+   *
+   * 三条边界：
+   *
+   * 1. **不自动猜。** 这里只**列出候选**，勾不勾由用户决定（2026-08-26 拍板）。
+   *    按成交时刻自动关联到「之前最近的一条」会造出一批看起来有依据、实际是猜的链接，
+   *    而 IS 分解会把它当事实用 —— 用户完全可能是看了行情自己决定的，与那条提醒无关。
+   * 2. **被降级 / 被挡的那些照样列出来**，只是 `shown` 为 false。用户可能是看着状态点
+   *    动的手，把它们滤掉等于替他判断「你不可能是照这条做的」。
+   * 3. 数据层没起来时给空数组而不是抛错 —— 一个下拉为空不该让整个表单报错。
+   */
+  decisionOptions(query: { code: SecCode; limit?: number }): TradeDecisionOption[] {
+    const layer = this.data
+    if (!layer) return []
+    const limit = Math.max(1, Math.min(50, Math.floor(query.limit ?? 20)))
+    return layer.storage.alerts.query({ code: query.code, limit }).map((row) => ({
+      signalId: row.signalId,
+      at: row.createdAt,
+      direction: row.direction,
+      level: row.level,
+      shown: row.channels.length > 0,
+      priceAt: row.priceAt,
+      headline: row.headline,
+    }))
   }
 
   /**

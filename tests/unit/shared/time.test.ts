@@ -6,6 +6,7 @@ import {
   shanghaiHhmm,
   shanghaiHhmmss,
   shanghaiMdHhmm,
+  shanghaiMsFrom,
 } from '@shared/time'
 
 /** 北京时间 2026-08-15 00:00:00 = UTC 2026-08-14 16:00:00 */
@@ -86,5 +87,58 @@ describe('展示用格式化：一律北京时间', () => {
     // 北京 2026-08-19 00:30 = UTC 2026-08-18 16:30
     expect(shanghaiDate(Date.UTC(2026, 7, 18, 16, 30, 0))).toBe('2026-08-19')
     expect(shanghaiDate(CLOSE)).toBe('2026-08-18')
+  })
+})
+
+/**
+ * `shanghaiMsFrom` 是表单那一侧的入口（成交日期 + 可选时刻 → epoch）。
+ *
+ * 它替掉的是 `TradePanel` 里那个 `new Date('2026-08-26T12:00:00')` ——
+ * 后者按**宿主本地时区**解析：UTC+8 上恰好对，本机（UTC+7）上无害（同一个北京日），
+ * 但极西时区上会落到**前一个**北京日，而 `TradeRepo.boughtSharesSince` 拿它卡
+ * T+1 卖出锁定 ⇒ 昨天的买入被算成今天的，多锁一天（016 / trade.ts 头注释）。
+ */
+describe('shanghaiMsFrom', () => {
+  it('不给时刻时取北京 12:00 —— 与宿主时区无关', () => {
+    // 北京 2026-08-15 12:00 = UTC 2026-08-15 04:00
+    expect(shanghaiMsFrom('2026-08-15')).toBe(Date.UTC(2026, 7, 15, 4, 0, 0))
+  })
+
+  it('给了时刻就按北京时间解析', () => {
+    expect(shanghaiMsFrom('2026-08-15', '09:47')).toBe(Date.UTC(2026, 7, 15, 1, 47, 0))
+    // 北京 00:05 落在前一个 UTC 日 —— 这正是本地时区解析会出错的那一档
+    expect(shanghaiMsFrom('2026-08-15', '00:05')).toBe(Date.UTC(2026, 7, 14, 16, 5, 0))
+  })
+
+  /**
+   * 这一条是这个函数存在的理由：**往返必须闭合**。
+   * `shanghaiDate(shanghaiMsFrom(d)) === d` 在任何宿主时区都成立，
+   * 而旧写法在 UTC−5 上会把 `'2026-08-15'` 变成北京 8-16 的凌晨。
+   */
+  it('与 shanghaiDate 往返闭合', () => {
+    for (const d of ['2026-01-01', '2026-08-15', '2026-12-31', '2024-02-29']) {
+      const ms = shanghaiMsFrom(d)
+      expect(ms).not.toBeNull()
+      expect(shanghaiDate(ms as number)).toBe(d)
+    }
+  })
+
+  /**
+   * 非法输入给 `null`，**不许退成 `Date.now()`** —— 一个悄悄变成「现在」的时刻
+   * 会被当作真实成交时刻记进账本，而那是编出来的数据（016 头注释那条纪律）。
+   */
+  it('非法输入给 null，而不是悄悄退成某个时刻', () => {
+    expect(shanghaiMsFrom('')).toBeNull()
+    expect(shanghaiMsFrom('2026-8-15')).toBeNull()
+    expect(shanghaiMsFrom('2026-13-01')).toBeNull()
+    // 2 月 31 日：Date.UTC 会滚到 3 月 3 日 —— 往返比对把它挡下来
+    expect(shanghaiMsFrom('2026-02-31')).toBeNull()
+    expect(shanghaiMsFrom('2026-08-15', '9:47')).toBeNull()
+    expect(shanghaiMsFrom('2026-08-15', '24:00')).toBeNull()
+    expect(shanghaiMsFrom('2026-08-15', '12:60')).toBeNull()
+  })
+
+  it('空时刻串等同于「没给」—— 表单里清空时间框不该变成非法', () => {
+    expect(shanghaiMsFrom('2026-08-15', '')).toBe(shanghaiMsFrom('2026-08-15'))
   })
 })

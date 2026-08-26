@@ -72,6 +72,41 @@ export function shanghaiDate(epochMs: number): string {
   return `${at.getUTCFullYear()}-${pad2(at.getUTCMonth() + 1)}-${pad2(at.getUTCDate())}`
 }
 
+/**
+ * `YYYY-MM-DD` [+ `HH:mm`] → epoch ms，**按北京时间解析**。不给时刻时取当天 **12:00**。
+ *
+ * 上面那几个函数是「epoch → 文本」，这一个是**反方向** —— 表单里用户填的日期与时刻
+ * 要变回一个时刻，而 `new Date('2026-08-26T12:00:00')` 按**宿主本地时区**解析：
+ * 在 UTC+8 上恰好对，在本机（UTC+7）上落到北京 13:00（同一个北京日，无害），
+ * 但在极西时区（如 UTC−5）上会落到**前一个**北京日 ⇒ `TradeRepo.boughtSharesSince`
+ * 会把昨天的买入算成今天的，T+1 卖出锁定多锁一天（`trade.ts` 头注释里记着这个坑）。
+ *
+ * **为什么缺省是 12:00 而不是 00:00**：这个值同时被当成「哪个交易日」用，
+ * 而 00:00 落在日界上 —— 任何一处不小心用了本地时区去读它（`getDate()`），
+ * 在 UTC+7 上就会显示成前一天。正午离两边日界都有 12 小时，任何时区都读不错。
+ *
+ * ⚠ **非法输入返回 `null`，不要退成 `Date.now()`**：调用方对「填错了」与「没填」
+ * 的处置不一样，而一个悄悄变成「现在」的时刻会被当成真实成交时刻记进账本。
+ */
+export function shanghaiMsFrom(date: string, hhmm?: string): number | null {
+  const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date)
+  if (!day) return null
+  const [y, mo, d] = [Number(day[1]), Number(day[2]), Number(day[3])]
+  let h = 12
+  let mi = 0
+  if (hhmm !== undefined && hhmm !== '') {
+    const time = /^(\d{2}):(\d{2})$/.exec(hhmm)
+    if (!time) return null
+    h = Number(time[1])
+    mi = Number(time[2])
+    if (h > 23 || mi > 59) return null
+  }
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null
+  const ms = Date.UTC(y, mo - 1, d, h, mi) - SHANGHAI_OFFSET_MS
+  // Date.UTC 会把 2 月 31 日滚到 3 月 3 日 —— 往返比一次，滚过头的一律判非法
+  return shanghaiDate(ms) === date ? ms : null
+}
+
 /** `MM-DD HH:mm`（北京时间）。跨天的时刻用它 —— 只给 `HH:mm` 会让昨晚的东西看起来像刚才的 */
 export function shanghaiMdHhmm(epochMs: number): string {
   const at = new Date(epochMs + SHANGHAI_OFFSET_MS)

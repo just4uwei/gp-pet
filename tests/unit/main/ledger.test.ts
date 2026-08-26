@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { applyTrade, isTradeError, replayTrades, t1SellNotice } from '@main/trades/ledger'
+import { applyTrade, isTradeError, replayTrades, resolveDecision, t1SellNotice } from '@main/trades/ledger'
 import { DEFAULT_COSTS, buyFees, sellFees } from '../../../src/backtest/costs'
 
 /**
@@ -209,5 +209,40 @@ describe('t1SellNotice', () => {
     const outcome = applyTrade({ shares: 1000, cost: 10 }, { side: 'SELL', price: 11, shares: 1000, board: 'MAIN' })
     expect(isTradeError(outcome)).toBe(false)
     expect(t1SellNotice({ side: 'SELL', shares: 1000, ...held })).not.toBeNull()
+  })
+})
+
+/**
+ * 「照哪条提醒做的」那个关联的判据（016）。
+ *
+ * 这一组钉的全是同一件事：**关联要么是真的，要么就没有** ——
+ * 一个挂错的或半成的关联比没有关联更坏，因为 IS 分解会把它当事实用。
+ */
+describe('resolveDecision', () => {
+  const signal = { code: 'SH600000', createdAt: 1_700_000_000_000, priceAt: 12.34 }
+
+  it('没选 = 合法，不是错误', () => {
+    expect(resolveDecision({ signalId: undefined, code: 'SH600000', signal: null })).toEqual({
+      decision: null,
+    })
+    // 表单清空之后送过来的是空串，与 undefined 同义
+    expect(resolveDecision({ signalId: '', code: 'SH600000', signal: null })).toEqual({
+      decision: null,
+    })
+  })
+
+  it('选了但库里没有 ⇒ 报错，**不许静默落 NULL**', () => {
+    const out = resolveDecision({ signalId: 'sig-1', code: 'SH600000', signal: null })
+    expect('error' in out).toBe(true)
+  })
+
+  it('选了别的票的提醒 ⇒ 报错', () => {
+    const out = resolveDecision({ signalId: 'sig-1', code: 'SZ000001', signal })
+    expect('error' in out).toBe(true)
+  })
+
+  it('快照取库里的 createdAt / priceAt —— 调用方送什么都不采信', () => {
+    const out = resolveDecision({ signalId: 'sig-1', code: 'SH600000', signal })
+    expect(out).toEqual({ decision: { at: 1_700_000_000_000, price: 12.34 } })
   })
 })

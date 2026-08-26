@@ -64,6 +64,14 @@ export interface AlertJoinedRow extends AlertRow {
   regime: Regime
   stage: SignalStage
   headline: string
+  /**
+   * 引擎判定那一刻真正看到的价 —— **implementation shortfall 的「决策价」**（M2 §5.53）。
+   *
+   * 一起 SELECT 出来是为了让「这笔是照哪条提醒做的」那个下拉只查一次库：
+   * 另起一条查询按 `signalId` 去补这一个数，等于把同一个 join 写第二遍。
+   * ⚠ 它**不是**信号日的收盘价 —— 两个口径能让 IS 的符号相反，§5.53 已判后者为错。
+   */
+  priceAt: number
 }
 
 interface RawRow {
@@ -88,6 +96,7 @@ interface RawJoinedRow extends RawRow {
   regime: string
   stage: string
   evidence: string
+  price_at: number
 }
 
 const COLUMNS = `id, signal_id, level, channel, suppressed_reason, read_at, created_at,
@@ -147,6 +156,7 @@ function toJoinedRow(raw: RawJoinedRow): AlertJoinedRow {
     regime: raw.regime as Regime,
     stage: raw.stage as SignalStage,
     headline: headlineOf(raw.evidence),
+    priceAt: raw.price_at,
   }
 }
 
@@ -223,7 +233,7 @@ export class AlertRepo {
       .prepare(
         `SELECT a.id, a.signal_id, a.level, a.channel, a.suppressed_reason, a.read_at, a.created_at,
                 a.repeat_count, a.last_at, a.suppressed_gate, a.would_block,
-                s.code, s.direction, s.score, s.regime, s.stage, s.evidence
+                s.code, s.direction, s.score, s.regime, s.stage, s.evidence, s.price_at
          FROM alert_log a JOIN signal s ON s.id = a.signal_id
          ${where} ORDER BY a.created_at DESC LIMIT ?`
       )

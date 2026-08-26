@@ -47,9 +47,34 @@
  * 不是要不要可见）；② **L3 与非 L3 的界线本身是个自由度** —— 用户「整体上调/下调一档」
  * 不作用于持仓强制类（`alert-candidates` 有用例钉着），所以这条界线在提醒层是稳定的，
  * **别在 IS 这一侧另立一套 level 判定**。
- * 计算实现在 `scripts/verify/impl-shortfall.ts`，而它还缺两样输入（成交时刻精确到分钟 +
- * `signal_id` 关联，见[计划 §4.12](../../../docs/notes/下一阶段取舍与迭代计划.md)）
- * ⇒ **今天这个口径只是定死了，还算不出数。**
+ * 计算实现在 `scripts/verify/impl-shortfall.ts`。
+ *
+ * ## 真实成交时刻已落库（2026-08-26，016_trade_decision.sql）
+ *
+ * 上面那个口径此前「定死了但算不出数」，缺的两样输入现在有了 ——
+ * `trade_log` 多了四列：`traded_at_exact`（真实成交时刻，含分钟）·
+ * `signal_id`（照哪条提醒做的）· `decision_at` / `decision_price`（决策时刻与决策价的冗余快照）。
+ *
+ * **四条纪律**（每一条都有对应的坑）：
+ *
+ * 1. **四列全部可空，NULL 是「不知道」不是 0**（约束 4）。**不许拿 `traded_at` 顶替
+ *    `traded_at_exact`** —— 那是把「不记得分钟」写成「中午 12 点成交」，
+ *    而 IS 分解会把它当真实时刻用。补录历史成交时用户根本不记得分钟，
+ *    所以它**永远是可选的**：少一个样本，好过多一个编出来的时刻。
+ * 2. **关联由用户手动选，程序不猜。** 按成交时刻自动挂到「之前最近的一条提醒」
+ *    会造出一批看起来有依据、实际是猜的链接 —— 用户完全可能是看了行情自己决定的。
+ *    候选列表走 `trade:decisionOptions`（`controller.decisionOptions`）。
+ * 3. **快照以库里的为准。** `addTrade` 拿 `signalId` 回 `signal` 表查，
+ *    查不到或 `code` 对不上就**报错**（静默落 NULL 的话，用户以为关联上了、
+ *    而 IS 那边永远少一个样本，两边都看不出来）。渲染层送来的决策价一概不采信。
+ * 4. **`C_i` 仍然测不了，别把这次改动读成「IS 四项齐了」。** 拆 `C_d`/`C_i` 需要
+ *    **下单时价**（arrival price），而用户不会记录「几点挂的单 vs 几点成交」。
+ *    这次拿到的是另外两样：**决策 → 成交的时间轴精确到分钟**（不再按日），
+ *    以及**样本不再静默丢**（M2 §5.53：`SH601788` 08-18 首条信号 13:04 vs 假时刻 13:00，
+ *    **差 4 分钟**就让整对配不上，表里只剩一个「—」）。
+ *
+ * ⚠ **`C_o` 还是算不出数**，但卡的东西换了：不再是缺字段，而是**缺带关联的成交**
+ * —— 016 之前的 18 行四列全 NULL（不猜、不回填），得等新的成交攒起来。
  */
 
 import type { Board } from '@core/types'
@@ -180,6 +205,40 @@ export function t1SellNotice(input: {
     `那天最多卖 ${sellable} 股。确认一下成交日期是否填对。` +
     `（跨境 / 债券 / 黄金 ETF 与可转债是 T+0，不受此限，可以照录）`
   )
+}
+
+/**
+ * 「这笔是照哪条提醒做的」那个关联的**判据**（016）。
+ *
+ * ## 为什么是纯函数而不是写在 controller 里
+ *
+ * 与 `t1SellNotice` 同一个理由：它决定的是**账本里存下什么**，而那要能被用例钉住。
+ * controller 只负责去库里把那条信号捞出来，判断在这里做。
+ *
+ * ## 三条边界
+ *
+ * 1. **查不到就报错，绝不静默落 NULL。** 静默的症状最坏：用户在表单里明明选了
+ *    一条提醒、以为关联上了，而 IS 那边永远少一个样本 —— **两边都看不出来**。
+ * 2. **`code` 对不上也报错。** 换票时表单会清空关联，但配置导入、手改库、
+ *    以及日后任何一个新入口都可能送来别的票的 id，而挂错的关联比没有关联更坏
+ *    （它会被 IS 当成事实用）。
+ * 3. **快照一律取库里的 `createdAt` / `priceAt`**，调用方送来的一概不采信。
+ *    决策价的正确口径是 `signal.price_at`（引擎判定那一刻真正看到的价，M2 §5.53）
+ *    —— 按信号日收盘价当决策价会把 IS 的符号读反。
+ */
+export function resolveDecision(input: {
+  /** 用户选的信号 id。`undefined` / 空串 = 未关联（**这是合法的**，不是错误） */
+  signalId: string | undefined
+  /** 这笔成交的标的 */
+  code: string
+  /** 从库里捞出来的那条信号；`null` = 没捞到 */
+  signal: { code: string; createdAt: number; priceAt: number } | null
+}): { decision: { at: number; price: number } | null } | { error: string } {
+  const id = input.signalId
+  if (id === undefined || id === '') return { decision: null }
+  if (input.signal === null) return { error: '关联的那条提醒已经不在库里了，先清空关联再录' }
+  if (input.signal.code !== input.code) return { error: '关联的那条提醒不是这只票的' }
+  return { decision: { at: input.signal.createdAt, price: input.signal.priceAt } }
 }
 
 /**

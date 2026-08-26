@@ -31,6 +31,7 @@ export const INVOKE_CHANNELS = [
   'trade:list',
   'trade:preview',
   'trade:entryCheck',
+  'trade:decisionOptions',
   'trade:add',
   'trade:remove',
   'alert:history',

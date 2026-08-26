@@ -117,14 +117,53 @@ export interface TradeView {
   id: string
   code: SecCode
   side: 'BUY' | 'SELL' | 'OPENING'
-  /** 成交时刻（用户填的日期），不是录入时刻 */
+  /** 成交**日**（用户填的日期，存成北京 12:00），不是录入时刻，也不是真实成交时刻 */
   tradedAt: number
+  /**
+   * **真实成交时刻**（含分钟，016）。**缺省 = 不知道**，不是 0、不是 12:00（约束 4）。
+   *
+   * 补录历史成交时用户根本不记得分钟，所以它**永远是可选的**。缺省的那些不进
+   * 「决策 → 成交」的按分钟配对 —— 少一个样本，好过多一个编出来的时刻。
+   */
+  tradedAtExact?: number
+  /** 照哪条提醒做的（016）。缺省 = 用户没关联（**不是「没有提醒」**） */
+  signalId?: string
+  /** 上面那条信号的时刻。冗余快照：`signal` 按 2 年裁剪，而账本永不裁剪 */
+  decisionAt?: number
+  /** 决策价 = `signal.price_at`（引擎判定那一刻真正看到的价，M2 §5.53） */
+  decisionPrice?: number
   price: number
   shares: number
   fee: number
   /** 卖出结转的已实现盈亏（含费）。买入与期初**缺省** —— 不是 0 */
   realized?: number
   note?: string
+}
+
+/**
+ * 「这笔是照哪条提醒做的」那个下拉的选项（`trade:decisionOptions`）。
+ *
+ * **为什么不复用 `alert:history`**：`AlertRecord` 没有 `priceAt`，而这一屏要的正是
+ * **决策价**。在渲染层拿 `alert:history` + `signal:history` 按 `signalId` 拼两份列表，
+ * 等于把口径抄到第三处 —— 与 `trade:preview` 那条纪律同一形状。
+ */
+export interface TradeDecisionOption {
+  signalId: string
+  /** 提醒发生的时刻 */
+  at: number
+  direction: GatedDirection
+  level: AlertLevel
+  /** 这条**真的弹过气泡**吗。被降级成 L1 的照样列出来，但要能看出区别 */
+  shown: boolean
+  /**
+   * 决策价 = `signal.price_at`（引擎判定那一刻真正看到的价，M2 §5.53）。
+   *
+   * **必填**：这个列表来自 `alert_log ⋈ signal` 的**内连接** —— 原信号被裁剪掉的话
+   * 整行就不在了，不会出现「有选项但没有决策价」的状态。做成可选会让调用方
+   * 去写一个永远走不到的分支，而那个分支里写什么都没人会发现。
+   */
+  priceAt: number
+  headline: string
 }
 
 /** 某只票的账本视图（`trade:list`）。汇总在主进程算，避免渲染层再实现一遍口径 */
@@ -174,8 +213,18 @@ export interface TradeDraft {
   side: 'BUY' | 'SELL'
   price: number
   shares: number
-  /** 成交时刻。缺省取现在 */
+  /** 成交**日**。缺省取现在 */
   tradedAt?: number
+  /** 真实成交时刻（含分钟）。**缺省 = 用户没填**，主进程落 NULL，不拿 `tradedAt` 顶替 */
+  tradedAtExact?: number
+  /**
+   * 照哪条提醒做的。缺省 = 未关联。
+   *
+   * ⚠ 主进程**不采信**渲染层送来的决策快照 —— 它拿这个 id 回 `signal` 表查，
+   * 查不到或 `code` 对不上就**报错**（不静默落 NULL），查得到就用库里的
+   * `created_at` / `price_at` 填 `decisionAt` / `decisionPrice`。
+   */
+  signalId?: string
   note?: string
 }
 
@@ -1345,6 +1394,12 @@ export interface IpcInvokeMap {
    */
   'trade:entryCheck': (query: { code: SecCode; price?: number; shares?: number }) => EntryCheckView
   /** 录一笔成交：追加流水 + 按加权平均更新持仓。参数非法时抛错，由渲染层显示 */
+  /**
+   * 该票最近发生过的提醒，供「这笔是照哪条提醒做的」那个下拉用。
+   * **只读**，不发网络请求（一次 `alert_log × signal` 的本地 join）。
+   */
+  'trade:decisionOptions': (query: { code: SecCode; limit?: number }) => TradeDecisionOption[]
+
   'trade:add': (draft: TradeDraft) => TradeLedger
   /** 删一笔（录错了）。**按剩余流水重放重建持仓**，不做反向增量 */
   'trade:remove': (id: string) => TradeLedger
