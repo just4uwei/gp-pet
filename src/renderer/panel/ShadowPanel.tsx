@@ -15,12 +15,21 @@
  * - 资金占用率与基准收益**同框显示**。基准是满仓的，缺这个数会把超额读反（M2 §5.13）。
  * - 「置信度」不得称「胜率」—— 但影子运行里的胜率是**已实现的模拟成交统计**，
  *   那是事实而不是预测，可以叫胜率。两者的区别就在这里：一个是回头看，一个是往前猜。
+ *
+ * ## 「模拟持仓」那一节是这一屏唯一读实时行情的地方（2026-08-26）
+ *
+ * 其余每个数字都来自模拟账本（`shadow/summary.ts`），而持仓那几行要答「现在值多少」，
+ * 于是多了现价与**当日参考盈亏**两列。两条边界写死在 `dayPnlOf` 的头注释里，
+ * 最要紧的一条是：**当日参考盈亏不在净值里** —— 净值按最后一个已推进交易日的收盘价盯市，
+ * 把它和「浮动盈亏」相加等于把今天算两遍。界面上因此两列各有列头、脚注点名说「别相加」。
  */
 
 import { useCallback, useEffect, useState } from 'react'
-import { shanghaiHhmm } from '@shared/time'
+import { shanghaiHhmm, shanghaiMdHhmm } from '@shared/time'
+import type { SecCode } from '@core/types'
 import type {
   MaintenanceResult,
+  QuoteTick,
   ShadowJournalView,
   ShadowSummary,
   ShadowTradeView,
@@ -87,6 +96,33 @@ function tone(value: number): string {
   return 'text-white/60'
 }
 
+/** 带符号的金额。0 也不加号 —— 「持平」不该看起来像一次微小的盈利 */
+function signedMoney(value: number): string {
+  return `${value > 0 ? '+' : ''}${money(value)}`
+}
+
+/**
+ * 当日参考盈亏（2026-08-26）：`股数 ×（现价 − 昨收）`，两个价都是**不复权**的。
+ *
+ * 三条边界，少一条就会被读错：
+ *
+ * 1. **它不在净值里。** 上面那个「累计收益」是影子账本按**最后一个已推进交易日的收盘价**
+ *    盯市算出来的（`shadow/summary.ts` 的 `positionValue`），而这个数取的是此刻的行情 ——
+ *    两个相加等于把今天算两遍。所以它只放在持仓这一节，且旁边写清「未计入累计收益」。
+ * 2. **昨收拿不到就是 null**（显示「—」）。算成 0 元等于说「今天没赚没亏」，
+ *    而真相是这个数算不出来（约束 4）。`QuoteTick.changePct` 恰恰在这种情况下给 0，
+ *    所以这里读 `preClose` 而**不是**拿涨跌幅去反推金额。
+ * 3. **不复权，与影子的浮动盈亏（前复权）不是同一口径** —— 但它只取**同一天之内**
+ *    的价差，除权除息在这个窗口里不会发生，两个价一起偏或一起不偏。
+ *
+ * ⚠ 行情可能是 `STORED`（重启后从留痕或日线读回来的，甚至是上一个交易日的）。
+ * 那时「当日」这两个字就不准了，所以调用处必须灰显并把价格时刻写进 `title`。
+ */
+function dayPnlOf(shares: number, quote: QuoteTick | undefined): number | null {
+  if (!quote || quote.preClose === null || quote.preClose <= 0) return null
+  return (quote.last - quote.preClose) * shares
+}
+
 function Metric({
   label,
   value,
@@ -109,9 +145,18 @@ function Metric({
 
 export function ShadowPanel({
   refreshKey,
+  quoteOf,
   onError,
 }: {
   refreshKey: number
+  /**
+   * 实时行情（上层那份 `push:quoteTick` 投影）。**只用于「模拟持仓」那一节的现价与
+   * 当日参考盈亏** —— 绩效那一堆数字一律来自模拟账本，不受它影响。
+   *
+   * 这一屏本身刻意不订阅推送（与日报同一条：切进来拉一次），但行情由上层推着走，
+   * 于是持仓那几行会跟着跳而别处静止 —— 那正是想要的：只有「现在多少钱」需要实时。
+   */
+  quoteOf: Map<SecCode, QuoteTick>
   onError: (message: string) => void
 }): React.JSX.Element {
   const [summary, setSummary] = useState<ShadowSummary | null>(null)
@@ -404,28 +449,109 @@ export function ShadowPanel({
         </p>
       ) : null}
 
-      {/* ── 未平仓 ─────────────────────────────────────────────── */}
+      {/* ── 未平仓 ───────────────────────────────────────────────
+          两个盈亏并排，**必须各自有列头**：一个是「从建仓到最后一次盯市」（进净值），
+          一个是「今天」（不进净值）。只给数字的话它们看起来是同一种东西的两个值。 */}
       {summary.open.length > 0 ? (
         <div className="rounded border border-white/10 bg-white/[0.03] p-3">
-          <h3 className="text-xs font-medium text-white/70">模拟持仓 {summary.open.length} 只</h3>
-          <ul className="mt-1.5 flex flex-col gap-1">
-            {summary.open.map((position) => (
-              <li key={position.code} className="flex items-center gap-2 text-[11px]">
-                <span className="w-20 shrink-0 font-mono text-white/60">{position.code}</span>
-                <span className="w-16 shrink-0 text-right font-mono text-white/45">{position.shares} 股</span>
-                <span className="w-14 shrink-0 text-right font-mono text-white/45">
-                  {position.entryPrice.toFixed(2)}
+          <div className="flex items-baseline justify-between gap-2">
+            <h3 className="text-xs font-medium text-white/70">模拟持仓 {summary.open.length} 只</h3>
+            {/*
+              合计当日参考盈亏。**只加得出来的那几只**，缺行情的不当 0 计 ——
+              否则「3 只里 2 只没行情」会显示成一个看起来完整、实际只覆盖 1 只的合计。
+              所以覆盖只数写在旁边。
+            */}
+            {(() => {
+              const priced = summary.open
+                .map((p) => dayPnlOf(p.shares, quoteOf.get(p.code)))
+                .filter((v): v is number => v !== null)
+              if (priced.length === 0) return <span className="text-[10px] text-white/25">当日参考盈亏 —</span>
+              const total = priced.reduce((sum, v) => sum + v, 0)
+              return (
+                <span className="text-[10px] text-white/35">
+                  当日参考盈亏合计{' '}
+                  <span className={`font-mono ${tone(total)}`}>{signedMoney(total)} 元</span>
+                  {priced.length < summary.open.length ? (
+                    <span className="text-white/25">（{priced.length}/{summary.open.length} 只有行情）</span>
+                  ) : null}
                 </span>
-                <span className={`w-20 shrink-0 text-right font-mono ${tone(position.unrealized)}`}>
-                  {position.unrealized > 0 ? '+' : ''}
-                  {money(position.unrealized)}
-                </span>
-                <span className="text-white/25">持有 {position.barsHeld} 日</span>
-              </li>
-            ))}
+              )
+            })()}
+          </div>
+
+          <div className="mt-1.5 flex items-center gap-2 border-b border-white/[0.06] pb-1 text-[10px] text-white/30">
+            <span className="w-20 shrink-0">名称</span>
+            <span className="w-16 shrink-0 font-mono">代码</span>
+            <span className="w-16 shrink-0 text-right">股数</span>
+            <span className="w-12 shrink-0 text-right">建仓价</span>
+            <span className="w-12 shrink-0 text-right">现价</span>
+            <span className="w-20 shrink-0 text-right" title="股数 ×（现价 − 昨收），未计入上面的累计收益">
+              当日参考
+            </span>
+            <span className="w-20 shrink-0 text-right" title="建仓至最后一次收盘盯市，已计入上面的累计收益">
+              浮动盈亏
+            </span>
+            <span className="w-14 shrink-0 text-right">持有</span>
+          </div>
+
+          <ul className="mt-1 flex flex-col gap-1">
+            {summary.open.map((position) => {
+              const quote = quoteOf.get(position.code)
+              const dayPnl = dayPnlOf(position.shares, quote)
+              // 行情不是这一轮真的拉到的（重启后回落、或取数失败）⇒ 「当日」两个字就不准了。
+              // 灰显 + 把价格时刻写进 title，与自选列表那一列同一条口径（不许用 toLocaleTimeString）
+              const stale = quote?.stale === true
+              const priceTitle = quote
+                ? stale
+                  ? `${shanghaiMdHhmm(quote.at)} 的价，非实时`
+                  : `${shanghaiHhmm(quote.at)} 的价`
+                : '还没有这只的行情'
+              return (
+                <li key={position.code} className="flex items-center gap-2 text-[11px]">
+                  <span className="w-20 shrink-0 truncate text-white/70" title={position.name}>
+                    {position.name}
+                  </span>
+                  <span className="w-16 shrink-0 font-mono text-white/35">{position.code}</span>
+                  <span className="w-16 shrink-0 text-right font-mono text-white/45">{position.shares} 股</span>
+                  <span
+                    className="w-12 shrink-0 text-right font-mono text-white/45"
+                    title="模拟建仓价（不复权，含滑点）"
+                  >
+                    {position.entryPrice.toFixed(2)}
+                  </span>
+                  {/* 没有行情就是「—」，不拿最后一次收盘价冒充现价 */}
+                  <span
+                    className={`w-12 shrink-0 text-right font-mono ${stale ? 'text-white/30' : 'text-white/60'}`}
+                    title={priceTitle}
+                  >
+                    {quote ? quote.last.toFixed(2) : '—'}
+                  </span>
+                  <span
+                    className={`w-20 shrink-0 text-right font-mono ${
+                      dayPnl === null ? 'text-white/30' : stale ? 'text-white/35' : tone(dayPnl)
+                    }`}
+                    title={
+                      dayPnl === null
+                        ? '拿不到这只的现价或昨收，算不出来 —— 不是「今天没赚没亏」'
+                        : `${priceTitle}；${position.shares} 股 ×（现价 − 昨收）`
+                    }
+                  >
+                    {dayPnl === null ? '—' : signedMoney(dayPnl)}
+                  </span>
+                  <span className={`w-20 shrink-0 text-right font-mono ${tone(position.unrealized)}`}>
+                    {signedMoney(position.unrealized)}
+                  </span>
+                  <span className="w-14 shrink-0 text-right text-white/25">{position.barsHeld} 日</span>
+                </li>
+              )
+            })}
           </ul>
-          <p className="mt-1.5 text-[10px] text-white/30">
-            浮动盈亏已经计入上面的「累计收益」：净值每个交易日按收盘价盯市。
+
+          <p className="mt-1.5 text-[10px] leading-snug text-white/30">
+            「浮动盈亏」已经计入上面的「累计收益」：净值每个交易日按收盘价盯市。
+            「当日参考」是<span className="text-white/45">另一件事</span> —— 它按此刻的行情算
+            （股数 ×（现价 − 昨收），未扣卖出费用），
+            <span className="text-white/45">还没有进净值</span>，两个数别相加。
           </p>
         </div>
       ) : null}

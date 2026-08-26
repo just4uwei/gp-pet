@@ -681,6 +681,7 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
           code,
           last: snapshot.last,
           changePct: changePct(snapshot.last, snapshot.preClose),
+          preClose: snapshot.preClose,
           stale,
           at: snapshot.at,
           source: 'LIVE',
@@ -696,8 +697,10 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
           ticks.push({
             code,
             last: tick.last,
-            // 昨收拿不到就给 0 涨跌幅，**不编一个** —— 与 `changePct` 自己的口径一致
+            // 昨收拿不到就给 0 涨跌幅，**不编一个** —— 与 `changePct` 自己的口径一致。
+            // 而 `preClose` 原样带 null 出去：要算金额的调用方据此显示「—」而不是 0 元
             changePct: tick.preClose === null ? 0 : changePct(tick.last, tick.preClose),
+            preClose: tick.preClose,
             stale: true,
             at: tick.ts,
             source: 'STORED',
@@ -713,6 +716,7 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
           code,
           last: day.close,
           changePct: prev ? changePct(day.close, prev.close) : 0,
+          preClose: prev?.close ?? null,
           stale: true,
           // 收盘线的时刻就是那天的收盘 —— 与日报的 quoteOf 同一条口径
           at: closeMsOf(day.date),

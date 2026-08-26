@@ -307,8 +307,14 @@ function ReportNoteBlock({
               <SectionTime at={stored.createdAt} reportDate={date} what="这段评价的生成时刻" />
             ) : null}
           </h2>
+          {/*
+            「评的是今天」这句话原先靠**位置**表达（这一块排在今日的事实之后）。
+            2026-08-26 置顶之后位置不再说这件事，所以它必须写在字面上并点名日期 ——
+            否则一段排在最上面、又紧挨着「明日预览」的评价，很容易被读成在评明天。
+          */}
           <p className="mt-0.5 text-[11px] leading-snug text-white/35">
-            由你在设置里配置的模型生成。它只做跨标的的横向观察，不改任何结论、也不给单只票的买卖建议。
+            对 <span className="font-mono text-white/50">{date}</span> 这一天的横向观察
+            —— 由你在设置里配置的模型生成，只看下面已经算好的事实，不改任何结论、也不给单只票的买卖建议。
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -396,8 +402,9 @@ const ACTION_TONE: Record<NextDayPreviewRow['action'], string> = {
  *
  * ## 三处刻意的设计，改之前先读
  *
- * 1. **不并进上面那个「明日关注」** —— 那一节的纪律是「每一项都要指回一个**已经存在**
- *    的东西」（今日已落库的信号 / 观察点 / 持仓裁决），而预览是就地算的、**不落库**，
+ * 1. **不并进「明日关注」那一节**（2026-08-26 置顶后它排在下面）—— 那一节的纪律是
+ *    「每一项都要指回一个**已经存在**的东西」（今日已落库的信号 / 观察点 / 持仓裁决），
+ *    而预览是就地算的、**不落库**，
  *    它指不回去。并进去就把那条纪律破了。
  * 2. **要点按钮才算**，不跟着页签打开就跑：它要为每只自选算一遍 320 根的全套指标。
  *    与「分时图的量由人决定」同一条。
@@ -570,9 +577,22 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
     */
     <div className="flex flex-col gap-4">
       {/*
-        **板块按交易日的时间线排**（2026-08-15）：
-        页头 → 今日环境（今天的背景，贯穿全天）→ 逐只（盘中各只发生了什么）
-        → 今日汇总（收盘后的统计）→ 整体评价 → 明日关注（明天）→ 今日提醒（折叠）。
+        **排序 2026-08-26 由用户改成「可操作的在最上面」**，旧的时间线排法记在下面。
+
+        现在：页头 → 整体评价（AI）→ 明日预览 → 今日环境 → 逐只 → 今日汇总
+        → 明日关注 → 今日提醒（折叠）。
+
+        判据是**这一屏哪两块需要人动手**：那两块各有一个按钮，且都要花时间或花钱
+        （AI 评价按第三方规则计费，明日预览要为每只自选算一遍 320 根的全套指标）。
+        它们此前排在第 4、第 8 位 —— 而这一屏有八张卡，滚到底才看见按钮，
+        等于把「要不要点这一下」这个决定藏在了一屏静态数字后面。
+
+        旧排法（2026-08-15）是**按交易日的时间线**：今日环境（背景）→ 逐只（盘中）
+        → 今日汇总（收盘）→ 整体评价 → 明日关注 → 明日预览。它当时有一条具体的理由，
+        换过来就得认这个代价：**AI 评的是「今天」，现在它排在今天的事实之前** ——
+        所以那一块的副标题必须自己说清它评的是什么，不能靠位置暗示（见 ReportNoteBlock）。
+        「明日关注」仍留在原位：它是**复述**，没有按钮，不属于「可操作」那一档，
+        且它与「明日预览」刻意不并排（两者的纪律不同，见 NextDayPreviewBlock 的第 1 条）。
 
         页头**不是卡片**，只是一行：日期与「已定稿 / 盘中数据」是整屏的限定条件，
         不属于任何一个时段的板块。把它塞进第一张卡会让那张卡看起来比别的卡更重要，
@@ -625,6 +645,13 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
         </div>
       </div>
 
+      {/*
+        可操作的两块置顶（2026-08-26，用户拍板）。顺序是「评今天 → 看明天」，
+        与它们各自的内容一致；两块都**不会自己跑**，要点按钮才动。
+      */}
+      <ReportNoteBlock date={report.date} onSaved={load} />
+      <NextDayPreviewBlock reportDate={report.date} />
+
       <EnvironmentCard env={report.environment} at={report.stamps.environment} reportDate={report.date} />
 
       <section className="gp-card">
@@ -662,12 +689,6 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
           ))}
         </div>
       </section>
-
-      {/*
-        AI 评价排在事实之后、明日关注之前：先看今天发生了什么，再看模型怎么评今天，
-        最后才是明天。它评的是**今天**，排到「明日关注」后面会读起来像在评明天。
-      */}
-      <ReportNoteBlock date={report.date} onSaved={load} />
 
       <section className="gp-card">
         <div className="px-3 py-2">
@@ -757,8 +778,6 @@ export function DailyReportPanel({ refreshKey }: { refreshKey: number }): React.
           </div>
         ) : null}
       </section>
-
-      <NextDayPreviewBlock reportDate={report.date} />
 
       {/*
         缺数据的提示**不放进上面那个折叠块** —— 它说的是「这份报告有几只是空的」，

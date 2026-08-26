@@ -134,6 +134,32 @@ describe('组合口径', () => {
     expect(summary.positionValue).toBe(12_000)
   })
 
+  it('持仓带股票名，拿不到名字时回落成代码而不是空串', () => {
+    const position: ShadowPosition = {
+      code: 'SH600000',
+      shares: 1000,
+      entryDate: '2026-01-05',
+      entryPriceAdj: 10,
+      entryPriceRaw: 10,
+      entryCosts: 10,
+      entryRegime: 'RANGE',
+      entryScore: 0.7,
+      entryRule: 'T1',
+      peakRaw: 12,
+      lastCloseAdj: 12,
+      barsHeld: 5,
+      engineVersion: 'v1',
+    }
+    const named = summarize(
+      base({ positions: [position], nameOf: (code) => (code === 'SH600000' ? '浦发银行' : undefined) })
+    )
+    expect(named.open[0]?.name).toBe('浦发银行')
+
+    // 已移出自选 ⇒ 查不到名字。**空串会让那一列看起来是空的**，回落成代码才认得出是哪只
+    const anonymous = summarize(base({ positions: [position] }))
+    expect(anonymous.open[0]?.name).toBe('SH600000')
+  })
+
   it('基准两端都要有值才算同期收益，只有一端时给 null', () => {
     const both = summarize(
       base({ equity: equity([['2026-01-05', 1_000_000, 4000], ['2026-01-12', 1_010_000, 4200]]) })

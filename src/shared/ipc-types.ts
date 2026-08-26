@@ -30,6 +30,15 @@ export interface QuoteTick {
   code: SecCode
   last: number
   changePct: number
+  /**
+   * 昨收（不复权），与 `last` 同口径（2026-08-26）。
+   *
+   * **拿不到时是 null，不是 0** —— `changePct` 在昨收缺失时给的是 0（见 data-layer
+   * 的 `quoteTicks()`），于是「今天平盘」与「不知道昨收」在那个字段上长得一模一样。
+   * 要算「当日盈亏 = 股数 ×（现价 − 昨收）」这类**金额**就必须能区分这两件事：
+   * 算出一个 0 元会被读成「今天没赚没亏」，而真相是这个数算不出来（约束 4）。
+   */
+  preClose: number | null
   /** 数据陈旧 —— UI 应显示灰态而非假装实时 */
   stale: boolean
   /**
@@ -402,6 +411,8 @@ export interface ProviderHealth {
 /** 影子组合里一个未平仓的模拟持仓 */
 export interface ShadowOpenPosition {
   code: SecCode
+  /** 股票名。拿不到（已移出自选）时回落成代码 —— 与 `pending` / `trades` 同一条 */
+  name: string
   shares: number
   entryDate: TradeDate
   /** 不复权成交价（「我买在多少」） */

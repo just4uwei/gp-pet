@@ -1208,7 +1208,8 @@ export function App(): React.JSX.Element {
       ) : null}
       {tab === 'SHADOW' ? (
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
-          <ShadowPanel refreshKey={signalKey} onError={setError} />
+          {/* 行情传下去只为「模拟持仓」那一节的现价与当日参考盈亏；绩效数字一律来自模拟账本 */}
+          <ShadowPanel refreshKey={signalKey} quoteOf={quoteOf} onError={setError} />
         </div>
       ) : null}
       {tab === 'SETTINGS' ? (

@@ -80,7 +80,7 @@ export interface SummaryInput {
    * 拿不到日历时给 null（**别拿「今天」顶替**：休市日会算出一个假的落后）。
    */
   lastTradingDate: string | null
-  /** 委托上显示的股票名。拿不到就回落成代码 —— 展示层的事，缺了不影响任何数字 */
+  /** 委托与持仓上显示的股票名。拿不到就回落成代码 —— 展示层的事，缺了不影响任何数字 */
   nameOf?: (code: string) => string | undefined
   /** 墙上时间，由调用方传入（不读时钟） */
   now: number
@@ -205,6 +205,8 @@ export function summarize(input: SummaryInput): ShadowSummary {
     },
     open: input.positions.map((p) => ({
       code: p.code,
+      // 与 `pending` / `trades` 同一条回落：拿不到名字就给代码，别在这里编一个空串
+      name: input.nameOf?.(p.code) ?? p.code,
       shares: p.shares,
       entryDate: p.entryDate,
       entryPrice: p.entryPriceRaw,
