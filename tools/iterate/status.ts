@@ -645,24 +645,45 @@ async function runtimeState(): Promise<Maybe<RuntimeSnapshot>> {
  * | 档 | 含义 | 那天的提醒日志能不能当判据 |
  * |---|---|---|
  * | `clean` | 一次都没启动 | 能 |
- * | `postOnly` | 启动过，但**全在盘外** | **能**（当日计数器没被清）—— 但它清掉了跨日的 `lastForcedLoss`，下一个交易日可能多一条强制类 |
- * | `dirty` | **盘中**启动过 | 不能（冷却/配额/台阶当场清零） |
+ * | `postOnly` | 启动过，但**全在盘外** | **能** —— 当天的提醒早在重启之前就写完了，而次日的计数器由 `meta.alert_gate_state` 恢复 |
+ * | `dirty` | **盘中**启动过 | 不能 —— 但**理由 2026-08-26 换了**，见下 |
  * | `unknown` | 日志读不到 | 不知道 —— **绝不并进任何一边**，那是编事实 |
  *
- * **`postOnly` 算不算「干净交易日」是判据问题，看板不替 M3 清单 §4.0 拍板。**
- * 所以下面的 `clean` 仍然只数零重启那一档，`postOnly` 单独报出来给人看。
+ * ## `postOnly` 从 2026-08-26 起计入「干净交易日」（判据放宽，依据是实现变了）
+ *
+ * M3 清单 §4.0 那条「盘中重启过的交易日不能计入」写于 2026-08-17，前提是
+ * 「冷却、配额、强制类台阶**全在内存里**，每次重启全部清零」。
+ * **而 2026-08-19 闸门状态已经落库**（`meta.alert_gate_state`）⇒
+ * 真库实测含 `lastSent` / `perCodeToday` / `l3Today` / **跨日的 `lastForcedLoss`**，
+ * `restore()` 还会按当前时间立刻跑 `rollDay` + `pruneHourly`
+ * ⇒ **「重启 ⇒ 同一条止损重新发一次」这个机制没有了。**
+ *
+ * ⚠ **`dirty` 仍然不算干净，但换了理由**：防抖计数 `streaks` **刻意不落库**
+ * （重启跨过一段没有观测的时间，续上等于用不存在的连续性放行一条提醒）
+ * ⇒ 盘中重启后头几轮条件要重新连续成立才放行 ⇒ 可能**漏**一条。
+ * 它污染的是「没有漏掉重要信号」那一半，方向与旧理由**相反**。
+ *
+ * ⚠ **日期下界 `GATE_STATE_SINCE` 不能去掉**：更早的盘外重启日仍然不算干净 ——
+ * **老数据不会因为后来修好了就变得可用**（08-13 启动 14 次、08-14 二十七次那两天）。
  */
+const GATE_STATE_SINCE = '2026-08-19'
+
 function cleanDaysOf(r: RuntimeSnapshot): {
   clean: number
   postOnly: number
   dirty: number
   unknown: number
 } {
+  /** 全在盘外，且这一天在闸门状态落库之后 ⇒ 那天的提醒日志可以当判据 */
+  const postOnlyClean = (d: { date: TradeDate; boots: DayRestarts | null }): boolean =>
+    d.boots !== null && d.boots.total > 0 && d.boots.inSession === 0 && d.date >= GATE_STATE_SINCE
   return {
-    clean: r.restarts.filter((d) => d.boots !== null && d.boots.total === 0).length,
-    postOnly: r.restarts.filter((d) => d.boots !== null && d.boots.total > 0 && d.boots.inSession === 0)
-      .length,
-    dirty: r.restarts.filter((d) => d.boots !== null && d.boots.inSession > 0).length,
+    clean: r.restarts.filter((d) => (d.boots !== null && d.boots.total === 0) || postOnlyClean(d)).length,
+    // 仍然单独报出来 —— 「零重启」与「盘外重启但算干净」是两种事实，合并就看不出来了
+    postOnly: r.restarts.filter(postOnlyClean).length,
+    dirty: r.restarts.filter(
+      (d) => d.boots !== null && (d.boots.inSession > 0 || (d.boots.total > 0 && d.date < GATE_STATE_SINCE))
+    ).length,
     unknown: r.restarts.filter((d) => d.boots === null).length,
   }
 }
@@ -814,14 +835,15 @@ function tasks(input: {
       out.push({ bucket: '只能靠时间', title: 'M1 跑满一个交易日', why: 'signal 表里一个交易日都没有' })
     } else if (cleanDaysOf(r).clean < 5) {
       /*
-        **只数「那天没重启过」的交易日**（M3 清单 §4.0）。盘中重启会把冷却/配额/台阶
-        清零、同一条止损重新发一次，那样的日子拿去回答 4.1「几条值不值得被打断」
-        必然得出「太吵」，而真实原因是开发期在重启。
+        数的是「零重启」＋「只在盘外重启且在 2026-08-19 之后」两档（M3 清单 §4.0，
+        2026-08-26 放宽）。**盘中**重启仍然作废 —— 但理由换成了「防抖计数 `streaks`
+        不落库 ⇒ 重启后头几轮可能漏一条」，不再是旧那条「冷却清零 ⇒ 重复发」。
+        判据与依据在 `cleanDaysOf` 的头注释，别在这里另写一份。
       */
       const { clean, postOnly, dirty, unknown: unclear } = cleanDaysOf(r)
       const tail = [
         dirty > 0 ? `${dirty} 天盘中重启作废` : null,
-        postOnly > 0 ? `${postOnly} 天只在盘外重启（算不算干净待 §4.0 定）` : null,
+        postOnly > 0 ? `其中 ${postOnly} 天只在盘外重启（**算干净**，§4.0 已放宽）` : null,
         unclear > 0 ? `${unclear} 天日志读不到` : null,
       ]
         .filter((s) => s !== null)
@@ -1169,12 +1191,13 @@ function render(input: {
     L.push('')
     /*
       逐日列重启次数。**这不是运维信息，是判据的有效性** ——
-      重启会清空冷却/配额/台阶，那天的提醒日志不能用来答 M3 的出口条件（清单 §4.0）。
+      **盘中**重启会让防抖计数归零、那天可能漏一条，提醒日志不能用来答 M3 的出口条件
+      （清单 §4.0；旧理由「冷却/配额被清零」已于 08-19 随闸门状态落库而失效）。
     */
     const c = cleanDaysOf(r)
     L.push(
-      `其中**零重启**的交易日 **${c.clean}** 天` +
-        (c.postOnly > 0 ? ` · **只在盘外重启 ${c.postOnly} 天**（当日日志仍可用）` : '') +
+      `其中**可当判据**的交易日 **${c.clean}** 天` +
+        (c.postOnly > 0 ? ` · 其中 **${c.postOnly} 天只在盘外重启**（§4.0 已放宽，算干净）` : '') +
         (c.dirty > 0 ? ` · 盘中重启 ${c.dirty} 天（提醒日志不可当判据）` : '') +
         (c.unknown > 0 ? ` · ${c.unknown} 天日志读不到` : '') +
         '：'
@@ -1193,9 +1216,13 @@ function render(input: {
     if (c.postOnly > 0) {
       L.push('')
       L.push(
-        '> **「只在盘外重启」这一档算不算干净，看板不替你定**（M3 清单 §4.0 的判据问题）。' +
-          '当日的冷却/配额没被污染（那些是当日语义），但 `lastForcedLoss` 是**跨日**的 —— ' +
-          '清零会让**下一个交易日**的同一条止损多发一次。'
+        '> **「只在盘外重启」自 2026-08-26 起计入干净交易日**（M3 清单 §4.0 放宽，' +
+          '依据是**实现变了**：08-19 闸门状态落库进 `meta.alert_gate_state`，' +
+          '连**跨日**的 `lastForcedLoss` 都在里面 ⇒ 「重启 ⇒ 同一条止损重新发一次」' +
+          '这个机制没有了）。⚠ **盘中重启仍然作废**，但理由换成了「防抖计数 `streaks` ' +
+          '刻意不落库 ⇒ 重启后头几轮可能**漏**一条」—— 方向与旧理由相反。' +
+          `⚠ 日期下界 \`${GATE_STATE_SINCE}\`：更早的盘外重启日仍不算干净，` +
+          '**老数据不会因为后来修好了就变得可用**。'
       )
     }
     if (straddlesLocalMidnight()) {
