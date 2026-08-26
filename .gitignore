@@ -31,6 +31,10 @@ data/liquidity-em/
 # ⚠ 刻意与 data/history 分开：往主 fixture 目录里补 2015–2017 的 K 线会改变
 # 那 261 只的预热段，历史回测基线就再也复现不出来了。重出命令写在那个脚本的头注释里
 data/verify-jq/
+# 财务业绩报表（scripts/fetch-financials.mjs 的产物，M2 §5.62）。
+# 可重出：一只票一个请求，261 只约 4 分钟、实测零失败、无需 token。
+# ⚠ **退市股一只都抓不到**（源里就没有，不是限流）—— 那不是待重试，是台账里的硬限制。
+data/financials/
 .vite/
 .eslintcache
 

@@ -92,8 +92,15 @@ const HORIZONS = [5, 10, 20] as const
 /** 逐日横截面至少要这么多个有效标的才算一天 —— 少于它的日子 IC 没有意义 */
 const MIN_CROSS_SECTION = 10
 
-interface Row {
+/**
+ * 横截面表的一行。**导出是为了让别的因子共用 `icOf`** ——
+ * `scripts/verify/factor-ic.ts`（财务因子，M2 §5.62）就是这么接的。
+ * 各写一份 IC 实现的症状是「引擎得分的 IC 与财务因子的 IC 不是同一个口径」，
+ * 而两个数会被并排放进同一张表里比。
+ */
+export interface Row {
   code: SecCode
+  /** 被检验的那个横截面量。对引擎是买入得分，对因子脚本是因子值 */
   score: number
   /** 持有期 → 前瞻收益；数据不够时缺项 */
   fwd: Map<number, number>
