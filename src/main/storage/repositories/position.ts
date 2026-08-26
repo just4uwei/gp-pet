@@ -85,14 +85,48 @@ export class PositionRepo {
   /**
    * 用户确认「接受这一段亏损」，把止损线顺延到 `stopFloor`。
    * 没有这行持仓时什么都不做 —— 不给一条不存在的持仓建止损线。
+   *
+   * ## ⚠ 同时把 `peak_price` 重设为确认那一刻的价（2026-08-26，docs/05 §2.3a）
+   *
+   * 不重设的后果**不是「多一条提醒」，是「回撤减仓从此永久失去信息量」**：
+   * `fromPeak` 会永远停在确认那一刻的大小 ⇒ 回撤减仓天天触发，
+   * 而它说的是一件用户三天前就按下确认的事。
+   * 真机实测 `SZ001296`：成本 23.998、`peak_price` 也是 23.998（建仓后一天没涨过）、
+   * 已确认接受 −19.5% ⇒ `fromPeak = −18.1%` 恒 ≤ −7%，靠「跌幅每再扩大 2%」的台阶硬挡
+   * （M3 复盘那五天里 192 行 `STEP`）。
+   *
+   * 重设之后回撤减仓**仍然带枪**，只是从用户接受的那个位置重新算 ——
+   * **再跌 7% 才响，那时它说的是「跌得比你接受的还多」**，是新信息。
+   *
+   * **为什么动这一列而不是新加一列**：它**本来就不是「历史最高价」**，
+   * 而是**风控用的回撤参考点** —— `bumpPeak` 没值时拿 `cost` 兜底，
+   * `addTrade` 还会显式把它抬到成本价（否则移动止损会拿一个比成本还低的 peak 算回撤）。
+   * 重设一个控制参考点不是篡改事实。价格回升时 `bumpPeak` 会把它一路带上去。
+   *
+   * ⚠ `priceAt` **必须是不复权价**，与 `cost` / `stop_floor` 同一口径（docs/03 §2.3）。
+   * 取不到现价时**不动 `peak_price`** —— 用一个猜出来的价重设参考点，
+   * 比不重设更坏（它会静默地改变一条 L3 强制类规则的触发点）。
    */
-  acceptLoss(code: SecCode, stopFloor: number, lossPct: number, now: number): boolean {
+  acceptLoss(
+    code: SecCode,
+    stopFloor: number,
+    lossPct: number,
+    now: number,
+    priceAt?: number
+  ): boolean {
+    const resetPeak = priceAt !== undefined && Number.isFinite(priceAt) && priceAt > 0
     return (
       this.db
         .prepare(
-          `UPDATE position SET stop_floor = ?, stop_ack_at = ?, stop_ack_loss = ? WHERE code = ?`
+          `UPDATE position SET stop_floor = ?, stop_ack_at = ?, stop_ack_loss = ?` +
+            (resetPeak ? `, peak_price = ?` : '') +
+            ` WHERE code = ?`
         )
-        .run(stopFloor, Math.round(now), lossPct, code).changes > 0
+        .run(
+          ...(resetPeak
+            ? [stopFloor, Math.round(now), lossPct, priceAt, code]
+            : [stopFloor, Math.round(now), lossPct, code])
+        ).changes > 0
     )
   }
 

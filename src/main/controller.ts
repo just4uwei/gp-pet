@@ -494,9 +494,22 @@ export class AppController {
     }
 
     const lossPct = held.cost > 0 && price !== undefined ? ((price - held.cost) / held.cost) * 100 : 0
-    layer.storage.positions.acceptLoss(code, stopFloor, lossPct, Date.now())
+    /*
+      `price` 一起传下去：`acceptLoss` 会把 `peak_price` 重设成确认那一刻的价
+      （docs/05 §2.3a）。不重设的话回撤减仓会永久停在确认时的幅度上、天天触发，
+      而它说的是一件用户刚刚按下确认的事。
+      ⚠ 取不到现价时**不重设** —— 猜一个价去改一条 L3 强制类规则的触发点更坏。
+    */
+    layer.storage.positions.acceptLoss(
+      code,
+      stopFloor,
+      lossPct,
+      Date.now(),
+      ...(price === undefined ? [] : [price])
+    )
     log.info(
-      `[risk] ${code} 用户确认接受 ${lossPct.toFixed(1)}% 的亏损，止损线顺延到 ${stopFloor}`
+      `[risk] ${code} 用户确认接受 ${lossPct.toFixed(1)}% 的亏损，止损线顺延到 ${stopFloor}` +
+        (price === undefined ? '（取不到现价，回撤参考点未重设）' : `，回撤参考点重设为 ${price}`)
     )
     this.onStateChanged()
     const updated = layer.storage.positions.get(code)

@@ -252,10 +252,17 @@ describe('PositionRepo', () => {
     以及用户自己对账用的那张成交表就全错了，而错法是静默的。
 
     判据用逐字段比较而不是「跑完没报错」：`acceptLoss` 是一条 UPDATE，
-    日后有人往 SET 里多加一列（比如「顺手把 peak_price 重置一下」）时，
-    这一条会红。
+    日后有人往 SET 里多加一列时，这一条会红。
+
+    ⚠ **`peak_price` 这一格 2026-08-26 被刻意打开了**（docs/05 §2.3a）。
+    原注释写着「日后有人顺手把 peak_price 重置一下时，这一条会红」——
+    而现在**传了现价就是要重置它**。那不是「顺手」：不重置的后果是
+    回撤减仓永久停在确认那一刻的幅度上、天天触发同一件已确认的事
+    （真机 `SZ001296` 实测，M3 复盘那五天 192 行 `STEP`）。
+    ⇒ 这条用例因此拆成两条：**交易数据仍然一列都不许动**（下面这条），
+    而**回撤参考点按有没有给现价决定**（再下面那条）。
   */
-  it('acceptLoss 只改止损线，成本 / 股数 / 建仓时刻 / 峰值价一律不动', () => {
+  it('acceptLoss 不动任何交易数据：成本 / 股数 / 建仓时刻（不给现价时峰值价也不动）', () => {
     storage.positions.set('SH600000', 1000, 11, 1)
     const before = storage.positions.get('SH600000')
 
@@ -265,9 +272,48 @@ describe('PositionRepo', () => {
     expect(after?.shares).toBe(before?.shares)
     expect(after?.cost).toBe(before?.cost)
     expect(after?.openedAt).toBe(before?.openedAt)
+    // 不给现价 ⇒ **不重设**参考点：猜一个价去改一条 L3 强制类规则的触发点更坏
     expect(after?.peakPrice).toBe(before?.peakPrice)
-    // 变的只有这一样
     expect(after?.stopFloor).toBeCloseTo(9.2, 6)
+  })
+
+  /*
+    **给了现价就把回撤参考点重设到那里**（docs/05 §2.3a）。
+
+    这一条钉的是那个改动**存在的理由**：不重设的话 `fromPeak` 永远等于
+    确认那一刻的回撤幅度 ⇒ 回撤减仓（`fromPeak ≤ −7%`）恒成立、天天响，
+    而它说的是一件用户刚按下确认的事。重设之后它仍然带枪 ——
+    **再跌 7% 才响，那时才是新信息**。
+  */
+  it('acceptLoss 给了现价就把回撤参考点重设到现价 —— 否则回撤减仓永久失去信息量', () => {
+    storage.positions.set('SH600000', 1000, 11, 1)
+    storage.positions.bumpPeak('SH600000', 12) // 曾涨到 12
+    expect(storage.positions.get('SH600000')?.peakPrice).toBeCloseTo(12, 6)
+
+    // 现价 9.9（自 12 回撤 17.5%，早已越过回撤减仓那条 −7%），确认接受
+    storage.positions.acceptLoss('SH600000', 9.1, -10, 555, 9.9)
+
+    const after = storage.positions.get('SH600000')
+    expect(after?.peakPrice).toBeCloseTo(9.9, 6)
+    // 交易数据仍然一列都没动
+    expect(after?.cost).toBeCloseTo(11, 6)
+    expect(after?.shares).toBe(1000)
+    // 而且参考点只被重设、之后照旧随新高上移（bumpPeak 的既有行为）
+    storage.positions.bumpPeak('SH600000', 10.4)
+    expect(storage.positions.get('SH600000')?.peakPrice).toBeCloseTo(10.4, 6)
+    // 反向不动：低于参考点的价不会把它拉下来
+    storage.positions.bumpPeak('SH600000', 9.0)
+    expect(storage.positions.get('SH600000')?.peakPrice).toBeCloseTo(10.4, 6)
+  })
+
+  it('acceptLoss 的现价非法（0 / 负 / NaN）时不重设参考点，其余照常写', () => {
+    storage.positions.set('SH600000', 1000, 11, 1)
+    storage.positions.bumpPeak('SH600000', 12)
+    for (const bad of [0, -1, Number.NaN]) {
+      storage.positions.acceptLoss('SH600000', 9.1, -10, 555, bad)
+      expect(storage.positions.get('SH600000')?.peakPrice).toBeCloseTo(12, 6)
+    }
+    expect(storage.positions.get('SH600000')?.stopFloor).toBeCloseTo(9.1, 6)
   })
 
   it('acceptLoss 不写 trade_log —— 它不是一笔成交', () => {
