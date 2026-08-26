@@ -96,13 +96,24 @@ export interface DispatchContext {
 }
 
 /**
- * 四道闸门的离散标识（`alert_log.suppressed_gate` / `would_block` 的取值）。
+ * 拦下候选的那道闸门 —— `alert_log.suppressed_gate` / `would_block` 的取值。
  *
  * **`reason` 那句话不能拿去分组** —— 它嵌着连续量（「1/2 个 tick」「还有 87 分钟」），
  * 按它 GROUP BY 会得到成百上千个只差一个数字的桶。与 `signalSignature` 里
  * `reasons[0]` 那个坑同一个形状（两天落了 243 行同一条止损）。见 011 迁移的头注释。
+ *
+ * ⚠ **`STEP` 是 2026-08-26 从 `COOLDOWN` 里分出来的**，而分开是 M3 验收的**必要条件**：
+ * `checkCooldown` 一直在处理**两个不同的机制** —— 持仓强制类（`forced`）走的是
+ * 「跌幅每扩大 2% 才再提醒一次」的**台阶**，其余走**同键冷却** —— 但两者都记成 `COOLDOWN`。
+ * 于是 [M3 清单 §4.4](../../../docs/checklists/M3-提醒层验收.md) 那条硬规则
+ * 「**止损类若出现在冷却列 = bug，强制类本不该受冷却**」**在数据上无法判**：
+ * L3 行确实带着 `COOLDOWN`，但它其实是台阶，不是冷却 ⇒ 复盘会报一个假警。
+ * （§4.5 已经提醒过这个形状：「要连着看**是哪一道闸门**记的账」。）
+ *
+ * ⚠ **历史行仍然是 `COOLDOWN`**（不回填）。读取端不做白名单过滤（011 头注释），
+ * 判读 08-26 之前的日志时，`level = 'L3'` + `COOLDOWN` 要按**台阶**读。
  */
-export type AlertGate = 'DEBOUNCE' | 'COOLDOWN' | 'CAP' | 'QUIET'
+export type AlertGate = 'DEBOUNCE' | 'COOLDOWN' | 'STEP' | 'CAP' | 'QUIET'
 
 export interface AlertDecision {
   candidate: AlertCandidate
@@ -279,12 +290,15 @@ export class AlertDispatcher {
       const gate1 = this.checkDebounce(candidate, debounceKey, ctx)
       // ⚠ 无论 ① 有没有拦下来都要算 ②③④ —— 那是 `wouldBlock` 的全部意义。
       // 三个 check 都是纯读（记账在 commit 里），所以提前算不会改变分发行为
+      // ⚠ 强制类走**台阶**、其余走**同键冷却**，两者记成不同的闸门（见 `AlertGate`）
+      const forced = candidate.forced === true
       const gate2 = this.checkCooldown(candidate, now)
+      const gate2Name: AlertGate = forced ? 'STEP' : 'COOLDOWN'
       const gate3 = candidate.level === 'L1' ? null : this.checkCaps(candidate, candidate.level)
       const quiet = ctx.quiet === true && candidate.level !== 'L1'
       const wouldBlock: AlertGate[] = []
       if (gate1) wouldBlock.push('DEBOUNCE')
-      if (gate2) wouldBlock.push('COOLDOWN')
+      if (gate2) wouldBlock.push(gate2Name)
       if (gate3) wouldBlock.push('CAP')
       if (quiet) wouldBlock.push('QUIET')
 
@@ -293,7 +307,7 @@ export class AlertDispatcher {
         continue
       }
       if (gate2) {
-        decisions.push(drop(candidate, gate2, 'COOLDOWN', wouldBlock))
+        decisions.push(drop(candidate, gate2, gate2Name, wouldBlock))
         continue
       }
       survivors.push(candidate)

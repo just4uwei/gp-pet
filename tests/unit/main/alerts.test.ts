@@ -496,9 +496,14 @@ describe('跨重启：snapshot / restore', () => {
     d.dispatch([forced], T0, calm)
 
     const after = restart(d, T0 + 10 * MIN)
-    // 浮亏没再扩大 2%：台阶应当仍然挡着它
+    /*
+      浮亏没再扩大 2%：台阶应当仍然挡着它。
+      ⚠ 闸门名是 **`STEP`** 不是 `COOLDOWN`（2026-08-26 分开的）——
+      持仓强制类**不受同键冷却**，它受的是这条台阶。两者此前共用一个标签，
+      导致 M3 清单 §4.4 那条硬规则（「止损类出现在冷却列 = bug」）在数据上判不了。
+    */
     const same = after.dispatch([candidate({ ...forced, lossPct: -0.085 })], T0 + 10 * MIN, calm)
-    expect(same[0]?.blockedBy).toBe('COOLDOWN')
+    expect(same[0]?.blockedBy).toBe('STEP')
   })
 
   it('跨日重启后当日计数清零 —— restore 会立刻按 now 裁剪一遍', () => {

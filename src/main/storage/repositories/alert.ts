@@ -307,6 +307,9 @@ export class AlertRepo {
     const zero = (): Record<AlertGate, number> => ({
       DEBOUNCE: 0,
       COOLDOWN: 0,
+      // 2026-08-26 从 COOLDOWN 分出来的**强制类台阶**（见 `AlertGate` 头注释）。
+      // ⚠ 历史行不回填 ⇒ 08-26 之前的台阶仍然计在 COOLDOWN 那一格里
+      STEP: 0,
       CAP: 0,
       QUIET: 0,
     })

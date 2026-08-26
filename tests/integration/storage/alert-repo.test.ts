@@ -212,9 +212,9 @@ describe('AlertRepo.gateFunnel', () => {
 
     const f = storage.alerts.gateFunnel(T0 - 1, T0 + 1)
     // 实际拦截：只算第一道 ⇒ 冷却与配额都是 0，单看这一行会以为它们形同虚设
-    expect(f.blockedBy).toEqual({ DEBOUNCE: 1, COOLDOWN: 0, CAP: 0, QUIET: 0 })
+    expect(f.blockedBy).toEqual({ DEBOUNCE: 1, COOLDOWN: 0, STEP: 0, CAP: 0, QUIET: 0 })
     // 独立判定：三道各自都会拦 ⇒ 和 = 3 > 候选数 1，这是**预期**的重叠
-    expect(f.wouldBlock).toEqual({ DEBOUNCE: 1, COOLDOWN: 1, CAP: 1, QUIET: 0 })
+    expect(f.wouldBlock).toEqual({ DEBOUNCE: 1, COOLDOWN: 1, STEP: 0, CAP: 1, QUIET: 0 })
   })
 
   it('空串 wouldBlock 是「四道都放行」，与 null「没记录」必须分开', async () => {
