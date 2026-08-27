@@ -33,8 +33,14 @@ export interface DataSource {
  * 代码 → 缺省的 SecProfile。
  *
  * 板块由代码段推出（涨跌停比例只依赖它）；名称与 ST 标记数据源不一定有，
- * 缺时按「非 ST」处理，并在报告里注明 —— ST 降级规则因此在回测中偏乐观，
- * 这个偏差要写在报告里而不是藏起来。
+ * 缺时按「非 ST」处理 —— **偏差方向是偏乐观**（真 ST 涨停在 +5%，按 +10% 算会让
+ * 该被挡住的买入放行）。
+ *
+ * ⚠ **`name` 必须传，而且今天没有任何东西在挡漏传。** 原注释写着「缺时……并在报告里注明」，
+ * 而**报告里从来没有那一行**（2026-08-27 查证）—— 于是 `openFixtureSource` 漏传名字这件事
+ * 静默存在了很久：549 份 fixture 里 225 份名称带 ST/退，退市池 **212/233 = 91%**
+ * 全被当成非 ST（M2 §5.66）。**这是「写下一条纪律不等于装上一道闸门」的又一个实例。**
+ * ⇒ 调用方自己负责传；`profile.name === code` 就是「名字未知」的标志。
  */
 export function fallbackProfile(code: SecCode, name?: string): SecProfile {
   const parsed = splitCode(code)
@@ -153,10 +159,23 @@ export function openFixtureSource(
       const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
       const raw = Array.isArray(parsed)
         ? { candles: parsed as Candle[] }
-        : (parsed as { profile?: SecProfile; candles: Candle[] })
+        : (parsed as {
+            profile?: SecProfile
+            candles: Candle[]
+            _meta?: { nameAtFetch?: string }
+          })
       const candles = raw.candles.filter((c) => c.date >= range.from && c.date <= range.to)
       if (candles.length === 0) return null
-      return { profile: raw.profile ?? fallbackProfile(code), candles }
+      // `_meta.nameAtFetch` 是 `fetch:history` 落盘时的名称。不读它的后果是
+      // `fallbackProfile(code)` 把代码当名字 ⇒ `isST` 恒 false ⇒ **全按 ±10% 算涨跌停**，
+      // 而 549 份 fixture 里 225 份名称带 ST/退（退市池 212/233 = 91%）
+      // ⇒ 该被涨停挡住的买入被放行，偏差方向**偏乐观**（M2 §5.66）。
+      // ⚠ 它是**抓取时**的名字，不是每一天的状态 ⇒ 这只把「完全不知道」升级成
+      // 「知道今天的状态」，**仍是时点错误**；逐日 `isST` 要 baostock（见信源台账 §4）。
+      return {
+        profile: raw.profile ?? fallbackProfile(code, raw._meta?.nameAtFetch),
+        candles,
+      }
     },
     close: () => {},
   }
