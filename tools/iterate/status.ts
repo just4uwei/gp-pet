@@ -273,6 +273,19 @@ interface AlphaSnapshot {
     paired: number | null
     /** 中位口径的配对胜率（2026-08-20 加，M2 §5.45）。旧报告没有这个字段 ⇒ null */
     pairedMedian: number | null
+    /**
+     * **效应量** `μ` = 真实中位 − 随机中位（2026-08-27 加，M2 §5.74）。
+     *
+     * **为什么它必须与胜率并排印**：配对胜率是 `Φ(μ/σ_D)` 的**饱和变换**
+     * ⇒ 这张表**竖着比幅度是无效的**（33 层里按两者排序 Spearman 只有 0.865，
+     * 最大错位 11 位）。而 §5.73 ④ 当天就这么读错过一次 ——
+     * 把 `RANGE` 的 13.1pp 当成「分辨力集中在 RANGE」，
+     * 而它底层的 `μ` 比 `TRANSITION` 小 2.7 倍。
+     * ⇒ 一条纪律挡不住这个坑，把效应量放在同一行才挡得住。
+     *
+     * 旧报告缺 `passiveMedianMean` / `randomMedianMean` 时是 **null 不是 0**（约束 4）。
+     */
+    effectSize: number | null
     percentile: number
   }[]
 }
@@ -304,7 +317,13 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
           label: string
           realCount: number
           passivePercentile: number
-          shuffled: { pairedWinFraction: number; pairedMedianWinFraction?: number } | null
+          shuffled: {
+            pairedWinFraction: number
+            pairedMedianWinFraction?: number
+            /** 效应量 μ 的两个分量（M2 §5.74）。老报告可能没有 ⇒ 算不出就落 null */
+            passiveMedianMean?: number
+            randomMedianMean?: number
+          } | null
         }[]
       }
       if (!j.strata) continue
@@ -340,6 +359,15 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
             count: s.realCount,
             paired: s.shuffled?.pairedWinFraction ?? null,
             pairedMedian: s.shuffled?.pairedMedianWinFraction ?? null,
+            /*
+              μ = 真实中位 − 随机中位。**两个分量缺任一就落 null**（约束 4）——
+              用 0 冒充会让「这份报告太老没有这个字段」看起来像「效应量正好是零」。
+            */
+            effectSize:
+              s.shuffled?.passiveMedianMean === undefined ||
+              s.shuffled?.randomMedianMean === undefined
+                ? null
+                : s.shuffled.passiveMedianMean - s.shuffled.randomMedianMean,
             percentile: s.passivePercentile,
           })),
       })
@@ -1034,12 +1062,13 @@ function render(input: {
         `${a.matchRegime ? '同 regime' : '无条件'}${a.shuffleSpans ? ' · 打散跨度' : ' · ⚠ 未打散跨度'}）`
     )
     L.push('')
-    L.push('| 分层 | 建仓 | 配对胜率·加权 | **配对胜率·中位** | 被动分位 |')
-    L.push('|---|---|---|---|---|')
+    L.push('| 分层 | 建仓 | 配对胜率·加权 | **配对胜率·中位** | **效应量 μ** | 被动分位 |')
+    L.push('|---|---|---|---|---|---|')
     for (const s of a.byStratum) {
       L.push(
         `| ${s.label} | ${s.count} | ${s.paired === null ? '—' : pct(s.paired)} | ` +
-          `${s.pairedMedian === null ? '—' : `**${pct(s.pairedMedian)}**`} | ${pct(s.percentile)} |`
+          `${s.pairedMedian === null ? '—' : `**${pct(s.pairedMedian)}**`} | ` +
+          `${s.effectSize === null ? '—' : pct(s.effectSize)} | ${pct(s.percentile)} |`
       )
     }
     L.push('')
@@ -1059,7 +1088,7 @@ function render(input: {
         '效应量的**饱和变换** —— 灵敏度在 50% 处最大、往 0%/100% 两端塌缩，而 `σ_D ∝ 1/√n` ' +
         '⇒ **层越大胜率越极端**。实测 33 层里按胜率排 vs 按效应量排 Spearman 只有 **0.865**，' +
         '最大错位 **11 位**（`ALL` 胜率排 30/33 而它的效应量只排 19/33）。' +
-        '要比幅度就看 `pnpm audit:random` 打印表里的 **效应量 μ** 那一列。' +
+        '**要比幅度就看这张表的「效应量 μ」列**（μ = 真实中位 − 随机中位）。' +
         '✅ **阈值型用法不受影响** —— `Φ` 单调 ⇒ 「> 50%」等价于「μ > 0」，L2 条件① 一字不改。'
     )
     // 零分布的时间结构必须与数字一起印（§4.6）：只报数字不报口径，读的人无从判断

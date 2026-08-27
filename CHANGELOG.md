@@ -40,8 +40,16 @@ UI 与工程改动看 git 历史，不必往这里搬。
 **动了什么（唯一的生产代码改动）**：`src/backtest/random-audit.ts` 的打散跨度表
 **加了一列「效应量 μ」**（数据早就在 JSON 的 `passiveMedianMean`/`randomMedianMean` 里，
 只是从没印过差值），并在表下印了饱和纪律与「不受影响的用法」；
-`tools/iterate/status.ts` 那张四层表加了同一条（它最常被竖着读）。
-`renderText` 因此改为导出，供用例断言。
+`tools/iterate/status.ts` 那张四层表加了同一条（它最常被竖着读），
+**并把 μ 接成了一列**（`effectSize`）。`renderText` 因此改为导出，供用例断言。
+
+接上看板那一列之后**立刻纠正了一个正在生效的误读**：只看胜率会以为 `ALL`（中位 **8.50%**）
+几乎和 `TRANSITION`（**0.00%**）一样差，而 μ 说 **`TRANSITION` 是 −1.26% 而 `ALL` 只有 −0.36%
+（差 3.5 倍）**，`ALL` 其实更靠近 `TREND_UP`（−0.24%）。
+⚠ 这张四层表上**排序方向没有倒挂**（两种口径都把 `TRANSITION` 排最差、`RANGE` 最好）
+—— 倒挂出现在 33 层那张宽表上。**失真的是间距，不是次序。**
+⚠ 看板那一列目前只有**类型层**保护（`effectSize` 必填，删了 typecheck 会红），
+没有文案用例 —— `status.ts` 的渲染整体没有测试。
 
 **闸门**：`tests/unit/backtest/random-audit.test.ts` **+5 条**（1845 → 1850）。
 **验证过它抓得住** —— 临时删掉纪律行与 μ 列，3 条立刻变红。
