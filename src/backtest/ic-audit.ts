@@ -86,6 +86,31 @@ function evalFromOf(argv: readonly string[]): string | null {
   return i >= 0 ? (argv[i + 1] ?? null) : null
 }
 
+/** `--industry <file>`：申万行业变迁史（`pnpm fetch:industry` 的产物）。不给就不做中性化。 */
+function industryFileOf(argv: readonly string[]): string | null {
+  const i = argv.indexOf('--industry')
+  return i >= 0 ? (argv[i + 1] ?? null) : null
+}
+
+/**
+ * 把本文件自己处理的旗标从 argv 里摘掉再交给 `parseArgs`。
+ *
+ * ⚠ **必须连值一起摘**：只摘旗标名会让下一个词（路径/日期）被当成位置参数。
+ */
+function stripLocalFlags(argv: readonly string[]): string[] {
+  const LOCAL = new Set(['--eval-from', '--industry'])
+  const out: string[] = []
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i]
+    if (a !== undefined && LOCAL.has(a)) {
+      i += 1 // 跳过它的值
+      continue
+    }
+    if (a !== undefined) out.push(a)
+  }
+  return out
+}
+
 /** 预注册写死的三个持有期（交易日）。它们不是三次尝试，是同一问题的三个时间尺度 */
 const HORIZONS = [5, 10, 20] as const
 
@@ -283,6 +308,151 @@ export function icOf(byDate: Map<TradeDate, Row[]>, horizon: number): IcResult {
   }
 }
 
+// ────────────────────── 行业中性化（预注册见 M2 §5.68） ──────────────────────
+
+/**
+ * 申万行业变迁史 → `(code, date) → 一级行业码`，**按时点取**。
+ *
+ * ⚠ **PIT 是这一层唯一不能出错的地方**：取 `startDate <= 该日` 的**最后一条**。
+ * 拿今天的归属去回标 2018 年是未来函数 —— 而这份数据存在的全部理由就是避免它
+ * （东财 `f127` 只给当前归属，那条路做不了这件事）。错了不会报错，只会让 IC 变好看。
+ */
+export function loadIndustryAsOf(
+  file: string
+): (code: SecCode, date: TradeDate) => string | null {
+  const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
+    rows?: { code: string; l1: string; startDate: string }[]
+  }
+  const rows = parsed.rows ?? []
+  if (rows.length === 0) {
+    throw new Error(`${file} 里没有 rows —— 先跑 pnpm fetch:industry`)
+  }
+  const byCode = new Map<string, { l1: string; startDate: string }[]>()
+  for (const r of rows) {
+    const list = byCode.get(r.code)
+    if (list) list.push(r)
+    else byCode.set(r.code, [r])
+  }
+  for (const list of byCode.values()) list.sort((a, b) => a.startDate.localeCompare(b.startDate))
+  return (code, date) => {
+    // 我们的代码是 `SH600000`，申万表里是六位
+    const list = byCode.get(code.slice(2))
+    if (!list) return null
+    let hit: string | null = null
+    for (const r of list) {
+      if (r.startDate <= date) hit = r.l1
+      else break
+    }
+    return hit
+  }
+}
+
+export interface NeutralizeStats {
+  horizon: number
+  /** 该持有期上原本可用的观测数（与 `icOf` 的 `usable` 同一口径） */
+  rowsIn: number
+  rowsOut: number
+  droppedNoIndustry: number
+  droppedSmallGroup: number
+  daysIn: number
+  /**
+   * 组规模的中位数（丢弃前），用来判「中性化吃掉了多少自由度」。
+   * **一组都没有时是 `null` 不是 0**（约束 4）—— 0 会被读成「组里一只票都没有」。
+   */
+  medianGroupSize: number | null
+}
+
+/**
+ * **行业中性化**：逐日、组内、对秩去均值。返回可直接喂给 `icOf` 的新 `byDate`。
+ *
+ * 口径（预注册 §5.68，事后不许改）：
+ * 1. **先在当日全横截面算秩**（`score` 与该持有期的 `fwd` 各一次），**再**在行业组内减组均值；
+ * 2. 组规模 < `minGroup` 的整组丢弃 —— 组内只有 1 只时两侧残差**恒为 0**，
+ *    不携带任何组内排序信息，留着只是往 Spearman 里注入一大块 0 的并列；
+ * 3. 拿不到行业的行丢弃并计数（**不许当成一个「其它」组** —— 那会把一批互不相关的票
+ *    绑成一个伪行业，而它的组均值没有任何含义）。
+ *
+ * **为什么能干净地复用 `icOf`**：Spearman 对单调变换不变 ⇒ `icOf` 把残差再排一次秩
+ * 不改变相关系数。所以原始那一臂与中性那一臂走的是**同一个** IC 实现。
+ *
+ * ⚠ 它**减掉**了行业那一层，**不是测量**了它 —— 答不了「行业轮动有没有 alpha」。
+ */
+export function neutralizeByIndustry(
+  byDate: Map<TradeDate, Row[]>,
+  industryOf: (code: SecCode, date: TradeDate) => string | null,
+  horizon: number,
+  minGroup = 2
+): { byDate: Map<TradeDate, Row[]>; stats: NeutralizeStats } {
+  const out = new Map<TradeDate, Row[]>()
+  const stats: NeutralizeStats = {
+    horizon,
+    rowsIn: 0,
+    rowsOut: 0,
+    droppedNoIndustry: 0,
+    droppedSmallGroup: 0,
+    daysIn: 0,
+    medianGroupSize: null,
+  }
+  const groupSizes: number[] = []
+
+  for (const [date, rows] of byDate) {
+    const usable = rows.filter((r) => r.fwd.has(horizon))
+    if (usable.length === 0) continue
+    stats.daysIn += 1
+    stats.rowsIn += usable.length
+
+    // ① 全横截面的秩（在丢弃之前算 —— 预注册第 1 条）
+    const scoreRanks = ranksOf(usable.map((r) => r.score))
+    const fwdRanks = ranksOf(usable.map((r) => r.fwd.get(horizon) ?? 0))
+
+    // ② 按行业分组
+    const groups = new Map<string, number[]>()
+    usable.forEach((r, i) => {
+      const ind = industryOf(r.code, date)
+      if (ind === null) {
+        stats.droppedNoIndustry += 1
+        return
+      }
+      const list = groups.get(ind)
+      if (list) list.push(i)
+      else groups.set(ind, [i])
+    })
+
+    // ③ 组内对秩去均值，小组整组丢弃
+    const kept: Row[] = []
+    for (const idx of groups.values()) {
+      groupSizes.push(idx.length)
+      if (idx.length < minGroup) {
+        stats.droppedSmallGroup += idx.length
+        continue
+      }
+      let ms = 0
+      let mf = 0
+      for (const i of idx) {
+        ms += scoreRanks[i] ?? 0
+        mf += fwdRanks[i] ?? 0
+      }
+      ms /= idx.length
+      mf /= idx.length
+      for (const i of idx) {
+        const row = usable[i]
+        if (!row) continue
+        kept.push({
+          code: row.code,
+          score: (scoreRanks[i] ?? 0) - ms,
+          fwd: new Map([[horizon, (fwdRanks[i] ?? 0) - mf]]),
+        })
+      }
+    }
+    if (kept.length > 0) {
+      out.set(date, kept)
+      stats.rowsOut += kept.length
+    }
+  }
+  stats.medianGroupSize = median(groupSizes)
+  return { byDate: out, stats }
+}
+
 /** 逐标的扫一遍判定根，把 (日期, 得分, 前瞻收益) 收进横截面表 */
 export function collect(
   series: LoadedSeries,
@@ -350,6 +520,34 @@ function pct(v: number | null, digits = 3): string {
   return v === null ? '—' : `${(v * 100).toFixed(digits)}%`
 }
 
+/**
+ * 行业中性那一臂的打印。**单独一个函数**是因为 `render` 内部对每个持有期重算 `icOf`，
+ * 而中性化后的 `byDate` **每个持有期一份**（组的可用集合随 `fwd.has(h)` 变）
+ * ⇒ 不能传一个 map 进去。
+ */
+function renderNeutral(
+  label: string,
+  results: readonly (IcResult & { horizon: number; neutralize: NeutralizeStats })[]
+): string[] {
+  const lines = ['', `【${label}】`]
+  lines.push(
+    '  持有期  有效交易日   平均 IC      IC 标准差    t(NW,L=h−1)   组规模中位  丢弃(无行业/小组)   保留观测'
+  )
+  for (const r of results) {
+    const num = (v: number | null): string => (v === null ? '—' : v.toFixed(2))
+    const s = r.neutralize
+    const dropped = s.rowsIn === 0 ? 0 : (s.droppedNoIndustry + s.droppedSmallGroup) / s.rowsIn
+    lines.push(
+      `  ${String(r.horizon).padStart(4)} 日  ${String(r.days).padStart(10)}  ${pct(r.meanIc, 4).padStart(10)}  ` +
+        `${pct(r.sdIc, 4).padStart(12)}  ${`${num(r.tNw)}(L=${r.lagNw})`.padStart(12)}  ` +
+        `${(s.medianGroupSize === null ? '—' : s.medianGroupSize.toFixed(1)).padStart(9)}  ` +
+        `${`${s.droppedNoIndustry}/${s.droppedSmallGroup} = ${(dropped * 100).toFixed(1)}%`.padStart(17)}  ` +
+        `${String(s.rowsOut).padStart(9)}`
+    )
+  }
+  return lines
+}
+
 function render(
   label: string,
   byDate: Map<TradeDate, Row[]>,
@@ -383,7 +581,8 @@ function render(
 
 export async function main(argv: readonly string[]): Promise<number> {
   const evalFrom = evalFromOf(argv)
-  const rest = evalFrom === null ? argv : argv.filter((a, i) => a !== '--eval-from' && argv[i - 1] !== '--eval-from')
+  const industryFile = industryFileOf(argv)
+  const rest = stripLocalFlags(argv)
   let options: CliOptions | 'help'
   try {
     options = parseArgs(rest)
@@ -446,6 +645,23 @@ ${USAGE}`)
       if (kept.length > 0) positive.set(date, kept)
     }
 
+    /*
+      行业中性化那一臂（预注册 §5.68）。**只在给了 `--industry` 时才算** ——
+      不给时 payload 逐字段与旧报告相同，既有的 `ic-*.json` 不会因此变得读不出来。
+      两个子集都做，因为预注册里主子集是 `positiveOnly`、`all` 并排报。
+    */
+    const industryOf = industryFile === null ? null : loadIndustryAsOf(industryFile)
+    const neutral = industryOf === null ? null : {
+      all: HORIZONS.map((h) => {
+        const { byDate, stats } = neutralizeByIndustry(all, industryOf, h)
+        return { horizon: h, ...icOf(byDate, h), neutralize: stats }
+      }),
+      positiveOnly: HORIZONS.map((h) => {
+        const { byDate, stats } = neutralizeByIndustry(positive, industryOf, h)
+        return { horizon: h, ...icOf(byDate, h), neutralize: stats }
+      }),
+    }
+
     const payload = {
       meta: {
         engineVersion: engineVersionOf(params),
@@ -456,12 +672,16 @@ ${USAGE}`)
         horizons: HORIZONS,
         minCrossSection: MIN_CROSS_SECTION,
         evalFrom,
+        industryFile,
         judged: counters.judged,
         unusable: counters.unusable,
         zeroScore: counters.zeroScore,
       },
       all: HORIZONS.map((h) => ({ horizon: h, ...icOf(all, h) })),
       positiveOnly: HORIZONS.map((h) => ({ horizon: h, ...icOf(positive, h) })),
+      ...(neutral === null
+        ? {}
+        : { industryNeutralAll: neutral.all, industryNeutralPositiveOnly: neutral.positiveOnly }),
     }
 
     if (options.out !== undefined) {
@@ -480,6 +700,21 @@ ${USAGE}`)
         ` · ${engineVersionOf(params)}`,
       ...render('全体（含买入得分为 0 的并列）', all, counters),
       ...render('得分 > 0 的子集', positive, counters),
+      ...(neutral === null
+        ? []
+        : [
+            ...renderNeutral('行业中性 · 全体（申万一级，组内对秩去均值）', neutral.all),
+            ...renderNeutral(
+              '行业中性 · 得分 > 0 的子集（**§5.68 的主判据**）',
+              neutral.positiveOnly
+            ),
+            '',
+            '  行业中性 = 逐日先算全横截面的秩，再在申万一级组内减组均值（组规模 < 2 整组丢弃，',
+            '    拿不到行业的行丢弃、**不并成「其它」组**）。行业按**时点**取（`startDate <= 该日`）——',
+            '    用今天的归属回标历史是未来函数，而那正是这份数据存在的理由。',
+            '  ⚠ 它**减掉**了行业那一层，**不是测量**了它 ⇒ 答不了「行业轮动有没有 alpha」。',
+            '  ⚠ 中性化吃自由度 ⇒ 就算点估计不动，`t` 也会变小（组规模中位那一列就是它的量）。',
+          ]),
       '',
       '  IC 是逐日横截面的 Spearman 秩相关（得分 vs 前瞻收益），**不构造零分布**（§5.46）。',
       '  t(朴素) = mean(IC)/(sd(IC)/√有效交易日) —— 把交易日当独立样本，**是上界，不许引用**。',
