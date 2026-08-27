@@ -594,6 +594,187 @@ function normalCdf(x: number): number {
   return x >= 0 ? 1 - p : p
 }
 
+/** mulberry32 —— 32 位整数运算（教科书 LCG 在 JS 双精度里会溢出，M2 §5.60 踩过）。可复现是硬要求 */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0
+    let t = a
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+/**
+ * 一条样本上的 `Δ̂` 与**块结构**标准误（LW 2008 Eq. (8) + 原文 §3.2.2 的 `Ω̂*`）。
+ *
+ * ⚠ 与 `sharpeDiffHac` 里那个核估计**不是同一套**，而这正是原文的设计：
+ * 自举样本由**独立的块**拼成 ⇒ 块和之间独立 ⇒ 直接用块和的样本协方差，**不需要核**
+ * （Götze & Künsch 1996）。
+ *
+ * ⚠ **这里不带 `T/(T−4)`**：那个小样本修正是原文**核估计** `Ω̂_T` 定义的一部分，
+ * 不是 `Ω̂*` 的（原文 `Ω̂* = l⁻¹ Σ_j ζ_j ζ_j′`，没有这一项）。抄过来会让内外层口径不一致。
+ */
+function diffWithBlockSe(
+  ra: readonly number[],
+  rb: readonly number[],
+  block: number
+): { delta: number; se: number } | null {
+  const T = Math.min(ra.length, rb.length)
+  const l = Math.floor(T / block)
+  if (l < 2) return null
+  const muA = mean(ra)
+  const muB = mean(rb)
+  const varA = ra.reduce((s, v) => s + (v - muA) ** 2, 0) / T
+  const varB = rb.reduce((s, v) => s + (v - muB) ** 2, 0) / T
+  const floorOf = (xs: readonly number[]): number =>
+    (1e-9 * xs.reduce((m, v) => Math.max(m, Math.abs(v)), Number.MIN_VALUE)) ** 2
+  if (varA <= floorOf(ra) || varB <= floorOf(rb)) return null
+  const gammaA = varA + muA * muA
+  const gammaB = varB + muB * muB
+  const gradient = [
+    gammaA / varA ** 1.5,
+    -gammaB / varB ** 1.5,
+    (-muA / 2) * varA ** -1.5,
+    (muB / 2) * varB ** -1.5,
+  ]
+  // ζ_j = b^(−1/2) Σ_{t=1..b} y*_{(j−1)b+t}，Ω̂* = l⁻¹ Σ_j ζ_j ζ_j′
+  const omega = [0, 1, 2, 3].map(() => [0, 0, 0, 0])
+  const invSqrtB = 1 / Math.sqrt(block)
+  for (let j = 0; j < l; j++) {
+    const zeta = [0, 0, 0, 0]
+    for (let t = 0; t < block; t++) {
+      const i = j * block + t
+      const a = ra[i] ?? 0
+      const b = rb[i] ?? 0
+      zeta[0] = (zeta[0] ?? 0) + (a - muA)
+      zeta[1] = (zeta[1] ?? 0) + (b - muB)
+      zeta[2] = (zeta[2] ?? 0) + (a * a - gammaA)
+      zeta[3] = (zeta[3] ?? 0) + (b * b - gammaB)
+    }
+    for (let p = 0; p < 4; p++) {
+      for (let q = 0; q < 4; q++) {
+        const row = omega[p]
+        if (row) row[q] = (row[q] ?? 0) + (zeta[p] ?? 0) * invSqrtB * ((zeta[q] ?? 0) * invSqrtB)
+      }
+    }
+  }
+  let quad = 0
+  for (let p = 0; p < 4; p++) {
+    for (let q = 0; q < 4; q++) {
+      quad += (gradient[p] ?? 0) * (gradient[q] ?? 0) * ((omega[p]?.[q] ?? 0) / l)
+    }
+  }
+  if (!(quad > 0)) return null
+  return {
+    delta: muA / Math.sqrt(varA) - muB / Math.sqrt(varB),
+    se: Math.sqrt(quad / T),
+  }
+}
+
+export interface SharpeDiffBootstrapResult {
+  /** 块长 */
+  block: number
+  /** 重抽样次数 */
+  resamples: number
+  /** `PV = (#{d*_m ≥ d} + 1)/(M + 1)`，LW 2008 Eq. (9) */
+  pValue: number
+  /** 原始统计量 `d = |Δ̂| / s(Δ̂)`（`s` 来自 `sharpeDiffHac`，即 Bartlett + Andrews） */
+  d: number
+  /** 因块结构退化而作废的重抽样次数（`Ω̂*` 非正定等）—— 必须报，静默丢样本会让 `PV` 偏掉 */
+  dropped: number
+  /** `PV` 自己的蒙特卡洛标准误 `√(p(1−p)/M)` —— 引用 `PV` 必须带它（同 §5.76 的 `trials`） */
+  monteCarloSe: number
+}
+
+/**
+ * **两条相关收益序列的夏普之差**的 `p` 值：**studentized 循环块自举**。
+ *
+ * 归属：**Ledoit, O. & Wolf, M.** (2008), *Robust performance hypothesis testing with the
+ * Sharpe ratio*, **J. Empirical Finance 15(4) 850–859** §3.2.2 + Remark 3.2（一手核对，M2 §5.80）·
+ * 循环块自举本身是 **Politis & Romano (1992)** · 块结构标准误是 **Götze & Künsch (1996)**。
+ *
+ * ```
+ * d      = |Δ̂| / s(Δ̂)                          ← s 来自原始数据（核估计）
+ * d*_m   = |Δ̂*_m − Δ̂| / s(Δ̂*_m)               ← **中心化**；s* 用块结构，逐样本各算一个
+ * PV     = (#{ d*_m ≥ d } + 1) / (M + 1)        ← Eq. (9)
+ * ```
+ *
+ * ## 为什么需要它（`sharpeDiffHac` 已经给了一个 `p`）
+ *
+ * **LW 原文明说 HAC 推断在中小样本上偏自由**（拒真过多）⇒ 落在 0.01–0.10 那个区间里的
+ * `p_HAC` 系统性偏小，**方向不保守**。而这个项目已经在三处引用过那样的 `p`
+ * （M2 §5.60 / §5.77 / §5.79）。原文推荐的就是这个自举，HAC 只是它给的备选。
+ *
+ * ## ⚠ 四条抄错就静默给错数的地方
+ *
+ * 1. **每个自举样本用它自己的标准误** —— 原文点名 Vinod & Morey (1999) 的错误是
+ *    「对所有自举统计量共用一个标准误」。内层绝不能复用外层的 `s(Δ̂)`。
+ * 2. **`d*` 必须减 `Δ̂`**：自举世界的真值是 `Δ̂` 而不是 0。不减就变成检验
+ *    「自举分布偏离 0 吗」，那是另一个问题。
+ * 3. **`PV` 的 `+1` 不是平滑**，是把观测统计量自己算作一次；写成 `#/M` 会给出 `p = 0`。
+ * 4. **块长 `b` 是个由研究者申报、外部无法审计的自由度** ⇒ 调用方要**报一整条网格**，
+ *    不许挑一档（同 DSR 的 `N`，M2 §5.48 ④）。原文的 `b̂ = 4 / 6` 是 **T = 120 的周/月频**
+ *    数据上校准出来的，**不能搬到日频 T ≈ 1240 上**。
+ *
+ * ⚠ **我们的 `s(Δ̂)` 用 Bartlett + Andrews，而原文推荐预白化 QS 核** —— 那是一处
+ * 已知偏差（M2 §5.60 易读错 ④），本函数不修它：换核是另一次改动。
+ *
+ * @param lag `s(Δ̂)` 的 HAC 滞后阶（走 Andrews 规则，不许看着结果挑）
+ * @param block 块长。`1` 退化成 iid 自举（原文脚注 9）
+ * @returns 样本不足 / 方差退化 / 块长过大时给 **null**，不用 0 冒充
+ */
+export function sharpeDiffBootstrap(
+  a: readonly number[],
+  b: readonly number[],
+  opts: { lag: number; block: number; resamples: number; seed: number }
+): SharpeDiffBootstrapResult | null {
+  const T = Math.min(a.length, b.length)
+  const base = sharpeDiffHac(a, b, opts.lag)
+  if (base === null || opts.block < 1 || opts.resamples < 1) return null
+  if (Math.floor(T / opts.block) < 2) return null
+  const d = Math.abs(base.delta) / base.standardError
+  const ra = a.slice(0, T)
+  const rb = b.slice(0, T)
+  const rand = mulberry32(opts.seed)
+  const blocks = Math.ceil(T / opts.block)
+
+  let exceed = 0
+  let dropped = 0
+  const sa = new Array<number>(T)
+  const sb = new Array<number>(T)
+  for (let m = 0; m < opts.resamples; m++) {
+    // 循环块：块起点均匀取自 [0,T)，块内下标 mod T（原文脚注 7：循环是为了避开移动块的边缘效应）
+    let n = 0
+    for (let k = 0; k < blocks && n < T; k++) {
+      const start = Math.floor(rand() * T) % T
+      for (let t = 0; t < opts.block && n < T; t++, n++) {
+        const i = (start + t) % T
+        sa[n] = ra[i] ?? 0
+        sb[n] = rb[i] ?? 0
+      }
+    }
+    const boot = diffWithBlockSe(sa, sb, opts.block)
+    if (boot === null) {
+      dropped++
+      continue
+    }
+    if (Math.abs(boot.delta - base.delta) / boot.se >= d) exceed++
+  }
+  const used = opts.resamples - dropped
+  if (used < 1) return null
+  const pValue = (exceed + 1) / (used + 1)
+  return {
+    block: opts.block,
+    resamples: used,
+    pValue,
+    d,
+    dropped,
+    monteCarloSe: Math.sqrt((pValue * (1 - pValue)) / used),
+  }
+}
+
 /** 信息比率：超额收益的年化均值 / 年化跟踪误差 */
 export function informationRatio(
   strategy: readonly number[],

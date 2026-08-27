@@ -34,8 +34,16 @@
  * - 滞后阶一律走 Andrews 规则，**不许看着结果挑**。
  */
 import { readFileSync } from 'node:fs'
+
+/**
+ * 自举重抽样次数。**预注册 4999，不是原文的 499** —— 理由是 M2 §5.76 那条
+ * `trials` 的教训：`PV` 也是一个**重抽样次数上的比例** ⇒ `SE ≈ √(p(1−p)/M)`，
+ * `M = 499` 在 `p ≈ 0.09` 上给 1.3pp 的蒙特卡洛噪音，而我们要判的恰恰是
+ * 「它在 0.05 的哪一边」。4999 压到 0.4pp。
+ */
+const BOOT_M = 4999
 import { andrewsLag } from '../../src/backtest/ic-audit'
-import { BARS_PER_YEAR, alignedReturns, sharpeDiffHac } from '../../src/backtest/metrics'
+import { BARS_PER_YEAR, alignedReturns, sharpeDiffBootstrap, sharpeDiffHac } from '../../src/backtest/metrics'
 import { DEFAULT_COSTS } from '../../src/backtest/costs'
 import { loadBars, returnsOfBars, simulatePath, volTargetLegs } from '../../src/backtest/vol-target'
 
@@ -203,6 +211,28 @@ function report(
   console.log(`| **朴素合成 SE**（两条单腿平方相加） | ±${num(r.naiveCombinedSe * ann, 3)} |`)
   console.log(`| **朴素 / LW** | **${num(r.naiveRatio, 2)} 倍** |`)
   console.log(`| \`z\` | **${num(r.z, 3)}** · p = ${num(r.pValue, 4)} |`)
+
+  /*
+    LW 原文推荐的**循环块自举**（M2 §5.80）。**整条网格一起报，不提供选一档的接口**
+    —— `b` 是一个由研究者申报、外部无法审计的自由度，同 DSR 的 `N`（§5.48 ④）。
+    原文的 `b̂ = 4 / 6` 是 **T = 120 的周/月频**上校准的，搬不到日频 T ≈ 1240。
+  */
+  const grid = [1, 5, 10, 20, 40]
+  console.log('')
+  console.log(`| 块长 \`b\` | 自举 \`p\`（M = ${BOOT_M}, seed 1） | 蒙特卡洛 SE | 作废重抽样 |`)
+  console.log('|---|---|---|---|')
+  for (const block of grid) {
+    const boot = sharpeDiffBootstrap(a, b, { lag, block, resamples: BOOT_M, seed: 1 })
+    if (!boot) {
+      console.log(`| ${block} | 算不出（块长过大 / 退化） | — | — |`)
+      continue
+    }
+    console.log(
+      `| ${block} | **${num(boot.pValue, 4)}** | ±${num(boot.monteCarloSe, 4)} | ${boot.dropped} |`
+    )
+  }
+  console.log(`
+（原始统计量 d = ${num(Math.abs(r.z), 3)} · HAC p = ${num(r.pValue, 4)} 供对照）`)
 }
 
 function main(): void {

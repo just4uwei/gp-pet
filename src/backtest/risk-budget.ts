@@ -51,8 +51,10 @@ import {
   mean,
   sameRiskPassive,
   sampleStdev,
+  sharpeDiffBootstrap,
   sharpeDiffHac,
   type SameRiskPassive,
+  type SharpeDiffBootstrapResult,
   type SharpeDiffResult,
 } from './metrics'
 import type { TradeDate } from '../core/types'
@@ -73,6 +75,16 @@ export const LEGS = [
 ] as const
 /** 固定权重对照：等权。**唯一一组**（论证 §13.4：不设第二组） */
 export const FIXED_WEIGHTS = [1 / 3, 1 / 3, 1 / 3] as const
+
+/**
+ * 自举块长网格（M2 §5.80）。**整条一起报，不提供「选一档」的接口** ——
+ * `b` 是个由研究者申报、外部无法审计的自由度，同 DSR 的 `N`（§5.48 ④）。
+ * ⚠ LW 原文的 `b̂ = 4 / 6` 是 **T = 120 的周/月频**上校准出来的，**搬不到日频 T ≈ 1240**。
+ * 网格盖住实测的 Andrews 滞后阶（6–7）。
+ */
+export const BOOTSTRAP_BLOCKS = [1, 5, 10, 20, 40] as const
+/** 重抽样次数。4999 而不是原文的 499 —— `PV` 是重抽样上的比例，`M=499` 的蒙特卡洛噪音 1.3pp（§5.76 的同一条教训） */
+export const BOOTSTRAP_RESAMPLES = 4999
 
 interface Window {
   name: string
@@ -423,6 +435,14 @@ export interface WindowResult {
   legOnly: ArmResult[]
   diff: SharpeDiffResult | null
   /**
+   * LW 原文推荐的**循环块自举** `p`（M2 §5.80）—— 整条块长网格，**不挑一档**。
+   *
+   * **为什么与 `diff.pValue` 并排印**：LW 原文说 HAC 推断在中小样本上**偏自由**
+   * ⇒ 落在 0.01–0.10 里的 `p_HAC` 系统性偏小。自举是原文推荐的那一条，
+   * HAC 只是备选。`b` 是个由研究者申报、外部无法审计的自由度 ⇒ **一起报**（同 DSR 的 `N`）。
+   */
+  bootstrap: (SharpeDiffBootstrapResult | null)[]
+  /**
    * **同风险的被动持有**（GH1，论证 §13.4 预注册的第二条并排列）：
    * 把**固定权重那一臂**与现金按每日恒定权重混到 `σ` 等于 ERC 的 `σ`，再比收益。
    *
@@ -584,6 +604,14 @@ export function runWindow(data: LegData, window: Window, costs: CostModel): Wind
     // ⚠ 对照必须与主判据同一条臂（2026-08-27 当场踩到：换了 A₁ 之后这一行还指着旧对照
     // ⇒ 打出来的 p 答的是另一个比较，而表上完全看不出来）
     diff: sharpeDiffHac(ercArm.daily, staticArm.daily, lag),
+    bootstrap: BOOTSTRAP_BLOCKS.map((block) =>
+      sharpeDiffBootstrap(ercArm.daily, staticArm.daily, {
+        lag,
+        block,
+        resamples: BOOTSTRAP_RESAMPLES,
+        seed: 1,
+      })
+    ),
     gh1: sameRiskPassive(points),
   }
 }
@@ -702,6 +730,18 @@ function render(results: readonly WindowResult[], data: LegData, costs: CostMode
       L.push(
         '     ⚠ LW 原文自己说 HAC 推断在中小样本上**偏自由**（拒真过多）⇒ 这个 p 是**下界**，' +
           '不许拿它当「显著」的结论。'
+      )
+      const boots = r.bootstrap
+        .map((x, i) => `b=${BOOTSTRAP_BLOCKS[i]} ${x === null ? '—' : x.pValue.toFixed(4)}`)
+        .join(' · ')
+      const mcSe = r.bootstrap.find((x) => x !== null)?.monteCarloSe
+      L.push(
+        `  自举 p（LW 原文推荐的循环块自举，M=${BOOTSTRAP_RESAMPLES} · seed 1 · M2 §5.80）：${boots}` +
+          `${mcSe === undefined ? '' : ` 蒙特卡洛 SE ±${mcSe.toFixed(4)}`}`
+      )
+      L.push(
+        '     ⇒ **整条块长网格一起报，不挑一档**（`b` 是研究者申报的自由度，同 DSR 的 `N`）。' +
+          '⚠ 它同样**不参与主判据**。'
       )
     } else {
       L.push('  显著性：算不出（样本不足）')

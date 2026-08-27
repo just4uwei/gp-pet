@@ -23,6 +23,7 @@ import {
   averageExposure,
   bartlettLongRunCovariance,
   betaOf,
+  sharpeDiffBootstrap,
   sharpeDiffHac,
   sharpeRatioHac,
   informationRatio,
@@ -638,5 +639,97 @@ describe('场内基金免印花税与过户费', () => {
         10
       )
     }
+  })
+})
+
+/**
+ * `sharpeDiffBootstrap`（LW 2008 §3.2.2 + Remark 3.2 的 studentized 循环块自举，M2 §5.80）。
+ *
+ * 钉的是**那三处抄错就静默给错数的地方**：
+ *
+ * 1. **`d*` 要中心化**（减 `Δ̂`）—— 不减就变成检验「自举分布偏离 0 吗」，
+ *    而自举世界的真值是 `Δ̂`。症状是**两条腿完全相同时 `p` 反而接近 0**（该是 1）。
+ * 2. **`PV` 的 `+1` 不是平滑项** —— 写成 `#/M` 会给出 `p = 0` 这种不存在的值。
+ * 3. **`b = 1` 必须退化成 iid 自举**（原文脚注 9），此时它与 HAC(`lag = 0`) 估同一个量。
+ */
+describe('sharpeDiffBootstrap（Ledoit–Wolf 2008 的 studentized 循环块自举）', () => {
+  /** 造两条相关但均值不同的序列（定种子，可复现是硬要求） */
+  const synth = (n: number, shift: number): { a: number[]; b: number[] } => {
+    let seed = 12345
+    const next = (): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff
+      return seed / 0x7fffffff - 0.5
+    }
+    const a: number[] = []
+    const bb: number[] = []
+    for (let i = 0; i < n; i++) {
+      const common = next() * 0.02
+      a.push(common + next() * 0.004 + shift)
+      bb.push(common + next() * 0.004)
+    }
+    return { a, b: bb }
+  }
+
+  it('两条腿完全相同 ⇒ 退化给 null（SE = 0 时无法 studentize，不许编一个 p 出来）', () => {
+    const { a } = synth(300, 0)
+    expect(sharpeDiffHac(a, a, 0)).toBeNull()
+    expect(sharpeDiffBootstrap(a, a, { lag: 0, block: 5, resamples: 199, seed: 1 })).toBeNull()
+  })
+
+  /*
+    **这一条是「d* 有没有中心化」的判别器**，而它是本函数最容易抄错的地方（LW Remark 3.2）。
+    构造一个大的真实差异：
+    - **中心化**（正确）：d*_m 量的是「离 Δ̂ 有多远」⇒ 绝大多数 d*_m ≪ d ⇒ **p 很小**；
+    - 忘了减 Δ̂：d*_m ≈ |Δ̂*_m|/s* ≈ d ⇒ 约一半的重抽样命中 ⇒ **p 跳到 0.5 附近**。
+    ⇒ 断言 p < 0.05 就能把那个错误抓住（验证过：去掉 `- base.delta` 这一条立刻变红）。
+  */
+  it('差异很大时 p 必须很小 —— 忘了给 d* 中心化会让它跳到 0.5 附近', () => {
+    const { a, b } = synth(400, 0.004)
+    const got = sharpeDiffBootstrap(a, b, { lag: 0, block: 5, resamples: 999, seed: 1 })
+    expect(got).not.toBeNull()
+    expect(got!.d).toBeGreaterThan(3)
+    expect(got!.pValue).toBeLessThan(0.05)
+  })
+
+  it('p 永远落在 (0, 1] —— `+1` 保证它取不到 0', () => {
+    const { a, b } = synth(300, 0.05) // 巨大的均值差 ⇒ d 很大
+    const got = sharpeDiffBootstrap(a, b, { lag: 0, block: 5, resamples: 199, seed: 1 })
+    expect(got).not.toBeNull()
+    expect(got!.pValue).toBeGreaterThan(0)
+    expect(got!.pValue).toBeLessThanOrEqual(1)
+    // 199 次重抽样的下界恰好是 1/200
+    expect(got!.pValue).toBeGreaterThanOrEqual(1 / 200)
+  })
+
+  it('b = 1 上与 HAC(lag = 0) 的 p 量级一致（此时两者估同一个量）', () => {
+    const { a, b } = synth(600, 0.0015)
+    const boot = sharpeDiffBootstrap(a, b, { lag: 0, block: 1, resamples: 1999, seed: 1 })
+    const hac = sharpeDiffHac(a, b, 0)
+    expect(boot).not.toBeNull()
+    expect(hac).not.toBeNull()
+    expect(Math.abs(boot!.pValue - hac!.pValue)).toBeLessThan(0.05)
+  })
+
+  it('同一种子逐位可复现，换种子只在蒙特卡洛误差内变', () => {
+    const { a, b } = synth(400, 0.001)
+    const o = { lag: 2, block: 5, resamples: 999 }
+    const p1 = sharpeDiffBootstrap(a, b, { ...o, seed: 1 })!.pValue
+    const p2 = sharpeDiffBootstrap(a, b, { ...o, seed: 1 })!.pValue
+    const p3 = sharpeDiffBootstrap(a, b, { ...o, seed: 7 })!.pValue
+    expect(p1).toBe(p2)
+    // 换种子的差应在 3 个蒙特卡洛标准误内（M = 999 ⇒ 约 1.5pp × 3）
+    expect(Math.abs(p1 - p3)).toBeLessThan(0.06)
+  })
+
+  it('蒙特卡洛标准误跟着报（引用 p 必须带它，同 §5.76 的 trials）', () => {
+    const { a, b } = synth(400, 0.001)
+    const got = sharpeDiffBootstrap(a, b, { lag: 2, block: 5, resamples: 999, seed: 1 })!
+    expect(got.monteCarloSe).toBeCloseTo(Math.sqrt((got.pValue * (1 - got.pValue)) / got.resamples), 12)
+  })
+
+  it('块长过大 / 样本太短 ⇒ null，不用 0 冒充', () => {
+    const { a, b } = synth(20, 0.001)
+    expect(sharpeDiffBootstrap(a, b, { lag: 0, block: 15, resamples: 99, seed: 1 })).toBeNull()
+    expect(sharpeDiffBootstrap([0.01, 0.02], [0.01, 0.03], { lag: 0, block: 1, resamples: 99, seed: 1 })).toBeNull()
   })
 })
