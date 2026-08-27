@@ -2073,7 +2073,7 @@ function pct(x: number): string {
   return Number.isFinite(x) ? `${(x * 100).toFixed(2)}%` : '—'
 }
 
-function renderText(p: RandomAuditPayload): string {
+export function renderText(p: RandomAuditPayload): string {
   const m = p.meta
   const lines: string[] = []
   lines.push('随机入场基准（零假设分布）')
@@ -2230,7 +2230,17 @@ function renderText(p: RandomAuditPayload): string {
     lines.push('【打散跨度】剥掉 holdingBars 内生性之后的配对检验')
     lines.push('-'.repeat(W + 84))
     lines.push(
-      ['分层', '建仓', '真实入场·加权', '随机入场·加权', '真实入场·中位', '随机入场·中位', '配对胜率·加权', '配对胜率·中位']
+      [
+        '分层',
+        '建仓',
+        '真实入场·加权',
+        '随机入场·加权',
+        '真实入场·中位',
+        '随机入场·中位',
+        '**效应量 μ**',
+        '配对胜率·加权',
+        '配对胜率·中位',
+      ]
         .map((h, i) => (i === 0 ? h.padEnd(W) : h.padStart(16)))
         .join('')
     )
@@ -2246,6 +2256,8 @@ function renderText(p: RandomAuditPayload): string {
           pct(sh.randomWeightedMean).padStart(16),
           pct(sh.passiveMedianMean).padStart(16),
           pct(sh.randomMedianMean).padStart(16),
+          // 效应量 μ = 真实中位 − 随机中位。**它才是"差多少"**，见下面那条纪律
+          pct(sh.passiveMedianMean - sh.randomMedianMean).padStart(16),
           pct(sh.pairedWinFraction).padStart(16),
           pct(sh.pairedMedianWinFraction).padStart(16),
         ].join('')
@@ -2256,6 +2268,16 @@ function renderText(p: RandomAuditPayload): string {
     lines.push('  直接检验：50% ⇒ 入场与随机无异，接近 0% ⇒ 入场系统性更差。')
     lines.push('  ⚠ **两个口径要一起读，背离时以中位为准**（CLAUDE.md 读数纪律 2）：加权口径在窄分层上')
     lines.push('  会被单笔妖股支配 —— 实测「流通市值 Q2」加权 84.5%，而中位口径两组几乎相同（§5.45）。')
+    lines.push('  ⚠ **配对胜率是效应量的饱和变换 ⇒ 跨层比它的差无效，要比就比 μ**（M2 §5.74）：')
+    lines.push('    胜率 ≈ Φ(μ/σ_D)，灵敏度 φ(z)/σ_D 在 50% 处最大、往 0%/100% 两端塌缩。')
+    lines.push('    实测 RANGE（基线 51.4%）的增益是 TRANSITION（0.9%）的 **24 倍** ——')
+    lines.push('    于是 RANGE 的 μ 只动 +0.09pp 却让胜率动 12.7pp，而 TRANSITION 的 μ 动了')
+    lines.push('    −0.34pp（**2.7 倍大**）胜率才动 0.6pp。**幅度不可跨层比。**')
+    lines.push('  ⚠ **σ_D ∝ 1/√n ⇒ 层越大胜率越极端**：实测 33 层里按胜率排 vs 按 μ 排')
+    lines.push('    Spearman 只有 0.865，最大错位 **11 位** —— `ALL`（n=1097）胜率排 30/33')
+    lines.push('    而它的 μ 只排 19/33。**排序比的是信噪比，不是效应量。**')
+    lines.push('  ✅ **不受影响的用法**：Φ 单调 ⇒ 「> 50%」这个阈值等价于「μ > 0」，')
+    lines.push('    所以阈值型判据（含 L2 条件①）与符号/方向的读法**完全有效**。')
   }
 
   lines.push('')

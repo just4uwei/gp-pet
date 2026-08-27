@@ -10,7 +10,13 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { findBases, nearestInPool, regimeRuns, type RegimeRun } from '@backtest/random-audit'
+import {
+  findBases,
+  nearestInPool,
+  regimeRuns,
+  renderText,
+  type RegimeRun,
+} from '@backtest/random-audit'
 import { andrewsLag, correlation, neweyWestVariance, ranksOf } from '@backtest/ic-audit'
 
 describe('块位移的吸附：nearestInPool', () => {
@@ -244,5 +250,121 @@ describe('Newey-West 长期方差', () => {
     const ordered = [1, 1, 1, -1, -1, -1, 1, 1, 1, -1, -1, -1]
     const shuffled = [1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1]
     expect(neweyWestVariance(ordered, 2)).not.toBeCloseTo(neweyWestVariance(shuffled, 2) as number, 6)
+  })
+})
+
+/**
+ * 打散跨度那张表的**读数闸门**（M2 §5.74）。
+ *
+ * **为什么要钉文案**：`pairedMedianWinFraction ≈ Φ(μ/σ_D)` 是效应量的**饱和变换** ——
+ * 灵敏度在 50% 处最大、往两端塌缩，而 `σ_D ∝ 1/√n` ⇒ **层越大胜率越极端**。
+ * 实测 33 层里按胜率排 vs 按 `μ` 排 Spearman 只有 **0.865**，最大错位 **11 位**。
+ *
+ * 这个坑的形状是：**它不会报错，只会让人把放大器读成分辨力**
+ * —— §5.73 ④ 就这么读错过一次（把 RANGE 的 13.1pp 当成「分辨力集中在 RANGE」，
+ * 而它底层的 `μ` 比 TRANSITION 小 2.7 倍）。
+ * ⇒ 唯一有效的防线是**把 `μ` 印出来、把纪律印在表下面**，而这条用例钉住它们还在。
+ */
+describe('打散跨度表：效应量列与饱和纪律', () => {
+  /*
+    最小 payload。**刻意用 cast 而不是把 40 个字段全填一遍** —— 这条用例断言的是
+    渲染出来的**文本**，不是 payload 的形状；日后 renderText 多读一个字段时它会
+    在运行时大声炸掉，那是可接受的失败方式（不是静默通过）。
+  */
+  const payload = {
+    meta: {
+      baseline: 'reports/calib/x.json',
+      engineVersion: '0.2.8-test',
+      paramsFingerprint: 'deadbeef',
+      codes: 2,
+      from: '2018-01-01',
+      to: '2023-12-31',
+      capitalPerCode: 100000,
+      costs: null,
+      knobs: { deviations: [], unverifiable: [] },
+      trials: 200,
+      seed: 1,
+      matchRegime: true,
+      crossCode: false,
+      crossPool: null,
+      timingNull: 'REGIME_BLOCK',
+      timingNullReason: '测试',
+      blocks: 10,
+      blockFallback: 0,
+      blockWeight: 'runs',
+      blockCoverage: 1,
+      blockCoverageByRegime: null,
+      snapMedian: 0,
+      snapP90: 0,
+      capCovered: null,
+      warmup: 300,
+      minCount: 30,
+      positionsTotal: 100,
+      positionsPaired: 100,
+      skipped: 0,
+      regimeSelfCheck: null,
+    },
+    strata: [
+      {
+        label: 'RANGE',
+        realCount: 639,
+        realWeightedPnlPct: 0,
+        realWinRate: 0.5,
+        realNetPnl: 0,
+        passiveCount: 639,
+        passiveWeightedPnlPct: 0,
+        passiveWinRate: 0.5,
+        passivePercentile: 0.5,
+        passiveMedianPnlPct: 0,
+        randomMedianMean: -0.004,
+        passiveMedianPercentile: 0.5,
+        shuffled: {
+          passiveWeightedMean: 0,
+          randomWeightedMean: 0,
+          // μ = 0.0125 − (−0.004) = 0.0165 ⇒ 表里应出现 1.65%
+          passiveMedianMean: 0.0125,
+          randomMedianMean: -0.004,
+          pairedWinFraction: 0.5,
+          pairedMedianWinFraction: 0.514,
+        },
+        randomWeightedMean: 0,
+        randomWeightedSd: 0,
+        randomWeightedP05: 0,
+        randomWeightedP50: 0,
+        randomWeightedP95: 0,
+        realPercentile: 0.5,
+        randomWinRateMean: 0.5,
+        randomWinRateP05: 0.4,
+        randomWinRateP95: 0.6,
+        realWinRatePercentile: 0.5,
+        randomSampleMean: 0,
+      },
+    ],
+  } as unknown as Parameters<typeof renderText>[0]
+
+  const text = renderText(payload)
+
+  it('表头有**效应量 μ** 那一列', () => {
+    expect(text).toContain('**效应量 μ**')
+  })
+
+  it('μ 真的被算出来并印在表里（真实中位 − 随机中位）', () => {
+    // 0.0125 − (−0.004) = 0.0165 ⇒ pct() 给 "1.65%"
+    expect(text).toContain('1.65%')
+  })
+
+  it('饱和纪律印在表下面：跨层比胜率的差无效', () => {
+    expect(text).toContain('跨层比它的差无效')
+    expect(text).toContain('Φ(μ/σ_D)')
+  })
+
+  it('样本量那一半也印了：层越大胜率越极端', () => {
+    expect(text).toContain('层越大胜率越极端')
+    expect(text).toContain('0.865')
+  })
+
+  it('**同时**印了「不受影响的用法」—— 否则会被读成「配对胜率作废」', () => {
+    expect(text).toContain('不受影响的用法')
+    expect(text).toContain('L2 条件①')
   })
 })
