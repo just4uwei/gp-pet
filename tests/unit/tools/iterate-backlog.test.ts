@@ -11,7 +11,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { itemState, parseBacklog, type BacklogItem } from '../../../tools/iterate/backlog'
+import { MARKER, itemState, parseBacklog, type BacklogItem } from '../../../tools/iterate/backlog'
 
 const marker = (fields: string): string => `<!-- ITEM ${fields} -->`
 
@@ -150,5 +150,24 @@ describe('itemState', () => {
       return ''
     })
     expect(asked).toEqual(['src/a.ts'])
+  })
+})
+
+describe('MARKER 整行锚定（2026-08-27 现场踩过）', () => {
+  /*
+    文档里到处有「这类条目要带一行 `<!-- ITEM ... -->` 标记」这种**散文提及**。
+    正则不整行锚定，就会把它们也当成条目 —— 而 `status.ts` 的清单外扫描
+    （`strayBacklogItems`）复用同一条正则，症状是「报了三条根本不存在的条目」，
+    人会去找一个不存在的登记错误。**两处共用一条正则**就是为了这个。
+  */
+  it('散文里的提及不算条目', () => {
+    expect(MARKER.test('所以这类条目要带一行 `<!-- ITEM ... -->` 标记登记在那一节里')).toBe(false)
+    expect(MARKER.test('| `status.ts` | 读日志、`<!-- ITEM -->` | 有 IO |')).toBe(false)
+  })
+
+  it('整行的真标记算', () => {
+    expect(MARKER.test(marker(FULL))).toBe(true)
+    // 前面有缩进也算（文档里有缩进过的标记）
+    expect(MARKER.test(`   ${marker(FULL)}`)).toBe(true)
   })
 })

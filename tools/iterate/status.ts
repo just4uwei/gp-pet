@@ -70,7 +70,7 @@ import { countByStatus, paramRows } from '@main/settings/params-view'
 import { createTradingCalendar, parseHolidayTable, type TradingCalendar } from '@main/scheduler/calendar'
 import { SHANGHAI_OFFSET_MS } from '@shared/time'
 import { dataFreshness, sinceFixLanded, type Freshness } from './session'
-import { itemState, parseBacklog } from './backlog'
+import { MARKER, itemState, parseBacklog } from './backlog'
 /*
   渲染层住 `./render.ts`（2026-08-27 分家，M2 §5.74 ⑤）。这个文件从第一行就在读
   文件系统与 `market.db`、末尾还直接 `main()` ⇒ import 它就会跑一遍
@@ -97,9 +97,15 @@ const REPORTS = join(ROOT, 'reports', 'calib')
 const BOARD = join(ROOT, 'docs', 'iteration', '看板.md')
 
 /**
- * 扫 `<!-- ITEM ... -->` 的文档。**条目登记在它论证所在的那份文档里**，
- * 所以这里只列「候选与决定」的两个出处 —— M2 是实验流水，不放条目
- * （那会让同一件事有两个出处，而这个项目已经踩过一次：台账对、计划文档错）。
+ * 扫 `<!-- ITEM ... -->` 的文档。**条目登记在它论证所在的那份文档里** ——
+ * 所以这里列的是所有「论证与决定」的出处。**M2 不放条目**（那是实验流水，
+ * 放了就让同一件事有两个出处，而这个项目已经踩过一次：台账对、计划文档错）。
+ *
+ * ⚠ **这份清单本身是个静默失效点，2026-08-27 真踩过**：往
+ * `配置形态-论证.md` 里登记了两条，而它当时不在清单上 ⇒ **看板一个字都没说，
+ * 那两条就地消失了**。修法是两条一起：① 把那份论证加进来；
+ * ② `strayBacklogItems()` 扫全 `docs/`，把清单外的标记报成登记错误
+ * —— 少了 ② 的话下一份新论证会重演一次。
  *
  * ⚠ 一律写**正斜杠**：这几个串会原样印进看板（「登记在 `xxx:123`」），
  * 用 `join()` 在 Windows 上会印成 `docs\notes\…` 而判据那一列是 `/` —— 同一份文档两种写法。
@@ -108,6 +114,7 @@ const BOARD = join(ROOT, 'docs', 'iteration', '看板.md')
 const BACKLOG_DOCS = [
   'docs/notes/下一阶段取舍与迭代计划.md',
   'docs/notes/与机构量化系统的差距.md',
+  'docs/notes/配置形态-论证.md',
 ] as const
 const HOLIDAYS = join(ROOT, 'resources', 'data', 'holidays.json')
 
@@ -593,7 +600,49 @@ function backlogState(): BacklogSnapshot {
       rows.push({ item, state: itemState(item, readIfExists) })
     }
   }
+  errors.push(...strayBacklogItems())
   return { rows, errors }
+}
+
+/**
+ * 扫 `docs/` 下**不在 `BACKLOG_DOCS` 里**的 `<!-- ITEM -->` 标记。
+ *
+ * **为什么要有它**（2026-08-27，踩过）：往一份没进清单的论证里登记条目，
+ * 看板**一个字都不会说** —— 那条待办就地消失，而登记的人以为登记好了。
+ * 这与「静默少给几行」是同一类错误，而它比漏一条待办更贵：
+ * 它让「登记」这个动作变得不可信。
+ *
+ * ⚠ 报成**登记错误**而不是自动收进来：条目该放哪份文档是人的判断
+ * （M2 就明确不放），工具替人决定会把「一件事一个出处」那条纪律绕过去。
+ */
+function strayBacklogItems(): string[] {
+  const allowed = new Set<string>(BACKLOG_DOCS)
+  const out: string[] = []
+  const walk = (rel: string): void => {
+    const abs = join(ROOT, rel)
+    if (!existsSync(abs)) return
+    for (const name of readdirSync(abs)) {
+      const child = `${rel}/${name}`
+      if (statSync(join(ROOT, child)).isDirectory()) {
+        walk(child)
+        continue
+      }
+      if (!name.endsWith('.md') || allowed.has(child)) continue
+      const text = readIfExists(child)
+      if (text === null) continue
+      text.split(/\r?\n/).forEach((line, i) => {
+        // 整行锚定的 MARKER（单一出处）—— 散文里「`<!-- ITEM ... -->`」那种提及不算
+        if (MARKER.test(line)) {
+          out.push(
+            `${child}:${i + 1} 这份文档不在 BACKLOG_DOCS 里 ⇒ 这条 ITEM **不会被任何人看见**。` +
+              '要么把文档加进那份清单，要么把条目挪到计划文档 / 差距文档'
+          )
+        }
+      })
+    }
+  }
+  walk('docs')
+  return out
 }
 
 // ── ⑤ 规则驱动的任务清单 ─────────────────────────────────────────────

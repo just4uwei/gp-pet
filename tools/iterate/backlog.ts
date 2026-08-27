@@ -79,7 +79,13 @@ export interface BacklogItem {
 
 export type ItemState = 'OPEN' | 'LANDED' | 'UNREADABLE'
 
-const MARKER = /^\s*<!--\s*ITEM\s+(.+?)\s*-->\s*$/
+/**
+ * 标记的**唯一**正则。整行锚定（`^…$`）**不是排版洁癖**：
+ * 文档里到处有「条目要带一行 `<!-- ITEM ... -->` 标记」这种散文提及，
+ * 不锚定就会把它们也当成条目。`status.ts` 的 `strayBacklogItems()` 复用它，
+ * 各写一份的症状是「清单外扫描报了三条不存在的条目」（2026-08-27 现场踩过）。
+ */
+export const MARKER = /^\s*<!--\s*ITEM\s+(.+?)\s*-->\s*$/
 
 /** `a=1 | b=2` → Map。值里可以有 `=`（`判据=路径:串` 就有冒号，将来也可能有等号） */
 function parseFields(body: string): Map<string, string> {
