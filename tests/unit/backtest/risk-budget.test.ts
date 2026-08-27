@@ -17,6 +17,7 @@ import {
   FIXED_WEIGHTS,
   covarianceMatrix,
   erc,
+  inverseVol,
   simulateLegs,
 } from '@backtest/risk-budget'
 import { DEFAULT_COSTS } from '@backtest/costs'
@@ -232,5 +233,55 @@ describe('月内漂移（2026-08-27 加，M2 §5.78）', () => {
     close(arm.turnover, 1)
     close(arm.totalReturn, 1.1 * 0.95 * 1.03 - 1)
     close(arm.legWeights[0] ?? 0, 1)
+  })
+})
+
+describe('逆波动率（A₃，论证 §15.2）', () => {
+  it('w ∝ 1/σ 的解析解', () => {
+    // σ = 1, 2, 4 ⇒ w ∝ 4 : 2 : 1
+    const w = inverseVol([
+      [1, 0, 0],
+      [0, 4, 0],
+      [0, 0, 16],
+    ])
+    close(w[0] ?? 0, 4 / 7)
+    close(w[1] ?? 0, 2 / 7)
+    close(w[2] ?? 0, 1 / 7)
+  })
+
+  /*
+    这一条是 A₃ 存在的全部理由：零相关时它与 ERC **解析相同**
+    ⇒ `A₀ − A₃` 恰好是「协方差非对角那一半买到了什么」。
+    若哪天这条变红，说明两个求解器里有一个不再是它声称的东西。
+  */
+  it('零相关时与 ERC 逐位相同 —— 差别只可能来自非对角项', () => {
+    const cov = [
+      [1e-4, 0, 0],
+      [0, 4e-6, 0],
+      [0, 0, 9e-5],
+    ]
+    const a = erc(cov)
+    const b = inverseVol(cov)
+    a.forEach((v, i) => close(v, b[i] ?? 0, 1e-8))
+  })
+
+  it('有相关性时两者不同（否则 A₃ 这一列没有信息）', () => {
+    const cov = [
+      [1e-4, 5e-5, 0],
+      [5e-5, 4e-6, 0],
+      [0, 0, 9e-5],
+    ]
+    const a = erc(cov)
+    const b = inverseVol(cov)
+    expect(Math.abs((a[0] ?? 0) - (b[0] ?? 0))).toBeGreaterThan(1e-3)
+  })
+
+  it('方差非正 ⇒ 抛错，不许静默退回等权（与 erc 同一条纪律）', () => {
+    expect(() =>
+      inverseVol([
+        [1, 0],
+        [0, 0],
+      ])
+    ).toThrow(/方差非正/)
   })
 })

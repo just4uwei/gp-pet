@@ -206,6 +206,27 @@ export function erc(cov: readonly (readonly number[])[], maxIter = 10_000, tol =
 }
 
 /**
+ * **逆波动率权重**：`w_i ∝ 1/σ_i`，**忽略相关性**（论证 §15.2 的 A₃，描述性）。
+ *
+ * 它与 ERC 的差别恰好是**协方差的非对角那一半** ——
+ * 零相关时两者解析相同（`erc` 那组用例里「对角协方差 ⇒ w ∝ 1/σ」钉着这件事），
+ * 所以 `A₀ − A₃` 答的是「用整个协方差矩阵，比只用边际波动多买到了什么」。
+ *
+ * ⚠ 与 `erc` 同一条纪律：方差非正就抛错，**不许静默退回等权**。
+ */
+export function inverseVol(cov: readonly (readonly number[])[]): number[] {
+  const k = cov.length
+  if (k === 0) throw new Error('逆波动率：协方差矩阵是空的')
+  const inv = Array.from({ length: k }, (_, i) => {
+    const v = cov[i]?.[i]
+    if (v === undefined || !(v > 0)) throw new Error(`逆波动率：第 ${i} 条腿的方差非正`)
+    return 1 / Math.sqrt(v)
+  })
+  const total = inv.reduce((a, b) => a + b, 0)
+  return inv.map((v) => v / total)
+}
+
+/**
  * 跑一条多腿净值。
  *
  * ## `weights` 是**目标**权重，不是实际权重（2026-08-27 改，M2 §5.78）
@@ -375,6 +396,21 @@ export interface WindowResult {
   bars: number
   months: number
   erc: ArmResult
+  /**
+   * **A₁ 静态等价**（论证 §15.2 的**承重对照**）：ERC 在该窗口的**平均权重向量**，固定不变。
+   *
+   * **零自由参数** —— 不用选「剩余怎么分」，直接用 ERC 自己的平均权重
+   * ⇒ `A₀ − A₁` 恰好等于「权重随时间变化」这一件事的全部贡献，
+   * 而「债多少」被平均权重按构造固定住 ⇒ §14.2 那个混淆被**结构性**排除。
+   *
+   * ⚠ **事后构造、不可实施**（平均值是从 A₀ 的结果里读出来的）⇒ 它是**归因对照**，
+   * 不是一个可以买的组合。A₀ 输了**不能**推出「静态倾斜可实施」（§15.5 ①）。
+   */
+  staticEquiv: ArmResult
+  /** A₂ 债腿路径匹配（描述性，不承重）：照抄 A₀ 的债腿权重，剩余按 A₀ 的平均股:金比例分 */
+  bondPathMatched: ArmResult
+  /** A₃ 逆波动率（描述性，不承重）：`w ∝ 1/σ`，**忽略相关性** ⇒ 答「协方差那一层买到了什么」 */
+  invVol: ArmResult
   fixed: ArmResult
   equityOnly: ArmResult
   /**
@@ -414,6 +450,7 @@ export function runWindow(data: LegData, window: Window, costs: CostModel): Wind
   const used: number[] = []
   const returns: number[][] = []
   const ercWeights: number[][] = []
+  const invVolWeights: number[][] = []
   const fixedWeights: number[][] = []
   const equityWeights: number[][] = []
   /*
@@ -424,6 +461,7 @@ export function runWindow(data: LegData, window: Window, costs: CostModel): Wind
   const rebalanceAt: boolean[] = []
   let pendingRebalance = true
   let current: number[] | null = null
+  let currentInvVol: number[] | null = null
   let sawWarmup = false
 
   for (const i of inWindow) {
@@ -439,7 +477,9 @@ export function runWindow(data: LegData, window: Window, costs: CostModel): Wind
         if (row) rows.push(row)
       }
       if (rows.length < COV_WINDOW) continue
-      current = erc(covarianceMatrix(rows))
+      const cov = covarianceMatrix(rows)
+      current = erc(cov)
+      currentInvVol = inverseVol(cov)
       sawWarmup = true
     }
     const row = data.rets[i]
@@ -447,6 +487,7 @@ export function runWindow(data: LegData, window: Window, costs: CostModel): Wind
     used.push(i)
     returns.push(row)
     ercWeights.push(current)
+    invVolWeights.push(currentInvVol ?? current)
     fixedWeights.push([...FIXED_WEIGHTS])
     equityWeights.push([1, 0, 0])
     rebalanceAt.push(pendingRebalance)
@@ -460,15 +501,50 @@ export function runWindow(data: LegData, window: Window, costs: CostModel): Wind
         if (r) rows.push(r)
       }
       if (rows.length === COV_WINDOW) {
-        current = erc(covarianceMatrix(rows))
+        const cov = covarianceMatrix(rows)
+        current = erc(cov)
+        currentInvVol = inverseVol(cov)
         pendingRebalance = true
       }
     }
   }
   if (!sawWarmup) throw new Error(`${window.name}：协方差预热凑不够 ${COV_WINDOW} 根`)
 
-  const ercArm = simulateLegs('ERC', returns, ercWeights, costs, rebalanceAt)
-  const fixedArm = simulateLegs('固定权重 1/3', returns, fixedWeights, costs, rebalanceAt)
+  const ercArm = simulateLegs('A₀ ERC', returns, ercWeights, costs, rebalanceAt)
+  /*
+    A₁ / A₂ 是**两趟**：先跑 A₀，再用它的**实际**平均权重构造对照（论证 §15.2）。
+    ⚠ 用的是 `legWeights`（漂移后的实际），不是目标序列的平均 ——
+    A₁ 要等价的是「A₀ 真的拿了多少」，而那两个数在漂移建模之后不再相同。
+  */
+  const avg = ercArm.legWeights
+  const avgSum = avg.reduce((a, b) => a + b, 0)
+  const staticVector = avg.map((v) => (avgSum > 0 ? v / avgSum : 1 / LEGS.length))
+  const staticArm = simulateLegs(
+    'A₁ 静态等价（归因对照）',
+    returns,
+    returns.map(() => [...staticVector]),
+    costs,
+    rebalanceAt
+  )
+  /*
+    A₂：照抄 A₀ 每一根的债腿**目标**权重，剩余按 A₀ 的平均股:金比例分。
+    ⇒ 「债多少」逐日与 A₀ 相同，只有风险腿内部的时变被抹掉。
+  */
+  const riskyAvg = (staticVector[0] ?? 0) + (staticVector[2] ?? 0)
+  const equityShare = riskyAvg > 0 ? (staticVector[0] ?? 0) / riskyAvg : 0.5
+  const bondPathArm = simulateLegs(
+    'A₂ 债腿路径匹配（描述）',
+    returns,
+    ercWeights.map((w) => {
+      const bond = w[1] ?? 0
+      const risky = 1 - bond
+      return [risky * equityShare, bond, risky * (1 - equityShare)]
+    }),
+    costs,
+    rebalanceAt
+  )
+  const invVolArm = simulateLegs('A₃ 逆波动率（描述）', returns, invVolWeights, costs, rebalanceAt)
+  const fixedArm = simulateLegs('固定权重 1/3（§5.77 的旧对照）', returns, fixedWeights, costs, rebalanceAt)
   // 「单独持有」与「满仓宽基」是**买入并持有**的参照 ⇒ 刻意不给调仓日
   // （单腿组合没有「再平衡」这件事，硬给它一份调仓日只会白付换手）
   const equityArm = simulateLegs('满仓宽基', returns, equityWeights, costs)
@@ -480,7 +556,7 @@ export function runWindow(data: LegData, window: Window, costs: CostModel): Wind
       costs
     )
   )
-  const lag = andrewsLag(Math.min(ercArm.daily.length, fixedArm.daily.length))
+  const lag = andrewsLag(Math.min(ercArm.daily.length, staticArm.daily.length))
   /*
     GH1 走 `metrics.sameRiskPassive`（**单一出处**）—— 它自带三条纪律：
     严格配对、每日恒定权重的复利（不许用线性近似 `w × R`，实测最大差 16.81pp）、
@@ -492,17 +568,22 @@ export function runWindow(data: LegData, window: Window, costs: CostModel): Wind
   const points = ercArm.equity.map((v, t) => ({
     date: (data.dates[used[Math.max(0, t - 1)] ?? 0] ?? '1970-01-01') as TradeDate,
     equity: v,
-    benchmark: fixedArm.equity[t] ?? null,
+    benchmark: staticArm.equity[t] ?? null,
   }))
   return {
     window,
     bars: used.length,
     months: new Set(used.map((i) => (data.dates[i] ?? '').slice(0, 7))).size,
     erc: ercArm,
+    staticEquiv: staticArm,
+    bondPathMatched: bondPathArm,
+    invVol: invVolArm,
     fixed: fixedArm,
     equityOnly: equityArm,
     legOnly,
-    diff: sharpeDiffHac(ercArm.daily, fixedArm.daily, lag),
+    // ⚠ 对照必须与主判据同一条臂（2026-08-27 当场踩到：换了 A₁ 之后这一行还指着旧对照
+    // ⇒ 打出来的 p 答的是另一个比较，而表上完全看不出来）
+    diff: sharpeDiffHac(ercArm.daily, staticArm.daily, lag),
     gh1: sameRiskPassive(points),
   }
 }
@@ -541,7 +622,7 @@ function render(results: readonly WindowResult[], data: LegData, costs: CostMode
     L.push(`  ${r.bars} 个交易日 · ${r.months} 个月`)
     L.push('-'.repeat(100))
     L.push(
-      '  臂'.padEnd(20) +
+      '  臂'.padEnd(28) +
         '总收益'.padStart(11) +
         '年化'.padStart(10) +
         '最大回撤'.padStart(11) +
@@ -551,9 +632,16 @@ function render(results: readonly WindowResult[], data: LegData, costs: CostMode
         '换手'.padStart(9) +
         '成本'.padStart(9)
     )
-    for (const arm of [r.erc, r.fixed, ...r.legOnly]) {
+    for (const arm of [
+      r.erc,
+      r.staticEquiv,
+      r.bondPathMatched,
+      r.invVol,
+      r.fixed,
+      ...r.legOnly,
+    ]) {
       L.push(
-        `  ${arm.label}`.padEnd(20) +
+        `  ${arm.label}`.padEnd(28) +
           pct(arm.totalReturn).padStart(11) +
           pct(arm.annualized).padStart(10) +
           pct(arm.maxDrawdown).padStart(11) +
@@ -566,20 +654,43 @@ function render(results: readonly WindowResult[], data: LegData, costs: CostMode
     }
     L.push('')
     L.push(
-      '  各腿平均权重 ERC：' +
+      '  各腿平均权重 A₀：' +
         LEGS.map((l, i) => `${l.name} ${pct(r.erc.legWeights[i] ?? 0)}`).join(' · ')
     )
-    L.push(`  平均暴露 ERC ${pct(r.erc.exposure)} · 固定权重 ${pct(r.fixed.exposure)}（都该是 100%）`)
-    L.push('')
-    const dS = (r.erc.sharpe ?? 0) - (r.fixed.sharpe ?? 0)
-    const dC = (r.erc.calmar ?? 0) - (r.fixed.calmar ?? 0)
-    const dD = r.erc.maxDrawdown - r.fixed.maxDrawdown
     L.push(
-      `  ⚖ 对**固定权重**（承重的对照）：夏普 ${dS >= 0 ? '+' : ''}${dS.toFixed(3)} · ` +
+      '  各腿平均权重 A₁：' +
+        LEGS.map((l, i) => `${l.name} ${pct(r.staticEquiv.legWeights[i] ?? 0)}`).join(' · ') +
+        '（**构造自检：应与上一行逐位相近** —— A₁ 就是 A₀ 的平均权重）'
+    )
+    L.push(`  平均暴露 A₀ ${pct(r.erc.exposure)} · A₁ ${pct(r.staticEquiv.exposure)}（都该是 100%）`)
+    L.push('')
+    const dS = (r.erc.sharpe ?? 0) - (r.staticEquiv.sharpe ?? 0)
+    const dC = (r.erc.calmar ?? 0) - (r.staticEquiv.calmar ?? 0)
+    const dD = r.erc.maxDrawdown - r.staticEquiv.maxDrawdown
+    L.push(
+      `  ⚖ 对 **A₁ 静态等价**（承重的对照，论证 §15.2）：夏普 ${dS >= 0 ? '+' : ''}${dS.toFixed(3)} · ` +
         `Calmar ${dC >= 0 ? '+' : ''}${dC.toFixed(3)} · 回撤 ${dD >= 0 ? '+' : ''}${pct(dD)}`
     )
     L.push(
-      `     ⇒ 本窗口主判据（两项同时改善）：${dS > 0 && dC > 0 ? '**改善**' : '**未同时改善**'}`
+      `     ⇒ 本窗口主判据（夏普与 Calmar 同时改善）：${dS > 0 && dC > 0 ? '**改善**' : '**未同时改善**'}`
+    )
+    /*
+      次判据来自 §4④ 2026-08-27 的拍板（回撤优先）：回撤不升 + 总收益 ≥ 对照的 80%。
+      那个 80% 沿用论证 §5 第一次预注册就写着的数，**不是看完结果新定的**。
+    */
+    const retOk = r.staticEquiv.totalReturn <= 0 ? null : r.erc.totalReturn / r.staticEquiv.totalReturn >= 0.8
+    L.push(
+      `     ⇒ 次判据（回撤不升 + 总收益 ≥ A₁ 的 80%）：回撤 ${dD <= 0 ? '过' : '**不过**'} · ` +
+        `收益比 ${r.staticEquiv.totalReturn <= 0 ? '—（对照收益非正，比值无意义）' : pct(r.erc.totalReturn / r.staticEquiv.totalReturn)}` +
+        ` ${retOk === null ? '' : retOk ? '过' : '**不过**'}`
+    )
+    const dS2 = (r.erc.sharpe ?? 0) - (r.bondPathMatched.sharpe ?? 0)
+    const dS3 = (r.erc.sharpe ?? 0) - (r.invVol.sharpe ?? 0)
+    const dSf = (r.erc.sharpe ?? 0) - (r.fixed.sharpe ?? 0)
+    L.push(
+      `  ⓘ 描述性（**都不承重**）：vs A₂ 债腿路径匹配 夏普 ${dS2 >= 0 ? '+' : ''}${dS2.toFixed(3)}` +
+        `（剩下的是「风险腿内部择时」）· vs A₃ 逆波动率 ${dS3 >= 0 ? '+' : ''}${dS3.toFixed(3)}` +
+        `（剩下的是「协方差非对角那一半」）· vs 固定权重 1/3（§5.77 的旧对照）${dSf >= 0 ? '+' : ''}${dSf.toFixed(3)}`
     )
     if (r.diff !== null) {
       L.push(
@@ -597,12 +708,12 @@ function render(results: readonly WindowResult[], data: LegData, costs: CostMode
     }
     if (r.gh1 !== null) {
       L.push(
-        `  ⚖ GH1 同风险（把**固定权重那一臂**与现金混到 σ 等于 ERC）：` +
+        `  ⚖ GH1 同风险（把 **A₁** 与现金混到 σ 等于 A₀）：` +
           `w ${pct(r.gh1.weight)} · 参照收益 ${pct(r.gh1.referenceReturn)} · ` +
           `**GH1 ${r.gh1.gh1 >= 0 ? '+' : ''}${pct(r.gh1.gh1)}**`
       )
       L.push(
-        '     ⇒ 它回答的是「ERC 比**持有更少的等权组合**好吗」。' +
+        '     ⇒ 它回答的是「A₀ 比**持有更少的 A₁**好吗」。' +
           '夏普与 Calmar 都会奖励降风险，而这一列把降风险那部分扣掉（论证 §13.4 预注册的并排列，不承重）。'
       )
     }
@@ -614,18 +725,25 @@ function render(results: readonly WindowResult[], data: LegData, costs: CostMode
     L.push('')
   }
 
-  const both = results.every((r) => (r.erc.sharpe ?? 0) > (r.fixed.sharpe ?? 0) && (r.erc.calmar ?? 0) > (r.fixed.calmar ?? 0))
+  const both = results.every(
+    (r) => (r.erc.sharpe ?? 0) > (r.staticEquiv.sharpe ?? 0) && (r.erc.calmar ?? 0) > (r.staticEquiv.calmar ?? 0)
+  )
   L.push('='.repeat(100))
-  L.push(`主判据（对固定权重：夏普与 Calmar 同时改善，且两个窗口同向）：${both ? '**通过**' : '**不通过**'}`)
+  L.push(
+    `主判据（对 **A₁ 静态等价**：夏普与 Calmar 同时改善，且两个窗口同向）：${both ? '**通过**' : '**不通过**'}`
+  )
   L.push('')
   L.push('⚠ 读数纪律（论证 §13）：')
-  L.push('  1. 承重的对照是**同一批资产的固定权重**，不是任何单腿 —— 单腿量的是 beta（§13.2）。')
-  L.push('     「单独持有 …」三行是**描述性的**，印出来是为了让 §13.5 ① 那个最大弱点')
-  L.push('     （ERC 的优势可能只是「把钱挪去了恰好在牛市里的那条腿」）在同一张表上可见。')
+  L.push('  1. **承重的对照只有 A₁ 静态等价**（论证 §15.2）：它是 A₀ 自己的平均权重向量')
+  L.push('     ⇒ 「债多少」被结构性固定住，A₀ − A₁ 恰好等于「权重随时间变化」的全部贡献。')
+  L.push('     ⚠ **A₁/A₂ 事后构造、不可实施** ⇒ 它们是归因对照，不是可以买的组合；')
+  L.push('     **A₀ 输了不能推出「静态倾斜可实施」**（§15.5 ①）。')
+  L.push('     A₂/A₃/固定权重/单腿那几行**都是描述性的**，不进裁决。')
   L.push('  2. 债腿权重高不是缺陷，是这条规则的算术后果；它同时是本轮最大的弱点（§13.5 ①）。')
   L.push('  3. `COV_WINDOW` 预注册一个值，**不许搜**（§13.5 ②）。')
-  L.push('  4. **停止规则已事先绑定**：主判据不通过 ⇒ 配置形态这条线结案，')
-  L.push('     且「不可判」按不通过处置（§13.6，用户 2026-08-27 在知道代价的前提下拍的）。')
+  L.push('  4. **本轮的停止规则与上一轮刻意不同**（§15.4）：不通过 ⇒ 关闭的是')
+  L.push('     「ERC / 风险平价这条**规则**」，**不是配置层** —— 因为「静态债券倾斜」')
+  L.push('     本身就是一个配置决定，而 A₁ 若赢了，赢的正是它。')
   return L.join('\n')
 }
 
