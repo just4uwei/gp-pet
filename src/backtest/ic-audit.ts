@@ -54,7 +54,13 @@ import {
 import { CONTINUOUS_MINUTES } from '../core/session'
 import type { EngineContext, SecCode, TradeDate } from '../core/types'
 import { USAGE, parseArgs, type CliOptions } from './args'
-import { openFixtureSource, openSqliteSource, sentimentSeries, type LoadedSeries } from './data'
+import {
+  loadLiquidity,
+  openFixtureSource,
+  openSqliteSource,
+  sentimentSeries,
+  type LoadedSeries,
+} from './data'
 import { bartlettLongRunCovariance } from './metrics'
 
 /** 与 cli.ts / crosssec-audit.ts 同一份实现（那两处也各有一份，改动要一起改） */
@@ -93,20 +99,31 @@ function industryFileOf(argv: readonly string[]): string | null {
 }
 
 /**
+ * 预注册写死的两个动量回看期（M2 §5.70）。
+ * **5 是 §5.45 已识别的那个暴露，20 是通行的月度动量。不扫 N。**
+ */
+const MOMENTUM_LAGS = [5, 20] as const
+
+/**
  * 把本文件自己处理的旗标从 argv 里摘掉再交给 `parseArgs`。
  *
  * ⚠ **必须连值一起摘**：只摘旗标名会让下一个词（路径/日期）被当成位置参数。
  */
 function stripLocalFlags(argv: readonly string[]): string[] {
-  const LOCAL = new Set(['--eval-from', '--industry'])
+  /** 带值的：摘掉旗标**和它的值** */
+  const WITH_VALUE = new Set(['--eval-from', '--industry'])
+  /** 布尔的：只摘旗标本身。**混进上面那组会把下一个参数吃掉** */
+  const BOOLEAN = new Set(['--risk-factors'])
   const out: string[] = []
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]
-    if (a !== undefined && LOCAL.has(a)) {
-      i += 1 // 跳过它的值
+    if (a === undefined) continue
+    if (WITH_VALUE.has(a)) {
+      i += 1
       continue
     }
-    if (a !== undefined) out.push(a)
+    if (BOOLEAN.has(a)) continue
+    out.push(a)
   }
   return out
 }
@@ -453,6 +470,249 @@ export function neutralizeByIndustry(
   return { byDate: out, stats }
 }
 
+// ────────────── 风险因子中性化：秩上的横截面回归（预注册见 M2 §5.70） ──────────────
+
+/**
+ * 一个控制变量。**连续量只吃 1 个自由度，类别量吃「类别数 − 1」个** ——
+ * 这就是 §5.70 从「分组去均值」换成回归的理由（§5.69 实测组规模中位只有 2）。
+ */
+export type Control =
+  | {
+      kind: 'continuous'
+      name: string
+      /** null = 缺数 ⇒ 该行整行丢弃（约束 4：不许拿 0 冒充） */
+      valueOf: (code: SecCode, date: TradeDate) => number | null
+    }
+  | {
+      kind: 'categorical'
+      name: string
+      groupOf: (code: SecCode, date: TradeDate) => string | null
+    }
+
+export interface RegressStats {
+  horizon: number
+  controls: string[]
+  rowsIn: number
+  rowsOut: number
+  /** 因某个控制变量缺数而丢弃的行 */
+  droppedMissing: number
+  daysIn: number
+  /** 设计矩阵实际用到的列数（含截距）—— 它就是「吃掉了多少自由度」 */
+  medianColumns: number | null
+  /** 残差自由度 `n − 列数` 的中位数。太小的话点估计不可承重（§5.70 限制 1） */
+  medianResidualDf: number | null
+  /** 因秩亏被丢掉的列数（合计）—— 类别量在小横截面上常出现空类别 */
+  droppedColumns: number
+}
+
+/**
+ * 最小二乘残差：解 `min ‖y − Xb‖`，返回 `y − Xb`。
+ *
+ * 用**带列主元的高斯消元**解正规方程 `XᵀX b = Xᵀy`，并把主元过小的列**整列丢掉**
+ * （秩亏 ⇒ 那一列被别的列线性表示，硬解会得到一个爆炸的系数）。
+ * 规模很小（列数 ≤ 30 上下），不值得引第三方线代库。
+ *
+ * ⚠ **丢列必须计数**：静默丢列 = 悄悄换了一个模型（no silent caps）。
+ */
+function olsResiduals(
+  X: readonly number[][],
+  ys: readonly number[][]
+): { residuals: number[][]; used: number; dropped: number } | null {
+  const n = X.length
+  const p = X[0]?.length ?? 0
+  if (n === 0 || p === 0 || n <= p) return null
+
+  // 正规方程
+  const A: number[][] = Array.from({ length: p }, () => new Array<number>(p).fill(0))
+  const B: number[][] = ys.map(() => new Array<number>(p).fill(0))
+  for (let i = 0; i < n; i += 1) {
+    const row = X[i]
+    if (!row) continue
+    for (let a = 0; a < p; a += 1) {
+      const xa = row[a] ?? 0
+      for (let b = a; b < p; b += 1) {
+        const v = xa * (row[b] ?? 0)
+        ;(A[a] as number[])[b] = ((A[a] as number[])[b] ?? 0) + v
+        if (b !== a) (A[b] as number[])[a] = ((A[b] as number[])[a] ?? 0) + v
+      }
+      ys.forEach((y, k) => {
+        ;(B[k] as number[])[a] = ((B[k] as number[])[a] ?? 0) + xa * (y[i] ?? 0)
+      })
+    }
+  }
+
+  // 高斯-约当消元，主元过小即弃列
+  const scale = Math.max(1, n)
+  const TOL = 1e-9 * scale
+  const alive = new Array<boolean>(p).fill(true)
+  const coef: number[][] = ys.map(() => new Array<number>(p).fill(0))
+  const order: number[] = []
+  for (let step = 0; step < p; step += 1) {
+    let pivot = -1
+    let best = 0
+    for (let c = 0; c < p; c += 1) {
+      if (!alive[c] || order.includes(c)) continue
+      const v = Math.abs((A[c] as number[])[c] ?? 0)
+      if (v > best) {
+        best = v
+        pivot = c
+      }
+    }
+    if (pivot < 0 || best < TOL) break
+    order.push(pivot)
+    const prow = A[pivot] as number[]
+    const pv = prow[pivot] ?? 1
+    for (let c = 0; c < p; c += 1) prow[c] = (prow[c] ?? 0) / pv
+    B.forEach((b) => {
+      ;(b as number[])[pivot] = ((b as number[])[pivot] ?? 0) / pv
+    })
+    for (let r = 0; r < p; r += 1) {
+      if (r === pivot) continue
+      const f = (A[r] as number[])[pivot] ?? 0
+      if (f === 0) continue
+      for (let c = 0; c < p; c += 1) {
+        ;(A[r] as number[])[c] = ((A[r] as number[])[c] ?? 0) - f * (prow[c] ?? 0)
+      }
+      B.forEach((b) => {
+        ;(b as number[])[r] = ((b as number[])[r] ?? 0) - f * ((b as number[])[pivot] ?? 0)
+      })
+    }
+  }
+  for (let c = 0; c < p; c += 1) if (!order.includes(c)) alive[c] = false
+  ys.forEach((_y, k) => {
+    for (const c of order) (coef[k] as number[])[c] = (B[k] as number[])[c] ?? 0
+  })
+
+  const residuals = ys.map((y, k) => {
+    const out = new Array<number>(n).fill(0)
+    for (let i = 0; i < n; i += 1) {
+      let fit = 0
+      const row = X[i]
+      for (const c of order) fit += (row?.[c] ?? 0) * ((coef[k] as number[])[c] ?? 0)
+      out[i] = (y[i] ?? 0) - fit
+    }
+    return out
+  })
+  return { residuals, used: order.length, dropped: p - order.length }
+}
+
+/**
+ * **风险因子中性化**：逐日把 `rank(score)` 与 `rank(fwd)` 对控制变量回归，残差进 `icOf`。
+ *
+ * 口径（预注册 §5.70，事后不许改）：
+ * 1. **所有秩都在「保留子集」上算** —— 保留 = 每个控制变量都非空的行。
+ *    这与 §5.69（先在全横截面算秩、再丢小组）**不同**，因为设计矩阵要求参与回归的是同一批行。
+ *    两节的可比性由「只放行业哑变量」那一臂验证（P2）。
+ * 2. **类别量丢掉第一个类别当参照**，否则与截距共线。
+ * 3. 任一控制变量缺数 ⇒ **整行丢弃并计数**。
+ *
+ * **为什么能复用 `icOf`**：Spearman 只看秩，而 `icOf` 会把残差再排一次秩
+ * ⇒ 与「直接在残差上算 Spearman」等价。
+ *
+ * ⚠ 它**减掉**了这些暴露，**不是测量**了它们 ⇒ 答不了「动量因子本身有没有 alpha」。
+ */
+export function neutralizeByRegression(
+  byDate: Map<TradeDate, Row[]>,
+  controls: readonly Control[],
+  horizon: number
+): { byDate: Map<TradeDate, Row[]>; stats: RegressStats } {
+  const out = new Map<TradeDate, Row[]>()
+  const stats: RegressStats = {
+    horizon,
+    controls: controls.map((c) => c.name),
+    rowsIn: 0,
+    rowsOut: 0,
+    droppedMissing: 0,
+    daysIn: 0,
+    medianColumns: null,
+    medianResidualDf: null,
+    droppedColumns: 0,
+  }
+  const cols: number[] = []
+  const dfs: number[] = []
+
+  for (const [date, rows] of byDate) {
+    const usable = rows.filter((r) => r.fwd.has(horizon))
+    if (usable.length === 0) continue
+    stats.daysIn += 1
+    stats.rowsIn += usable.length
+
+    // ① 逐行取控制变量；任一缺数即丢弃
+    const kept: { row: Row; cont: number[]; cat: (string | null)[] }[] = []
+    for (const row of usable) {
+      const cont: number[] = []
+      const cat: (string | null)[] = []
+      let ok = true
+      for (const c of controls) {
+        if (c.kind === 'continuous') {
+          const v = c.valueOf(row.code, date)
+          if (v === null || !Number.isFinite(v)) {
+            ok = false
+            break
+          }
+          cont.push(v)
+        } else {
+          const g = c.groupOf(row.code, date)
+          if (g === null) {
+            ok = false
+            break
+          }
+          cat.push(g)
+        }
+      }
+      if (!ok) {
+        stats.droppedMissing += 1
+        continue
+      }
+      kept.push({ row, cont, cat })
+    }
+    if (kept.length === 0) continue
+
+    // ② 秩（在保留子集上 —— 预注册第 1 条）
+    const yScore = ranksOf(kept.map((k) => k.row.score))
+    const yFwd = ranksOf(kept.map((k) => k.row.fwd.get(horizon) ?? 0))
+    const contCount = controls.filter((c) => c.kind === 'continuous').length
+    const contRanks: number[][] = []
+    for (let j = 0; j < contCount; j += 1) {
+      contRanks.push(ranksOf(kept.map((k) => k.cont[j] ?? 0)))
+    }
+
+    // ③ 设计矩阵：截距 + 连续量的秩 + 类别哑变量（丢第一个类别当参照）
+    const catLevels: string[][] = []
+    const catCount = controls.filter((c) => c.kind === 'categorical').length
+    for (let j = 0; j < catCount; j += 1) {
+      const levels = [...new Set(kept.map((k) => k.cat[j] ?? ''))].sort()
+      catLevels.push(levels.slice(1))
+    }
+    const X = kept.map((k, i) => {
+      const row = [1]
+      for (let j = 0; j < contCount; j += 1) row.push(contRanks[j]?.[i] ?? 0)
+      for (let j = 0; j < catCount; j += 1) {
+        for (const lv of catLevels[j] ?? []) row.push(k.cat[j] === lv ? 1 : 0)
+      }
+      return row
+    })
+
+    const solved = olsResiduals(X, [yScore, yFwd])
+    if (solved === null) continue // n <= p：这一天回归不出来，整天丢弃（不是「IC = 0」）
+    stats.droppedColumns += solved.dropped
+    cols.push(solved.used)
+    dfs.push(kept.length - solved.used)
+
+    const [rs, rf] = solved.residuals
+    const emitted: Row[] = kept.map((k, i) => ({
+      code: k.row.code,
+      score: rs?.[i] ?? 0,
+      fwd: new Map([[horizon, rf?.[i] ?? 0]]),
+    }))
+    out.set(date, emitted)
+    stats.rowsOut += emitted.length
+  }
+  stats.medianColumns = median(cols)
+  stats.medianResidualDf = median(dfs)
+  return { byDate: out, stats }
+}
+
 /** 逐标的扫一遍判定根，把 (日期, 得分, 前瞻收益) 收进横截面表 */
 export function collect(
   series: LoadedSeries,
@@ -548,6 +808,28 @@ function renderNeutral(
   return lines
 }
 
+/** §5.70 的臂：一行一个持有期，带自由度那一列（限制 1 的量） */
+function renderRiskArm(
+  label: string,
+  subset: string,
+  byHorizon: readonly (IcResult & { horizon: number; regress: RegressStats })[]
+): string[] {
+  const lines = ['', `【${label}】 子集 = ${subset}`]
+  lines.push(
+    '  持有期  有效交易日   平均 IC      t(NW,L=h−1)   设计矩阵列数  残差自由度中位  缺数丢弃  弃列'
+  )
+  for (const r of byHorizon) {
+    const num = (v: number | null): string => (v === null ? '—' : v.toFixed(2))
+    const s = r.regress
+    lines.push(
+      `  ${String(r.horizon).padStart(4)} 日  ${String(r.days).padStart(10)}  ${pct(r.meanIc, 4).padStart(10)}  ` +
+        `${`${num(r.tNw)}(L=${r.lagNw})`.padStart(12)}  ${String(s.medianColumns ?? '—').padStart(12)}  ` +
+        `${String(s.medianResidualDf ?? '—').padStart(14)}  ${String(s.droppedMissing).padStart(8)}  ${String(s.droppedColumns).padStart(4)}`
+    )
+  }
+  return lines
+}
+
 function render(
   label: string,
   byDate: Map<TradeDate, Row[]>,
@@ -582,6 +864,8 @@ function render(
 export async function main(argv: readonly string[]): Promise<number> {
   const evalFrom = evalFromOf(argv)
   const industryFile = industryFileOf(argv)
+  /** `--risk-factors`：打开 §5.70 那六条中性化臂。不给它时 payload 与旧报告逐字段相同。 */
+  const riskFactors = argv.includes('--risk-factors')
   const rest = stripLocalFlags(argv)
   let options: CliOptions | 'help'
   try {
@@ -620,6 +904,7 @@ ${USAGE}`)
 
     const all = new Map<TradeDate, Row[]>()
     const counters = { judged: 0, unusable: 0, zeroScore: 0 }
+    const momentumOf = new Map<SecCode, Map<TradeDate, Map<number, number>>>()
     let audited = 0
     for (const raw of options.codes) {
       const code = normalizeCode(raw)
@@ -630,6 +915,25 @@ ${USAGE}`)
         continue
       }
       collect(loaded, params, options, sentimentAt, all, counters, evalFrom)
+      /*
+        动量的边侧表（§5.70 的控制变量之一）。**在这里顺手算，不改 `Row` 也不改 `collect`**
+        —— 那两个是 `factor-ic.ts` 也在用的共享结构，为一次归因实验加字段不值得。
+        用 `closeAdj`（后复权）：除权不该被算成一次下跌。
+      */
+      if (riskFactors) {
+        const perDate = new Map<TradeDate, Map<number, number>>()
+        loaded.candles.forEach((bar, i) => {
+          const byLag = new Map<number, number>()
+          for (const lag of MOMENTUM_LAGS) {
+            const base = loaded.candles[i - lag]?.closeAdj
+            if (base !== undefined && base > 0 && bar.closeAdj > 0) {
+              byLag.set(lag, bar.closeAdj / base - 1)
+            }
+          }
+          if (byLag.size > 0) perDate.set(bar.date, byLag)
+        })
+        momentumOf.set(loaded.profile.code, perDate)
+      }
       audited++
       if (!options.quiet && !options.json && audited % 20 === 0) {
         process.stdout.write(`[audit] ${audited} 只，累计判定根 ${counters.judged}
@@ -662,6 +966,77 @@ ${USAGE}`)
       }),
     }
 
+    /*
+      §5.70 的六条臂。**臂的清单写死在这里，不是运行时挑的** ——
+      预注册的全部意义就是「事后不许换臂」。缺输入的臂（市值要 `--liquidity`、
+      行业要 `--industry`）**整条省略并在 meta 里说明**，不静默降级成别的控制组合。
+    */
+    const riskArms: {
+      key: string
+      label: string
+      controls: Control[]
+      subset: 'positiveOnly' | 'all'
+    }[] = []
+    if (riskFactors) {
+      const capByCode = new Map<SecCode, Map<TradeDate, number>>()
+      if (options.liquidity) {
+        for (const one of loadLiquidity(options.liquidity, options.codes.map(normalizeCode))) {
+          const perDate = new Map<TradeDate, number>()
+          for (const row of one.rows) if (row.floatCap !== null) perDate.set(row.date, row.floatCap)
+          capByCode.set(one.code, perDate)
+        }
+      }
+      // 控制变量取**当日横截面的秩**（在 neutralizeByRegression 里做）⇒ 单调变换等价
+      // ⇒ 取不取 log 不影响结果，省掉一个自由参数
+      const cap: Control = {
+        kind: 'continuous',
+        name: 'floatCap',
+        valueOf: (c, d) => capByCode.get(c)?.get(d) ?? null,
+      }
+      const mom = (lag: number): Control => ({
+        kind: 'continuous',
+        name: `mom${lag}`,
+        valueOf: (c, d) => momentumOf.get(c)?.get(d)?.get(lag) ?? null,
+      })
+      const ind: Control | null =
+        industryOf === null
+          ? null
+          : { kind: 'categorical', name: 'swL1', groupOf: (c, d) => industryOf(c, d) }
+      const hasCap = capByCode.size > 0
+      const push = (key: string, label: string, controls: (Control | null)[]): void => {
+        if (controls.some((c) => c === null)) return
+        riskArms.push({ key, label, controls: controls as Control[], subset: 'positiveOnly' })
+      }
+      if (hasCap) push('A1', 'A1 市值', [cap])
+      push('A2', 'A2 动量5', [mom(5)])
+      push('A3', 'A3 动量20', [mom(20)])
+      if (hasCap) push('A4', 'A4 市值 + 动量20（**主判据**）', [cap, mom(20)])
+      if (hasCap) push('A5', 'A5 市值 + 动量20 + 行业（自由度紧张，只当描述）', [cap, mom(20), ind])
+      push('A6', 'A6 只放行业（与 §5.69 对齐用）', [ind])
+      if (hasCap) {
+        riskArms.push({
+          key: 'A4-all',
+          label: 'A4 同样的控制组、换成全体子集（稳健性）',
+          controls: [cap, mom(20)],
+          subset: 'all',
+        })
+      }
+    }
+    const riskResults = riskArms.map((arm) => ({
+      key: arm.key,
+      label: arm.label,
+      subset: arm.subset,
+      controls: arm.controls.map((c) => c.name),
+      byHorizon: HORIZONS.map((h) => {
+        const { byDate, stats } = neutralizeByRegression(
+          arm.subset === 'all' ? all : positive,
+          arm.controls,
+          h
+        )
+        return { horizon: h, ...icOf(byDate, h), regress: stats }
+      }),
+    }))
+
     const payload = {
       meta: {
         engineVersion: engineVersionOf(params),
@@ -673,6 +1048,8 @@ ${USAGE}`)
         minCrossSection: MIN_CROSS_SECTION,
         evalFrom,
         industryFile,
+        riskFactors,
+        riskArms: riskArms.map((a) => ({ key: a.key, controls: a.controls.map((c) => c.name), subset: a.subset })),
         judged: counters.judged,
         unusable: counters.unusable,
         zeroScore: counters.zeroScore,
@@ -682,6 +1059,7 @@ ${USAGE}`)
       ...(neutral === null
         ? {}
         : { industryNeutralAll: neutral.all, industryNeutralPositiveOnly: neutral.positiveOnly }),
+      ...(riskResults.length === 0 ? {} : { riskNeutral: riskResults }),
     }
 
     if (options.out !== undefined) {
@@ -714,6 +1092,19 @@ ${USAGE}`)
             '    用今天的归属回标历史是未来函数，而那正是这份数据存在的理由。',
             '  ⚠ 它**减掉**了行业那一层，**不是测量**了它 ⇒ 答不了「行业轮动有没有 alpha」。',
             '  ⚠ 中性化吃自由度 ⇒ 就算点估计不动，`t` 也会变小（组规模中位那一列就是它的量）。',
+          ]),
+      ...(riskResults.length === 0
+        ? []
+        : [
+            ...riskResults.flatMap((a) => renderRiskArm(a.label, a.subset, a.byHorizon)),
+            '',
+            '  风险因子中性 = 逐日把 rank(得分) 与 rank(前瞻收益) 对「截距 + 控制变量」做横截面 OLS，',
+            '    取残差再算 Spearman（M2 §5.70）。控制变量取**当日横截面的秩** ⇒ 取不取 log 等价。',
+            '    连续量只吃 1 个自由度；类别量（行业）吃「类别数 − 1」个 —— 那就是 A5 自由度紧张的原因。',
+            '  ⚠ **臂的清单在预注册里写死**，缺输入的臂整条省略（不静默降级成别的控制组合）。',
+            '  ⚠ **动量与得分在构造上相关**（T3_BREAKOUT 就是「创新高 + 带宽扩张」）',
+            '    ⇒ 「Δ 大」有两种读法：暴露解释了负 IC，**或者**我们把得分本身砍掉了一块。**本轮分不开**。',
+            '  ⚠ 它**减掉**了这些暴露，**不是测量**了它们 ⇒ 答不了「动量因子本身有没有 alpha」。',
           ]),
       '',
       '  IC 是逐日横截面的 Spearman 秩相关（得分 vs 前瞻收益），**不构造零分布**（§5.46）。',

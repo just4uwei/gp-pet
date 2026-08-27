@@ -11,6 +11,7 @@ import type { SecCode, TradeDate } from '@core/types'
 import {
   icOf,
   neutralizeByIndustry,
+  neutralizeByRegression,
   type Row,
 } from '../../../src/backtest/ic-audit'
 
@@ -130,5 +131,116 @@ describe('neutralizeByIndustry', () => {
     const { stats } = neutralizeByIndustry(byDate, () => '480000', 10)
     expect(stats.rowsIn).toBe(2)
     expect(stats.rowsOut).toBe(2)
+  })
+})
+
+/**
+ * 秩上的横截面回归（`neutralizeByRegression`，预注册 M2 §5.70）。
+ *
+ * **手写 OLS 是这一族里风险最高的一块** —— 解错了不报错，只会给出一个别的数，
+ * 而我们要拿它与原始 IC 并排比。所以这里钉的是四条能把实现判死的恒等式，
+ * 其中一条**拿已经通过测试的分组去均值做交叉验证**。
+ */
+describe('neutralizeByRegression', () => {
+  const rows12 = day([
+    [0.9, 0.05],
+    [0.7, -0.02],
+    [0.5, 0.11],
+    [0.3, -0.07],
+    [0.2, 0.01],
+    [0.15, 0.03],
+    [0.1, -0.04],
+    [0.08, 0.09],
+    [0.06, -0.01],
+    [0.04, 0.02],
+    [0.02, 0.06],
+    [0.01, -0.09],
+  ])
+  const one = new Map([[date('2020-01-02'), rows12]])
+
+  it('【不变量①】只有截距（控制变量为空）时，IC 逐位等于原始 IC', () => {
+    // 只减去全横截面均值 ⇒ 不改变秩 ⇒ Spearman 不变
+    const raw = icOf(one, H)
+    const { byDate, stats } = neutralizeByRegression(one, [], H)
+    expect(icOf(byDate, H).meanIc).toBeCloseTo(raw.meanIc, 12)
+    expect(stats.medianColumns).toBe(1) // 只有截距
+    expect(stats.droppedMissing).toBe(0)
+  })
+
+  it('【不变量②】单一类别的哑变量等价于只有截距 ⇒ 仍等于原始 IC', () => {
+    const raw = icOf(one, H)
+    const { byDate, stats } = neutralizeByRegression(
+      one,
+      [{ kind: 'categorical', name: 'ind', groupOf: () => '480000' }],
+      H
+    )
+    expect(icOf(byDate, H).meanIc).toBeCloseTo(raw.meanIc, 12)
+    // 只有一个类别 ⇒ 丢掉参照后没有哑变量列 ⇒ 仍是 1 列
+    expect(stats.medianColumns).toBe(1)
+  })
+
+  it('【不变量③·交叉验证】两个类别的哑变量回归 = 分组去均值（两套实现必须给同一个数）', () => {
+    const groupOf = (c: SecCode): string =>
+      rows12.slice(0, 6).some((r) => r.code === c) ? 'A' : 'B'
+    const viaGroups = neutralizeByIndustry(one, groupOf, H, 1)
+    const viaOls = neutralizeByRegression(
+      one,
+      [{ kind: 'categorical', name: 'g', groupOf }],
+      H
+    )
+    const a = icOf(viaGroups.byDate, H)
+    const b = icOf(viaOls.byDate, H)
+    expect(a.days).toBe(1)
+    expect(b.days).toBe(1)
+    // 这一条是整块 OLS 的正确性证明：它必须复现一条独立实现的结果
+    expect(b.meanIc).toBeCloseTo(a.meanIc, 10)
+  })
+
+  it('【不变量④】拿得分自己当控制变量 ⇒ 残差全为 0 ⇒ 没有可用横截面，不是「IC = 0」', () => {
+    const { byDate } = neutralizeByRegression(
+      one,
+      [
+        {
+          kind: 'continuous',
+          name: 'self',
+          valueOf: (c) => rows12.find((r) => r.code === c)?.score ?? null,
+        },
+      ],
+      H
+    )
+    // 得分的秩被自己完全解释 ⇒ 残差恒 0 ⇒ correlation 返回 null ⇒ 不计入
+    expect(icOf(byDate, H).days).toBe(0)
+  })
+
+  it('共线的重复列被丢弃并计数，不是硬解出一个爆炸的系数', () => {
+    const valueOf = (c: SecCode): number =>
+      rows12.findIndex((r) => r.code === c)
+    const { stats } = neutralizeByRegression(
+      one,
+      [
+        { kind: 'continuous', name: 'x', valueOf },
+        { kind: 'continuous', name: 'x-again', valueOf },
+      ],
+      H
+    )
+    expect(stats.droppedColumns).toBeGreaterThan(0)
+    expect(stats.medianColumns).toBe(2) // 截距 + 一份 x
+  })
+
+  it('控制变量缺数的行整行丢弃并计数（约束 4：不许拿 0 冒充）', () => {
+    const { stats } = neutralizeByRegression(
+      one,
+      [
+        {
+          kind: 'continuous',
+          name: 'cap',
+          valueOf: (c) => (c === rows12[0]?.code ? null : 1),
+        },
+      ],
+      H
+    )
+    expect(stats.droppedMissing).toBe(1)
+    expect(stats.rowsIn).toBe(rows12.length)
+    expect(stats.rowsOut).toBe(rows12.length - 1)
   })
 })
