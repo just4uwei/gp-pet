@@ -14,6 +14,11 @@ logs/
 reports/
 # 抓下来的历史行情（scripts/fetch-history.mjs 的产物，可重出）
 data/history/
+# 申万行业变迁史（scripts/fetch-industry.mjs 的产物，可重出）。
+# 不进版本控制的另一个理由：申万随时会更新这份表，提交一份快照会让
+# 「我手上这份是哪天的」变成一个要翻 git log 才知道的问题 —— 文件里的 fetchedAt 才是出处。
+data/industry/
+
 # 公告源探针的累计样本（scripts/probe-announcements.mjs，docs/11 N0）。
 # 它是**本机这条网络**上的观测，换台机器不通用，所以不进版本控制；
 # 结论归档在 docs/notes/公告源-可达性实测.md

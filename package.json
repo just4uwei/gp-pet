@@ -36,6 +36,7 @@
     "build:universe": "node scripts/build-universe.mjs",
     "fetch:announcements": "node scripts/fetch-announcements.mjs",
     "fetch:liquidity": "node scripts/fetch-liquidity.mjs",
+    "fetch:industry": "node scripts/fetch-industry.mjs",
     "fetch:page": "node scripts/fetch-page.mjs"
   },
   "dependencies": {
