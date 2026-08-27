@@ -208,14 +208,41 @@ export function erc(cov: readonly (readonly number[])[], maxIter = 10_000, tol =
 /**
  * 跑一条多腿净值。
  *
+ * ## `weights` 是**目标**权重，不是实际权重（2026-08-27 改，M2 §5.78）
+ *
+ * 旧写法把 `weights[t]` 当成 t 期的**实际**权重 ⇒ 调仓之间被**无成本地**拉回目标
+ * ⇒ 每一条臂都白得「逐日再平衡」这件事。上一轮（[论证 §14.4 ②](../../docs/notes/配置形态-论证.md)）
+ * 只把它记成「方向对 ERC 保守」的小事，因为承重对照的目标每月都在动、两条臂都被同等地美化。
+ *
+ * **这一轮它压在主判据的正中央**：承重对照是「**不随时间变的**权重」
+ * ⇒ 旧写法会让那条静态臂白得逐日再平衡，而本轮问的恰恰是「时变权重值不值」。
+ * ⇒ 现在按持有量记账：各腿市值随自己的收益漂移，**只有目标变化的那一根才交易到目标**，
+ * 换手 = `Σ|目标 − 漂移后的实际|`。
+ *
+ * ⚠ **`legWeights` 报的是漂移后的实际平均权重**，不是目标 —— 报目标会让「实际拿了多少」
+ * 这件事在表上看不出来，而它是读收益差的前提（§5.13）。
+ *
+ * ## ⚠ `rebalanceAt` 为什么必须显式给（改完漂移之后当场发现的第二处偏差）
+ *
+ * 只按「目标变了没有」判断要不要交易，会让**目标恒定**的那条臂**一次都不再平衡**
+ * —— 那是「买入并持有」，而 [§13.4](../../docs/notes/配置形态-论证.md) 预注册的是
+ * 「固定权重**月度**再平衡」。⇒ 修完漂移之后，那条对照从「白得逐日再平衡」
+ * 一步跨到了另一个极端。两个极端都不是预注册说的东西。
+ *
+ * ⇒ 调仓日由调用方显式给，**所有臂共用同一份**（同一日历、同一节奏）
+ * ⇒ 「谁多付了换手」这件事只由权重差决定，不由节奏差决定。
+ * **判据是预注册的措辞，不是哪一组数更好看。**
+ *
  * @param returns  `returns[t][k]` 第 t 期第 k 条腿的收益
- * @param weights  `weights[t][k]` 第 t 期**已生效**的权重（调用方保证只用了 t−1 及以前的信息）
+ * @param weights  `weights[t][k]` 第 t 期的**目标**权重（调用方保证只用了 t−1 及以前的信息）
+ * @param rebalanceAt `rebalanceAt[t]` 为真时，即使目标没变也交易回目标。省略 = 只在目标变化时交易
  */
 export function simulateLegs(
   label: string,
   returns: readonly (readonly number[])[],
   weights: readonly (readonly number[])[],
-  costs: CostModel
+  costs: CostModel,
+  rebalanceAt?: readonly boolean[]
 ): ArmResult {
   const rate = oneWayRate(costs)
   const k = LEGS.length
@@ -223,7 +250,9 @@ export function simulateLegs(
   const daily: number[] = []
   const weightSum = Array.from({ length: k }, () => 0)
   let value = 1
+  /** 各腿市值（元）。它们各自随本腿收益漂移，只有调仓那一根才被拉回目标 */
   let held = Array.from({ length: k }, () => 0)
+  let target: number[] | null = null
   let rebalances = 0
   let turnover = 0
   let costPaid = 0
@@ -231,24 +260,41 @@ export function simulateLegs(
   for (let t = 0; t < returns.length; t++) {
     const w = weights[t] ?? []
     const r = returns[t] ?? []
-    // 换手发生在这一根开盘之前（权重由 t−1 收盘定），成本先扣再吃当日收益
-    let delta = 0
-    for (let j = 0; j < k; j++) delta += Math.abs((w[j] ?? 0) - (held[j] ?? 0))
-    if (delta > 1e-12) {
-      const fee = value * delta * rate
-      costPaid += fee
-      value -= fee
-      turnover += delta
-      rebalances++
-      held = w.slice()
+    /*
+      目标变了才交易，交易发生在这一根开盘之前（目标由 t−1 收盘定），
+      成本先扣再吃当日收益 —— 与 `vol-target.ts` 的 `simulatePath` 逐字同口径。
+      换手按**漂移后的实际权重**与目标之差算，这正是旧写法漏掉的那一块。
+    */
+    const targetChanged = target === null || w.some((v, j) => Math.abs(v - (target?.[j] ?? 0)) > 1e-12)
+    const forced = rebalanceAt === undefined ? false : rebalanceAt[t] === true
+    if (targetChanged || forced) {
+      let delta = 0
+      for (let j = 0; j < k; j++) {
+        const actual = value > 0 ? (held[j] ?? 0) / value : 0
+        delta += Math.abs((w[j] ?? 0) - actual)
+      }
+      if (delta > 1e-12) {
+        const fee = value * delta * rate
+        costPaid += fee
+        value -= fee
+        turnover += delta
+        rebalances++
+      }
+      target = w.slice()
+      held = w.map((v) => v * value)
     }
-    let portfolioReturn = 0
+    // 这一根的实际权重（漂移后、交易后）—— 报表与组合收益都用它
     for (let j = 0; j < k; j++) {
-      portfolioReturn += (w[j] ?? 0) * (r[j] ?? 0)
-      weightSum[j] = (weightSum[j] ?? 0) + (w[j] ?? 0)
+      weightSum[j] = (weightSum[j] ?? 0) + (value > 0 ? (held[j] ?? 0) / value : 0)
     }
     const before = value
-    value *= 1 + portfolioReturn
+    let after = 0
+    for (let j = 0; j < k; j++) {
+      const grown = (held[j] ?? 0) * (1 + (r[j] ?? 0))
+      held[j] = grown
+      after += grown
+    }
+    value = after
     daily.push(before > 0 ? value / before - 1 : 0)
     equity.push(value)
   }
@@ -370,6 +416,13 @@ export function runWindow(data: LegData, window: Window, costs: CostModel): Wind
   const ercWeights: number[][] = []
   const fixedWeights: number[][] = []
   const equityWeights: number[][] = []
+  /*
+    调仓日 = **ERC 的新目标真正生效那一天**（月末判定 ⇒ 次一根）。
+    所有臂共用它 ⇒ 节奏完全一致，「谁多付了换手」只由权重差决定。
+    见 `simulateLegs` 的 `rebalanceAt` 头注释。
+  */
+  const rebalanceAt: boolean[] = []
+  let pendingRebalance = true
   let current: number[] | null = null
   let sawWarmup = false
 
@@ -396,6 +449,8 @@ export function runWindow(data: LegData, window: Window, costs: CostModel): Wind
     ercWeights.push(current)
     fixedWeights.push([...FIXED_WEIGHTS])
     equityWeights.push([1, 0, 0])
+    rebalanceAt.push(pendingRebalance)
+    pendingRebalance = false
 
     // 月末收盘判定 ⇒ 下一根生效（同日生效就是未来函数）
     if (ends.has(i)) {
@@ -404,13 +459,18 @@ export function runWindow(data: LegData, window: Window, costs: CostModel): Wind
         const r = data.rets[t]
         if (r) rows.push(r)
       }
-      if (rows.length === COV_WINDOW) current = erc(covarianceMatrix(rows))
+      if (rows.length === COV_WINDOW) {
+        current = erc(covarianceMatrix(rows))
+        pendingRebalance = true
+      }
     }
   }
   if (!sawWarmup) throw new Error(`${window.name}：协方差预热凑不够 ${COV_WINDOW} 根`)
 
-  const ercArm = simulateLegs('ERC', returns, ercWeights, costs)
-  const fixedArm = simulateLegs('固定权重 1/3', returns, fixedWeights, costs)
+  const ercArm = simulateLegs('ERC', returns, ercWeights, costs, rebalanceAt)
+  const fixedArm = simulateLegs('固定权重 1/3', returns, fixedWeights, costs, rebalanceAt)
+  // 「单独持有」与「满仓宽基」是**买入并持有**的参照 ⇒ 刻意不给调仓日
+  // （单腿组合没有「再平衡」这件事，硬给它一份调仓日只会白付换手）
   const equityArm = simulateLegs('满仓宽基', returns, equityWeights, costs)
   const legOnly = LEGS.map((leg, j) =>
     simulateLegs(

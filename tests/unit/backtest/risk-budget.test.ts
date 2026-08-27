@@ -163,3 +163,74 @@ describe('预注册的常量', () => {
     expect([...FIXED_WEIGHTS]).toEqual([1 / 3, 1 / 3, 1 / 3])
   })
 })
+
+describe('月内漂移（2026-08-27 加，M2 §5.78）', () => {
+  const zero = { ...DEFAULT_COSTS, slippage: 0, commissionRate: 0 }
+
+  /*
+    这一组钉的是「`weights` 是**目标**不是实际」。
+    旧写法把它当实际 ⇒ 调仓之间被无成本地拉回目标 ⇒ **每条臂都白得逐日再平衡**，
+    而第四轮的承重对照恰恰是「不随时间变的权重」⇒ 那个偏差压在主判据正中央。
+  */
+  it('目标不变而两腿收益不同 ⇒ 实际权重必须偏离目标，且期间零换手', () => {
+    const arm = simulateLegs(
+      'x',
+      [
+        [0.2, 0, 0], // 第一腿涨 20%
+        [0, 0, 0],
+      ],
+      [
+        [0.5, 0.5, 0],
+        [0.5, 0.5, 0],
+      ],
+      zero
+    )
+    // t=0 实际 0.5 / 0.5；t=1 漂移成 0.6/1.1 = 0.5454…
+    close(arm.legWeights[0] ?? 0, (0.5 + 0.6 / 1.1) / 2)
+    close(arm.legWeights[1] ?? 0, (0.5 + 0.5 / 1.1) / 2)
+    // 漂移真的发生了（旧写法这里恰好等于 0.5）
+    expect(arm.legWeights[0] ?? 0).toBeGreaterThan(0.5)
+    // 只有建仓那一次交易
+    expect(arm.rebalances).toBe(1)
+    close(arm.turnover, 1)
+    close(arm.totalReturn, 0.1)
+  })
+
+  it('目标变化那一根的换手按「目标 − 漂移后的实际」算，不是「目标 − 上次目标」', () => {
+    const arm = simulateLegs(
+      'x',
+      [
+        [0.2, 0, 0],
+        [0, 0, 0],
+      ],
+      [
+        [0.5, 0.5, 0],
+        [0.4, 0.6, 0], // 目标变了 ⇒ 交易
+      ],
+      zero
+    )
+    const drifted0 = 0.6 / 1.1
+    const drifted1 = 0.5 / 1.1
+    const expected = 1 + Math.abs(0.4 - drifted0) + Math.abs(0.6 - drifted1)
+    close(arm.turnover, expected)
+    expect(arm.rebalances).toBe(2)
+    // 按「目标 − 上次目标」算会是 1 + 0.1 + 0.1 = 1.2，明显不同
+    expect(Math.abs(arm.turnover - 1.2)).toBeGreaterThan(1e-3)
+  })
+
+  it('单腿满仓 ⇒ 漂移不产生任何换手（权重恒为 1）', () => {
+    const arm = simulateLegs('x', [
+      [0.1, 0, 0],
+      [-0.05, 0, 0],
+      [0.03, 0, 0],
+    ], [
+      [1, 0, 0],
+      [1, 0, 0],
+      [1, 0, 0],
+    ], zero)
+    expect(arm.rebalances).toBe(1)
+    close(arm.turnover, 1)
+    close(arm.totalReturn, 1.1 * 0.95 * 1.03 - 1)
+    close(arm.legWeights[0] ?? 0, 1)
+  })
+})
