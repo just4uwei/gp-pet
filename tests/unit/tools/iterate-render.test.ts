@@ -36,6 +36,7 @@ const ALPHA: AlphaSnapshot = {
   matchRegime: true,
   shuffleSpans: true,
   seed: 1,
+  trials: 2000,
   timingNull: 'REGIME_BLOCK',
   timingNullReason: null,
   blockCoverage: 0.9964,
@@ -84,12 +85,12 @@ const RUNTIME: RuntimeSnapshot = {
   latestAlertDate: '2026-08-27' as TradeDate,
   signalFreshness: {
     kind: 'CAUGHT_UP',
-    session: { date: '2026-08-27' as TradeDate, source: 'db' },
+    session: { date: '2026-08-27' as TradeDate, source: 'db', uncertain: false },
     latest: '2026-08-27' as TradeDate,
   },
   alertFreshness: {
     kind: 'CAUGHT_UP',
-    session: { date: '2026-08-27' as TradeDate, source: 'db' },
+    session: { date: '2026-08-27' as TradeDate, source: 'db', uncertain: false },
     latest: '2026-08-27' as TradeDate,
   },
 }
@@ -143,6 +144,22 @@ describe('看板 · 策略质量那张表', () => {
     })
     expect(old).toContain('| ALL | 900 | 43.00% | — | — | 1.00% |')
     expect(old).not.toContain('| ALL | 900 | 43.00% | **0.00%** | 0.00% | 1.00% |')
+  })
+
+  it('trials 与它的噪音地板必须与那两列一起印（M2 §5.76）', () => {
+    const out = board()
+    // 口径行上要看得见本次的 trials
+    expect(out).toContain('**trials 2000**')
+    expect(out).toContain('引用这两列必须带 `trials`')
+    expect(out).toContain('每层的地板要各自量')
+
+    // 归档里仍有一堆 trials=200 的报告 ⇒ 低于现默认时要额外点名
+    const old = board({ alpha: known({ ...ALPHA, trials: 200 }) })
+    expect(old).toContain('**这份是 trials=200**')
+    // 读不到时说读不到，不许印成 0（纪律 3）
+    const missing = board({ alpha: known({ ...ALPHA, trials: null }) })
+    expect(missing).toContain('**trials 读不到**')
+    expect(missing).not.toContain('**trials 0**')
   })
 
   it('中位与加权的读法（读数纪律 2）与零点口径必须一起印', () => {

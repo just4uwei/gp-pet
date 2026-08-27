@@ -11,8 +11,10 @@
 
 import { describe, expect, it } from 'vitest'
 import {
+  USAGE,
   findBases,
   nearestInPool,
+  parse,
   regimeRuns,
   renderText,
   type RegimeRun,
@@ -265,13 +267,15 @@ describe('Newey-West 长期方差', () => {
  * 而它底层的 `μ` 比 TRANSITION 小 2.7 倍）。
  * ⇒ 唯一有效的防线是**把 `μ` 印出来、把纪律印在表下面**，而这条用例钉住它们还在。
  */
-describe('打散跨度表：效应量列与饱和纪律', () => {
-  /*
-    最小 payload。**刻意用 cast 而不是把 40 个字段全填一遍** —— 这条用例断言的是
-    渲染出来的**文本**，不是 payload 的形状；日后 renderText 多读一个字段时它会
-    在运行时大声炸掉，那是可接受的失败方式（不是静默通过）。
-  */
-  const payload = {
+/*
+  最小 payload。**刻意用 cast 而不是把 40 个字段全填一遍** —— 用它的用例断言的是
+  渲染出来的**文本**，不是 payload 的形状；日后 renderText 多读一个字段时它会
+  在运行时大声炸掉，那是可接受的失败方式（不是静默通过）。
+
+  按 `trials` 参数化，因为报告的纪律行要把本次的试验数印出来（§5.76）。
+*/
+function payloadWith(trials: number): Parameters<typeof renderText>[0] {
+  return {
     meta: {
       baseline: 'reports/calib/x.json',
       engineVersion: '0.2.8-test',
@@ -282,7 +286,7 @@ describe('打散跨度表：效应量列与饱和纪律', () => {
       capitalPerCode: 100000,
       costs: null,
       knobs: { deviations: [], unverifiable: [] },
-      trials: 200,
+      trials,
       seed: 1,
       matchRegime: true,
       crossCode: false,
@@ -341,8 +345,10 @@ describe('打散跨度表：效应量列与饱和纪律', () => {
       },
     ],
   } as unknown as Parameters<typeof renderText>[0]
+}
 
-  const text = renderText(payload)
+describe('打散跨度表：效应量列与饱和纪律', () => {
+  const text = renderText(payloadWith(200))
 
   it('表头有**效应量 μ** 那一列', () => {
     expect(text).toContain('**效应量 μ**')
@@ -366,5 +372,41 @@ describe('打散跨度表：效应量列与饱和纪律', () => {
   it('**同时**印了「不受影响的用法」—— 否则会被读成「配对胜率作废」', () => {
     expect(text).toContain('不受影响的用法')
     expect(text).toContain('L2 条件①')
+  })
+})
+
+describe('trials 是判据不是性能旋钮（M2 §5.73 ⑤ / §5.76）', () => {
+  const opts = (extra: readonly string[] = []): { trials: number } => {
+    const p = parse(['--baseline', 'x.json', '--fixtures', './d', ...extra])
+    if (p === 'help') throw new Error('不该是 help')
+    return p
+  }
+
+  /*
+    2026-08-27 用户拍板把默认从 200 提到 2000。**这不是性能取舍**：
+    `pairedMedianWinFraction` 是试验数上的二项比例（SE = √(p(1−p)/trials)）
+    ⇒ 200 那档的噪音地板实测 6.00pp，比 §5.72 预注册的「咬得住」门槛（5pp）还大
+    ⇒ 那一档在自己的预注册口径下根本不可能被干净地判定（§5.73 ② 就是这么落进「不确定」的）。
+    ⚠ 改回 200 会让全项目的配对胜率读数悄悄回到 6pp 地板上，而**没有任何一处会报错**。
+  */
+  it('不给 --trials 时默认 2000', () => {
+    expect(opts().trials).toBe(2000)
+  })
+
+  it('显式给值仍然听话（预承诺一个更高的精度是允许的，反过来要人拍板）', () => {
+    expect(opts(['--trials', '5000']).trials).toBe(5000)
+  })
+
+  it('帮助文本里写着「trials 默认 2000」与「不是样本量」—— 登记项的判据就在这', () => {
+    expect(parse(['--help'])).toBe('help')
+    // 这七个字同时是登记项 random-trials-default 的判据串（看板靠它认出已落地）
+    expect(USAGE).toContain('trials 默认 2000')
+    expect(USAGE).toContain('不是样本量')
+  })
+
+  it('报告把本次的 trials 印在纪律行上（引用配对胜率必须带它）', () => {
+    expect(renderText(payloadWith(200))).toContain('本次 trials=200')
+    expect(renderText(payloadWith(2000))).toContain('本次 trials=2000')
+    expect(renderText(payloadWith(2000))).toContain('每一层的地板要各自量')
   })
 })

@@ -240,6 +240,7 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
           engineVersion?: string
           matchRegime?: boolean
           seed?: number
+          trials?: number
           timingNull?: 'BLOCK' | 'INDEPENDENT' | 'REGIME_BLOCK' | null
           timingNullReason?: string | null
           blockCoverage?: number | null
@@ -281,6 +282,8 @@ function latestAlpha(): Maybe<AlphaSnapshot> {
         matchRegime: j.meta?.matchRegime === true,
         shuffleSpans: j.strata.some((s) => s.shuffled !== null),
         seed: j.meta?.seed ?? 0,
+        // 读不到就是 null，不许当 0（纪律 3）—— 而它现在是引用配对胜率的必要口径（§5.76）
+        trials: j.meta?.trials ?? null,
         timingNull: j.meta?.timingNull ?? null,
         timingNullReason: j.meta?.timingNullReason ?? null,
         blockCoverage: j.meta?.blockCoverage ?? null,

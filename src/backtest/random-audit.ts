@@ -3,7 +3,7 @@
  * 随机入场基准（零假设分布）。
  *
  * ```bash
- * pnpm audit:random -- --baseline reports/calib/baseline-261.json --fixtures ./data/history --trials 200
+ * pnpm audit:random -- --baseline reports/calib/baseline-261.json --fixtures ./data/history
  * ```
  *
  * **为什么需要这个工具**：回测报出「TREND_UP 建仓 396 次 / 仓位加权 −1.01%」，
@@ -1034,7 +1034,7 @@ interface Options {
   json: boolean
 }
 
-const USAGE = `用法：
+export const USAGE = `用法：
   pnpm audit:random -- --baseline <report.json> --fixtures ./data/history [选项]
 
 必需：
@@ -1045,7 +1045,10 @@ const USAGE = `用法：
   --db <file>            market.db 路径
 
 选项：
-  --trials <n>           随机试验次数，默认 200
+  --trials <n>           随机试验次数，**trials 默认 2000**（2026-08-27 从 200 提上来，M2 §5.76）。
+                         它是**蒙特卡洛复制次数，不是样本量** —— 提高它不让数据多说一个字，
+                         只把同一个量测得更准（配对胜率是试验数上的二项比例，
+                         SE = √(p(1−p)/trials)）。200 那档的噪音地板实测 6.00pp，2000 是 1.65pp
   --seed <n>             RNG 种子，默认 1（可复现是硬要求）
   --match-regime         随机入场日限定在与真实建仓相同的市场状态里
                          （慢很多：要为每只票重算一遍 regime 序列）
@@ -1089,10 +1092,15 @@ const USAGE = `用法：
   --json                 只输出 JSON
 `
 
-function parse(argv: readonly string[]): Options | 'help' {
+/**
+ * 导出只为了让**默认值**有一条用例钉着（2026-08-27，M2 §5.76）。
+ * `trials` 的默认值是一个**判据**（它决定了配对胜率的噪音地板），
+ * 而判据没有闸门就只是又一条纪律 —— 这个项目已经证过一次（§5.44）。
+ */
+export function parse(argv: readonly string[]): Options | 'help' {
   const o: Options = {
     baseline: '',
-    trials: 200,
+    trials: 2000,
     seed: 1,
     matchRegime: false,
     shuffleSpans: false,
@@ -2268,6 +2276,10 @@ export function renderText(p: RandomAuditPayload): string {
     lines.push('  直接检验：50% ⇒ 入场与随机无异，接近 0% ⇒ 入场系统性更差。')
     lines.push('  ⚠ **两个口径要一起读，背离时以中位为准**（CLAUDE.md 读数纪律 2）：加权口径在窄分层上')
     lines.push('  会被单笔妖股支配 —— 实测「流通市值 Q2」加权 84.5%，而中位口径两组几乎相同（§5.45）。')
+    lines.push('  ⚠ **它是试验数上的二项比例 ⇒ 引用它必须带 `trials`**（M2 §5.73 ⑤ / §5.76）：')
+    lines.push(`    SE = √(p(1−p)/trials)。本次 trials=${p.meta.trials}。实测三个种子的极差`)
+    lines.push('    在 trials=200 下是 **6.00pp**、2000 下是 **1.65pp**，而**每一层的地板要各自量**')
+    lines.push('    （RANGE 4.90pp · TRANSITION 0.25pp）—— 小于该层地板的差读不出任何东西。')
     lines.push('  ⚠ **配对胜率是效应量的饱和变换 ⇒ 跨层比它的差无效，要比就比 μ**（M2 §5.74）：')
     lines.push('    胜率 ≈ Φ(μ/σ_D)，灵敏度 φ(z)/σ_D 在 50% 处最大、往 0%/100% 两端塌缩。')
     lines.push('    实测 RANGE（基线 51.4%）的增益是 TRANSITION（0.9%）的 **24 倍** ——')
