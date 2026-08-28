@@ -12,6 +12,7 @@ import {
   belowStopLine,
   downgrade,
   downgrades,
+  forcedExit,
   gateSignal,
   hardSuppressions,
   positionVerdict,
@@ -317,6 +318,58 @@ describe('持仓强制通道（docs/05 §2.3）', () => {
     for (const bad of [0, -1]) {
       expect(belowStopLine(9.2, position({ cost: 10, stopFloor: bad }), P)).toBe(true)
     }
+  })
+
+  /*
+    `forcedExit()` 与 `belowStopLine` 同一个形状：那四条规则被抽成窄入参
+    （2026-08-28），因为它有了第二个调用方 —— **影子运行**拿自己的 `ShadowPosition`
+    判一次（`main/shadow/portfolio.ts` 的 `shadowExitOrder`）。
+
+    分叉的代价已经实测过：影子此前根本没有这条通路，于是影子持仓的风控离场
+    结构上跑不起来，而回测里 96.9% 的离场由风控触发（M2 §5.24）。
+
+    这一条钉的是「**只有一份实现**」：两个入口在同一批输入上必须逐位一致。
+    它变红的意思是有人在某一侧另写了一遍。
+  */
+  it('forcedExit 与 positionVerdict 在同一批输入上逐位一致 —— 规则只有一份实现', () => {
+    const cases: { cost: number; peakPrice: number; price: number; stopFloor?: number }[] = [
+      { cost: 10, peakPrice: 11, price: 9.1 }, // ① 固定止损
+      { cost: 10, peakPrice: 11, price: 10.6 }, // ② 移动止损
+      { cost: 10, peakPrice: 11, price: 10.2 }, // ③ 回撤减仓
+      { cost: 10, peakPrice: 10.6, price: 10.1 }, // ④ 盈利保护
+      { cost: 10, peakPrice: 10, price: 10 }, // 一条都不命中
+      // 画过线且未触及 ⇒ ① 让开，但自峰 −50% 让 ③ 接手（「重画止损线不影响回撤减仓」）
+      { cost: 20, peakPrice: 20, price: 10, stopFloor: 9 },
+      { cost: 20, peakPrice: 20, price: 9, stopFloor: 9 }, // 画过线且已触及
+    ]
+
+    const hit: (string | null)[] = []
+    for (const c of cases) {
+      const held = position(c)
+      const narrow = forcedExit({ position: held, price: c.price, params: P })
+      expect(narrow).toEqual(positionVerdict(input({ position: held, snapshot: snapshot({ last: c.price }) })))
+      hit.push(narrow?.verdict.rule ?? null)
+    }
+
+    // 上面那组 `toEqual` 在两侧都是 null 时会**空过**，所以钉住这组输入真的把四条都走了一遍
+    expect(hit).toEqual([
+      'STOP_LOSS',
+      'TRAILING_STOP',
+      'DRAWDOWN_REDUCE',
+      'PROFIT_PROTECT',
+      null,
+      'DRAWDOWN_REDUCE',
+      'STOP_LOSS',
+    ])
+  })
+
+  it('forcedExit：拿不到价 / 空仓 / 成本非正时是 null，不是「没有风险」', () => {
+    const held = position({ cost: 10, peakPrice: 11 })
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(forcedExit({ position: held, price: bad, params: P })).toBeNull()
+    }
+    expect(forcedExit({ position: position({ shares: 0 }), price: 9.1, params: P })).toBeNull()
+    expect(forcedExit({ position: position({ cost: 0 }), price: 9.1, params: P })).toBeNull()
   })
 
   it('移动止损：**当前**仍盈利 ≥ 5%，但自最高点回撤 3%', () => {

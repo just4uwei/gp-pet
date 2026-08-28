@@ -364,6 +364,13 @@ export async function createDataLayer(options: DataLayerOptions): Promise<DataLa
       const entry = storage.watchlist.get(code)
       return entry ? { board: entry.profile.board, isST: entry.profile.isST } : null
     },
+    /*
+      强制离场那四条阈值。**必须是函数**：`settings` 是 `let`，换灵敏度档位要跟着走
+      —— 而换档本来就会改 `engineVersion()` ⇒ 闸门 ② 停止累积，
+      所以不会出现「用新阈值续旧曲线」。传值（而不是函数）的症状是换完档以后
+      影子还按旧阈值判离场，与那个「引擎实例握着旧 params」的坑同一形状。
+    */
+    params: () => withSensitivity(settings.sensitivity),
     newId: () => randomUUID(),
     log,
   })

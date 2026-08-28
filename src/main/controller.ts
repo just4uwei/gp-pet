@@ -688,6 +688,8 @@ export class AppController {
       engineVersion: current,
       // 只有「记过、且不一致」才算暂停。从未记过（还没开始）不是暂停
       stalledEngineVersion: recorded !== null && recorded !== current ? recorded : null,
+      // 离场口径的分段日。缺失 = 全程一套口径（账本是修复之后才开始的）
+      exitRulesFrom: meta.get(SHADOW_KEYS.exitRulesFrom),
       /*
         「跟上了没有」的参照系。复用 `expectedLastBar`（「此刻应该已经存在的最后一根日线」），
         **别拿「今天」顶替** —— 休市日会算出一个假的落后。

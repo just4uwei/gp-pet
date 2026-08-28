@@ -71,10 +71,25 @@ export interface GateInput {
 }
 
 /**
+ * 四条强制离场规则真正需要的那几项。
+ *
+ * **比 `Position` 窄，是为了让影子运行也能调**（2026-08-28）：它的账本是
+ * `ShadowPosition`，没有 `code` / `openedAt`，而这四条规则一个都不读那两项 ——
+ * 要求完整 `Position` 只会逼调用方**编两个假字段**出来，而编出来的假值
+ * 在日后某条规则真的去读它时会静默地给出一个错的结论。
+ *
+ * ⚠ `cost` 与 `peakPrice` 一律**不复权**（与用户真实成交价同口径）。
+ * 混进复权价会在除权那天凭空触发一次止损 —— 见 `Position.cost` 的注释。
+ */
+export type ExitablePosition = Pick<Position, 'shares' | 'cost' | 'peakPrice'> & {
+  stopFloor?: number | undefined
+}
+
+/**
  * 用户重画的那条固定止损线；没画过返回 null（**不是 0** —— 0 会被读成
  * 「跌到 0 才止损」，等于静默关掉整条规则，见约束 4）。
  */
-export function stopLineOf(position: Position): number | null {
+export function stopLineOf(position: ExitablePosition): number | null {
   return position.stopFloor !== undefined && position.stopFloor > 0 ? position.stopFloor : null
 }
 
@@ -89,7 +104,7 @@ export function stopLineOf(position: Position): number | null {
  * 判据本身：画过线 → 比那个**绝对价**；没画过 → 比 `risk.stopLossPct` 那个百分比。
  * 两者在深套时差别最大，而那正是这个功能存在的场景。
  */
-export function belowStopLine(price: number, position: Position, params: EngineParams): boolean {
+export function belowStopLine(price: number, position: ExitablePosition, params: EngineParams): boolean {
   const floor = stopLineOf(position)
   if (floor !== null) return price <= floor
   if (position.cost <= 0) return false
@@ -113,13 +128,35 @@ export function sellableShares(position: Position | undefined): number {
   return Math.max(0, position.shares - Math.max(0, position.lockedShares ?? 0))
 }
 
-/** 持仓风控的四条强制规则，按严重程度排序 —— 命中第一条即定案 */
-export function positionVerdict(input: GateInput): { verdict: RiskVerdict; direction: GatedDirection; level: AlertLevel } | null {
-  const { position, params } = input
-  if (!position || position.shares <= 0 || position.cost <= 0) return null
+/** 四条强制规则的裁决。`positionVerdict` 与 `forcedExit` 共用这个形状 */
+export interface ForcedExit {
+  verdict: RiskVerdict
+  direction: GatedDirection
+  level: AlertLevel
+}
 
-  const price = currentPrice(input)
-  if (price === null) return null
+/**
+ * 持仓风控的四条强制规则，按严重程度排序 —— 命中第一条即定案。
+ *
+ * **这是那四条规则的唯一实现。** 单独抽出来（2026-08-28）是因为它有了第二个调用方：
+ * `positionVerdict()` 走完整的 `GateInput`（实盘/回测的闸门），而**影子运行**要拿
+ * 自己的 `ShadowPosition` 判一次 —— 它的账本与用户手工录入的 `position` 表无关。
+ *
+ * 分叉的代价已经实测过一次：影子此前根本没有这条通路，于是**影子持仓的风控离场
+ * 结构上跑不起来**（`positionVerdict` 第一句就要求有用户持仓），而回测里
+ * **96.9% 的离场由风控触发**（M2 §5.24）⇒ 影子量的不是回测那套策略。
+ * 与 `belowStopLine` / `sellableShares` 被抽出来的理由逐字相同：各写一遍必然分叉。
+ *
+ * @param price 现价，与 `position.cost` / `peakPrice` **同为不复权**
+ */
+export function forcedExit(input: {
+  position: ExitablePosition
+  price: number
+  params: EngineParams
+}): ForcedExit | null {
+  const { position, params, price } = input
+  if (position.shares <= 0 || position.cost <= 0) return null
+  if (!Number.isFinite(price) || price <= 0) return null
 
   const profit = (price - position.cost) / position.cost
   const peak = position.peakPrice > 0 ? position.peakPrice : Math.max(position.cost, price)
@@ -226,6 +263,20 @@ export function positionVerdict(input: GateInput): { verdict: RiskVerdict; direc
   }
 
   return null
+}
+
+/**
+ * 闸门那一侧的入口：从 `GateInput` 取出持仓与现价，交给 `forcedExit()`。
+ *
+ * 现价优先快照最新价、否则用当根**不复权**收盘（`currentPrice`）。
+ * 拿不到持仓或拿不到价 → null（**不是「没有风险」**，是「判不了」）。
+ */
+export function positionVerdict(input: GateInput): ForcedExit | null {
+  const { position, params } = input
+  if (!position) return null
+  const price = currentPrice(input)
+  if (price === null) return null
+  return forcedExit({ position, price, params })
 }
 
 /** 硬抑制（docs/05 §2.1）。返回全部命中项，便于面板显示「为什么被静默」 */

@@ -16,6 +16,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { DEFAULT_PARAMS } from '@core/params'
 import type { Candle, GatedSignal, SecCode } from '@core/types'
 import { createStorage, openDatabase, type Storage } from '@main/storage'
 import { SHADOW_KEYS } from '@main/storage/repositories/shadow'
@@ -311,6 +312,9 @@ async function harness(bars: Record<string, Candle[]> = {}): Promise<Harness> {
     engineVersion: () => version.value,
     trackedCodes: () => tracked,
     profileOf: () => ({ board: 'MAIN', isST: false }),
+    // 强制离场那四条阈值走出厂值（stopLossPct 0.08 / trailingStopPct 0.03 /
+    // drawdownReducePct 0.07 / profitProtectTrigger 0.05 / profitProtectFallback 0.02）
+    params: () => DEFAULT_PARAMS,
     newId: () => `trade-${++seq}`,
   })
   return { storage, runner, version, tracked }
@@ -591,6 +595,180 @@ describe('推进器', () => {
       h.runner.advance({ date: '2026-08-12', at: 2, outcomes: [outcome({ date: '2026-08-12' })] })
 
       expect(h.storage.shadow.journal(100).filter((row) => row.date === '2026-08-12')).toHaveLength(1)
+    })
+  })
+
+  /**
+   * 强制离场按**影子自己的**持仓判定（2026-08-28，`shadowExitOrder`）。
+   *
+   * 这一组守的是一个结构性缺口：闸门那条持仓强制通道读的是**用户手工录入的**
+   * `position` 表，而 `positionVerdict()` 第一句就是「没有持仓 → null」
+   * ⇒ 影子持有、用户没录入的票，四条规则一条都不会触发；`REDUCE` 永远不可能出现。
+   * 而回测里 **96.9% 的离场由风控触发**（M2 §5.24）⇒ 缺了它，影子量的不是回测那套策略。
+   *
+   * 每条用例都对应一种「看起来能跑、实际跑不到」的写法。
+   */
+  describe('强制离场（影子自己的持仓）', () => {
+    it('当天一条信号都没有，跌破止损线照样挂卖单 —— 这就是那个缺口', async () => {
+      const h = await harness({
+        SH600000: [candle('2026-08-12', 9.1), candle('2026-08-13', 9.1, { open: 9.1 })],
+      })
+      // 成本 10、现价 9.1 ⇒ 亏 9% > 8% 止损线
+      h.storage.shadow.putPosition(position({ peakRaw: 10, lastCloseAdj: 9.1 }))
+
+      // outcomes 为空：**没有任何信号**。用户的 position 表也是空的
+      const day1 = h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [] })
+      expect(day1?.placed).toBe(1)
+      const placed = h.storage.shadow.orders()[0]
+      expect(placed?.action).toBe('SELL')
+      expect(placed?.rule).toBe('STOP_LOSS')
+      // 不来自任何一行 signal —— 那正是它必须独立于 outcomes 的原因
+      expect(placed?.signalId).toBeNull()
+
+      // 次日开盘成交，全清
+      const day2 = h.runner.advance({ date: '2026-08-13', at: 2, outcomes: [] })
+      expect(day2?.closed).toBe(1)
+      expect(h.storage.shadow.positions()).toHaveLength(0)
+      expect(h.storage.shadow.trades()[0]?.exitRule).toBe('STOP_LOSS')
+    })
+
+    it('回撤减仓 → REDUCE → 次日开盘卖一半', async () => {
+      const h = await harness({
+        SH600000: [candle('2026-08-12', 10.2), candle('2026-08-13', 10.2, { open: 10.2 })],
+      })
+      // 峰值 11、现价 10.2 ⇒ 自峰值 −7.3% ≤ −7%；且盈利 +2% ⇒ 没触及止损
+      h.storage.shadow.putPosition(position({ peakRaw: 11, lastCloseAdj: 10.2 }))
+
+      h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [] })
+      expect(h.storage.shadow.orders()[0]).toMatchObject({
+        action: 'REDUCE',
+        rule: 'DRAWDOWN_REDUCE',
+      })
+
+      h.runner.advance({ date: '2026-08-13', at: 2, outcomes: [] })
+      expect(h.storage.shadow.trades()[0]?.shares).toBe(500)
+      expect(h.storage.shadow.positions()[0]?.shares).toBe(500)
+    })
+
+    it('强制离场压过同日的策略买入信号 —— 与 gateSignal 的优先级一致', async () => {
+      const h = await harness({ SH600000: [candle('2026-08-12', 9.1)] })
+      h.storage.shadow.putPosition(position({ peakRaw: 10, lastCloseAdj: 9.1 }))
+
+      // 同一天既跌破止损、又来一条 CONFIRMED 买入
+      const result = h.runner.advance({
+        date: '2026-08-12',
+        at: 1,
+        outcomes: [outcome({ date: '2026-08-12', direction: 'BUY' })],
+      })
+      // 只挂一张，且是卖出那张（策略信号被跳过，没有覆盖它）
+      expect(result?.placed).toBe(1)
+      expect(h.storage.shadow.orders()).toHaveLength(1)
+      expect(h.storage.shadow.orders()[0]).toMatchObject({ action: 'SELL', rule: 'STOP_LOSS' })
+    })
+
+    it('停牌（volume 0）不挂单 —— 判据与 hardSuppressions 的 SUSPENDED 同源', async () => {
+      const h = await harness({ SH600000: [candle('2026-08-12', 9.1, { volume: 0 })] })
+      h.storage.shadow.putPosition(position({ peakRaw: 10, lastCloseAdj: 9.1 }))
+
+      expect(h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [] })?.placed).toBe(0)
+      expect(h.storage.shadow.orders()).toHaveLength(0)
+    })
+
+    it('拿不到当日 K 线时不判 —— 「不知道价」不许当成「没有风险」', async () => {
+      const h = await harness({ SH600000: [candle('2026-08-10', 9.1)] })
+      h.storage.shadow.putPosition(position({ peakRaw: 10, lastCloseAdj: 9.1 }))
+
+      expect(h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [] })?.placed).toBe(0)
+      expect(h.storage.shadow.orders()).toHaveLength(0)
+    })
+
+    it('顺延中的委托不被覆盖 —— 覆盖会把 deferred 重置成 0，MAX_DEFER_BARS 就永远咬不住', async () => {
+      const h = await harness({
+        SH600000: [
+          candle('2026-08-11', 10),
+          // 开盘 9.00 = 昨收 10 的 −10% ⇒ 跌停卖不掉 ⇒ ③ 只会顺延，委托留着；
+          // 而收盘 9.1 相对成本 10 是 −9% ⇒ ⑤a 那边止损条件同时成立
+          candle('2026-08-12', 9.1, { open: 9.0, low: 9.0 }),
+        ],
+      })
+      h.storage.shadow.putPosition(position({ peakRaw: 10, lastCloseAdj: 9.1 }))
+      // 一张已经顺延了 3 天的卖单
+      h.storage.shadow.putOrder(order({ action: 'SELL', rule: 'STOP_LOSS', deferred: 3 }))
+
+      const result = h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [] })
+
+      // ⑤a 一张都没重挂
+      expect(result?.placed).toBe(0)
+      expect(h.storage.shadow.journal(100).filter((row) => row.kind === 'PLACED')).toHaveLength(0)
+      // 顺延计数继续往上走，而不是被重置成 0
+      expect(h.storage.shadow.orders()).toHaveLength(1)
+      expect(h.storage.shadow.orders()[0]?.deferred).toBe(4)
+    })
+
+    it('不涨不跌的持仓不挂单 —— 四条规则一条都没命中', async () => {
+      const h = await harness({ SH600000: [candle('2026-08-12', 10)] })
+      h.storage.shadow.putPosition(position({ peakRaw: 10, lastCloseAdj: 10 }))
+
+      expect(h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [] })?.placed).toBe(0)
+    })
+  })
+
+  /**
+   * 口径换了、记录没清空 ⇒ 分界线必须落库，否则那是一条静默换了含义的曲线。
+   *
+   * 「参数一变就停止累积」那条纪律真正在防的是**事后拆不开**，
+   * 而记下分界点恰好把它拆得开。
+   */
+  describe('离场口径的分段标记', () => {
+    it('既有记录之上第一次推进时写 exitRulesFrom + 一行 RULES_CHANGED，且只写一次', async () => {
+      const h = await harness({
+        SH600000: [candle('2026-08-12', 10), candle('2026-08-13', 10), candle('2026-08-14', 10)],
+      })
+      // 伪造「修复之前就已经攒了一天」：直接塞一根净值点
+      h.storage.shadow.putEquity({
+        date: '2026-08-12',
+        cash: 1_000_000,
+        positionValue: 0,
+        equity: 1_000_000,
+        benchmark: null,
+      })
+
+      h.runner.advance({ date: '2026-08-13', at: 1, outcomes: [] })
+      expect(h.storage.meta.get(SHADOW_KEYS.exitRulesFrom)).toBe('2026-08-13')
+      expect(
+        h.storage.shadow.journal(100).filter((row) => row.kind === 'RULES_CHANGED')
+      ).toHaveLength(1)
+
+      // 第二天不再写第二行 —— 一个账本最多一次
+      h.runner.advance({ date: '2026-08-14', at: 2, outcomes: [] })
+      expect(h.storage.meta.get(SHADOW_KEYS.exitRulesFrom)).toBe('2026-08-13')
+      expect(
+        h.storage.shadow.journal(100).filter((row) => row.kind === 'RULES_CHANGED')
+      ).toHaveLength(1)
+    })
+
+    it('全新账本不写标记 —— 没有第一段就没有分段', async () => {
+      const h = await harness({ SH600000: [candle('2026-08-12', 10)] })
+      h.runner.advance({ date: '2026-08-12', at: 1, outcomes: [] })
+
+      expect(h.storage.meta.get(SHADOW_KEYS.exitRulesFrom)).toBeNull()
+      expect(h.storage.shadow.journal(100).filter((r) => r.kind === 'RULES_CHANGED')).toHaveLength(0)
+    })
+
+    it('reset() 把标记一起清掉 —— 清空之后是全新账本，不该还挂着一条分界线', async () => {
+      const h = await harness({ SH600000: [candle('2026-08-12', 10), candle('2026-08-13', 10)] })
+      h.storage.shadow.putEquity({
+        date: '2026-08-12',
+        cash: 1_000_000,
+        positionValue: 0,
+        equity: 1_000_000,
+        benchmark: null,
+      })
+      h.runner.advance({ date: '2026-08-13', at: 1, outcomes: [] })
+      expect(h.storage.meta.get(SHADOW_KEYS.exitRulesFrom)).not.toBeNull()
+
+      h.runner.reset()
+      expect(h.storage.meta.get(SHADOW_KEYS.exitRulesFrom)).toBeNull()
     })
   })
 

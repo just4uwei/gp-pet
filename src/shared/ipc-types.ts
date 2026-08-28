@@ -498,7 +498,16 @@ export interface ShadowJournalView {
   date: TradeDate
   seq: number
   at: number
-  kind: 'PLACED' | 'FILLED_BUY' | 'FILLED_SELL' | 'VOIDED' | 'DEFERRED' | 'CLOSED_OUT' | 'NOT_ADVANCED'
+  /** 各档含义见 `repositories/shadow.ts` 的 `ShadowJournalEntry.kind` */
+  kind:
+    | 'PLACED'
+    | 'FILLED_BUY'
+    | 'FILLED_SELL'
+    | 'VOIDED'
+    | 'DEFERRED'
+    | 'CLOSED_OUT'
+    | 'NOT_ADVANCED'
+    | 'RULES_CHANGED'
   code: SecCode | null
   /** 拿不到名字（已移出自选）时回落成代码 */
   name: string | null
@@ -635,6 +644,17 @@ export interface ShadowSummary {
    * 继续累积会把两套参数的结果混进同一条曲线，而那条曲线不属于任何一套参数。
    */
   stalledEngineVersion: string | null
+  /**
+   * 「离场按影子自己的持仓判定」这条口径从哪一天起生效（2026-08-28）。
+   *
+   * 非空 ⇒ **这条曲线分两段**：这一天之前，四条强制离场规则读的是用户手工录入的
+   * `position` 表 ⇒ 影子持有、用户没录入的票**一次都不会离场**（`shadowExitOrder`）。
+   * 修复时**没有清空重来**（那时 `shadow_trade` 一行都没有 ⇒ 第一段里不存在
+   * 带着旧口径的往返成交），所以引用绩效要按这一天切开读。
+   *
+   * null 有两种含义、**别混**：账本是修复之后才开始的（全程一套口径），或者还没开始推进。
+   */
+  exitRulesFrom: TradeDate | null
 }
 
 // ─────────────────────── 设置页（M4，docs/01 §5.5）───────────────────────

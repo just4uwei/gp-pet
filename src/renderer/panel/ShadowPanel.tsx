@@ -49,6 +49,9 @@ const ACTION_LABEL: Record<string, string> = { BUY: '买入', SELL: '卖出', RE
  *
  * `NOT_ADVANCED` 用警示色是刻意的：它意味着那个交易日的前向记录**永久缺失**，
  * 而这件事此前只在主进程日志里出现一行，界面上完全不可见。
+ *
+ * `RULES_CHANGED` 反过来用**中性色**：它是一次修复留下的分界线，不是故障。
+ * 用警示色会让人以为影子出了问题（而它恰恰是从这一天起才开始正确工作）。
  */
 const KIND_LABEL: Record<ShadowJournalView['kind'], { text: string; tone: string }> = {
   PLACED: { text: '挂委托', tone: 'text-sky-300/80' },
@@ -58,6 +61,7 @@ const KIND_LABEL: Record<ShadowJournalView['kind'], { text: string; tone: string
   DEFERRED: { text: '顺延', tone: 'text-white/45' },
   CLOSED_OUT: { text: '移出自选而了结', tone: 'text-white/45' },
   NOT_ADVANCED: { text: '未推进', tone: 'text-amber-300/90' },
+  RULES_CHANGED: { text: '判定口径变更', tone: 'text-white/55' },
 }
 
 function pct(value: number | null, digits = 2): string {
@@ -249,6 +253,24 @@ export function ShadowPanel({
             清空并重新开始…
           </button>
         </div>
+      )}
+
+      {/*
+        离场口径的分界线（2026-08-28）。**中性色，不是警示色** —— 它是一次修复，
+        不是故障：从这一天起，四条强制离场规则才开始按影子自己的成本与峰值判定
+        （此前读的是用户手工录入的持仓 ⇒ 影子持有、用户没录入的票一次都不会离场）。
+        记录**没有清空**，所以这条曲线分两段，而引用绩效的人必须看得见这件事。
+      */}
+      {summary.exitRulesFrom === null ? null : (
+        <p className="rounded border border-white/15 bg-white/[0.04] px-3 py-2 text-xs leading-relaxed text-white/55">
+          离场规则自 <span className="font-mono text-white/75">{summary.exitRulesFrom}</span>{' '}
+          起按影子自己的持仓判定（止损 / 移动止损 / 回撤减仓 / 盈利保护）。
+          <span className="text-white/45">
+            {' '}
+            这一天以前那一段没有任何离场记录 —— 记录未清空，
+            引用下面的绩效时请按这一天切成两段读。
+          </span>
+        </p>
       )}
 
       {notice ? (

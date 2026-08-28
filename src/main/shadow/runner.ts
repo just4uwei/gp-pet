@@ -9,7 +9,8 @@
  * ③ 执行昨天挂下的委托 —— 用**今天的开盘价**
  * ④ 已不在自选的持仓按最后收盘价了结（不再跟踪 = 影子也不再持有）
  * ⑤ 持仓逐日盯市：峰值、最后收盘、持有根数
- * ⑥ 用今天的收盘确认信号挂明天的委托
+ * ⑤a 强制离场：按**影子自己的**成本与峰值判四条风控规则，命中就挂明天的卖单
+ * ⑥ 用今天的收盘确认信号挂明天的委托（⑤a 已经挂过的跳过 —— 强制离场优先）
  * ⑦ 写一行净值（含沪深300 收盘）
  * ⑧ 把历史上没取到基准的那些天补齐
  * ```
@@ -38,6 +39,19 @@
  * - **影子持仓与用户的真实持仓无关。** 用户手工录入的 `position` 表是风控输入，
  *   这里的 `shadow_position` 是模拟账本，两者刻意不同步：影子要的是「若每条信号都执行」，
  *   而用户只会执行其中一部分。
+ *   ⚠ **这句话必须连着后半句读**（2026-08-28）：**离场判据用影子自己的仓**（⑤a）。
+ *   此前只有前半句，后果是一个结构性缺口 —— 闸门那条持仓强制通道读的是用户的
+ *   `position` 表，于是影子持有、用户没录入的票**一次都不会离场**，
+ *   而回测里 96.9% 的离场由风控触发（M2 §5.24）⇒ 影子量的不是回测那套策略。
+ *   诊断与三条边界在 `portfolio.ts` 的 `shadowExitOrder` 头注释。
+ *
+ * ## 那次修复没有清空记录，所以曲线分两段
+ *
+ * 判据：修复之前 `shadow_trade` **一行都没有**（实测 2026-08-28：9 个净值点、
+ * 7 只持仓全在、0 笔往返成交）⇒ 第一段里不存在带着旧口径的成交
+ * ⇒ 「两套口径混进同一条曲线、事后拆不开」在那份数据上不成立。
+ * 而分界点落在 `SHADOW_KEYS.exitRulesFrom` + 一行 `RULES_CHANGED` 流水里（见 ⓿）
+ * —— 「参数一变就停止累积」那条纪律防的是**拆不开**，记下分界点恰好把它拆得开。
  */
 
 import { BENCHMARK_CODE } from '../engine'
@@ -48,11 +62,13 @@ import type { MetaRepo } from '../storage/repositories/meta'
 import type { ShadowJournalEntry, ShadowRepo } from '../storage/repositories/shadow'
 import { SHADOW_KEYS } from '../storage/repositories/shadow'
 import { DEFAULT_COSTS, sellFees, sellFill, type CostModel } from '../../backtest/costs'
+import type { EngineParams } from '@core/params'
 import {
   MAX_DEFER_BARS,
   exitRuleOf,
   executeOrder,
   orderFrom,
+  shadowExitOrder,
   type ShadowOrder,
   type ShadowPosition,
   type VoidReason,
@@ -72,6 +88,13 @@ export interface ShadowRunnerDeps {
   trackedCodes: () => ReadonlySet<SecCode>
   /** 标的的板块与 ST 标志，算涨跌停用 */
   profileOf: (code: SecCode) => { board: Board; isST: boolean } | null
+  /**
+   * 当前引擎参数，强制离场那四条阈值从这里取（2026-08-28）。
+   *
+   * **必须是函数而不是值**：换灵敏度档位要跟着走。不过那本来就会改变
+   * `engineVersion()` ⇒ 闸门 ② 会停止累积，所以这里不会出现「用新阈值续旧曲线」。
+   */
+  params: () => EngineParams
   costs?: CostModel
   startCapital?: number
   notionalPerTrade?: number
@@ -156,6 +179,7 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
     engineVersion,
     trackedCodes,
     profileOf,
+    params,
     costs = DEFAULT_COSTS,
     startCapital = DEFAULT_SHADOW_CAPITAL,
     notionalPerTrade = DEFAULT_SHADOW_NOTIONAL,
@@ -240,8 +264,49 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
       }
 
       const tracked = trackedCodes()
+      // 本轮的参数取一次就定住：⑤a 在持仓循环里用它，逐只重取虽然结果一样，
+      // 但「同一轮里两只票用了不同阈值」这种可能性不该在结构上存在
+      const engineParams = params()
       const journal: JournalDraft[] = []
       const note = (entry: JournalDraft): void => void journal.push(entry)
+      /**
+       * 本轮已经由 ⑤a 强制离场挂过单的代码。**⑥ 必须跳过它们** ——
+       * 那是 `gateSignal` 的优先级（`forced ? forced.direction : signal.direction`）：
+       * 止损压过策略信号。少了这一步，同一只票的一条策略买入会把止损委托覆盖掉。
+       */
+      const forcedCodes = new Set<SecCode>()
+
+      /*
+        ⓿ 口径分段标记（2026-08-28）。
+
+        「离场按影子自己的持仓判定」这条修复**不清空既有记录**，判据是：修复之前
+        `shadow_trade` 一行都没有 ⇒ 第一段里没有任何一笔往返成交带着旧口径
+        ⇒ 「两套口径混进同一条曲线、事后拆不开」这件事在那份数据上不成立。
+
+        但曲线的**含义**确实从某一天起变了，所以那一天必须落库 ——
+        「参数一变就停止累积」那条纪律真正在防的是**拆不开**，
+        而记下分界点恰好把它拆得开。不记的话就是一条静默换了含义的曲线，那才是坏的。
+
+        `barCount() === 0`（全新账本）不写：没有第一段，就没有分段。
+      */
+      if (meta.get(SHADOW_KEYS.exitRulesFrom) === null && repo.barCount() > 0) {
+        meta.set(SHADOW_KEYS.exitRulesFrom, date)
+        note({
+          at,
+          kind: 'RULES_CHANGED',
+          code: null,
+          action: null,
+          shares: null,
+          price: null,
+          rule: null,
+          regime: null,
+          score: null,
+          reason:
+            '离场规则改为按影子自己的持仓判定（此前读的是用户手工录入的持仓 ' +
+            '⇒ 影子持有、用户没录入的票一次都不会离场）。此前那一段没有任何离场，' +
+            '记录未清空 —— 引用绩效时按这一天切成两段读。',
+        })
+      }
 
       // ③ 执行昨天挂下的委托 —— 今天的开盘价
       for (const order of repo.orders()) {
@@ -349,6 +414,13 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
         }
       }
 
+      /*
+        ③ 之后仍挂着的委托 = 顺延下来的那些（跌停卖不掉 / 停牌拿不到 K 线）。
+        ⑤a 与 ⑥ 都不许覆盖它们：顺延计数 `deferred` 在委托对象上，
+        覆盖一次等于把「已经等了 3 天」重置成 0，`MAX_DEFER_BARS` 那道上限就永远咬不住。
+      */
+      const pendingCodes = new Set(repo.orders().map((order) => order.code))
+
       // ④⑤ 盯市；已移出自选的持仓就地了结
       let positionValue = 0
       for (const position of repo.positions()) {
@@ -410,6 +482,47 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
             position
         repo.putPosition(next)
         positionValue += next.shares * next.lastCloseAdj
+
+        /*
+          ⑤a 强制离场：按**影子自己的**成本与峰值判一次（2026-08-28，`shadowExitOrder`）。
+
+          位置与回测逐位对齐：`simulate.ts` 每根的顺序是
+          ① 开盘执行委托 → ② `peakRaw = max(peakRaw, bar.high)` → ③ 净值 → ④ 判定挂单，
+          所以这里必须用 `next`（**已含今日 high**）而不是 `position`。
+
+          **必须在这个循环里，不能挪进 ⑥。** ⑥ 遍历的是 `outcomes`（信号），
+          而强制离场的前提恰恰是「哪怕当日一条子信号都没成立」（risk/index.ts 头注释）
+          —— 一只票今天没有评估就没有 outcome，而它的成本线可能已经被击穿。
+        */
+        if (bars && !pendingCodes.has(position.code)) {
+          const exit = shadowExitOrder({
+            position: next,
+            closeRaw: bars.today.close,
+            volume: bars.today.volume,
+            date,
+            params: engineParams,
+          })
+          if (exit) {
+            repo.putOrder(exit)
+            pendingCodes.add(exit.code)
+            // 强制离场压过策略信号（见 ⑥ 里的 skip）—— 与 `gateSignal` 的
+            // `direction = forced ? forced.direction : signal.direction` 同一优先级
+            forcedCodes.add(exit.code)
+            result.placed++
+            note({
+              at,
+              kind: 'PLACED',
+              code: exit.code,
+              action: exit.action,
+              shares: null,
+              price: null,
+              rule: exit.rule,
+              regime: exit.regime,
+              score: exit.score,
+              reason: '持仓风控强制离场（按影子自己的成本与峰值），按次日开盘价成交',
+            })
+          }
+        }
       }
 
       // ⑥ 用今天的收盘确认信号挂明天的委托
@@ -418,6 +531,16 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
         if (evaluation.signal.stage !== 'CONFIRMED' || evaluation.date !== date) continue
         const code = evaluation.code
         if (!tracked.has(code)) continue
+        /*
+          强制离场（⑤a）压过策略信号 —— 与 `gateSignal` 的
+          `direction = forced ? forced.direction : signal.direction` 同一优先级。
+
+          ⚠ 这里**只**挡 `forcedCodes`，**不挡 `pendingCodes`** —— 后者会改变
+          2026-08-28 之前就有的行为（顺延中的委托本来就会被今天的新信号覆盖，
+          于是 `deferred` 重置成 0、`MAX_DEFER_BARS` 那道上限咬不住）。
+          那是一处独立的既有缺陷，不在这次改动的范围里，别顺手一起改。
+        */
+        if (forcedCodes.has(code)) continue
         const holding = repo.position(code) !== null
         const direction = evaluation.gated.direction === 'SELL' || evaluation.gated.direction === 'REDUCE' ? 'SELL' : 'BUY'
         const order = orderFrom({

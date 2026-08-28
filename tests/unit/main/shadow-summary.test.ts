@@ -65,6 +65,7 @@ function base(over: Partial<Parameters<typeof summarize>[0]> = {}): Parameters<t
     limitBlocked: 0,
     engineVersion: 'v1',
     stalledEngineVersion: null,
+    exitRulesFrom: null,
     lastTradingDate: null,
     now: START + 10 * DAY,
     ...over,

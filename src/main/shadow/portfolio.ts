@@ -31,6 +31,8 @@
  */
 
 import { priceLimits } from '@core/code'
+import { forcedExit } from '@core/risk'
+import type { EngineParams } from '@core/params'
 import type { Board, Candle, GatedDirection, GatedSignal, Regime, SecCode, TradeDate } from '@core/types'
 import {
   buyFees,
@@ -296,6 +298,96 @@ export function orderFrom(input: {
     score: input.score,
     regime: input.regime,
     signalId: input.signalId,
+    deferred: 0,
+  }
+}
+
+/**
+ * 影子持仓自己的强制离场（2026-08-28）。返回 null = 这只票今天不用走。
+ *
+ * ## 为什么需要它 —— 这里补的是一个结构性缺口
+ *
+ * 闸门那条持仓强制通道（止损 / 移动止损 / 回撤减仓 / 盈利保护）是拿**用户手工录入的
+ * `position` 表**算的（`engine/signals.ts` 取 `storage.positions`），而
+ * `positionVerdict()` 第一句就是「没有持仓 → null」。于是**影子持有、用户没录入的票，
+ * 那四条规则一条都不会触发**；`REDUCE` 更彻底 —— 它只由那条通道产出，
+ * 对这类票**永远不可能出现**。即使用户也持有同一只，触发判据用的还是
+ * **用户的成本价与峰值**，不是影子的建仓价。
+ *
+ * 对照回测：`simulate.ts` 喂进闸门的是**模拟持仓自己**，止损照常触发。
+ * 而实测 **96.9% 的离场由风控触发**（M2 §5.24，策略卖出子信号全池只有 171 次）
+ * ⇒ 缺了这条通路，影子量的**不是回测那套策略**，它的数字与任何一份回测都不可比。
+ * 而影子的全部职责就是「量策略值不值钱」（docs/07 §2.3）。
+ *
+ * 旁证：`peakRaw` 与 `barsHeld` 一直在逐日维护并落库，那正是移动止损与回撤减仓的输入
+ * —— 而在这个函数出现之前，**全项目没有任何地方读 `peakRaw`**。
+ *
+ * ## 三条边界
+ *
+ * 1. **规则实现只有一份** —— 调 `@core/risk` 的 `forcedExit()`，与闸门、回测同一份代码。
+ *    这里绝不许照抄那四条 if。
+ * 2. **口径全走不复权**：`entryPriceRaw` 当成本、`peakRaw` 当峰值、入参 `closeRaw`
+ *    当现价。混进复权价会在除权那天凭空触发一次止损。
+ *    （注意影子的**盈亏**是按 `*Adj` 算的，与回测同源 —— 两套口径各管一件事。）
+ * 3. **绝不设 `stopFloor` / `lockedShares`**。`Position` 那两个字段的注释写着
+ *    「回测与影子运行绝不设这个字段…… **别去「补上」**」：它们是用户对某一次具体持仓的
+ *    决定，让它们影响影子等于把「我扛住了没卖」记成策略绩效。
+ *
+ * ## `hardSuppressions` 那一整套刻意不在这里跑
+ *
+ * 逐条理由，别顺手「补全」：
+ *   * `T1_SELL_LOCK` —— 那是**用户**这一次建仓的事实，影子的仓不是今天买的；
+ *   * `HARD_LIMIT_DOWN` / `GAP` —— 由 `executeOrder()` 在**成交那一刻**处理
+ *     （跌停顺延，上限 `MAX_DEFER_BARS`；缺口段 `VOID: GAP`），在这里再判一遍是重复；
+ *   * `INSUFFICIENT_DATA` / `NEW_LISTING` —— 在**建仓**那一步就已经挡过了，
+ *     能有影子持仓说明当时通过了；
+ *   * `STALE_SNAPSHOT` —— 结构上不适用：影子在收盘后决策，不看快照。
+ *
+ * **只保留 `volume === 0`（停牌）这一条**，判据与 `hardSuppressions` 的 `SUSPENDED` 同源。
+ *
+ * @param closeRaw 今日**不复权**收盘（决策价；成交价另由次日开盘决定）
+ * @param volume   今日成交量。0 = 停牌，不挂单
+ */
+export function shadowExitOrder(input: {
+  position: ShadowPosition
+  closeRaw: number
+  volume: number
+  date: TradeDate
+  params: EngineParams
+}): ShadowOrder | null {
+  const { position, closeRaw, volume, date, params } = input
+  // 停牌：与 hardSuppressions 的 SUSPENDED 同一个判据（`candle.volume === 0`）
+  if (volume <= 0) return null
+
+  const exit = forcedExit({
+    position: {
+      shares: position.shares,
+      // ⚠ 不复权，且**不带 stopFloor** —— 见上面第 3 条边界
+      cost: position.entryPriceRaw,
+      peakPrice: position.peakRaw,
+    },
+    price: closeRaw,
+    params,
+  })
+  if (!exit) return null
+
+  const action = toShadowAction(exit.direction, true)
+  if (!action) return null
+
+  return {
+    code: position.code,
+    action,
+    placedDate: date,
+    // 归因用风控规则名（STOP_LOSS / TRAILING_STOP / DRAWDOWN_REDUCE / PROFIT_PROTECT），
+    // 与 `exitRuleOf` 的强制分支取的是同一个字段
+    rule: exit.verdict.rule,
+    // 这一单不来自得分。沿用建仓时的得分而不是填 0 ——
+    // 0 会在流水上被读成「置信度 0 的信号」，而它压根不是一条信号
+    score: position.entryScore,
+    regime: position.entryRegime,
+    // 没有来源信号：这条委托不由任何一行 `signal` 产生（那正是缺口所在 ——
+    // 当天可能一条信号都没有，而成本线已经被击穿）
+    signalId: null,
     deferred: 0,
   }
 }

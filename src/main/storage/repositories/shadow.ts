@@ -34,6 +34,19 @@ export const SHADOW_KEYS = {
   skippedNoCash: 'shadow_skipped_no_cash',
   /** 因涨停买不到 / 跌停卖不掉而作废的委托数 */
   limitBlocked: 'shadow_limit_blocked',
+  /**
+   * 「离场按影子自己的持仓判定」这条口径从哪一天起生效（2026-08-28）。
+   *
+   * 在这之前，四条强制离场规则读的是**用户手工录入的** `position` 表
+   * ⇒ 影子持有、用户没录入的票**一次都不会离场**（`shadowExitOrder` 头注释）。
+   * 修完之后**不清空重来**（既有记录里 `shadow_trade` 一行都没有 ⇒ 没有任何一笔
+   * 往返成交带着旧口径 ⇒ 没有「混进同一条曲线」这回事），
+   * 但那条曲线因此**分两段**，必须能事后切开 —— 这个键就是那把刀。
+   *
+   * null / 缺失有两种含义，**别混**：账本是修复之后才开始的（全程一套口径），
+   * 或者压根还没开始推进。两者都不需要分段。
+   */
+  exitRulesFrom: 'shadow_exit_rules_from',
 } as const
 
 interface OrderRow {
@@ -148,7 +161,26 @@ export interface ShadowJournalEntry {
   date: TradeDate
   seq: number
   at: number
-  kind: 'PLACED' | 'FILLED_BUY' | 'FILLED_SELL' | 'VOIDED' | 'DEFERRED' | 'CLOSED_OUT' | 'NOT_ADVANCED'
+  /**
+   * 各档的含义在 `013_shadow_journal.sql` 的注释里；**`RULES_CHANGED` 是 2026-08-28
+   * 新增的，说明写在这里** —— 迁移文件只前进不回退，不许回头去编辑已发布的那个。
+   *
+   * `RULES_CHANGED`：影子的**判定口径**变了，而记录**没有清空**。目前只有一种来源
+   * ——「离场改按影子自己的持仓判定」（`SHADOW_KEYS.exitRulesFrom`）。
+   * 它一天最多一行、一个账本最多一次，作用是让曲线事后能按日期切成两段。
+   *
+   * ⚠ `kind` 在库里是裸 `TEXT`、没有 CHECK 约束，所以加档**不需要迁移**；
+   * 但渲染层的 `KIND_LABEL` 是 `Record<kind, …>`，漏了标签会编译报错（那是免费的闸门）。
+   */
+  kind:
+    | 'PLACED'
+    | 'FILLED_BUY'
+    | 'FILLED_SELL'
+    | 'VOIDED'
+    | 'DEFERRED'
+    | 'CLOSED_OUT'
+    | 'NOT_ADVANCED'
+    | 'RULES_CHANGED'
   code: SecCode | null
   action: 'BUY' | 'SELL' | 'REDUCE' | null
   shares: number | null

@@ -75,6 +75,11 @@ export interface SummaryInput {
   /** 账本里记的引擎版本与当前不一致时传它 —— 推进已暂停 */
   stalledEngineVersion: string | null
   /**
+   * 「离场按影子自己的持仓判定」这条口径从哪天起生效（`SHADOW_KEYS.exitRulesFrom`）。
+   * 非空 ⇒ 这条曲线**分两段**，界面必须说出来（`ShadowSummary.exitRulesFrom`）。
+   */
+  exitRulesFrom: string | null
+  /**
    * 最后一个**已收盘**的交易日。与净值末端一比就知道影子跟上没有 ——
    * 全空仓时净值曲线是一条直线，和「压根没推进」在图上无法区分，这个数是唯一的判据。
    * 拿不到日历时给 null（**别拿「今天」顶替**：休市日会算出一个假的落后）。
@@ -233,6 +238,7 @@ export function summarize(input: SummaryInput): ShadowSummary {
     limitBlocked: input.limitBlocked,
     engineVersion: input.engineVersion,
     stalledEngineVersion: input.stalledEngineVersion,
+    exitRulesFrom: input.exitRulesFrom,
   }
 }
 
@@ -284,6 +290,7 @@ export function emptyShadowSummary(engineVersion: string): ShadowSummary {
     limitBlocked: 0,
     engineVersion,
     stalledEngineVersion: null,
+    exitRulesFrom: null,
   }
 }
 
