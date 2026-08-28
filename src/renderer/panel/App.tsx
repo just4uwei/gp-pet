@@ -36,6 +36,7 @@ import type {
   WatchPointView,
 } from '@shared/ipc-types'
 import { groupSignals } from '@shared/signal-group'
+import { dropUnheldExits } from '@shared/signal-visibility'
 import { watchMarkOf } from '@shared/watch-mark'
 import { T_HINT_LABEL, T_HINT_TITLE } from '@shared/intraday-t'
 import { SHANGHAI_OFFSET_MS, shanghaiDayStartMs, shanghaiMdHhmm } from '@shared/time'
@@ -710,18 +711,35 @@ export function App(): React.JSX.Element {
     }
   }, [signalKey, dayStart])
 
+  /**
+   * 有持仓的代码集合。**`null` = 还不知道**（自选还没读到，或 `watchlist:list` 抛了错）
+   * —— 那一档绝不能当成「都没持仓」，见 `dropUnheldExits` 的第 3 条边界。
+   *
+   * 判据用 `WatchItem.hasPosition`（主进程按 `position` 表现算，与 `observeCodes` 同源），
+   * 不在渲染层另拼一份。
+   */
+  const heldCodes = useMemo(
+    () =>
+      items.length === 0
+        ? null
+        : new Set(items.filter((item) => item.hasPosition).map((item) => item.code)),
+    [items]
+  )
+
   /*
-    先按「含被静默的」过滤，**再**分组 —— 顺序不能倒过来。
-    倒过来的话徽标会数上几条用户当前看不到的信号，而「写着 4 条、展开只有 1 条」
-    这种对不上比少显示更难排查（groupSignals 的头注释记着同一条）。
+    先滤掉「无持仓标的的卖出/减仓」，再按「含被静默的」过滤，**最后**才分组 ——
+    三步的顺序都不能动。倒过来的话徽标会数上几条用户当前看不到的信号，
+    而「写着 4 条、展开只有 1 条」这种对不上比少显示更难排查
+    （groupSignals 与 signal-visibility 两个头注释记着同一条）。
   */
   const { groups, suppressedCount } = useMemo(() => {
-    const suppressed = signalRecords.filter((r) => r.suppressedReason !== undefined)
+    const executable = dropUnheldExits(signalRecords, heldCodes)
+    const suppressed = executable.filter((r) => r.suppressedReason !== undefined)
     const visible = showSuppressed
-      ? signalRecords
-      : signalRecords.filter((r) => r.suppressedReason === undefined)
+      ? executable
+      : executable.filter((r) => r.suppressedReason === undefined)
     return { groups: groupSignals(visible, watchHits), suppressedCount: suppressed.length }
-  }, [signalRecords, showSuppressed, watchHits])
+  }, [signalRecords, showSuppressed, watchHits, heldCodes])
 
   // ── 详情抽屉与成交流水 ───────────────────────────────────────
   const loadLedger = useCallback((code: SecCode): void => {
