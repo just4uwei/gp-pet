@@ -232,8 +232,19 @@ describe('ProviderRegistry · 熔断与冷却', () => {
     clock += 60_000
     const during = await registry.fetchSnapshots(['SH600000'])
     expect(during.provider).toBe('sina')
-    expect(during.degraded).toBe(false)
     expect(em.calls).toHaveLength(3)
+    /*
+      ⚠ 这一行 2026-08-30 从 `false` 改成 `true`，**是这条用例原来钉错了**。
+
+      旧实现 `degraded = attempts.length > 1` 在这里给 false：主源在冷却里被跳过 ⇒
+      备源第一个就成功 ⇒ 只有一次 attempt。于是「值来自备源」这件事对调用方不可见 ——
+      真机 2026-08-26 11:35:23 就是这么丢掉行业的（79/79 全空、`industry_history` 一行没有，
+      而 `engine/watchlist.ts` 那个「降级时按字段重试」因此八天一次都没触发）。
+
+      要区分「主源试过并失败」与「主源压根没试」的调用方，判据是 `attempts.length`。
+    */
+    expect(during.degraded).toBe(true)
+    expect(during.attempts).toHaveLength(1)
   })
 
   it('冷却到期后半开：试探一次，成功即恢复 OK', async () => {

@@ -39,6 +39,14 @@ export const META_KEYS = {
   profileRefreshedAt: 'profile_refreshed_at',
   lastPruneAt: 'last_prune_at',
   /**
+   * 最近一次**补行业**的时刻（`engine/tick.ts` 的 `INDUSTRY_RETRY_INTERVAL_MS`）。
+   *
+   * 与 `profileRefreshedAt` 分开是因为两者的失败方式不同：整周刷新那趟**报成功也可能
+   * 一个行业都没拿到**（主源在冷却里被跳过，备源不提供这个字段），而它一旦盖下时间戳
+   * 就是七天之后才会再来。这个键让「只差行业」的那批标的每天再试一次，拿到即收敛。
+   */
+  industryRetryAt: 'industry_retry_at',
+  /**
    * 最近一次补跑过收盘确认轮的交易日（`engine/settle.ts`）。**存日期串不是时刻。**
    *
    * 它是幂等闸门：补跑本身是幂等的（签名去重 + 只动 PROVISIONAL 行 + upsert），

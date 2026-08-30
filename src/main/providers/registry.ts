@@ -86,7 +86,13 @@ export interface AttemptOutcome {
 export interface RegistryResult<T> {
   value: T
   provider: ProviderId
-  /** 用的不是当前可用序列里的第一优先级源 —— UI 该提示「已切换数据源」 */
+  /**
+   * 值**不是**来自优先级最高的那个源 —— UI 该提示「已切换数据源」。
+   *
+   * ⚠ 含**主源在冷却里、这一轮根本没被试**那一种（那时 `attempts` 只有一条且是成功的）。
+   * 要区分「试过并失败」与「压根没试」请自己数 `attempts`，别拿这个字段代替 ——
+   * 理由与真机证据见 `run()` 的头注释。
+   */
   degraded: boolean
   attempts: AttemptOutcome[]
 }
@@ -259,11 +265,30 @@ export function createProviderRegistry(config: RegistryOptions): ProviderRegistr
     health?.record({ provider: id, at, ok: false, latencyMs, error })
   }
 
+  /**
+   * ## ⚠ `degraded` 判的是「值来不来自主源」，不是「这次试了几个源」（2026-08-30 改）
+   *
+   * 旧写法是 `attempts.length > 1`，它漏掉了**主源在冷却里、这一轮压根没被试**那一种：
+   * `ordered()` 把冷却中的排到最后 ⇒ 备源第一个就成功 ⇒ `attempts.length === 1`
+   * ⇒ 结果来自备源却报 `degraded === false`。
+   *
+   * 这不是理论问题。真机 2026-08-26 11:35:23（`provider_health` 逐条可查）：
+   * eastmoney 连续三次失败（minute / calendar 2026 / calendar 2027）触发 5 分钟冷却，
+   * 而每周一次的 `refreshProfiles()` 恰好在同一秒开跑 ⇒ 79 只全部由腾讯服务
+   * （腾讯明写「industry 不提供」）⇒ `watchlist.industry` **79/79 全空**、
+   * `industry_history`（014）**一行都没有** —— 而 08-22 加的那个「降级时按字段重试」
+   * 因为 `degraded === false` **一次都没有触发过**。
+   *
+   * ⇒ 判据改成「值不是来自优先级最高的那个源」（含被冷却跳过的情形）。
+   * `attempts.length > 1` 的信息没有丢，它就在 `attempts` 里 —— 要区分
+   * 「试过并失败」与「压根没试」的调用方自己去数（`engine/watchlist.ts` 就要区分）。
+   */
   async function run<T>(
     capability: Capability,
     task: (provider: QuoteProvider) => Promise<T>,
     runOptions: RunOptions<T> = {}
   ): Promise<RegistryResult<T>> {
+    const primary = candidates(capability)[0]?.id
     const sequence = ordered(capability)
     const attempts: AttemptOutcome[] = []
 
@@ -284,7 +309,7 @@ export function createProviderRegistry(config: RegistryOptions): ProviderRegistr
         }
         attempts.push({ provider: provider.id, ok: true, latencyMs })
         onSuccess(provider.id, latencyMs, now())
-        return { value, provider: provider.id, degraded: attempts.length > 1, attempts }
+        return { value, provider: provider.id, degraded: provider.id !== primary, attempts }
       } catch (error) {
         const latencyMs = now() - startedAt
         const message = `${runOptions.label ?? capability}: ${messageOf(error)}`

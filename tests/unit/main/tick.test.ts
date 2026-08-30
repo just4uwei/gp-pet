@@ -64,6 +64,7 @@ function harness(over: Partial<TickPipelineDeps> & { isOpen?: boolean } = {}): {
   backfill: ReturnType<typeof vi.fn>
   refreshSnapshots: ReturnType<typeof vi.fn>
   refreshProfiles: ReturnType<typeof vi.fn>
+  pendingIndustry: ReturnType<typeof vi.fn>
   calendarRefresh: ReturnType<typeof vi.fn>
   markObserved: ReturnType<typeof vi.fn>
 } {
@@ -74,6 +75,7 @@ function harness(over: Partial<TickPipelineDeps> & { isOpen?: boolean } = {}): {
   )
   const refreshSnapshots = vi.fn(async () => outcome())
   const refreshProfiles = vi.fn(async () => 1)
+  const pendingIndustry = vi.fn((): SecCode[] => [])
   const calendarRefresh = vi.fn(async (years: readonly number[]) =>
     years.map((year) => ({ year, ok: true, written: 10 }))
   )
@@ -86,7 +88,7 @@ function harness(over: Partial<TickPipelineDeps> & { isOpen?: boolean } = {}): {
       looksLikeTradingNow: (snapshots: readonly Snapshot[]) =>
         snapshots.some((s) => !s.suspended && s.last > 0 && s.volume > 0),
     } as unknown as TickPipelineDeps['market'],
-    watchlist: { codes: () => ['SH600000' as SecCode], refreshProfiles },
+    watchlist: { codes: () => ['SH600000' as SecCode], refreshProfiles, pendingIndustry },
     calendar: {
       resolve: (date: TradeDate) => ({
         date,
@@ -112,7 +114,16 @@ function harness(over: Partial<TickPipelineDeps> & { isOpen?: boolean } = {}): {
     },
     ...over,
   }
-  return { deps, meta, backfill, refreshSnapshots, refreshProfiles, calendarRefresh, markObserved }
+  return {
+    deps,
+    meta,
+    backfill,
+    refreshSnapshots,
+    refreshProfiles,
+    pendingIndustry,
+    calendarRefresh,
+    markObserved,
+  }
 }
 
 describe('createTickPipeline', () => {
@@ -189,8 +200,60 @@ describe('createTickPipeline', () => {
     expect(h.meta.has(META_KEYS.profileRefreshedAt)).toBe(false)
   })
 
+  /**
+   * 每周那趟刷新只要拿到名字就算成功并盖下时间戳，而行业只有主源给 ——
+   * 主源那一刻在冷却里的话，这一整周就都没有行业（真机 2026-08-26 实测 79/79 全空）。
+   * 这一组钉的是补救那趟的三条边界。
+   */
+  describe('补行业（每天一趟，INDUSTRY_RETRY_INTERVAL_MS）', () => {
+    it('整周刷新刚跑过的那一轮不补 —— 同一批代码连打两遍，第二遍必然还是备源', async () => {
+      const h = harness()
+      h.pendingIndustry.mockReturnValue(['SH600000'])
+
+      await createTickPipeline(h.deps).run(ctxOf({ needsQuotes: false }))
+
+      expect(h.refreshProfiles).toHaveBeenCalledOnce()
+      expect(h.refreshProfiles).toHaveBeenCalledWith()
+      expect(h.meta.has(META_KEYS.industryRetryAt)).toBe(false)
+    })
+
+    it('只对还缺行业的那批再问一次，问过就盖时间戳（哪怕一只都没补上）', async () => {
+      const h = harness()
+      h.meta.set(META_KEYS.profileRefreshedAt, AT)
+      h.pendingIndustry.mockReturnValue(['SH600000', 'SZ000001'])
+
+      await createTickPipeline(h.deps).run(ctxOf({ needsQuotes: false }))
+
+      expect(h.refreshProfiles).toHaveBeenCalledWith(['SH600000', 'SZ000001'])
+      expect(h.meta.get(META_KEYS.industryRetryAt)).toBe(AT)
+    })
+
+    it('一个都不缺时不发请求也不写 meta —— 稳态是零请求', async () => {
+      const h = harness()
+      h.meta.set(META_KEYS.profileRefreshedAt, AT)
+
+      await createTickPipeline(h.deps).run(ctxOf({ needsQuotes: false }))
+
+      expect(h.refreshProfiles).not.toHaveBeenCalled()
+      expect(h.meta.has(META_KEYS.industryRetryAt)).toBe(false)
+    })
+
+    it('同一天内不重复补', async () => {
+      const h = harness()
+      h.meta.set(META_KEYS.profileRefreshedAt, AT)
+      h.meta.set(META_KEYS.industryRetryAt, AT - 60_000)
+      h.pendingIndustry.mockReturnValue(['SH600000'])
+
+      await createTickPipeline(h.deps).run(ctxOf({ needsQuotes: false }))
+
+      expect(h.refreshProfiles).not.toHaveBeenCalled()
+    })
+  })
+
   it('自选为空时不发任何行情请求', async () => {
-    const h = harness({ watchlist: { codes: () => [], refreshProfiles: async () => 0 } })
+    const h = harness({
+      watchlist: { codes: () => [], refreshProfiles: async () => 0, pendingIndustry: () => [] },
+    })
 
     await createTickPipeline(h.deps).run(ctxOf())
 

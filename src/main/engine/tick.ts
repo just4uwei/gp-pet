@@ -30,6 +30,20 @@ import type { WatchlistService } from './watchlist'
 export const MAINTENANCE_INTERVAL_MS = 7 * 24 * 60 * 60_000
 
 /**
+ * 「只差行业」的那批标的多久再试一次（2026-08-30）。
+ *
+ * **为什么不能跟着 `MAINTENANCE_INTERVAL_MS` 走**：整周那趟刷新只要拿到名字就算成功
+ * 并盖下时间戳，而行业只有主源给 —— 主源那一刻在冷却里的话，这一整周就都没有行业。
+ * 真机上正是这么丢的（`engine/watchlist.ts` 的 `profileOf` 头注释有逐条时刻）。
+ *
+ * **为什么是一天而不是更密**：一天一趟的上界是「还缺行业的股票数」个请求
+ * （自选上限 200，实际 79），而且**拿到即收敛**（`COALESCE` 保住存量、板块筛掉 ETF/指数）
+ * ⇒ 稳态是零请求。再密就要开始跟 docs/03 §2.4 那份轮询预算抢额度，
+ * 而 eastmoney 的冷却只有 5 分钟，隔天再来足够了。
+ */
+export const INDUSTRY_RETRY_INTERVAL_MS = 24 * 60 * 60_000
+
+/**
  * 收盘后的**日线收尾窗口**（2026-08-19）。
  *
  * ## 修的是什么
@@ -88,7 +102,7 @@ export interface TickMetaStore {
 
 export interface TickPipelineDeps {
   market: Pick<MarketDataService, 'backfill' | 'refreshSnapshots' | 'looksLikeTradingNow'>
-  watchlist: Pick<WatchlistService, 'codes' | 'refreshProfiles'>
+  watchlist: Pick<WatchlistService, 'codes' | 'refreshProfiles' | 'pendingIndustry'>
   calendar: Pick<TradingCalendar, 'resolve' | 'refresh' | 'markObserved'>
   meta: TickMetaStore
   /**
@@ -148,6 +162,8 @@ export interface TickPipelineDeps {
    * 代价是净值曲线比自然日**晚一天**落，且应用某天没开就永久缺那一天 —— 两者都是诚实的。
    */
   maintenanceIntervalMs?: number
+  /** 补行业那趟的间隔，见 `INDUSTRY_RETRY_INTERVAL_MS`（测试用它把一天压成几毫秒） */
+  industryRetryIntervalMs?: number
 }
 
 export interface TickState {
@@ -179,6 +195,7 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
     onSignals,
     settle,
     maintenanceIntervalMs = MAINTENANCE_INTERVAL_MS,
+    industryRetryIntervalMs = INDUSTRY_RETRY_INTERVAL_MS,
   } = deps
 
   let lastTickAt = 0
@@ -186,7 +203,28 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
   let lastSnapshots: SnapshotOutcome | null = null
   let lastSignals: SignalOutcome[] = []
 
-  const due = (key: string, at: number): boolean => (meta.getNumber(key) ?? 0) + maintenanceIntervalMs < at
+  const dueBy = (key: string, at: number, intervalMs: number): boolean =>
+    (meta.getNumber(key) ?? 0) + intervalMs < at
+  const due = (key: string, at: number): boolean => dueBy(key, at, maintenanceIntervalMs)
+
+  /**
+   * 只差行业的那批标的，每天再试一趟（`INDUSTRY_RETRY_INTERVAL_MS`）。
+   *
+   * 三条边界：**整周那趟刚跑过就不跑**（同一批代码连打两遍，而主源在冷却里时第二遍
+   * 必然还是备源）· **一个都不缺时不发请求也不写 meta**（稳态零请求）·
+   * **发过就盖时间戳**，哪怕一个都没补上 —— 补不上的原因多半是主源在冷却，
+   * 那不是再打一轮能解决的。
+   */
+  async function retryIndustry(at: number, refreshedNow: boolean): Promise<void> {
+    if (refreshedNow) return
+    if (!dueBy(META_KEYS.industryRetryAt, at, industryRetryIntervalMs)) return
+    const pending = watchlist.pendingIndustry()
+    if (pending.length === 0) return
+    await watchlist.refreshProfiles(pending)
+    meta.setNumber(META_KEYS.industryRetryAt, at)
+    const left = watchlist.pendingIndustry().length
+    log.info(`[watchlist] 补行业：${pending.length} 只待补，这趟之后还缺 ${left} 只`)
+  }
 
   /** 休市期间唯一允许发出的请求（docs/03 §2.4） */
   async function maintain(at: number): Promise<void> {
@@ -202,10 +240,15 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
       }
     }
 
+    let refreshedNow = false
     if (due(META_KEYS.profileRefreshedAt, at)) {
       const updated = await watchlist.refreshProfiles()
       if (updated > 0) meta.setNumber(META_KEYS.profileRefreshedAt, at)
+      refreshedNow = true
     }
+
+    // ⚠ 这一趟补的是「刷新报了成功、行业却仍然空着」那一批，见 retryIndustry 的头注释
+    await retryIndustry(at, refreshedNow)
 
     const pruned = prune?.(at)
     if (pruned) log.info(`[retention] 裁剪：${JSON.stringify(pruned)}`)

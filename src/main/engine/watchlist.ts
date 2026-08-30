@@ -12,7 +12,7 @@
  */
 
 import { parseCode } from '@core/code'
-import type { SecCode, SecProfile } from '@core/types'
+import type { Board, SecCode, SecProfile } from '@core/types'
 import { shanghaiDate } from '@shared/time'
 import type { WatchItem } from '@shared/ipc-types'
 import type { ProviderRegistry } from '../providers'
@@ -71,7 +71,17 @@ export interface WatchlistService {
   reorder(codes: SecCode[]): void
   /** 每周一次的基础信息刷新（docs/03 §1）。返回补全了名称/行业的代码数 */
   refreshProfiles(codes?: readonly SecCode[]): Promise<number>
+  /**
+   * 还缺行业、而且**本来应该有**行业的自选代码（`tick.ts` 每日补一次的入参）。
+   *
+   * ⚠ **必须按板块筛**：ETF 与指数结构上就没有行业，把它们留在这张单子里
+   * 会让那趟 pass 每天都为同一批标的白打十几个请求，且永远清不空。
+   */
+  pendingIndustry(): SecCode[]
 }
+
+/** 有行业分类的板块。ETF / INDEX 结构上没有，见 `pendingIndustry` */
+const INDUSTRY_BOARDS: ReadonlySet<Board> = new Set<Board>(['MAIN', 'GEM', 'STAR', 'BSE'])
 
 export function toWatchItem(entry: WatchEntry, hasPosition: boolean): WatchItem {
   const item: WatchItem = {
@@ -116,30 +126,55 @@ export function createWatchlistService(deps: WatchlistServiceDeps): WatchlistSer
    * （方向相反但同一类：拿整体的成败去判一个字段）。
    *
    * 这里做的是**按字段重试，且只在真有机会时重试**：
-   *   · 只在 `degraded === true`（主源没服务这次请求）时重试 ——
+   *   · 只在**主源这一轮真的被试过并且失败了**时重试（判据见下）——
    *     主源自己给了空行业说明它就是没有，再问一次纯属浪费预算；
-   *   · 只在**存量也没有**行业时重试 —— 拿到过一次就被 `COALESCE` 保住了，
-   *     ETF / 指数这类结构性没有行业的标的因此不会每轮都多打一次；
+   *   · 只在**存量也没有**行业时重试 —— 拿到过一次就被 `COALESCE` 保住了；
    *   · 只重试**一次**。台账写着 eastmoney 是间歇性的、重试能过，
    *     再多就该去查熔断而不是在这里堆重试。
+   *
+   * ## ⚠ 上面这个修法 2026-08-22 → 2026-08-30 之间**一次都没有触发过**
+   *
+   * 判据原本写的是 `result.degraded`，而它当时的实现是 `attempts.length > 1`
+   * ⇒ **主源在冷却里被跳过**时它是 `false`。真机 2026-08-26 11:35:23：
+   * eastmoney 连续三次失败触发 5 分钟冷却，每周一次的 `refreshProfiles()`
+   * 恰好在同一秒开跑 ⇒ 79 只全部由腾讯服务、`degraded === false` ⇒ 重试一次都没发生
+   * ⇒ `industry` 仍然 79/79 全空、`industry_history`（014）**一行都没有**。
+   * `registry.ts` 的 `degraded` 已改成「值不来自主源」，但**这里不能直接用它**：
+   *
+   *   · `degraded && attempts.length > 1` = 主源试过、这次失败了 ⇒ **立刻重试有机会**
+   *     （eastmoney 是间歇性的）⇒ 就是下面这条路；
+   *   · `degraded && attempts.length === 1` = 主源在冷却里、压根没试 ⇒
+   *     **立刻重试必然还是备源**（`ordered()` 把冷却中的排到最后）⇒ 重试等于白烧一个请求
+   *     ⇒ 交给 `tick.ts` 那趟每日补行业的 pass，等冷却过去再说。
+   *
+   * ⇒ **「重试」与「稍后再来」是两种失败，别用一个布尔盖住。**
    */
   async function profileOf(
     fallback: SecProfile
   ): Promise<{ profile: SecProfile; fromProvider: boolean }> {
     if (!registry) return { profile: fallback, fromProvider: false }
 
-    const once = async (): Promise<{ profile: SecProfile; fromProvider: boolean; degraded: boolean }> => {
+    const once = async (): Promise<{
+      profile: SecProfile
+      fromProvider: boolean
+      /** 主源这一轮**被试过并且失败了** —— 与「主源在冷却里没被试」是两回事，见头注释 */
+      primaryFailedNow: boolean
+    }> => {
       const result = await registry.fetchProfile(fallback.code)
       const value = result.value
       // 名称是唯一必须来自数据源的字段。空名称当作没拿到，否则面板会出现一行空白
-      if (!value.name.trim()) return { profile: fallback, fromProvider: false, degraded: false }
-      return { profile: value, fromProvider: true, degraded: result.degraded }
+      if (!value.name.trim()) return { profile: fallback, fromProvider: false, primaryFailedNow: false }
+      return {
+        profile: value,
+        fromProvider: true,
+        primaryFailedNow: result.degraded && result.attempts.length > 1,
+      }
     }
 
     try {
       const first = await once()
       const missingIndustry = !first.profile.industry && !fallback.industry
-      if (!first.fromProvider || !missingIndustry || !first.degraded) {
+      if (!first.fromProvider || !missingIndustry || !first.primaryFailedNow) {
         return { profile: first.profile, fromProvider: first.fromProvider }
       }
       // 主源这次没服务成，而我们缺的恰好是只有它给的字段 ⇒ 再问一次
@@ -213,6 +248,16 @@ export function createWatchlistService(deps: WatchlistServiceDeps): WatchlistSer
 
     reorder(codes) {
       repo.reorder([...codes])
+    },
+
+    pendingIndustry() {
+      return repo
+        .list()
+        .filter(
+          (entry) =>
+            INDUSTRY_BOARDS.has(entry.profile.board) && !entry.profile.industry?.trim()
+        )
+        .map((entry) => entry.profile.code)
     },
 
     async refreshProfiles(codes) {

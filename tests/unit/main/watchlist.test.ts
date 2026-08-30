@@ -149,26 +149,40 @@ describe('createWatchlistService', () => {
    * eastmoney 的 profile 端点间歇性失败 → 降级到腾讯 → 腾讯**结构上不提供** industry
    * → 拿到一个「有名字、没行业」的 profile → `fromProvider = true` → 刷新报「成功」。
    *
-   * 这一组钉的是**修法本身的三条边界** —— 每一条写反了都会变成另一个缺陷：
-   *   · 只在 `degraded` 时重试（主源自己给了空行业 ⇒ 再问一次是白费预算）；
-   *   · 只在存量也没有时重试（拿到过一次就被 COALESCE 保住，ETF 这类不该每轮多打一次）；
+   * 这一组钉的是**修法本身的四条边界** —— 每一条写反了都会变成另一个缺陷：
+   *   · 只在**主源这一轮被试过并且失败了**时重试（主源自己给了空行业 ⇒ 白费预算）；
+   *   · **主源在冷却里压根没被试**时不重试 —— 立刻再问必然还是同一个备源
+   *     （2026-08-30 加：这正是 08-22 那个修法整整八天一次都没触发的原因）；
+   *   · 只在存量也没有时重试（拿到过一次就被 COALESCE 保住）；
    *   · 只重试一次。
    */
   describe('industry 字段级重试（降级链会静默吃掉它）', () => {
-    /** 可控 degraded 与调用计数的 registry */
+    /** 这一次 profile 是谁服务的 —— 三种形态在 `attempts` 上长得不一样 */
+    type Served = 'PRIMARY' | 'FAILOVER' | 'COOLING'
+
+    /** 可控「谁服务的」与调用计数的 registry */
     function flakyRegistry(
       results: readonly SecProfile[],
-      degraded: readonly boolean[]
+      served: readonly Served[]
     ): { registry: Pick<ProviderRegistry, 'fetchProfile'>; calls: () => number } {
       let n = 0
+      const ok = { provider: 'tencent' as const, ok: true, latencyMs: 1 }
+      const failed = { provider: 'eastmoney' as const, ok: false, latencyMs: 1, error: 'other side closed' }
       return {
         calls: () => n,
         registry: {
           fetchProfile: async (code) => {
             const value = results[Math.min(n, results.length - 1)] ?? profileOf(code, '占位')
-            const isDegraded = degraded[Math.min(n, degraded.length - 1)] ?? false
+            const how = served[Math.min(n, served.length - 1)] ?? 'PRIMARY'
             n += 1
-            return { value, provider: 'tencent', degraded: isDegraded, attempts: [] }
+            // 主源被跳过（COOLING）时 attempts 只有一条且是成功的 —— 与 FAILOVER 的区别就在这里
+            const attempts = how === 'FAILOVER' ? [failed, ok] : [ok]
+            return {
+              value,
+              provider: how === 'PRIMARY' ? 'eastmoney' : 'tencent',
+              degraded: how !== 'PRIMARY',
+              attempts,
+            }
           },
         },
       }
@@ -179,7 +193,7 @@ describe('createWatchlistService', () => {
       const code = 'SH600000' as SecCode
       const { registry, calls } = flakyRegistry(
         [profileOf(code, '浦发银行'), profileOf(code, '浦发银行', '银行')],
-        [true, false]
+        ['FAILOVER', 'PRIMARY']
       )
       const service = createWatchlistService({ repo, registry, now: () => 1 })
 
@@ -192,7 +206,7 @@ describe('createWatchlistService', () => {
     it('**没降级**时不重试 —— 主源自己说没有，再问一次是白费预算', async () => {
       const repo = store()
       const code = 'SH600000' as SecCode
-      const { registry, calls } = flakyRegistry([profileOf(code, '银行ETF')], [false])
+      const { registry, calls } = flakyRegistry([profileOf(code, '银行ETF')], ['PRIMARY'])
       const service = createWatchlistService({ repo, registry, now: () => 1 })
 
       const item = await service.add('600000')
@@ -205,7 +219,7 @@ describe('createWatchlistService', () => {
       const repo = store()
       const code = 'SH600000' as SecCode
       repo.add(profileOf(code, '浦发银行', '银行'), DEFAULT_GROUP, 1)
-      const { registry, calls } = flakyRegistry([profileOf(code, '浦发银行')], [true])
+      const { registry, calls } = flakyRegistry([profileOf(code, '浦发银行')], ['FAILOVER'])
       const service = createWatchlistService({ repo, registry, now: () => 1 })
 
       await service.add('600000')
@@ -216,7 +230,7 @@ describe('createWatchlistService', () => {
     it('重试也没拿到就算了，只重试一次', async () => {
       const repo = store()
       const code = 'SH600000' as SecCode
-      const { registry, calls } = flakyRegistry([profileOf(code, '浦发银行')], [true])
+      const { registry, calls } = flakyRegistry([profileOf(code, '浦发银行')], ['FAILOVER'])
       const service = createWatchlistService({ repo, registry, now: () => 1 })
 
       const item = await service.add('600000')
@@ -224,6 +238,51 @@ describe('createWatchlistService', () => {
       expect(calls()).toBe(2)
       expect(item.name).toBe('浦发银行')
       expect(item.industry).toBeUndefined()
+    })
+
+    /**
+     * 真机 2026-08-26 11:35:23 就是这一种：eastmoney 连续三次失败进 5 分钟冷却，
+     * 每周一次的 refreshProfiles 恰好同一秒开跑 ⇒ 79 只全由腾讯服务、attempts 只有一条
+     * ⇒ 立刻重试拿到的还是腾讯。这一趟留给 tick.ts 的每日补行业 pass。
+     */
+    it('**主源在冷却里没被试**时不立刻重试 —— 再问一次必然还是同一个备源', async () => {
+      const repo = store()
+      const code = 'SH600000' as SecCode
+      const { registry, calls } = flakyRegistry([profileOf(code, '浦发银行')], ['COOLING'])
+      const service = createWatchlistService({ repo, registry, now: () => 1 })
+
+      const item = await service.add('600000')
+
+      expect(calls()).toBe(1)
+      expect(item.industry).toBeUndefined()
+      // 但它必须留在待补名单里，否则这只票永远不会再被问一次
+      expect(service.pendingIndustry()).toEqual([code])
+    })
+  })
+
+  /**
+   * `pendingIndustry()` 是 tick.ts 每日补行业那趟的入参。**按板块筛是硬要求**：
+   * ETF 与指数结构上没有行业，留在名单里会让那趟 pass 每天为同一批标的白打请求，
+   * 而且永远清不空（清不空的名单等于没有名单）。
+   */
+  describe('pendingIndustry（每日补行业的入参）', () => {
+    it('只列还缺行业的股票，ETF 与指数不进名单', () => {
+      const repo = store()
+      repo.add(profileOf('SH600000' as SecCode, '浦发银行'), DEFAULT_GROUP, 1)
+      repo.add(profileOf('SZ300750' as SecCode, '宁德时代', '电池'), DEFAULT_GROUP, 1)
+      repo.add(
+        { code: 'SH512800' as SecCode, name: '银行ETF', market: 'SH', board: 'ETF', isST: false },
+        DEFAULT_GROUP,
+        1
+      )
+      repo.add(
+        { code: 'SH000300' as SecCode, name: '沪深300', market: 'SH', board: 'INDEX', isST: false },
+        DEFAULT_GROUP,
+        1
+      )
+      const service = createWatchlistService({ repo, now: () => 1 })
+
+      expect(service.pendingIndustry()).toEqual(['SH600000'])
     })
   })
 
