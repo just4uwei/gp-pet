@@ -105,6 +105,71 @@ function industryFileOf(argv: readonly string[]): string | null {
 const MOMENTUM_LAGS = [5, 20] as const
 
 /**
+ * 预注册写死的三个**收益形态**因子（M2 §5.83），来源是竞品 `tickflow-stock-panel`
+ * 的因子目录里那一组「A 股实证维度」（[§5.82](../../docs/notes/M2-偏差报告.md) ⑧.1）。
+ *
+ * **它们在这里而不是在 `scripts/verify/factor-ic.ts` 里，理由只有一条**：
+ * 预注册要求样本与 [§5.46](../../docs/notes/M2-偏差报告.md) **逐条对齐**
+ * （`i >= warmup` · `i < len−1` · `hasGap` 跳过 · `sufficiency.usable`），
+ * 而那个样本只有 `collect()` 这条路造得出来 —— 接在这里是**构造上相同**，
+ * 而在别处重建一遍只能做到「看起来相同」。那个财务脚本的样本口径**确实不同**
+ * （它没有 300 根预热也不跑 `evaluate()`），所以两边的 IC **不可以并排比**。
+ *
+ * ⚠ **三个都写死，不许加、不许换、不许只报好看的那个** —— 预注册锁的就是这个。
+ * ⚠ 全部在**后复权**日收益上算（除权不该被算成一次暴涨/暴跌），窗口 20 根含当根。
+ * ⚠ **它们不是指标**（约束 5）：只读、不进 `params.ts`、不进引擎、不进 `indicator-catalog`。
+ */
+const PRICE_FACTORS = [
+  { key: 'max_ret_20d', label: '20 日最大单日涨幅（彩票效应 / MAX effect）' },
+  { key: 'ret_skew_20d', label: '20 日收益偏度' },
+  { key: 'up_days_20d', label: '20 日上涨天数占比' },
+] as const
+type PriceFactorKey = (typeof PRICE_FACTORS)[number]['key']
+
+/** 收益形态因子的回看窗口（根，含当根）。**预注册写死 20，不扫它** */
+const PRICE_FACTOR_WINDOW = 20
+
+/**
+ * 三个收益形态因子的值。窗口内任一根算不出日收益就返回空 Map ——
+ * **不用 0 补**（约束 4）：`max_ret = 0` 会被读成「这 20 天一天都没涨」。
+ *
+ * 偏度用**除 n** 的样本矩（`m₃ / m₂^{3/2}`），与布林带除 n 同一条口径纪律；
+ * `m₂ = 0`（20 天逐日收益完全相同，停牌段）时偏度为 null，不是 0。
+ */
+export function priceFactorsAt(
+  closeAdj: readonly (number | null | undefined)[],
+  index: number
+): Map<PriceFactorKey, number> {
+  const out = new Map<PriceFactorKey, number>()
+  const rets: number[] = []
+  for (let k = index - PRICE_FACTOR_WINDOW + 1; k <= index; k++) {
+    const prev = k - 1 >= 0 ? closeAdj[k - 1] : undefined
+    const cur = closeAdj[k]
+    if (prev === null || prev === undefined || prev <= 0) return out
+    if (cur === null || cur === undefined || cur <= 0) return out
+    rets.push(cur / prev - 1)
+  }
+  if (rets.length < PRICE_FACTOR_WINDOW) return out
+
+  out.set('max_ret_20d', Math.max(...rets))
+  out.set('up_days_20d', rets.filter((r) => r > 0).length / rets.length)
+
+  const n = rets.length
+  const mean = rets.reduce((s, v) => s + v, 0) / n
+  let m2 = 0
+  let m3 = 0
+  for (const r of rets) {
+    const d = r - mean
+    m2 += d * d
+    m3 += d * d * d
+  }
+  m2 /= n
+  m3 /= n
+  if (m2 > 0) out.set('ret_skew_20d', m3 / m2 ** 1.5)
+  return out
+}
+
+/**
  * 把本文件自己处理的旗标从 argv 里摘掉再交给 `parseArgs`。
  *
  * ⚠ **必须连值一起摘**：只摘旗标名会让下一个词（路径/日期）被当成位置参数。
@@ -113,7 +178,7 @@ function stripLocalFlags(argv: readonly string[]): string[] {
   /** 带值的：摘掉旗标**和它的值** */
   const WITH_VALUE = new Set(['--eval-from', '--industry'])
   /** 布尔的：只摘旗标本身。**混进上面那组会把下一个参数吃掉** */
-  const BOOLEAN = new Set(['--risk-factors'])
+  const BOOLEAN = new Set(['--risk-factors', '--price-factors'])
   const out: string[] = []
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]
@@ -866,6 +931,11 @@ export async function main(argv: readonly string[]): Promise<number> {
   const industryFile = industryFileOf(argv)
   /** `--risk-factors`：打开 §5.70 那六条中性化臂。不给它时 payload 与旧报告逐字段相同。 */
   const riskFactors = argv.includes('--risk-factors')
+  /**
+   * `--price-factors`：打开 §5.83 那三个收益形态因子。不给它时 payload
+   * 与旧报告逐字段相同 —— 既有的 `ic-*.json` 不会因此变得读不出来。
+   */
+  const priceFactors = argv.includes('--price-factors')
   const rest = stripLocalFlags(argv)
   let options: CliOptions | 'help'
   try {
@@ -905,6 +975,8 @@ ${USAGE}`)
     const all = new Map<TradeDate, Row[]>()
     const counters = { judged: 0, unusable: 0, zeroScore: 0 }
     const momentumOf = new Map<SecCode, Map<TradeDate, Map<number, number>>>()
+    /** §5.83 的边侧表，与 `momentumOf` 同一形状、同一理由（不改 `Row` 也不改 `collect`） */
+    const priceFactorOf = new Map<SecCode, Map<TradeDate, Map<PriceFactorKey, number>>>()
     let audited = 0
     for (const raw of options.codes) {
       const code = normalizeCode(raw)
@@ -933,6 +1005,15 @@ ${USAGE}`)
           if (byLag.size > 0) perDate.set(bar.date, byLag)
         })
         momentumOf.set(loaded.profile.code, perDate)
+      }
+      if (priceFactors) {
+        const closes = loaded.candles.map((b) => b.closeAdj)
+        const perDate = new Map<TradeDate, Map<PriceFactorKey, number>>()
+        loaded.candles.forEach((bar, i) => {
+          const values = priceFactorsAt(closes, i)
+          if (values.size > 0) perDate.set(bar.date, values)
+        })
+        priceFactorOf.set(loaded.profile.code, perDate)
       }
       audited++
       if (!options.quiet && !options.json && audited % 20 === 0) {
@@ -1022,6 +1103,71 @@ ${USAGE}`)
         })
       }
     }
+    /*
+      §5.83 的三条收益形态臂。
+
+      **样本直接复用 `all`**（判定根全集）：只把每行的 `score` 换成因子值、
+      算不出因子的行丢掉 ⇒ 与 §5.46 是**同一批判定根**，这是接在本文件里的全部理由。
+
+      ⚠ **主子集取 `all` 而不是 `positiveOnly`，这是看结果之前定的**（理由写在这里，
+      免得事后看起来像挑的）：「得分 > 0」是**我们自己那个得分**的性质，
+      拿它去筛一个外部因子的样本，量出来的就不再是那个因子的排序能力，
+      而是「在我们已经看上的票里它还能不能排序」—— 那是另一个问题（§5.45 问的那个）。
+      两档都照样报，因为 `positiveOnly` 是 §5.46 的主口径，并排放着才好对照。
+
+      ⚠ 顺带算 `Spearman(因子, 得分)` 的逐日均值。**它必须与 IC 并排读**：
+      某个因子与得分秩相关很高时，它的 IC 不是新信息，而是 §5.46 的一次重复测量。
+    */
+    const priceResults = !priceFactors
+      ? null
+      : PRICE_FACTORS.map((factor) => {
+          const swap = (src: Map<TradeDate, Row[]>): Map<TradeDate, Row[]> => {
+            const out = new Map<TradeDate, Row[]>()
+            for (const [date, rows] of src) {
+              const kept: Row[] = []
+              for (const row of rows) {
+                const value = priceFactorOf.get(row.code)?.get(date)?.get(factor.key)
+                if (value === undefined || !Number.isFinite(value)) continue
+                kept.push({ code: row.code, score: value, fwd: row.fwd })
+              }
+              if (kept.length > 0) out.set(date, kept)
+            }
+            return out
+          }
+          const allSwapped = swap(all)
+          // 与得分的横截面秩相关：逐日算再取均值（只在两边都有值的行上）
+          const corrs: number[] = []
+          let tiedDays = 0
+          let totalDays = 0
+          for (const [date, rows] of all) {
+            const pairs: { f: number; s: number }[] = []
+            for (const row of rows) {
+              const value = priceFactorOf.get(row.code)?.get(date)?.get(factor.key)
+              if (value === undefined || !Number.isFinite(value)) continue
+              pairs.push({ f: value, s: row.score })
+            }
+            if (pairs.length < MIN_CROSS_SECTION) continue
+            totalDays++
+            const values = pairs.map((p) => p.f)
+            // 并列比例：当日不同取值数 / 行数。`up_days_20d` 只有 21 个取值 ⇒ 这个数会很低
+            if (new Set(values).size < values.length) tiedDays++
+            const c = correlation(ranksOf(values), ranksOf(pairs.map((p) => p.s)))
+            if (c !== null) corrs.push(c)
+          }
+          return {
+            key: factor.key,
+            label: factor.label,
+            window: PRICE_FACTOR_WINDOW,
+            all: HORIZONS.map((h) => ({ horizon: h, ...icOf(allSwapped, h) })),
+            positiveOnly: HORIZONS.map((h) => ({ horizon: h, ...icOf(swap(positive), h) })),
+            /** 与引擎买入得分的逐日横截面秩相关的均值 */
+            corrWithScore: corrs.length === 0 ? null : corrs.reduce((s, v) => s + v, 0) / corrs.length,
+            corrDays: corrs.length,
+            /** 有并列的天数占比 —— 高并列会稀释 Spearman，是事实不是 bug */
+            tiedDayFraction: totalDays === 0 ? null : tiedDays / totalDays,
+          }
+        })
+
     const riskResults = riskArms.map((arm) => ({
       key: arm.key,
       label: arm.label,
@@ -1049,6 +1195,7 @@ ${USAGE}`)
         evalFrom,
         industryFile,
         riskFactors,
+        priceFactors,
         riskArms: riskArms.map((a) => ({ key: a.key, controls: a.controls.map((c) => c.name), subset: a.subset })),
         judged: counters.judged,
         unusable: counters.unusable,
@@ -1060,6 +1207,7 @@ ${USAGE}`)
         ? {}
         : { industryNeutralAll: neutral.all, industryNeutralPositiveOnly: neutral.positiveOnly }),
       ...(riskResults.length === 0 ? {} : { riskNeutral: riskResults }),
+      ...(priceResults === null ? {} : { priceFactorArms: priceResults }),
     }
 
     if (options.out !== undefined) {
@@ -1092,6 +1240,42 @@ ${USAGE}`)
             '    用今天的归属回标历史是未来函数，而那正是这份数据存在的理由。',
             '  ⚠ 它**减掉**了行业那一层，**不是测量**了它 ⇒ 答不了「行业轮动有没有 alpha」。',
             '  ⚠ 中性化吃自由度 ⇒ 就算点估计不动，`t` 也会变小（组规模中位那一列就是它的量）。',
+          ]),
+      ...(priceResults === null
+        ? []
+        : [
+            ...priceResults.flatMap((arm) => [
+              '',
+              `  【收益形态因子】${arm.label}（窗口 ${arm.window} 根 · §5.83）`,
+              `    与引擎买入得分的横截面秩相关均值 ${
+                arm.corrWithScore === null ? '—' : arm.corrWithScore.toFixed(3)
+              }（${arm.corrDays} 天）· 有并列的天数占比 ${pct(arm.tiedDayFraction, 1)}`,
+              '    子集   持有期   有效日   meanIc     sd      t(NW)  滞后   t(朴素·不许引用)',
+              ...(
+                [
+                  ['全体（**主口径**）', arm.all],
+                  ['得分>0 子集', arm.positiveOnly],
+                ] as const
+              ).flatMap(([label, rows]) =>
+                rows.map((r) => {
+                  const n = (v: number | null): string => (v === null ? '—' : v.toFixed(2))
+                  return (
+                    `    ${label.padEnd(18)} ${String(r.horizon).padStart(3)} 日` +
+                    ` ${String(r.days).padStart(6)}  ${pct(r.meanIc).padStart(9)}` +
+                    ` ${pct(r.sdIc).padStart(8)}  ${n(r.tNw).padStart(6)}   ${String(r.lagNw).padStart(2)}` +
+                    `   ${n(r.t).padStart(6)}`
+                  )
+                })
+              ),
+            ]),
+            '',
+            '  ⚠ 三个因子来自竞品 `tickflow-stock-panel` 的因子目录（§5.82 ⑧.1），',
+            '    **每一个数字都是 `GUESS` 不是事实**（ADR-0003）：本轮只量 IC，不进引擎、不进 params.ts。',
+            '  ⚠ **主口径是「全体」而不是「得分>0 子集」**，且这是看结果之前定的：',
+            '    「得分 > 0」是我们自己那个得分的性质，拿它筛外部因子的样本会把问题换成',
+            '    「在我们已经看上的票里它还能不能排序」—— 那是 §5.45 问的，不是这里问的。',
+            '  ⚠ **`corrWithScore` 必须与 IC 并排读**：它高就说明这个因子不是新信息，',
+            '    而是 §5.46 的一次重复测量。`up_days_20d` 只有 21 个取值 ⇒ 并列会稀释它的 IC。',
           ]),
       ...(riskResults.length === 0
         ? []
