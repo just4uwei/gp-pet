@@ -8,7 +8,7 @@
  * （录制的 fixture 里北交所直接返回 -1），而板块比例是公开的规则，本地算比取数更可靠。
  */
 
-import type { Board, Market, SecCode } from './types'
+import type { Board, Market, SecCode, TradeDate } from './types'
 
 export interface ParsedCode {
   code: SecCode
@@ -143,13 +143,32 @@ export function roundToTick(price: number, board: Board): number {
 }
 
 /**
- * 涨跌幅比例。主板 ST 为 ±5%；创业板/科创板即便是 ST 仍为 ±20%，故只对 MAIN 特殊处理。
- * INDEX 无涨跌停。
+ * 主板风险警示股票（ST / *ST）涨跌幅由 ±5% 放宽到 ±10% 的**生效日**。
+ *
+ * 依据是一级源：上交所与深交所 2026-04-24 同步发布的《交易规则（2026 年修订）》，
+ * 自 **2026-07-06** 施行（上交所修订三项内容之一；深交所同步）。
+ * **科创板 / 创业板 ST 仍为 ±20%、北交所仍为 ±30%** ⇒ 只有 `MAIN` 需要按日期分档。
+ *
+ * ⚠ **这一行存在的理由**：不带生效日期的规则常量迟早会错，而它错的时候没有任何东西会报警。
+ * 2026-08-31 之前这里写死 0.05 ⇒ 一只涨了 6% 的主板 ST 会被判成「已涨停，买不到」
+ * ⇒ `HARD_LIMIT_UP` 硬抑制 ⇒ `candidates.ts` 直接 `continue` ⇒ **连 `alert_log` 都不落**；
+ * 跌侧同理把止损那条 L3 整条吞掉 —— 而少发的错误用户发现不了。见 M2 §5.82 ②。
  */
-export function priceLimitRatio(board: Board, isST: boolean): number | null {
+export const MAIN_ST_LIMIT_WIDENED_ON = '2026-07-06'
+
+/**
+ * 涨跌幅比例。主板 ST 在 `MAIN_ST_LIMIT_WIDENED_ON` **之前**为 ±5%、之后与普通股同为 ±10%；
+ * 创业板/科创板即便是 ST 仍为 ±20%，北交所 ±30%，故只对 MAIN 按日期分档。
+ * INDEX 无涨跌停。
+ *
+ * `asOf` 是**这一天**的交易日期（`YYYY-MM-DD`），**必填**：
+ * 给它一个默认值等于让漏传的调用点静默沿用旧规则，而那正是这次要修的东西。
+ * 约束 1 不许 `src/core` 读时钟 ⇒ 回测传 K 线自己的日期、实盘传 `now.date`。
+ */
+export function priceLimitRatio(board: Board, isST: boolean, asOf: TradeDate): number | null {
   switch (board) {
     case 'MAIN':
-      return isST ? 0.05 : 0.1
+      return isST && asOf < MAIN_ST_LIMIT_WIDENED_ON ? 0.05 : 0.1
     case 'ETF':
       return 0.1
     case 'GEM':
@@ -173,9 +192,10 @@ export function priceLimitRatio(board: Board, isST: boolean): number | null {
 export function priceLimits(
   preClose: number,
   board: Board,
-  isST: boolean
+  isST: boolean,
+  asOf: TradeDate
 ): { limitUp: number; limitDown: number } | null {
-  const ratio = priceLimitRatio(board, isST)
+  const ratio = priceLimitRatio(board, isST, asOf)
   if (ratio === null || !Number.isFinite(preClose) || preClose <= 0) return null
   return {
     limitUp: roundToTick(preClose * (1 + ratio), board),

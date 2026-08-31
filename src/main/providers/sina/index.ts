@@ -7,6 +7,7 @@
 
 import type { AdjustMode, Candle, SecCode, SecProfile, Snapshot, TradeDate } from '@core/types'
 import { splitCode } from '@core/code'
+import { shanghaiDate } from '@shared/time'
 import type { HttpClient } from '../../net/http'
 import type { ProviderCapabilities, QuoteProvider } from '../types'
 import {
@@ -103,12 +104,14 @@ function toSnapshot(record: SinaRecord, fallbackAt: number): Snapshot | null {
   const last = positive(record.fields[F.last])
   const open = num(record.fields[F.open])
   const volume = num(record.fields[F.volume])
+  // `at` 要先算出来：涨跌停比例按**这条快照自己的交易日**分档（主板 ST 有生效日，见 core/code.ts）
+  const at = parseDateTime(record.fields[F.date] ?? '', record.fields[F.time] ?? '') ?? fallbackAt
   // 新浪不给涨跌停价，全部本地算
-  const limits = resolveLimits(preClose, meta.board, meta.isST)
+  const limits = resolveLimits(preClose, meta.board, meta.isST, shanghaiDate(at))
 
   return {
     code,
-    at: parseDateTime(record.fields[F.date] ?? '', record.fields[F.time] ?? '') ?? fallbackAt,
+    at,
     last: last ?? preClose,
     open: open ?? 0,
     high: num(record.fields[F.high]) ?? 0,

@@ -11,6 +11,7 @@
 
 import type { AdjustMode, SecCode, SecProfile, Snapshot, TradeDate } from '@core/types'
 import { isSTName, parseCode, splitCode } from '@core/code'
+import { shanghaiDate } from '@shared/time'
 import type { HttpClient } from '../../net/http'
 import type { Announcement, MinutePoint, MinuteSeries, ProviderCapabilities, QuoteProvider } from '../types'
 import {
@@ -394,11 +395,20 @@ function toSnapshot(row: Row, fallbackAt: number): Snapshot | null {
   const open = num(row[S.open])
   const volume = handsToShares(num(row[S.volumeHands]))
   const stamp = num(row[S.stamp])
-  const limits = resolveLimits(preClose, meta.board, meta.isST, num(row[S.limitUp]), num(row[S.limitDown]))
+  // `at` 要先算出来：涨跌停比例按**这条快照自己的交易日**分档（主板 ST 有生效日，见 core/code.ts）
+  const at = stamp === null ? fallbackAt : stamp * 1000
+  const limits = resolveLimits(
+    preClose,
+    meta.board,
+    meta.isST,
+    shanghaiDate(at),
+    num(row[S.limitUp]),
+    num(row[S.limitDown])
+  )
 
   return {
     code,
-    at: stamp === null ? fallbackAt : stamp * 1000,
+    at,
     last: last ?? preClose,
     open: open ?? 0,
     high: num(row[S.high]) ?? 0,

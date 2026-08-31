@@ -588,7 +588,17 @@ function limitPrices(input: GateInput): { limitUp: number; limitDown: number } |
       ? snapshot.preClose
       : (input.candles[input.index - 1]?.close ?? null)
   if (preClose === null || preClose <= 0) return null
-  return priceLimits(preClose, input.profile.board, input.profile.isST || isSTName(input.profile.name))
+  // 日期取**当前这根 K 线自己的**日期 —— 主板 ST 的涨跌幅有生效日（core/code.ts
+  // `MAIN_ST_LIMIT_WIDENED_ON`），而 `GateInput.now` 里刻意没有日期（只有分钟与时段）。
+  // 拿不到这根就返回 null，与本函数其余分支同一条纪律：不用编出来的日期去算规则。
+  const asOf = input.candles[input.index]?.date
+  if (asOf === undefined) return null
+  return priceLimits(
+    preClose,
+    input.profile.board,
+    input.profile.isST || isSTName(input.profile.name),
+    asOf
+  )
 }
 
 export * from './text'

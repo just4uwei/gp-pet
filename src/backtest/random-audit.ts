@@ -523,7 +523,7 @@ function fillTrade(
   if (!entry || prevClose === undefined) return null
   if (entry.hasGap === true) return null
 
-  const entryLimits = priceLimits(prevClose, series.profile.board, series.profile.isST)
+  const entryLimits = priceLimits(prevClose, series.profile.board, series.profile.isST, entry.date)
   // 涨停开盘买不到 —— 不排除的话随机组会白捡一批强势日的入场
   if (entryLimits !== null && entry.open >= entryLimits.limitUp - 0.001) return null
 
@@ -543,7 +543,7 @@ function fillTrade(
       exitIdx++
       continue
     }
-    const limits = priceLimits(before, series.profile.board, series.profile.isST)
+    const limits = priceLimits(before, series.profile.board, series.profile.isST, bar.date)
     const limitedDown = limits !== null && bar.open <= limits.limitDown + 0.001
     if (!limitedDown) {
       const exitAdj = sellFill(bar.openAdj, costs)

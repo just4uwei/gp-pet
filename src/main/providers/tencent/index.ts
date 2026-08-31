@@ -8,6 +8,7 @@
 
 import type { AdjustMode, SecCode, SecProfile, Snapshot, TradeDate } from '@core/types'
 import { splitCode } from '@core/code'
+import { shanghaiDate } from '@shared/time'
 import type { HttpClient } from '../../net/http'
 import type { MinutePoint, MinuteSeries, ProviderCapabilities, QuoteProvider } from '../types'
 import {
@@ -202,17 +203,20 @@ function toSnapshot(quote: TencentQuote, fallbackAt: number): Snapshot | null {
 
   const open = num(quote.fields[F.open])
   const volume = handsToShares(num(quote.fields[F.volumeHands]))
+  // `at` 要先算出来：涨跌停比例按**这条快照自己的交易日**分档（主板 ST 有生效日，见 core/code.ts）
+  const at = parseCompactStamp(quote.fields[F.stamp] ?? '') ?? fallbackAt
   const limits = resolveLimits(
     preClose,
     meta.board,
     meta.isST,
+    shanghaiDate(at),
     num(quote.fields[F.limitUp]),
     num(quote.fields[F.limitDown])
   )
 
   return {
     code,
-    at: parseCompactStamp(quote.fields[F.stamp] ?? '') ?? fallbackAt,
+    at,
     // 停牌股的 last 就是昨收，用昨收兜底比用 0 合理
     last: last ?? preClose,
     open: open ?? 0,

@@ -173,7 +173,7 @@ export function executeOrder(
   // 缺口段不成交：这一段的价格连续性本身就不可信（docs/07 §4）
   if (ctx.bar.hasGap === true) return { kind: 'VOID', reason: 'GAP' }
 
-  const limits = priceLimits(ctx.prevClose, ctx.board, ctx.isST)
+  const limits = priceLimits(ctx.prevClose, ctx.board, ctx.isST, ctx.bar.date)
 
   if (order.action === 'BUY') {
     // 开盘即涨停 → 买不到。作废而不是顺延：追高一天买入的成本已经不是这条信号的成本

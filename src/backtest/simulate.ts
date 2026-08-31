@@ -298,7 +298,7 @@ export function simulateCode(
         // 边读边写同一个变量在类型收窄上也站不住脚（顺延分支会从 order 重建 pending，
         // 不显式标注类型 TS 就得循环推断）
         const order: PendingOrder = pending
-        const limits = priceLimits(candles[i - 1]?.close ?? 0, profile.board, profile.isST)
+        const limits = priceLimits(candles[i - 1]?.close ?? 0, profile.board, profile.isST, bar.date)
         if (order.action === 'BUY') {
           const limitedUp = limits !== null && bar.open >= limits.limitUp - 0.001
           if (limitedUp) {

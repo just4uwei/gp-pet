@@ -253,7 +253,7 @@ export function limitUpBreakout(): Scenario {
   const overrides: Record<number, BarOverride> = {}
   let last = closes[closes.length - 1] ?? 10
   for (let i = 0; i < 3; i++) {
-    last = priceLimits(last, 'MAIN', false)?.limitUp ?? round(last * 1.1)
+    last = priceLimits(last, 'MAIN', false, '2020-01-02')?.limitUp ?? round(last * 1.1)
     closes.push(last)
     // 一字涨停：开=高=低=收
     overrides[closes.length - 1] = { open: last, high: last, low: last, close: last }

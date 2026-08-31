@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  MAIN_ST_LIMIT_WIDENED_ON,
   isSTName,
   normalizeCode,
   parseCode,
@@ -85,14 +86,48 @@ describe('价格档位与涨跌停', () => {
     expect(roundToTick(5.2349, 'ETF')).toBe(5.235)
   })
 
-  it('比例：主板 10%、ST 主板 5%、创业/科创 20%、北交所 30%、ETF 10%、指数无', () => {
-    expect(priceLimitRatio('MAIN', false)).toBe(0.1)
-    expect(priceLimitRatio('MAIN', true)).toBe(0.05)
-    expect(priceLimitRatio('GEM', true)).toBe(0.2)
-    expect(priceLimitRatio('STAR', false)).toBe(0.2)
-    expect(priceLimitRatio('BSE', false)).toBe(0.3)
-    expect(priceLimitRatio('ETF', false)).toBe(0.1)
-    expect(priceLimitRatio('INDEX', false)).toBeNull()
+  it('比例：主板 10%、创业/科创 20%、北交所 30%、ETF 10%、指数无', () => {
+    const day = '2026-08-31'
+    expect(priceLimitRatio('MAIN', false, day)).toBe(0.1)
+    expect(priceLimitRatio('GEM', true, day)).toBe(0.2)
+    expect(priceLimitRatio('STAR', false, day)).toBe(0.2)
+    expect(priceLimitRatio('BSE', false, day)).toBe(0.3)
+    expect(priceLimitRatio('ETF', false, day)).toBe(0.1)
+    expect(priceLimitRatio('INDEX', false, day)).toBeNull()
+  })
+
+  /**
+   * 主板 ST 的涨跌幅有**生效日**：2026-07-06 起由 ±5% 放宽到 ±10%
+   * （上交所/深交所《交易规则（2026 年修订）》，见 code.ts `MAIN_ST_LIMIT_WIDENED_ON`）。
+   *
+   * 这一组钉三件事，少一条都会让缺陷悄悄回来：
+   *   1. **生效日两侧**（07-03 与 07-06）结论不同 —— 这是「按日期分档」真的生效的唯一证据；
+   *   2. **生效日当天算新规则**（不是次日）；
+   *   3. **只有主板受影响** —— 创业板/科创板 ST 仍 20%、北交所仍 30%，
+   *      两侧逐位相同。写死 0.05 那个版本在第 1 条上失败，
+   *      而「顺手把所有板块都改成按日期」的版本在第 3 条上失败。
+   */
+  it('主板 ST 的涨跌幅按 2026-07-06 分档，且只有主板受影响', () => {
+    expect(MAIN_ST_LIMIT_WIDENED_ON).toBe('2026-07-06')
+    // 1 + 2：生效日两侧
+    expect(priceLimitRatio('MAIN', true, '2026-07-03')).toBe(0.05)
+    expect(priceLimitRatio('MAIN', true, '2026-07-06')).toBe(0.1)
+    expect(priceLimitRatio('MAIN', true, '2026-08-31')).toBe(0.1)
+    // 3：其他板块两侧逐位相同
+    for (const day of ['2026-07-03', '2026-07-06']) {
+      expect(priceLimitRatio('GEM', true, day)).toBe(0.2)
+      expect(priceLimitRatio('STAR', true, day)).toBe(0.2)
+      expect(priceLimitRatio('BSE', true, day)).toBe(0.3)
+      expect(priceLimitRatio('ETF', true, day)).toBe(0.1)
+    }
+    // 非 ST 的主板从来是 10%，不受生效日影响
+    expect(priceLimitRatio('MAIN', false, '2026-07-03')).toBe(0.1)
+  })
+
+  it('涨跌停价跟着生效日走：同一只主板 ST，07-06 之后的涨停价整个变了', () => {
+    // 昨收 10.00：旧规则 ±5% ⇒ 10.50 / 9.50；新规则 ±10% ⇒ 11.00 / 9.00
+    expect(priceLimits(10, 'MAIN', true, '2026-07-03')).toEqual({ limitUp: 10.5, limitDown: 9.5 })
+    expect(priceLimits(10, 'MAIN', true, '2026-07-06')).toEqual({ limitUp: 11, limitDown: 9 })
   })
 
   // 期望值取自 2026-08-11 录制的腾讯快照 fixture（字段 47/48），
@@ -102,13 +137,13 @@ describe('价格档位与涨跌停', () => {
     [393.87, 'GEM' as const, false, 472.64, 315.1],
     [4.759, 'ETF' as const, false, 5.235, 4.283],
   ])('昨收 %s 的涨跌停与数据源一致', (preClose, board, isST, up, down) => {
-    expect(priceLimits(preClose, board, isST)).toEqual({ limitUp: up, limitDown: down })
+    expect(priceLimits(preClose, board, isST, '2026-08-11')).toEqual({ limitUp: up, limitDown: down })
   })
 
   it('指数、无昨收、非法昨收一律返回 null 而不是 0', () => {
-    expect(priceLimits(3800, 'INDEX', false)).toBeNull()
-    expect(priceLimits(0, 'MAIN', false)).toBeNull()
-    expect(priceLimits(Number.NaN, 'MAIN', false)).toBeNull()
+    expect(priceLimits(3800, 'INDEX', false, '2026-08-31')).toBeNull()
+    expect(priceLimits(0, 'MAIN', false, '2026-08-31')).toBeNull()
+    expect(priceLimits(Number.NaN, 'MAIN', false, '2026-08-31')).toBeNull()
   })
 
   it('ST 从名称判', () => {

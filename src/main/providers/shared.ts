@@ -141,10 +141,16 @@ export function resolveLimits(
   preClose: number | null,
   board: Board,
   isST: boolean,
+  /**
+   * 这条快照自己的交易日（北京时区），由调用方从它的时间戳算出来（`shanghaiDate(atMs)`）。
+   * 主板 ST 的涨跌幅有生效日 —— 见 `core/code.ts` 的 `MAIN_ST_LIMIT_WIDENED_ON`。
+   * **用快照的时刻而不是「现在」**：补历史快照时两者不是同一天。
+   */
+  asOf: TradeDate,
   sourceUp?: number | null,
   sourceDown?: number | null
 ): { limitUp: number | null; limitDown: number | null } {
-  const local = preClose === null ? null : priceLimits(preClose, board, isST)
+  const local = preClose === null ? null : priceLimits(preClose, board, isST, asOf)
   if (local) return local
   return { limitUp: positive(sourceUp ?? null), limitDown: positive(sourceDown ?? null) }
 }
