@@ -986,6 +986,19 @@ ${USAGE}`)
     const momentumOf = new Map<SecCode, Map<TradeDate, Map<number, number>>>()
     /** §5.83 的边侧表，与 `momentumOf` 同一形状、同一理由（不改 `Row` 也不改 `collect`） */
     const priceFactorOf = new Map<SecCode, Map<TradeDate, Map<PriceFactorKey, number>>>()
+    /**
+     * §5.86 的稳健性臂：**同一个因子换成不复权 `close` 算**。
+     *
+     * 它存在的理由很窄：退市股的 `closeAdj` 与新浪复权因子的全窗累计漂移中位 **38.12%**
+     * （存活组 2.39%，§5.65），而 `max_ret_20d` 吃的是**日收益的极值**
+     * ⇒ 一个坏复权因子造成的单日虚假跳会**直接抬高**它。
+     *
+     * ⚠ **两臂各有偏、方向不同，必须并排读**：不复权那一侧会把除权造成的**向下**假跳
+     * 引进 `up_days_20d` / `ret_skew_20d`（`max_ret` 取最大**正**收益，受影响较小）。
+     * ⚠ **前瞻收益那一侧不动**，仍是 `closeAdj` —— 换掉它会让「除权日算成一次下跌」，
+     * 那是另一个错，而且是回测陷阱清单里的第一条。
+     */
+    const priceFactorRawOf = new Map<SecCode, Map<TradeDate, Map<PriceFactorKey, number>>>()
     let audited = 0
     for (const raw of options.codes) {
       const code = normalizeCode(raw)
@@ -1017,13 +1030,18 @@ ${USAGE}`)
         momentumOf.set(loaded.profile.code, perDate)
       }
       if (priceFactors) {
-        const closes = loaded.candles.map((b) => b.closeAdj)
+        const adj = loaded.candles.map((b) => b.closeAdj)
+        const raw = loaded.candles.map((b) => b.close)
         const perDate = new Map<TradeDate, Map<PriceFactorKey, number>>()
+        const perDateRaw = new Map<TradeDate, Map<PriceFactorKey, number>>()
         loaded.candles.forEach((bar, i) => {
-          const values = priceFactorsAt(closes, i)
+          const values = priceFactorsAt(adj, i)
           if (values.size > 0) perDate.set(bar.date, values)
+          const rawValues = priceFactorsAt(raw, i)
+          if (rawValues.size > 0) perDateRaw.set(bar.date, rawValues)
         })
         priceFactorOf.set(loaded.profile.code, perDate)
+        priceFactorRawOf.set(loaded.profile.code, perDateRaw)
       }
       audited++
       if (!options.quiet && !options.json && audited % 20 === 0) {
@@ -1131,12 +1149,15 @@ ${USAGE}`)
     const priceResults = !priceFactors
       ? null
       : PRICE_FACTORS.map((factor) => {
-          const swap = (src: Map<TradeDate, Row[]>): Map<TradeDate, Row[]> => {
+          const swapFrom = (
+            table: Map<SecCode, Map<TradeDate, Map<PriceFactorKey, number>>>,
+            src: Map<TradeDate, Row[]>
+          ): Map<TradeDate, Row[]> => {
             const out = new Map<TradeDate, Row[]>()
             for (const [date, rows] of src) {
               const kept: Row[] = []
               for (const row of rows) {
-                const value = priceFactorOf.get(row.code)?.get(date)?.get(factor.key)
+                const value = table.get(row.code)?.get(date)?.get(factor.key)
                 if (value === undefined || !Number.isFinite(value)) continue
                 kept.push({ code: row.code, score: value, fwd: row.fwd })
               }
@@ -1144,14 +1165,20 @@ ${USAGE}`)
             }
             return out
           }
+          const swap = (src: Map<TradeDate, Row[]>): Map<TradeDate, Row[]> =>
+            swapFrom(priceFactorOf, src)
           const allSwapped = swap(all)
+          const allRaw = swapFrom(priceFactorRawOf, all)
           /*
             §5.84 的两条中性化臂：控制 20 日 / 5 日动量。
             **复用 `neutralizeByRegression`，与 §5.70 的 A3/A2 逐字同一条路** —— 另写一份的症状是
             「得分的中性化 IC 与因子的中性化 IC 不是同一个口径」，而两个数要并排比。
             ⚠ 加控制**只可能让效应变小或不变** ⇒ 这是对候选不利的方向，不是移动球门。
           */
-          const controlArm = (lag: number): { lag: number; byHorizon: (IcResult & { horizon: number })[] } => {
+          const controlArmOn = (
+            source: Map<TradeDate, Row[]>,
+            lag: number
+          ): { lag: number; byHorizon: (IcResult & { horizon: number })[] } => {
             const control: Control = {
               kind: 'continuous',
               name: `mom${lag}`,
@@ -1160,11 +1187,13 @@ ${USAGE}`)
             return {
               lag,
               byHorizon: HORIZONS.map((h) => {
-                const { byDate } = neutralizeByRegression(allSwapped, [control], h)
+                const { byDate } = neutralizeByRegression(source, [control], h)
                 return { horizon: h, ...icOf(byDate, h) }
               }),
             }
           }
+          const controlArm = (lag: number): { lag: number; byHorizon: (IcResult & { horizon: number })[] } =>
+            controlArmOn(allSwapped, lag)
           // 与得分的横截面秩相关：逐日算再取均值（只在两边都有值的行上）
           const corrs: number[] = []
           let tiedDays = 0
@@ -1192,6 +1221,14 @@ ${USAGE}`)
             positiveOnly: HORIZONS.map((h) => ({ horizon: h, ...icOf(swap(positive), h) })),
             /** §5.84：两条臂写死（mom20 主判据 · mom5 对照），不加市值不加行业 */
             momNeutral: [controlArm(20), controlArm(5)],
+            /**
+             * §5.86 的稳健性臂：同一个因子换成**不复权**日收益算，控制 mom20 那一档并排给。
+             * 两臂结论不一致 ⇒ 本轮结论只能是「判不了」，不是挑一个。
+             */
+            raw: {
+              all: HORIZONS.map((h) => ({ horizon: h, ...icOf(allRaw, h) })),
+              momNeutral20: controlArmOn(allRaw, 20).byHorizon,
+            },
             /** 与引擎买入得分的逐日横截面秩相关的均值 */
             corrWithScore: corrs.length === 0 ? null : corrs.reduce((s, v) => s + v, 0) / corrs.length,
             corrDays: corrs.length,
@@ -1311,8 +1348,28 @@ ${USAGE}`)
                   )
                 })
               ),
+              ...(
+                [
+                  ['不复权·未控制', arm.raw.all],
+                  ['不复权·控制mom20', arm.raw.momNeutral20],
+                ] as const
+              ).flatMap(([label, rows]) =>
+                rows.map((r) => {
+                  const num = (v: number | null): string => (v === null ? '—' : v.toFixed(2))
+                  return (
+                    `    ${label.padEnd(18)} ${String(r.horizon).padStart(3)} 日` +
+                    ` ${String(r.days).padStart(6)}  ${pct(r.meanIc).padStart(9)}` +
+                    ` ${pct(r.sdIc).padStart(8)}  ${num(r.tNw).padStart(6)}   ${String(r.lagNw).padStart(2)}` +
+                    `   ${num(r.t).padStart(6)}`
+                  )
+                })
+              ),
             ]),
             '',
+            '  ⚠ **「不复权」那两组是 §5.86 的稳健性臂**（因子换成不复权日收益，前瞻收益仍用后复权）：',
+            '    退市股的 closeAdj 与新浪因子全窗漂移中位 38.12%（存活组 2.39%，§5.65），',
+            '    而 max_ret 吃日收益的极值 ⇒ 坏因子的单日假跳直接抬高它。',
+            '    **两臂各有偏、方向不同 ⇒ 并排读；结论不一致时结论是「判不了」，不是挑一个。**',
             '  ⚠ **控制 mom20 那两行是 §5.84 的主判据**：引擎得分自己的负 IC 在控制它之后',
             '    就掉到 |t| < 2（训练 −4.4% → −1.09%，验证翻正 —— `ic-train-risk.json` / §5.70），',
             '    ⇒ 若因子也这样，它就是**那个 20 日动量暴露的另一种测量**，不是新信息。',
