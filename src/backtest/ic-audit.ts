@@ -129,10 +129,10 @@ function stripLocalFlags(argv: readonly string[]): string[] {
 }
 
 /** 预注册写死的三个持有期（交易日）。它们不是三次尝试，是同一问题的三个时间尺度 */
-const HORIZONS = [5, 10, 20] as const
+export const HORIZONS = [5, 10, 20] as const
 
 /** 逐日横截面至少要这么多个有效标的才算一天 —— 少于它的日子 IC 没有意义 */
-const MIN_CROSS_SECTION = 10
+export const MIN_CROSS_SECTION = 10
 
 /**
  * 横截面表的一行。**导出是为了让别的因子共用 `icOf`** ——
