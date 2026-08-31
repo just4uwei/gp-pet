@@ -239,7 +239,16 @@ export interface IcResult {
    */
   tNwAndrews: number | null
   lagAndrews: number
-  /** 五等分（按当日得分排名）各组前瞻收益的**中位数** */
+  /**
+   * 五等分（按当日得分排名）各组前瞻收益的**中位数**。
+   *
+   * ⚠ **两条读法，缺一条就会读出一个假结论**：
+   * ① 水平里含**当日市场共同项**，只能看**组间差**（§5.46 限制 ②）；
+   * ② **中性化过的臂（`industryNeutral*` / `riskNeutral` / `priceFactorArms[].momNeutral`）
+   *    这一列是「残差秩」不是收益** —— 实测能打出 `+649%` / `−1067%` 这种数
+   *    （§5.84 那一轮），看起来像收益但不是。**那些臂只读 `meanIc` 与 `tNw`。**
+   *    打印函数刻意都不印它，但 JSON 里在，读 JSON 的人会撞上。
+   */
   quintileMedians: (number | null)[]
   /**
    * **逐日 IC 序列**（2026-08-22 加）。此前只落聚合量，而 §5.51 六处假设里
@@ -992,7 +1001,8 @@ ${USAGE}`)
         —— 那两个是 `factor-ic.ts` 也在用的共享结构，为一次归因实验加字段不值得。
         用 `closeAdj`（后复权）：除权不该被算成一次下跌。
       */
-      if (riskFactors) {
+      // §5.84 起 priceFactors 也要 mom20 做控制变量 ⇒ 两个旗标任一打开都算这张边侧表
+      if (riskFactors || priceFactors) {
         const perDate = new Map<TradeDate, Map<number, number>>()
         loaded.candles.forEach((bar, i) => {
           const byLag = new Map<number, number>()
@@ -1135,6 +1145,26 @@ ${USAGE}`)
             return out
           }
           const allSwapped = swap(all)
+          /*
+            §5.84 的两条中性化臂：控制 20 日 / 5 日动量。
+            **复用 `neutralizeByRegression`，与 §5.70 的 A3/A2 逐字同一条路** —— 另写一份的症状是
+            「得分的中性化 IC 与因子的中性化 IC 不是同一个口径」，而两个数要并排比。
+            ⚠ 加控制**只可能让效应变小或不变** ⇒ 这是对候选不利的方向，不是移动球门。
+          */
+          const controlArm = (lag: number): { lag: number; byHorizon: (IcResult & { horizon: number })[] } => {
+            const control: Control = {
+              kind: 'continuous',
+              name: `mom${lag}`,
+              valueOf: (c, d) => momentumOf.get(c)?.get(d)?.get(lag) ?? null,
+            }
+            return {
+              lag,
+              byHorizon: HORIZONS.map((h) => {
+                const { byDate } = neutralizeByRegression(allSwapped, [control], h)
+                return { horizon: h, ...icOf(byDate, h) }
+              }),
+            }
+          }
           // 与得分的横截面秩相关：逐日算再取均值（只在两边都有值的行上）
           const corrs: number[] = []
           let tiedDays = 0
@@ -1160,6 +1190,8 @@ ${USAGE}`)
             window: PRICE_FACTOR_WINDOW,
             all: HORIZONS.map((h) => ({ horizon: h, ...icOf(allSwapped, h) })),
             positiveOnly: HORIZONS.map((h) => ({ horizon: h, ...icOf(swap(positive), h) })),
+            /** §5.84：两条臂写死（mom20 主判据 · mom5 对照），不加市值不加行业 */
+            momNeutral: [controlArm(20), controlArm(5)],
             /** 与引擎买入得分的逐日横截面秩相关的均值 */
             corrWithScore: corrs.length === 0 ? null : corrs.reduce((s, v) => s + v, 0) / corrs.length,
             corrDays: corrs.length,
@@ -1267,8 +1299,23 @@ ${USAGE}`)
                   )
                 })
               ),
+              ...arm.momNeutral.flatMap((n) =>
+                n.byHorizon.map((r) => {
+                  const num = (v: number | null): string => (v === null ? '—' : v.toFixed(2))
+                  const label = `控制 mom${n.lag}${n.lag === 20 ? '（**§5.84 主判据**）' : ''}`
+                  return (
+                    `    ${label.padEnd(18)} ${String(r.horizon).padStart(3)} 日` +
+                    ` ${String(r.days).padStart(6)}  ${pct(r.meanIc).padStart(9)}` +
+                    ` ${pct(r.sdIc).padStart(8)}  ${num(r.tNw).padStart(6)}   ${String(r.lagNw).padStart(2)}` +
+                    `   ${num(r.t).padStart(6)}`
+                  )
+                })
+              ),
             ]),
             '',
+            '  ⚠ **控制 mom20 那两行是 §5.84 的主判据**：引擎得分自己的负 IC 在控制它之后',
+            '    就掉到 |t| < 2（训练 −4.4% → −1.09%，验证翻正 —— `ic-train-risk.json` / §5.70），',
+            '    ⇒ 若因子也这样，它就是**那个 20 日动量暴露的另一种测量**，不是新信息。',
             '  ⚠ 三个因子来自竞品 `tickflow-stock-panel` 的因子目录（§5.82 ⑧.1），',
             '    **每一个数字都是 `GUESS` 不是事实**（ADR-0003）：本轮只量 IC，不进引擎、不进 params.ts。',
             '  ⚠ **主口径是「全体」而不是「得分>0 子集」**，且这是看结果之前定的：',
