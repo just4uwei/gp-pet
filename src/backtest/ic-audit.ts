@@ -170,6 +170,89 @@ export function priceFactorsAt(
 }
 
 /**
+ * 预注册写死的两个**流动性**因子（M2 §5.88）。来源是 Amihud (2002)，
+ * *Illiquidity and stock returns*, JFM 5: 31–56 —— `ILLIQ = mean(|R_t| / DVOL_t)`，
+ * 读作「每一元成交额引起的价格变动」，是 Kyle (1985) λ 的粗代理。
+ *
+ * **`neg_dvol_20d` 不是第二个候选，它是主判据的控制变量。**
+ * 思路来自 Lou & Shu（*Price Impact or Trading Volume: Why is the Amihud (2002)
+ * Illiquidity Measure Priced?*）：**Fama-MacBeth 回归下**纯成交量分量的系数显著为正、
+ * 而残差 Amihud「either insignificant or significantly negative」
+ * ⇒ 不减掉分母就测它，量到的很可能是「成交额的又一次测量」。
+ * 取负号是为了让它与 `amihud` **同向**（都是「越大越不流动」），免得读表时反复换算符号。
+ *
+ * ⚠ **它不是原文那个 `A_C`，别把两者的数放在一起比**（M2 §5.89 ⑨.1）：
+ * 原文的 `A_C` 是「把分子的 `|R|` **换成 1**」⇒ `mean(1/DVOL)`，
+ * 而这里是 `−mean(DVOL)` —— 强单调相关，但不是同一个变换。
+ * ⇒ 本地那个 `corrWithDvol ≈ 0.89` **与原文的 0.90 相符是巧合级别的**，只能本地读。
+ * （原文的 0.90 是 `corr(A, A_C)`、0.75 是 `corr(AT, AT_C)` —— `AT` 是
+ * Brennan, Huh & Subrahmanyam (2013) 的**换手率版**，我们没做那一支。）
+ *
+ * ⚠ **三条口径**：
+ * - `DVOL` 两边都用**不复权**（`volume × close`）。`closeAdj × volume` 会得到放大上百倍的
+ *   假成交额（后复权锚在上市日，§5.40），而它**不报错**，只把老票系统性判成「最流动」。
+ * - `|r|` 用**后复权**（除权不该被算成一次暴跌）。稳健性臂换成不复权，与 §5.86 同一形状。
+ * - **不取 log**。文献通常取 log 是因为分布极右偏，而这里 IC 与
+ *   `neutralizeByRegression` 都吃**当日横截面的秩** ⇒ 单调变换等价 ⇒ 省掉一个自由参数。
+ *
+ * ⚠ **它们不是指标**（约束 5）：只读、不进 `params.ts`、不进引擎、不进 `indicator-catalog`。
+ */
+const LIQ_FACTORS = [
+  { key: 'amihud_20d', label: '20 日 Amihud 非流动性（|日收益| / 成交额，×1e9）' },
+  { key: 'neg_dvol_20d', label: '20 日平均成交额取负（纯成交量分量 · **控制变量**，非原文 A_C）' },
+] as const
+type LiqFactorKey = (typeof LIQ_FACTORS)[number]['key']
+
+/** 流动性因子的回看窗口（根，含当根）。**预注册写死 20，不扫它** */
+const LIQ_FACTOR_WINDOW = 20
+
+/**
+ * Amihud 原文缩放 10⁶；这里取 **1e9** 只为让打印出来的数落在可读区间。
+ * **它是常数 ⇒ 对秩零影响**，换成别的数所有 IC 逐位不变。
+ */
+const AMIHUD_SCALE = 1e9
+
+/**
+ * 两个流动性因子的值。窗口内任一根算不出日收益或成交额就返回空 Map ——
+ * **不用 0 补**（约束 4）：`amihud = 0` 会被读成「这只票流动性完美」，那是最活跃的一档。
+ *
+ * `retClose` 与 `dvolClose` **刻意分成两个入参**：前者是复权轨（算收益）、
+ * 后者是不复权轨（算成交额），混用任何一侧都会静默给出一个看起来正常的错数。
+ *
+ * ⚠ 零成交额那一天是 Amihud 最主要的机械缺陷（除零）。本地实测 867,077 行
+ * **零成交 0 行**（fixture 只含交易日）⇒ 今天不 binding，但这个判据要留着 ——
+ * 换数据源或接上停牌日之后它会立刻变成活的。
+ */
+export function liquidityFactorsAt(
+  retClose: readonly (number | null | undefined)[],
+  dvolClose: readonly (number | null | undefined)[],
+  volume: readonly (number | null | undefined)[],
+  index: number
+): Map<LiqFactorKey, number> {
+  const out = new Map<LiqFactorKey, number>()
+  const impacts: number[] = []
+  const dvols: number[] = []
+  for (let k = index - LIQ_FACTOR_WINDOW + 1; k <= index; k++) {
+    const prev = k - 1 >= 0 ? retClose[k - 1] : undefined
+    const cur = retClose[k]
+    if (prev === null || prev === undefined || prev <= 0) return out
+    if (cur === null || cur === undefined || cur <= 0) return out
+    const price = dvolClose[k]
+    const lots = volume[k]
+    if (price === null || price === undefined || price <= 0) return out
+    if (lots === null || lots === undefined || lots <= 0) return out
+    const dvol = price * lots
+    impacts.push(Math.abs(cur / prev - 1) / dvol)
+    dvols.push(dvol)
+  }
+  if (impacts.length < LIQ_FACTOR_WINDOW) return out
+
+  out.set('amihud_20d', (impacts.reduce((s, v) => s + v, 0) / impacts.length) * AMIHUD_SCALE)
+  out.set('neg_dvol_20d', -(dvols.reduce((s, v) => s + v, 0) / dvols.length))
+  return out
+}
+
+/**
  * 把本文件自己处理的旗标从 argv 里摘掉再交给 `parseArgs`。
  *
  * ⚠ **必须连值一起摘**：只摘旗标名会让下一个词（路径/日期）被当成位置参数。
@@ -178,7 +261,7 @@ function stripLocalFlags(argv: readonly string[]): string[] {
   /** 带值的：摘掉旗标**和它的值** */
   const WITH_VALUE = new Set(['--eval-from', '--industry'])
   /** 布尔的：只摘旗标本身。**混进上面那组会把下一个参数吃掉** */
-  const BOOLEAN = new Set(['--risk-factors', '--price-factors'])
+  const BOOLEAN = new Set(['--risk-factors', '--price-factors', '--liq-factors'])
   const out: string[] = []
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]
@@ -945,6 +1028,14 @@ export async function main(argv: readonly string[]): Promise<number> {
    * 与旧报告逐字段相同 —— 既有的 `ic-*.json` 不会因此变得读不出来。
    */
   const priceFactors = argv.includes('--price-factors')
+  /**
+   * `--liq-factors`：打开 §5.88 那两个流动性因子。
+   *
+   * ⚠ 它**顺带打开 `max_ret_20d` 的边侧表**（B3 臂要拿它当控制变量），
+   * 但**不打开 `priceFactorArms`** —— 那一组已经在 §5.85/§5.87 判过了，
+   * 再报一次等于同一个量的第四次测量，而它会被人当成第四个独立证据。
+   */
+  const liqFactors = argv.includes('--liq-factors')
   const rest = stripLocalFlags(argv)
   let options: CliOptions | 'help'
   try {
@@ -999,6 +1090,13 @@ ${USAGE}`)
      * 那是另一个错，而且是回测陷阱清单里的第一条。
      */
     const priceFactorRawOf = new Map<SecCode, Map<TradeDate, Map<PriceFactorKey, number>>>()
+    /** §5.88 的边侧表，与上面两张同一形状、同一理由（不改 `Row` 也不改 `collect`） */
+    const liqFactorOf = new Map<SecCode, Map<TradeDate, Map<LiqFactorKey, number>>>()
+    /**
+     * §5.88 的稳健性臂：**`|r|` 换成不复权 `close` 算**（`DVOL` 那一侧不动 ——
+     * 它本来就该是不复权，换了就成了假成交额）。与 §5.86 同一形状、同一理由。
+     */
+    const liqFactorRawOf = new Map<SecCode, Map<TradeDate, Map<LiqFactorKey, number>>>()
     let audited = 0
     for (const raw of options.codes) {
       const code = normalizeCode(raw)
@@ -1015,7 +1113,7 @@ ${USAGE}`)
         用 `closeAdj`（后复权）：除权不该被算成一次下跌。
       */
       // §5.84 起 priceFactors 也要 mom20 做控制变量 ⇒ 两个旗标任一打开都算这张边侧表
-      if (riskFactors || priceFactors) {
+      if (riskFactors || priceFactors || liqFactors) {
         const perDate = new Map<TradeDate, Map<number, number>>()
         loaded.candles.forEach((bar, i) => {
           const byLag = new Map<number, number>()
@@ -1029,7 +1127,8 @@ ${USAGE}`)
         })
         momentumOf.set(loaded.profile.code, perDate)
       }
-      if (priceFactors) {
+      // §5.88 的 B3 臂拿 `max_ret_20d` 当控制变量 ⇒ `--liq-factors` 也要这张边侧表
+      if (priceFactors || liqFactors) {
         const adj = loaded.candles.map((b) => b.closeAdj)
         const raw = loaded.candles.map((b) => b.close)
         const perDate = new Map<TradeDate, Map<PriceFactorKey, number>>()
@@ -1042,6 +1141,22 @@ ${USAGE}`)
         })
         priceFactorOf.set(loaded.profile.code, perDate)
         priceFactorRawOf.set(loaded.profile.code, perDateRaw)
+      }
+      if (liqFactors) {
+        const adj = loaded.candles.map((b) => b.closeAdj)
+        const raw = loaded.candles.map((b) => b.close)
+        const vol = loaded.candles.map((b) => b.volume)
+        const perDate = new Map<TradeDate, Map<LiqFactorKey, number>>()
+        const perDateRaw = new Map<TradeDate, Map<LiqFactorKey, number>>()
+        loaded.candles.forEach((bar, i) => {
+          // 收益走复权轨、成交额走不复权轨 —— 两个入参分开就是为了防混用
+          const values = liquidityFactorsAt(adj, raw, vol, i)
+          if (values.size > 0) perDate.set(bar.date, values)
+          const rawValues = liquidityFactorsAt(raw, raw, vol, i)
+          if (rawValues.size > 0) perDateRaw.set(bar.date, rawValues)
+        })
+        liqFactorOf.set(loaded.profile.code, perDate)
+        liqFactorRawOf.set(loaded.profile.code, perDateRaw)
       }
       audited++
       if (!options.quiet && !options.json && audited % 20 === 0) {
@@ -1237,6 +1352,122 @@ ${USAGE}`)
           }
         })
 
+    /*
+      §5.88 的两个流动性因子 × 四条臂。样本与上面那组**逐条相同**（复用 `all`，
+      只换每行的 `score`），这就是把它接在本文件里而不是新写脚本的全部理由。
+
+      ⚠ **主判据是 B2 不是 B1**，理由写在预注册 §5.88 ③ 里：对 Amihud 来说
+      最强的已知暴露不是 mom20，是**它自己的分母** —— 那是构造性的，不是经验相关。
+      加控制只可能让效应变小或不变 ⇒ 方向对候选不利，不是移动球门。
+      ⚠ **市值控制臂刻意不做**：`--liquidity` 只有 280 只，接进来会改变样本
+      ⇒ 与 §5.46/§5.85 就不再是同一批判定根。`neg_dvol_20d` 本身是市值的强代理。
+    */
+    const liqResults = !liqFactors
+      ? null
+      : LIQ_FACTORS.map((factor) => {
+          const swapFrom = (
+            table: Map<SecCode, Map<TradeDate, Map<LiqFactorKey, number>>>,
+            src: Map<TradeDate, Row[]>
+          ): Map<TradeDate, Row[]> => {
+            const out = new Map<TradeDate, Row[]>()
+            for (const [date, rows] of src) {
+              const kept: Row[] = []
+              for (const row of rows) {
+                const value = table.get(row.code)?.get(date)?.get(factor.key)
+                if (value === undefined || !Number.isFinite(value)) continue
+                kept.push({ code: row.code, score: value, fwd: row.fwd })
+              }
+              if (kept.length > 0) out.set(date, kept)
+            }
+            return out
+          }
+          const allSwapped = swapFrom(liqFactorOf, all)
+          const allRaw = swapFrom(liqFactorRawOf, all)
+          const mom = (lag: number): Control => ({
+            kind: 'continuous',
+            name: `mom${lag}`,
+            valueOf: (c, d) => momentumOf.get(c)?.get(d)?.get(lag) ?? null,
+          })
+          /** Lou & Shu 的纯成交量分量。**这就是 B2 那条臂的全部内容** */
+          const dvolControl: Control = {
+            kind: 'continuous',
+            name: 'neg_dvol20',
+            valueOf: (c, d) => liqFactorOf.get(c)?.get(d)?.get('neg_dvol_20d') ?? null,
+          }
+          const maxRetControl: Control = {
+            kind: 'continuous',
+            name: 'max_ret20',
+            valueOf: (c, d) => priceFactorOf.get(c)?.get(d)?.get('max_ret_20d') ?? null,
+          }
+          const armOn = (
+            source: Map<TradeDate, Row[]>,
+            controls: readonly Control[]
+          ): (IcResult & { horizon: number })[] =>
+            HORIZONS.map((h) => {
+              const { byDate } = neutralizeByRegression(source, controls, h)
+              return { horizon: h, ...icOf(byDate, h) }
+            })
+          /*
+            ⚠ **`neg_dvol_20d` 那一行不跑 B2** —— 拿一个变量去中性化它自己，
+            残差恒为 0，算出来的 IC 是噪音的秩相关。留 null 比留一个数安全：
+            一个数会被读成「控制之后它也没了」，而那是恒真的算术。
+          */
+          const isDvol = factor.key === 'neg_dvol_20d'
+          // 与得分 / 与纯成交量分量的逐日横截面秩相关（在两边都有值的行上算，再取均值）
+          const corrsScore: number[] = []
+          const corrsDvol: number[] = []
+          for (const [date, rows] of all) {
+            const pairs: { f: number; s: number; d: number | undefined }[] = []
+            for (const row of rows) {
+              const value = liqFactorOf.get(row.code)?.get(date)?.get(factor.key)
+              if (value === undefined || !Number.isFinite(value)) continue
+              pairs.push({
+                f: value,
+                s: row.score,
+                d: liqFactorOf.get(row.code)?.get(date)?.get('neg_dvol_20d'),
+              })
+            }
+            if (pairs.length < MIN_CROSS_SECTION) continue
+            const fRanks = ranksOf(pairs.map((p) => p.f))
+            const cs = correlation(fRanks, ranksOf(pairs.map((p) => p.s)))
+            if (cs !== null) corrsScore.push(cs)
+            if (!isDvol) {
+              const withD = pairs.filter((p) => p.d !== undefined && Number.isFinite(p.d))
+              if (withD.length >= MIN_CROSS_SECTION) {
+                const cd = correlation(
+                  ranksOf(withD.map((p) => p.f)),
+                  ranksOf(withD.map((p) => p.d as number))
+                )
+                if (cd !== null) corrsDvol.push(cd)
+              }
+            }
+          }
+          const mean = (xs: number[]): number | null =>
+            xs.length === 0 ? null : xs.reduce((s, v) => s + v, 0) / xs.length
+          return {
+            key: factor.key,
+            label: factor.label,
+            window: LIQ_FACTOR_WINDOW,
+            /** A 臂：未控制 */
+            all: HORIZONS.map((h) => ({ horizon: h, ...icOf(allSwapped, h) })),
+            /** B1：控制 mom20（与 §5.85 逐条对齐的对照口径） */
+            momNeutral20: armOn(allSwapped, [mom(20)]),
+            /** B2：**主判据** —— mom20 + 纯成交量分量。`neg_dvol` 自己那一行留 null */
+            dvolNeutral: isDvol ? null : armOn(allSwapped, [mom(20), dvolControl]),
+            /** B3：mom20 + `max_ret_20d`（判是不是 §5.87 那个因子的重复测量） */
+            maxRetNeutral: armOn(allSwapped, [mom(20), maxRetControl]),
+            /** 稳健性臂：`|r|` 换不复权。A 与 B2 两档并排给 */
+            raw: {
+              all: HORIZONS.map((h) => ({ horizon: h, ...icOf(allRaw, h) })),
+              dvolNeutral: isDvol ? null : armOn(allRaw, [mom(20), dvolControl]),
+            },
+            corrWithScore: mean(corrsScore),
+            /** 与纯成交量分量的秩相关 —— **它与 B2 必须并排读**（§5.88 ③.2） */
+            corrWithDvol: isDvol ? null : mean(corrsDvol),
+            corrDays: corrsScore.length,
+          }
+        })
+
     const riskResults = riskArms.map((arm) => ({
       key: arm.key,
       label: arm.label,
@@ -1265,6 +1496,7 @@ ${USAGE}`)
         industryFile,
         riskFactors,
         priceFactors,
+        liqFactors,
         riskArms: riskArms.map((a) => ({ key: a.key, controls: a.controls.map((c) => c.name), subset: a.subset })),
         judged: counters.judged,
         unusable: counters.unusable,
@@ -1277,6 +1509,7 @@ ${USAGE}`)
         : { industryNeutralAll: neutral.all, industryNeutralPositiveOnly: neutral.positiveOnly }),
       ...(riskResults.length === 0 ? {} : { riskNeutral: riskResults }),
       ...(priceResults === null ? {} : { priceFactorArms: priceResults }),
+      ...(liqResults === null ? {} : { liqFactorArms: liqResults }),
     }
 
     if (options.out !== undefined) {
@@ -1380,6 +1613,56 @@ ${USAGE}`)
             '    「在我们已经看上的票里它还能不能排序」—— 那是 §5.45 问的，不是这里问的。',
             '  ⚠ **`corrWithScore` 必须与 IC 并排读**：它高就说明这个因子不是新信息，',
             '    而是 §5.46 的一次重复测量。`up_days_20d` 只有 21 个取值 ⇒ 并列会稀释它的 IC。',
+          ]),
+      ...(liqResults === null
+        ? []
+        : [
+            ...liqResults.flatMap((arm) => {
+              const num = (v: number | null): string => (v === null ? '—' : v.toFixed(2))
+              const row = (label: string, r: IcResult & { horizon: number }): string =>
+                `    ${label.padEnd(24)} ${String(r.horizon).padStart(3)} 日` +
+                ` ${String(r.days).padStart(6)}  ${pct(r.meanIc).padStart(9)}` +
+                ` ${pct(r.sdIc).padStart(8)}  ${num(r.tNw).padStart(6)}   ${String(r.lagNw).padStart(2)}` +
+                `   ${num(r.t).padStart(6)}`
+              const block = (
+                label: string,
+                rows: (IcResult & { horizon: number })[] | null
+              ): string[] => (rows === null ? [] : rows.map((r) => row(label, r)))
+              return [
+                '',
+                `  【流动性因子】${arm.label}（窗口 ${arm.window} 根 · §5.88）`,
+                `    与引擎买入得分的秩相关均值 ${
+                  arm.corrWithScore === null ? '—' : arm.corrWithScore.toFixed(3)
+                }` +
+                  ` · 与纯成交量分量 ${
+                    arm.corrWithDvol === null ? '—' : arm.corrWithDvol.toFixed(3)
+                  }（${arm.corrDays} 天）`,
+                '    臂                       持有期   有效日   meanIc     sd      t(NW)  滞后   t(朴素·不许引用)',
+                ...block('A 未控制', arm.all),
+                ...block('B1 控制 mom20', arm.momNeutral20),
+                ...block('B2 +纯成交量（**主判据**）', arm.dvolNeutral),
+                ...block('B3 +max_ret_20d', arm.maxRetNeutral),
+                ...block('不复权·A', arm.raw.all),
+                ...block('不复权·B2', arm.raw.dvolNeutral),
+              ]
+            }),
+            '',
+            '  Amihud (2002) ILLIQ = mean(|R_t| / DVOL_t)，JFM 5: 31–56 ——「每一元成交额引起的价格变动」，',
+            '    Kyle (1985) λ 的粗代理。**越大越不流动。** DVOL 用 volume × **不复权** close',
+            '    （fixture 的 amount 列 100% 为空；这条代理本项目验证过，绝对误差中位 0.44% / p95 2.51%）。',
+            '  ⚠ **主判据是 B2 不是 B1**（§5.88 ③）：Lou & Shu 在 Fama-MacBeth 回归下报纯成交量分量的系数',
+            '    显著为正、而残差 Amihud「不显著或显著为负」⇒ 不减掉自己的分母，量到的很可能只是成交额的又一次测量。',
+            '    `corrWithDvol` 那一列就是这个混淆的本地量，**必须与 B2 并排读**。',
+            '  ⚠ **`neg_dvol_20d` 不是原文那个 `A_C`**（M2 §5.89 ⑨.1）：原文把分子 |R| 换成 1 ⇒ mean(1/DVOL)，',
+            '    这里是 −mean(DVOL)。强单调相关但不是同一个变换 ⇒ **corrWithDvol 不许与原文的 0.90 并排比**。',
+            '  ⚠ **`neg_dvol_20d` 那一行没有 B2**：拿一个变量中性化它自己，残差恒为 0 ⇒ 留 null 比留数安全。',
+            '  ⚠ **不取 log**（文献常取，因为分布极右偏）：IC 与中性化都吃当日横截面的**秩**',
+            '    ⇒ 单调变换等价 ⇒ 逐位不变，省掉一个自由参数。同理 ×1e9 的缩放对秩零影响。',
+            '  ⚠ **零成交日是这个估计量最主要的机械缺陷**（除零；含非交易日的窗口上它有偏）。',
+            '    本地实测 867,077 行**零成交 0 行** ⇒ 今天不 binding，但判据留着 —— 换数据源后会重新变活。',
+            '  ⚠ **Amihud 原文那套筛选（剔负价 / 量<100股 / 价格 $5–1000 / 年内>200日 / 上下 1% 尾）一条都没抄**，',
+            '    因为用途不同（我们做逐日横截面秩相关，不是年度 Fama-MacBeth）。写在这里免得日后有人以为抄了。',
+            '  ⚠ **每一个数字都是 `GUESS` 不是事实**（ADR-0003）：只量 IC，不进引擎、不进 params.ts（约束 5）。',
           ]),
       ...(riskResults.length === 0
         ? []
