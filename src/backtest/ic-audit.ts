@@ -1413,11 +1413,15 @@ ${USAGE}`)
             一个数会被读成「控制之后它也没了」，而那是恒真的算术。
           */
           const isDvol = factor.key === 'neg_dvol_20d'
-          // 与得分 / 与纯成交量分量的逐日横截面秩相关（在两边都有值的行上算，再取均值）
+          const maxRetAt = (c: SecCode, d: TradeDate): number | undefined =>
+            priceFactorOf.get(c)?.get(d)?.get('max_ret_20d')
+          // 与得分 / 与纯成交量分量 / 与 max_ret 的逐日横截面秩相关（两边都有值的行上算，再取均值）
           const corrsScore: number[] = []
           const corrsDvol: number[] = []
+          const corrsMaxRet: number[] = []
           for (const [date, rows] of all) {
-            const pairs: { f: number; s: number; d: number | undefined }[] = []
+            const pairs: { f: number; s: number; d: number | undefined; m: number | undefined }[] =
+              []
             for (const row of rows) {
               const value = liqFactorOf.get(row.code)?.get(date)?.get(factor.key)
               if (value === undefined || !Number.isFinite(value)) continue
@@ -1425,12 +1429,21 @@ ${USAGE}`)
                 f: value,
                 s: row.score,
                 d: liqFactorOf.get(row.code)?.get(date)?.get('neg_dvol_20d'),
+                m: maxRetAt(row.code, date),
               })
             }
             if (pairs.length < MIN_CROSS_SECTION) continue
             const fRanks = ranksOf(pairs.map((p) => p.f))
             const cs = correlation(fRanks, ranksOf(pairs.map((p) => p.s)))
             if (cs !== null) corrsScore.push(cs)
+            const withM = pairs.filter((p) => p.m !== undefined && Number.isFinite(p.m))
+            if (withM.length >= MIN_CROSS_SECTION) {
+              const cm = correlation(
+                ranksOf(withM.map((p) => p.f)),
+                ranksOf(withM.map((p) => p.m as number))
+              )
+              if (cm !== null) corrsMaxRet.push(cm)
+            }
             if (!isDvol) {
               const withD = pairs.filter((p) => p.d !== undefined && Number.isFinite(p.d))
               if (withD.length >= MIN_CROSS_SECTION) {
@@ -1442,6 +1455,37 @@ ${USAGE}`)
               }
             }
           }
+          /*
+            **B2 残差与 `max_ret_20d` 的秩相关**（§5.90 ③ 的第二个描述量）——
+            它答的是「减掉分母之后剩下的那部分，像不像彩票效应」。
+            在**最短持有期**那条臂的行集上算（行集只由 `fwd.has(h)` 决定，残差本身与 h 无关），
+            ⚠ **它是描述不是判据**：预注册写死了裁决只看 B4 那条臂，
+            免得事后拿一个相关系数去救/否一个结论。
+          */
+          const residCorrWithMaxRet = ((): number | null => {
+            if (isDvol) return null
+            const h = HORIZONS[0]
+            if (h === undefined) return null
+            const { byDate } = neutralizeByRegression(allSwapped, [mom(20), dvolControl], h)
+            const corrs: number[] = []
+            for (const [date, rows] of byDate) {
+              const kept: { r: number; m: number }[] = []
+              for (const row of rows) {
+                const m = maxRetAt(row.code, date)
+                if (m === undefined || !Number.isFinite(m)) continue
+                kept.push({ r: row.score, m })
+              }
+              if (kept.length < MIN_CROSS_SECTION) continue
+              const c = correlation(
+                ranksOf(kept.map((k) => k.r)),
+                ranksOf(kept.map((k) => k.m))
+              )
+              if (c !== null) corrs.push(c)
+            }
+            return corrs.length === 0
+              ? null
+              : corrs.reduce((s, v) => s + v, 0) / corrs.length
+          })()
           const mean = (xs: number[]): number | null =>
             xs.length === 0 ? null : xs.reduce((s, v) => s + v, 0) / xs.length
           return {
@@ -1456,14 +1500,28 @@ ${USAGE}`)
             dvolNeutral: isDvol ? null : armOn(allSwapped, [mom(20), dvolControl]),
             /** B3：mom20 + `max_ret_20d`（判是不是 §5.87 那个因子的重复测量） */
             maxRetNeutral: armOn(allSwapped, [mom(20), maxRetControl]),
-            /** 稳健性臂：`|r|` 换不复权。A 与 B2 两档并排给 */
+            /**
+             * **B4：§5.90 的主判据** —— mom20 + 纯成交量分量 + `max_ret_20d`。
+             * 它答的是 §5.89 ④ 留下的那一问：B2 那个负号是不是波动率/彩票效应的重复测量。
+             * ⚠ 裁决要**同时看 `|meanIc|` 的削弱幅度**（§5.90 ④ 第三行）：只看 `|t|` 分不开
+             * 「效应被吃掉」与「三个控制变量共线导致的功效损失」。
+             */
+            residVolArm: isDvol ? null : armOn(allSwapped, [mom(20), dvolControl, maxRetControl]),
+            /** 稳健性臂：`|r|` 换不复权。A / B2 / B4 三档并排给 */
             raw: {
               all: HORIZONS.map((h) => ({ horizon: h, ...icOf(allRaw, h) })),
               dvolNeutral: isDvol ? null : armOn(allRaw, [mom(20), dvolControl]),
+              residVolArm: isDvol
+                ? null
+                : armOn(allRaw, [mom(20), dvolControl, maxRetControl]),
             },
             corrWithScore: mean(corrsScore),
             /** 与纯成交量分量的秩相关 —— **它与 B2 必须并排读**（§5.88 ③.2） */
             corrWithDvol: isDvol ? null : mean(corrsDvol),
+            /** 与 `max_ret_20d` 的秩相关（§5.90 ③ 描述量，**不进裁决**） */
+            corrWithMaxRet: mean(corrsMaxRet),
+            /** **B2 残差**与 `max_ret_20d` 的秩相关（同上，描述量） */
+            corrResidWithMaxRet: residCorrWithMaxRet,
             corrDays: corrsScore.length,
           }
         })
@@ -1637,13 +1695,20 @@ ${USAGE}`)
                   ` · 与纯成交量分量 ${
                     arm.corrWithDvol === null ? '—' : arm.corrWithDvol.toFixed(3)
                   }（${arm.corrDays} 天）`,
+                `    与 max_ret_20d ${
+                  arm.corrWithMaxRet === null ? '—' : arm.corrWithMaxRet.toFixed(3)
+                } · **B2 残差**与 max_ret_20d ${
+                  arm.corrResidWithMaxRet === null ? '—' : arm.corrResidWithMaxRet.toFixed(3)
+                }（§5.90 的两个描述量，**不进裁决**）`,
                 '    臂                       持有期   有效日   meanIc     sd      t(NW)  滞后   t(朴素·不许引用)',
                 ...block('A 未控制', arm.all),
                 ...block('B1 控制 mom20', arm.momNeutral20),
-                ...block('B2 +纯成交量（**主判据**）', arm.dvolNeutral),
+                ...block('B2 +纯成交量（§5.88 主判据）', arm.dvolNeutral),
                 ...block('B3 +max_ret_20d', arm.maxRetNeutral),
+                ...block('B4 +两者（**§5.90 主判据**）', arm.residVolArm),
                 ...block('不复权·A', arm.raw.all),
                 ...block('不复权·B2', arm.raw.dvolNeutral),
+                ...block('不复权·B4', arm.raw.residVolArm),
               ]
             }),
             '',
@@ -1656,6 +1721,12 @@ ${USAGE}`)
             '  ⚠ **`neg_dvol_20d` 不是原文那个 `A_C`**（M2 §5.89 ⑨.1）：原文把分子 |R| 换成 1 ⇒ mean(1/DVOL)，',
             '    这里是 −mean(DVOL)。强单调相关但不是同一个变换 ⇒ **corrWithDvol 不许与原文的 0.90 并排比**。',
             '  ⚠ **`neg_dvol_20d` 那一行没有 B2**：拿一个变量中性化它自己，残差恒为 0 ⇒ 留 null 比留数安全。',
+      '  ⚠ **B4 是 §5.90 的主判据**（B2 + max_ret_20d）：B2 减掉分母之后剩下的主要是分子 `mean(|r|)`，',
+      '    而它是一个波动率代理 ⇒ 那个负号可能只是 §5.85/§5.87 那个彩票效应的又一次测量。',
+      '    外部方向锚是 Bali, Cakici & Whitelaw (2011, JFE 99: 427–446)：控制 MAX 之后 IVOL 的系数**翻正**',
+      '    （原文 corr(TVOL,IVOL) > 0.98 · corr(IVOL,MAX) ≈ 0.75 —— **那两个数不当我们的锚**，构造不同，只引方向）。',
+      '  ⚠ **读 B4 要同时看 |meanIc| 的削弱幅度，不能只看 |t|**（§5.90 ④）：三个控制变量彼此相关',
+      '    ⇒ 共线会抬高残差方差、压低 |t| ⇒ 「塌掉」有两种成因（效应被吃掉 / 功效损失），只看 |t| 分不开。',
             '  ⚠ **不取 log**（文献常取，因为分布极右偏）：IC 与中性化都吃当日横截面的**秩**',
             '    ⇒ 单调变换等价 ⇒ 逐位不变，省掉一个自由参数。同理 ×1e9 的缩放对秩零影响。',
             '  ⚠ **零成交日是这个估计量最主要的机械缺陷**（除零；含非交易日的窗口上它有偏）。',
