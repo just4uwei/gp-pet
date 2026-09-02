@@ -447,7 +447,9 @@ describe('createTickPipeline', () => {
       expect(settle).not.toHaveBeenCalled()
     })
 
-    it('收盘后那一跳不补跑当天 —— 那是正常的收盘确认轮自己的活', async () => {
+    // ⚠ 理由 2026-09-02 换了：当日补跑现在**做**，但只从 15:10 之后的收尾窗口进
+    // （见下面那个 describe）。取数轮这一处仍然只走「上一个交易日」
+    it('取数轮不补跑当天 —— 当日那条路只从 15:10 之后的收尾窗口进', async () => {
       const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: false }))
       const h = harness({ settle })
 
@@ -559,13 +561,70 @@ describe('createTickPipeline', () => {
       expect(h.backfill).not.toHaveBeenCalled()
     })
 
-    it('收盘确认轮的补跑仍然不在这里触发 —— 前向纪律一个字没动', async () => {
-      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: false }))
+    /*
+      「补齐才提前」（2026-09-02 用户拍板，计划 §4.12 的 `same-day-settle-decision`）。
+
+      这三条钉的是**被否掉的那个版本**：放宽成「试到底就算数」会在一次不完整的补跑上
+      写下 `lastSettledDate` 与 `shadow_equity.trade_date` 两道幂等闸门
+      ⇒ 次日那次完整补跑被整个挡掉，缺线那只票当天的确认**永久缺失**。
+      所以「补不齐 ⇒ 什么都不写」这一条比「补齐 ⇒ 跑」更值得钉。
+    */
+    it('当日补齐了就当天跑确认轮，且 feedShadow 为 true —— 下一个开盘还没到', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: true }))
       const h = harness({ settle })
 
       await createTickPipeline(h.deps).run(ctxOf(afterClose))
 
+      expect(settle).toHaveBeenCalledWith('2026-03-10', true)
+      expect(h.meta.get(META_KEYS.lastSettledDate)).toBe('2026-03-10')
+    })
+
+    it('同一天窗口内再跑几轮也只补跑一次', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: true }))
+      const h = harness({ settle })
+      const pipeline = createTickPipeline(h.deps)
+
+      await pipeline.run(ctxOf(afterClose))
+      await pipeline.run(ctxOf({ ...afterClose, minuteOfDay: 15 * 60 + 40 }))
+
+      expect(settle).toHaveBeenCalledOnce()
+    })
+
+    it('补不齐就什么都不写 —— 次日盘前那次完整补跑必须照常发生', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: false }))
+      const h = harness({ settle })
+      h.backfill.mockResolvedValue([{ code: 'SH600000', status: 'FAILED', written: 0, error: '源上没有' }])
+      const pipeline = createTickPipeline({ ...h.deps, log: { info: () => {}, warn: () => {} } })
+
+      await pipeline.run(ctxOf(afterClose))
+
       expect(settle).not.toHaveBeenCalled()
+      expect(h.meta.has(META_KEYS.lastSettledDate)).toBe(false)
+    })
+
+    it('15:05 那一轮不提前 —— 盘中引擎还在跑，先补跑会让之后的 PROVISIONAL 行永远不被推进', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: false }))
+      const h = harness({ settle })
+
+      // SETTLE 轮（15:05）：needsQuotes 仍为 true，走的是取数那条路
+      await createTickPipeline(h.deps).run(ctxOf({ session: 'SETTLE', minuteOfDay: 15 * 60 + 5 }))
+
+      expect(settle).not.toHaveBeenCalled()
+      // ⚠ 但它可能已经把当日补齐并置位了 —— 15:10 那一轮必须照样能跑到补跑
+      expect(h.meta.get(META_KEYS.dailyCompleteDate)).toBe('2026-03-10')
+    })
+
+    it('SETTLE 轮就已补齐时，15:10 那一轮仍然跑补跑（「已补齐」只挡取数不挡补跑）', async () => {
+      const settle = vi.fn(() => ({ evaluated: 1, persisted: 1, invalidated: 0, shadowAdvanced: true }))
+      const h = harness({ settle })
+      const pipeline = createTickPipeline(h.deps)
+
+      await pipeline.run(ctxOf({ session: 'SETTLE', minuteOfDay: 15 * 60 + 5 }))
+      h.backfill.mockClear()
+      await pipeline.run(ctxOf(afterClose))
+
+      expect(h.backfill).not.toHaveBeenCalled() // 取数照旧被挡住
+      expect(settle).toHaveBeenCalledWith('2026-03-10', true)
     })
   })
 

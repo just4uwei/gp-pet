@@ -10,7 +10,8 @@
  *   PRE_OPEN 及之后  → 先补日线缺口（无缺口则零请求），再批量拉快照
  *   连续竞价 / 盘后   → 取数之后跑一轮引擎（M2）
  *   15:00 之后       → 目标日线变成当日，收盘线由这一轮补进来，引擎据此做收盘确认
- *   15:10–16:00      → **只补日线**的收尾窗口（见 `CLOSE_CATCHUP`），不拉快照、不跑引擎
+ *   15:10–16:00      → **只补日线**的收尾窗口（见 `CLOSE_CATCHUP`）+ **补齐了就当天跑一次
+ *                      收盘确认轮**（2026-09-02 拍板，见 `settleDue`）。仍不拉快照、不跑盘中引擎
  *
  * 顺序是刻意的：**先取数、再算信号**。反过来会让引擎用上一轮的数据产出「新」信号。
  * 引擎失败不影响取数结果的上报 —— 行情能看，只是这一轮没有信号（docs/02 §7：缺口要看得见）。
@@ -59,8 +60,12 @@ export const INDUSTRY_RETRY_INTERVAL_MS = 24 * 60 * 60_000
  *
  * 三条一起才成立，少一条就会变成「休市期间一直在发请求」：
  *
- * 1. **只补日线**。不拉快照、不跑引擎、不碰 settle —— `market.backfill` 在已补齐时
+ * 1. **只补日线**。不拉快照、不跑盘中引擎 —— `market.backfill` 在已补齐时
  *    **一个请求都不发**，这是它能挂在这里的前提。
+ *    ⚠ **2026-09-02 起它会碰 settle**（用户拍板「补齐才提前」）：补齐那一刻**同一跳**
+ *    多跑一次收盘确认轮。这一条不破上面那句 —— `settleDay()` **只读库**
+ *    （走 `market.getContextThrough`，不拼临时线、不带快照、不发任何网络请求）
+ *    ⇒ docs/03 §2.4 那份轮询预算一个请求都不多。判据与代价见 `settleDue`。
  * 2. **窗口收口在 16:00**。数据源 15:30 前发完，留半小时余量。
  * 3. **两道停手闸门**。全部补齐 → 记 `dailyCompleteDate` 从此不再试；
  *    补不齐（那 10 只腾讯结构性没有 `qfqday`、eastmoney 又间歇失败的 ETF）→
@@ -276,30 +281,131 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
     return complete
   }
 
+  /**
+   * 这一跳该不该为 `through` 跑收盘确认轮（2026-09-02 用户拍板：**补齐才提前**）。
+   *
+   * ## 两条路，判据不同
+   *
+   * - `through < ctx.date`：**次日盘前补跑**，老路，一个字没改。
+   * - `through === ctx.date`：**当日提前**，而它多要一个条件 ——
+   *   `meta.dailyCompleteDate === ctx.date`，也就是**当日收盘线真的一只不缺**。
+   *
+   * ## 为什么必须是「补齐才提前」，而不是「试到底就算数」
+   *
+   * 后者会在一次**不完整**的补跑上写下 `lastSettledDate` 与 `shadow_equity.trade_date`
+   * 两道幂等闸门 ⇒ **次日那次完整补跑被整个挡掉**，缺线那只票当天的确认永久缺失
+   * （2026-08-17 那个静默缺陷的同一形状）。而本判据下，补不齐的日子**什么都不写**
+   * ⇒ 次日盘前照旧补跑，行为与改动前逐字相同。
+   *
+   * ## 它能覆盖多少天：近五个交易日 3/5
+   *
+   * 真机实测（`grep 已补齐 $APPDATA/gp-pet/logs/main-*.log`）：08-24 第 3 轮 ✅ ·
+   * 08-25 ❌ · 08-26 第 1 轮 ✅ · 08-27 ❌ · 08-28 第 5 轮 ✅。
+   * 拒绝这条路的第一条理由曾是「`dailyCompleteDate` 从来没被置位过」，2026-08-30 被这批
+   * 日志推翻 ⇒ 它是「时灵时不灵」而不是「永不成立」。剩下的两个 ❌ 卡在
+   * `backfillDaily` 的 all-or-nothing（登记项 `daily-complete-partial`）。
+   *
+   * ## ⚠ 当日那条路只从 `closeCatchup`（15:10 之后）进，不从取数轮进
+   *
+   * 15:10 之前**盘中引擎还在跑**，而它落的是 `PROVISIONAL` 行。补跑一旦先执行，
+   * `lastSettledDate` 就写下了 ⇒ 之后那几轮（15:05–15:10）落的 PROVISIONAL 行
+   * **再也不会被 `reconcile()` 推进**，永久停在 PROVISIONAL。
+   * 所以取数轮那一处显式只走 `through < ctx.date`；判据留在这里是为了两条路共用同一段话。
+   */
+  function settleDue(ctx: TickContext, through: string): boolean {
+    if (!settle) return false
+    if (meta.get(META_KEYS.lastSettledDate) === through) return false
+    if (through < ctx.date) return true
+    return through === ctx.date && meta.get(META_KEYS.dailyCompleteDate) === ctx.date
+  }
+
+  /**
+   * 跑一次收盘确认轮并记账。**两条路共用这一个出处** —— 各写一份会让「当日那条」
+   * 与「次日那条」在闸门、影子判据或日志上悄悄分叉。
+   */
+  function settlePass(ctx: TickContext, through: string): void {
+    if (!settle) return
+    /*
+      「成交机会还没过」这道闸门（settle.ts 的边界 2）。
+
+      影子按次日开盘成交 ⇒ 判据是「`through` 之后的那个开盘到了没」：
+
+      - **次日盘前那条路**（`through < ctx.date`）：要求今天是交易日且还没到 09:30。
+        用户下午才开应用的话，那一刻的「次日开盘」已经过去 ⇒ **不喂**，
+        否则同一段代码会从前向模拟退化成回填。
+        判据用 `ctx.minuteOfDay < SESSION_BOUNDS.open` 而不是 `ctx.session`：
+        竞价时段的切分与「开盘了没」不是同一件事，而这里问的恰恰是后者。
+      - **当日那条路**（`through === ctx.date`）：走到这里必然是 15:00 之后
+        （`expectedLastBar` 要收盘才把目标切到当天）⇒ 下一个开盘**必然还没到**
+        ⇒ 恒为 true。这不是放宽纪律，是同一条判据在这条路上的取值。
+
+      ⚠ 顺带一个真实的收益：老路要求用户**次日 09:30 之前**开着应用，否则那个交易日的
+      影子记录永久缺失（`SHADOW_SKIP_TEXT` 那几行就是在说这件事）。当日路把这个条件
+      换成了「当天收盘后应用还开着」—— 对一个桌面常驻应用，后者容易得多。
+    */
+    const feedShadow =
+      through === ctx.date ||
+      (calendar.resolve(ctx.date).isOpen && ctx.minuteOfDay < SESSION_BOUNDS.open)
+    const when = through === ctx.date ? '当日' : '次日盘前'
+    try {
+      const result = settle(through, feedShadow)
+      // 先记账再说：即使一只都没跑成（全部停牌 / 数据仍未到），也不该每轮重试 ——
+      // 那会把每一跳都变成一次全量指标重算
+      meta.set(META_KEYS.lastSettledDate, through)
+      log.info(
+        `[settle] ${through} 收盘确认补跑（${when}）：评估 ${result.evaluated} 只，新落 ${result.persisted} 行，判失效 ${result.invalidated} 条` +
+          // 「没喂影子」必须可见：它意味着那一天的前向记录永久缺失
+          (result.shadowAdvanced
+            ? '，已推进影子运行'
+            : // 「喂了但被跳过」与「压根没喂」是两件事，别合并成一句
+              `，**未喂影子**（${
+                result.shadowSkip === undefined
+                  ? feedShadow
+                    ? '推进失败，见上一条 warn'
+                    : '开盘已过或今日休市'
+                  : (SHADOW_SKIP_TEXT[result.shadowSkip] ?? result.shadowSkip)
+              }）`)
+      )
+    } catch (error) {
+      // 补跑挂了不该拖垮当轮取数（与引擎失败同一条：行情能看，只是少了这一步）
+      log.warn(`[settle] ${through} 补跑失败：${String(error)}`)
+    }
+  }
+
   /** 收盘后的日线收尾窗口。四道闸门全过才发请求，见 `CLOSE_CATCHUP` */
   async function closeCatchup(ctx: TickContext, codes: readonly SecCode[]): Promise<void> {
     if (codes.length === 0) return
     if (!ctx.isTradingDay) return
     if (ctx.minuteOfDay < CLOSE_CATCHUP.from || ctx.minuteOfDay >= CLOSE_CATCHUP.to) return
-    if (meta.get(META_KEYS.dailyCompleteDate) === ctx.date) return
-
-    // 次数跨日清零：昨天用满的额度不该让今天一轮都不跑
-    const counted = meta.get(META_KEYS.dailyCatchupDate) === ctx.date
-    const attempts = counted ? (meta.getNumber(META_KEYS.dailyCatchupAttempts) ?? 0) : 0
-    if (attempts >= CLOSE_CATCHUP.maxAttempts) return
 
     // 收盘后 expectedLastBar 给的就是当日。给不出当日说明日历判它不是交易日 —— 上面已经挡过，
     // 这里再判一次是因为「补的必须是今天那根」是这段代码存在的全部理由
     const through = expectedLastBar(calendar, ctx.date, ctx.minuteOfDay)
     if (through !== ctx.date) return
 
-    meta.set(META_KEYS.dailyCatchupDate, ctx.date)
-    meta.setNumber(META_KEYS.dailyCatchupAttempts, attempts + 1)
+    /*
+      ⚠ 「已补齐」这道闸门**只挡取数，不挡补跑**（2026-09-02 改）。
+      原先它是整个函数的早退，于是「15:00–15:10 的 SETTLE 轮就已经补齐」那种日子
+      会在 15:10 直接返回 ⇒ 当日确认轮一次都跑不成，而那恰恰是最该跑的日子。
+    */
+    if (meta.get(META_KEYS.dailyCompleteDate) !== ctx.date) {
+      // 次数跨日清零：昨天用满的额度不该让今天一轮都不跑
+      const counted = meta.get(META_KEYS.dailyCatchupDate) === ctx.date
+      const attempts = counted ? (meta.getNumber(META_KEYS.dailyCatchupAttempts) ?? 0) : 0
+      if (attempts >= CLOSE_CATCHUP.maxAttempts) return
 
-    if (await backfillDaily(codes, through)) {
-      meta.set(META_KEYS.dailyCompleteDate, ctx.date)
-      log.info(`[daily] ${ctx.date} 当日收盘线已补齐（收盘后第 ${attempts + 1} 轮），日报可定稿`)
+      meta.set(META_KEYS.dailyCatchupDate, ctx.date)
+      meta.setNumber(META_KEYS.dailyCatchupAttempts, attempts + 1)
+
+      if (await backfillDaily(codes, through)) {
+        meta.set(META_KEYS.dailyCompleteDate, ctx.date)
+        log.info(`[daily] ${ctx.date} 当日收盘线已补齐（收盘后第 ${attempts + 1} 轮），日报可定稿`)
+      }
     }
+
+    // 补齐了就把当天的收盘确认轮跑掉（2026-09-02 拍板「补齐才提前」）。
+    // 补不齐时 `settleDue` 恒 false ⇒ 什么都不写 ⇒ 次日盘前照旧补跑
+    if (settleDue(ctx, through)) settlePass(ctx, through)
   }
 
   return {
@@ -329,57 +435,22 @@ export function createTickPipeline(deps: TickPipelineDeps): TickPipeline {
       }
 
       /*
-        补跑上一个交易日的收盘确认轮（engine/settle.ts）。
+        收盘确认轮（engine/settle.ts）。
 
         **位置是必须的**：排在 backfill 之后 —— 它要用的正是刚刚补进来的那根收盘线。
         排在 refreshSnapshots 之前则是因为补跑与快照无关，早跑早写完，
         不必让它跟当轮取数抢同一个 SQLite 连接。
 
-        触发判据直接用 `through`：`expectedLastBar()` 给的是「此刻应该已存在的最后一根」，
-        15:00 前它就是上一个交易日。`through === ctx.date` 时不补跑 ——
-        那是当天，正常的收盘确认轮（engine.run 的 SETTLE 那一轮）自己会做。
+        触发判据在 `settleDue()`。**这一处显式只走 `through < ctx.date`**：
+        `expectedLastBar()` 15:00 前给的就是上一个交易日，那是老路（次日盘前补跑）。
+        当日那条路（2026-09-02 拍板）**刻意不从这里进** —— 15:10 之前盘中引擎还在跑，
+        先补跑会把 `lastSettledDate` 写下，之后那几轮落的 PROVISIONAL 行就再也不会被
+        `reconcile()` 推进。它只从 `closeCatchup`（15:10–16:00，引擎已停）进。
 
-        实践上这一段几乎总是在**次日盘前**那一跳执行：数据源发布个股日线在 15:05–15:30，
-        晚于当天的 SETTLE 窗口，所以当天那一轮拿不到收盘线（这正是要补跑的原因）。
+        实践上老路几乎总是在次日盘前那一跳执行：数据源发布个股日线在 15:05–15:30，
+        晚于当天的 SETTLE 窗口（15:00–15:10）。
       */
-      if (settle && through && through < ctx.date && meta.get(META_KEYS.lastSettledDate) !== through) {
-        /*
-          「成交机会还没过」这道闸门（settle.ts 的边界 2）。
-
-          影子按次日开盘成交，所以只有在 **今天是交易日 且 还没到 09:30** 时，
-          D 的 CONFIRMED 信号挂出的委托才仍然是前向的。
-          过了开盘（用户下午才开应用）就**不喂** —— 那一刻的「次日开盘」已经过去，
-          同一段代码会从前向模拟退化成回填，而回填出来的绩效不属于任何真实决策。
-
-          注意判据用 `ctx.minuteOfDay < SESSION_BOUNDS.open` 而不是 `ctx.session`：
-          竞价时段（PRE_OPEN / AUCTION）的切分与「开盘了没」不是同一件事，
-          而这里要问的恰恰是后者。
-        */
-        const feedShadow = calendar.resolve(ctx.date).isOpen && ctx.minuteOfDay < SESSION_BOUNDS.open
-        try {
-          const result = settle(through, feedShadow)
-          // 先记账再说：即使一只都没跑成（全部停牌 / 数据仍未到），也不该每轮重试 ——
-          // 那会把每一跳都变成一次全量指标重算
-          meta.set(META_KEYS.lastSettledDate, through)
-          log.info(
-            `[settle] ${through} 收盘确认补跑：评估 ${result.evaluated} 只，新落 ${result.persisted} 行，判失效 ${result.invalidated} 条` +
-              // 「没喂影子」必须可见：它意味着那一天的前向记录永久缺失
-              (result.shadowAdvanced
-                ? '，已推进影子运行'
-                : // 「喂了但被跳过」与「压根没喂」是两件事，别合并成一句
-                  `，**未喂影子**（${
-                    result.shadowSkip === undefined
-                      ? feedShadow
-                        ? '推进失败，见上一条 warn'
-                        : '开盘已过或今日休市'
-                      : (SHADOW_SKIP_TEXT[result.shadowSkip] ?? result.shadowSkip)
-                  }）`)
-          )
-        } catch (error) {
-          // 补跑挂了不该拖垮当轮取数（与引擎失败同一条：行情能看，只是少了这一步）
-          log.warn(`[settle] ${through} 补跑失败：${String(error)}`)
-        }
-      }
+      if (through && through < ctx.date && settleDue(ctx, through)) settlePass(ctx, through)
 
       const snapshots = await market.refreshSnapshots(codes)
       lastSnapshots = snapshots
