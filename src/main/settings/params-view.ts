@@ -90,7 +90,14 @@ const STATUS: Record<string, { status: Status; note?: string }> = {
   'adx.rangeGap': { status: 'KEPT', note: '随 adx 块一同上过网格' },
   'regime.hysteresisDays': {
     status: 'KEPT',
-    note: '1 明显更差（−0.34pp），2–6 分辨不出。若为「少改口」上调，判据是提醒日志不是回测（§5.17）',
+    // ⚠ 仍是 KEPT：2026-09-02 拍的是「保持出厂值」，没有写回任何数、没走清单 4.9a。
+    // **「拍板保持」与「标定过」是两件事**，别把这一行挪进 CALIBRATED。
+    note:
+      '1 明显更差（−0.34pp），2–6 在回测 Calmar 上分辨不出（§5.17）；' +
+      '改口率这个维度**分辨得出**（1→5 生效改口率 16.94/9.41/6.71/5.07/3.93%，§5.95），' +
+      '**2026-09-02 拍板保持 2**：上调的代价落在 RANGE 身上（N=2→5 时它占比相对 −19.6%），' +
+      '而 RANGE 是全池唯一中位配对胜率 > 50% 的层。' +
+      '⚠ §5.17 那句「判据是提醒日志」已订正 —— 提醒日志与 signal 表都答不了 regime 改口（§5.93 ④）',
   },
   'regime.rangeMidBand': { status: 'KEPT', note: '四个邻域取值全负但非单调、t ≤ 1.6，噪音的形状（§5.17）' },
   'risk.stopLossPct': { status: 'KEPT', note: '96.6% 的离场由风控触发，这一块已上网格（§5.18）' },
