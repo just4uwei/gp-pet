@@ -23,6 +23,7 @@ import type {
   AboutInfo,
   AppSettings,
   MaintenanceResult,
+  ParamGap,
   ParamRow,
 } from '@shared/ipc-types'
 import { DISCLAIMER } from './disclaimer'
@@ -180,11 +181,15 @@ function QuietHours({
 
 function ParamsTable(): React.JSX.Element {
   const [rows, setRows] = useState<ParamRow[] | null>(null)
+  const [gaps, setGaps] = useState<readonly ParamGap[]>([])
   const [open, setOpen] = useState(false)
 
   useEffect(() => {
     if (!open || rows !== null) return
-    void window.gp.invoke('app:params').then(setRows)
+    void window.gp.invoke('app:params').then((payload) => {
+      setRows(payload.rows)
+      setGaps(payload.gaps)
+    })
   }, [open, rows])
 
   const counts = (rows ?? []).reduce<Record<string, number>>((acc, row) => {
@@ -249,6 +254,27 @@ function ParamsTable(): React.JSX.Element {
                 </li>
               ))}
             </ul>
+            {/*
+              这张表**管不到**的数（`PARAM_GAPS`）。它必须与上面那六档计数一起显示 ——
+              只显示计数会让「未测 0」被读成「每个数都归过档」，而静默的空洞比标错档更糟。
+              文案的唯一出处是 main/settings/params-view.ts，这里只负责显示。
+            */}
+            {gaps.length > 0 ? (
+              <div className="mt-2 rounded border border-amber-400/20 bg-amber-400/[0.06] px-2.5 py-2">
+                <div className="text-[10px] font-medium text-amber-200/80">
+                  这张表管不到的数（已知空洞，不是遗漏）
+                </div>
+                {gaps.map((gap) => (
+                  <div key={gap.title} className="mt-1.5">
+                    <div className="text-[11px] leading-snug text-white/70">{gap.title}</div>
+                    <p className="mt-0.5 font-mono text-[10px] leading-snug text-white/35">
+                      {gap.where}
+                    </p>
+                    <p className="mt-0.5 text-[10px] leading-snug text-white/40">{gap.why}</p>
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </>
         )
       ) : null}

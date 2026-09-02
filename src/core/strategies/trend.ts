@@ -31,6 +31,14 @@ import {
   type SubSignalDraft,
 } from './context'
 
+/**
+ * ⚠ **这五个数是设计常量，不是待标定参数** —— 2026-09-02 用户拍板（计划 §4.5b 选 B）。
+ *
+ * 它们不在 `EngineParams` 里 ⇒ 不在那 62 个叶子参数里 ⇒ **标定网格在结构上扫不到**
+ * （八张网格 82 组候选一次都没动过它们）。依据是 M2 §5.35：「排序方向没有可测的增量」。
+ * **空洞写在 `main/settings/params-view.ts` 的 `PARAM_GAPS` 里（唯一出处），
+ * 设置页那张表下面会显示它** —— 别在这里再写一份解释，两处会漂移。
+ */
 export const TREND_WEIGHTS = {
   T1_MA_CROSS: 0.2,
   T2_MACD_ZERO_CROSS: 0.25,

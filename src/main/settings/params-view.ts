@@ -23,9 +23,48 @@
  */
 
 import { DEFAULT_PARAMS } from '@core/params'
-import type { ParamRow } from '@shared/ipc-types'
+import type { ParamGap, ParamRow } from '@shared/ipc-types'
 
 type Status = ParamRow['status']
+
+/**
+ * **这张表管不到的数**（2026-09-02 用户拍板，计划 §4.5b 选 B）。
+ *
+ * ## 为什么要有这么一节
+ *
+ * 上面那张 `STATUS` 表的全部价值是「**哪个数有依据**」。而它只覆盖 `EngineParams`
+ * 的叶子参数 —— 决定子信号排序的那五个权重是**写死在策略文件里的常量**，
+ * 既不在 62 个叶子里、也不在 `withParams()` / `--grid` 的射程内
+ * ⇒ 八张网格 82 组候选**一次都没扫到它们**，而这张表对它们**完全静默**。
+ *
+ * 静默是最糟的那一档：用户看到「未测 0」会以为每个数都被归过档。
+ *
+ * ## 为什么选「留作常量」而不是「补成参数」
+ *
+ * 二选一在计划 §4.5b 里写着，2026-09-02 用户拍板选 B：
+ * [M2 §5.35](../../../docs/notes/M2-偏差报告.md) 已实测「排序方向没有可测的增量」
+ * ⇒ 把五个从没被证据支持过的数升级成「待标定参数」只会让 `GUESS` 从 0 变成非 0
+ * （摘 `-unvalidated` 的条件是 `GUESS` 与 `BLOCKED` 两档都清零 ⇒ 更远了），
+ * **而不带来任何新证据**。⇒ 承认它们是设计常量，**但把空洞写出来**。
+ *
+ * ⚠ **它不是第七档**。这些条目不进 `paramRows()`、不进 `countByStatus()` ——
+ * 混进去会让六档计数变成一个说不清口径的数。它是表**外**的一段说明。
+ * ⚠ 要往这里加条目，先问一遍「它是不是其实该进 `STATUS`」：
+ * 只有**结构上进不了 `EngineParams`** 的才属于这里。
+ */
+export const PARAM_GAPS: readonly ParamGap[] = [
+  {
+    title: '决定子信号排序的五个权重不在这张表里',
+    where:
+      'TREND_WEIGHTS（src/core/strategies/trend.ts）T1 0.2 / T2 0.25 / T3 0.25 / T4 0.15 / T5 0.15；' +
+      'MEAN_REVERSION_WEIGHTS（src/core/strategies/mean-reversion.ts）R1–R4',
+    why:
+      '它们是写死的常量、不是 EngineParams 的叶子 ⇒ 标定网格在结构上扫不到，至今一格没跑过。' +
+      '2026-09-02 拍板保留为设计常量（计划 §4.5b 选 B）：M2 §5.35 已测出「排序方向没有可测的增量」，' +
+      '把它们升成待标定参数只会让「未测」计数变差而不带来新证据。' +
+      '⚠ 这是一个已知空洞，不是遗漏 —— 也就是说，上面那六档计数**没有覆盖这五个数**。',
+  },
+]
 
 /**
  * 逐参数归档。键是点分路径（`combine.voteThreshold.trend`），

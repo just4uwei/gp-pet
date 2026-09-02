@@ -695,6 +695,23 @@ export interface IndicatorSnapshotView {
   params: { path: string; value: string; status: ParamRow['status']; note?: string }[]
 }
 
+/**
+ * 那张参数表**管不到的数**（2026-09-02，计划 §4.5b 拍板选 B）。
+ *
+ * 它不是第七个状态档：这些量**结构上进不了 `EngineParams`**（写死在策略文件里的常量），
+ * 所以既不进 `ParamRow[]`、也不进六档计数。列出来是因为**静默的空洞比标错档更糟** ——
+ * 用户看到「未测 0」会以为每个数都被归过档。出处只有 `main/settings/params-view.ts`
+ * 的 `PARAM_GAPS`，渲染层照着显示，不自己写一份。
+ */
+export interface ParamGap {
+  /** 一行标题：缺的是什么 */
+  title: string
+  /** 它住在哪（文件 + 常量名 + 当前取值） */
+  where: string
+  /** 为什么不在那张表里，以及那是**决定**还是遗漏 */
+  why: string
+}
+
 export interface ParamRow {
   /** 参数块，如 `combine` / `risk` */
   group: string
@@ -1476,8 +1493,14 @@ export interface IpcInvokeMap {
    * 因此走系统确认框，不是一个点了就没的按钮。
    */
   'shadow:reset': () => MaintenanceResult
-  /** 只读参数表（含每一项的标定状态）。设置页不提供参数编辑，见 ParamRow */
-  'app:params': () => ParamRow[]
+  /**
+   * 只读参数表（含每一项的标定状态）。设置页不提供参数编辑，见 `ParamRow`。
+   *
+   * ⚠ `gaps` 与 `rows` **必须一起显示**（2026-09-02）：那六档计数只覆盖
+   * `EngineParams` 的叶子，而 `gaps` 说的正是「它没覆盖到什么」——
+   * 只显示 rows 会让「未测 0」被读成「每个数都归过档」。
+   */
+  'app:params': () => { rows: ParamRow[]; gaps: readonly ParamGap[] }
   /** 立刻备份 market.db（VACUUM INTO，可在运行中做）。返回落盘路径 */
   'app:backupDatabase': () => MaintenanceResult
   /** 清缓存：指标缓存 + 到期裁剪 + VACUUM。**不动** K 线、自选、持仓与影子账本 */

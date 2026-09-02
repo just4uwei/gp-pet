@@ -14,7 +14,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_PARAMS, SENSITIVITY_PRESETS, withSensitivity } from '@core/params'
-import { countByStatus, paramRows } from '@main/settings/params-view'
+import { PARAM_GAPS, countByStatus, paramRows } from '@main/settings/params-view'
 
 describe('归档完整性', () => {
   it('没有任何参数落在「未归档」兜底上', () => {
@@ -106,5 +106,45 @@ describe('摊的是当前生效的参数集', () => {
     const factory = countByStatus(paramRows())
     const sensitive = countByStatus(paramRows(withSensitivity('SENSITIVE')))
     expect(sensitive).toEqual(factory)
+  })
+})
+
+/*
+  那张表**管不到**的数（`PARAM_GAPS`，2026-09-02 用户拍板：计划 §4.5b 选 B）。
+
+  为什么要钉：这一节存在的全部理由是「静默的空洞比标错档更糟」——
+  六档计数只覆盖 `EngineParams` 的叶子，而决定子信号排序的那五个权重是写死的常量
+  ⇒ 用户看到「未测 0」会以为每个数都归过档。删掉这一节不会让任何用例变红，
+  只会让那张表悄悄退回到「看起来什么都归了档」，所以它必须自己有一条。
+*/
+describe('这张表管不到的数（PARAM_GAPS）', () => {
+  it('至少列着那五个子信号权重，并点名两个常量与它们所在的文件', () => {
+    const text = PARAM_GAPS.map((gap) => `${gap.title}\n${gap.where}\n${gap.why}`).join('\n')
+    expect(PARAM_GAPS.length).toBeGreaterThan(0)
+    expect(text).toContain('TREND_WEIGHTS')
+    expect(text).toContain('MEAN_REVERSION_WEIGHTS')
+    expect(text).toContain('strategies/trend.ts')
+    expect(text).toContain('strategies/mean-reversion.ts')
+  })
+
+  it('每条都说清了「为什么不在表里」——「是决定不是遗漏」是这一节唯一的产出', () => {
+    for (const gap of PARAM_GAPS) {
+      expect(gap.title.length).toBeGreaterThan(0)
+      expect(gap.where.length).toBeGreaterThan(0)
+      // 只说「缺了什么」而不说「为什么」的条目，读者没法判断该不该去补它
+      expect(gap.why.length).toBeGreaterThan(20)
+    }
+  })
+
+  it('它不是第七档 —— 空洞条目不进 paramRows，六档计数一个不动', () => {
+    const rows = paramRows()
+    const counts = countByStatus(rows)
+    // 六档之和恰好等于行数：多出来的任何一档都会让这条变红
+    expect(counts.CALIBRATED + counts.KEPT + counts.INERT + counts.UNTESTABLE + counts.BLOCKED + counts.GUESS).toBe(
+      rows.length
+    )
+    for (const gap of PARAM_GAPS) {
+      expect(rows.some((row) => `${row.group}.${row.key}` === gap.title)).toBe(false)
+    }
   })
 })

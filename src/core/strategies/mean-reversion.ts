@@ -41,6 +41,10 @@ import {
   type SubSignalDraft,
 } from './context'
 
+/**
+ * ⚠ **设计常量，不是待标定参数** —— 与 `TREND_WEIGHTS` 同一条（2026-09-02 拍板，计划 §4.5b 选 B）。
+ * 空洞的唯一出处是 `main/settings/params-view.ts` 的 `PARAM_GAPS`。
+ */
 export const MEAN_REVERSION_WEIGHTS = {
   R1_RSI_BAND: 0.3,
   R2_REVERT_TO_MID: 0.3,

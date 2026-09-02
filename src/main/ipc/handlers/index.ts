@@ -10,6 +10,7 @@ import { Menu } from 'electron'
 import { normalizeCode } from '@core/code'
 import type { AppController } from '../../controller'
 import { buildContextMenu } from '../../tray/menu'
+import { PARAM_GAPS } from '../../settings/params-view'
 import { parseWatchSuggestions } from '../../watch/suggestion'
 import { handle } from '../router'
 
@@ -171,7 +172,8 @@ export function registerHandlers(controller: AppController): void {
   // 四条维护动作都**不抛错**，走 MaintenanceResult 的 status + message：
   // 取消、文件已存在、组策略锁目录都是用户能看懂的正常结局（与 config:* 同一做法）
 
-  handle('app:params', () => controller.paramRows())
+  // `gaps` 与 `rows` 一起给：六档计数只覆盖 EngineParams 的叶子，而 gaps 说的是它漏了什么
+  handle('app:params', () => ({ rows: controller.paramRows(), gaps: PARAM_GAPS }))
 
   handle('app:about', () => controller.about())
 
