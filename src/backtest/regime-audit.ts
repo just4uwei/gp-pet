@@ -57,6 +57,13 @@ function bump(counter: Counter, key: string, by = 1): void {
   counter[key] = (counter[key] ?? 0) + by
 }
 
+/** 上中位（`sorted[⌊n/2⌋]`）—— 与 `ic-audit.ts` 里那个逐字相同的口径，别在两处取不同的中位 */
+function median(values: readonly number[]): number | null {
+  if (values.length === 0) return null
+  const sorted = [...values].sort((a, b) => a - b)
+  return sorted[Math.floor(sorted.length / 2)] ?? null
+}
+
 export interface Tally {
   judged: number
   /** 成因分解，五者互斥且求和等于 judged */
@@ -75,6 +82,29 @@ export interface Tally {
   sums: Counter
   /** 受限模式（bbwPct 恒 null）的根数 —— 这些根 RANGE 不可能成立 */
   bbwNull: number
+  /**
+   * **改口率与段长**（预注册 M2 §5.92）。§5.17 写着「`hysteresisDays` 的判据应该是
+   * 每日改口次数，不是回测 Calmar」，而那个数在 2026-09-02 之前一次都没量过。
+   *
+   * ⚠ **单位是「判定根」不是「日历日」** —— `hasGap` 会跳过根，所以 `adjacentPairs`
+   * （下标差 = 1 的对数）必须一起报：只有它接近 100% 时，段长才能与外部那些「天」比。
+   * ⚠ `raw` 与 `held` 各算一遍，**两者之差就是迟滞实际买到的东西**。
+   */
+  flip: {
+    /** 相邻判定根对数（逐标的内部，跨标的不配对） */
+    pairs: number
+    /** 其中下标差 = 1 的对数 —— 剩下的是被 `hasGap` / 预热边界跳开的 */
+    adjacentPairs: number
+    rawFlips: number
+    heldFlips: number
+    /** 逐标的改口率（held），用于「逐标的中位」那一列 */
+    perCodeHeldRate: number[]
+    /** 段长（判定根），分 raw / held */
+    runLengths: { raw: number[]; held: number[] }
+    /** held 段长按状态分：段数与总根数 ⇒ 均值 */
+    runsByRegime: Counter
+    runBarsByRegime: Counter
+  }
 }
 
 export function emptyTally(): Tally {
@@ -89,6 +119,16 @@ export function emptyTally(): Tally {
     nearMiss: {},
     sums: {},
     bbwNull: 0,
+    flip: {
+      pairs: 0,
+      adjacentPairs: 0,
+      rawFlips: 0,
+      heldFlips: 0,
+      perCodeHeldRate: [],
+      runLengths: { raw: [], held: [] },
+      runsByRegime: {},
+      runBarsByRegime: {},
+    },
   }
 }
 
@@ -206,6 +246,23 @@ function auditSeries(
 ): void {
   const candles = series.candles
   const warmup = options.warmup ?? params.data.fullBars
+  /*
+    改口与段长的逐标的状态（§5.92 ①）。**跨标的不配对** ——
+    把上一只票的最后一根与这一只票的第一根接起来会凭空造出一次改口。
+  */
+  let prev: { index: number; raw: Regime; held: Regime } | null = null
+  let codePairs = 0
+  let codeHeldFlips = 0
+  let runRaw = 0
+  let runHeld = 0
+  const closeRun = (kind: 'raw' | 'held', regime: Regime, bars: number): void => {
+    if (bars <= 0) return
+    tally.flip.runLengths[kind].push(bars)
+    if (kind === 'held') {
+      bump(tally.flip.runsByRegime, regime)
+      bump(tally.flip.runBarsByRegime, regime, bars)
+    }
+  }
 
   for (let i = 0; i < candles.length; i++) {
     const bar = candles[i]
@@ -232,7 +289,37 @@ function auditSeries(
     if (state.raw !== 'TRANSITION' && state.regime === 'TRANSITION') {
       bump(tally.cause, '⑤其中：原始已非 TRANSITION，生效仍是')
     }
+
+    if (prev === null) {
+      runRaw = 1
+      runHeld = 1
+    } else {
+      tally.flip.pairs++
+      codePairs++
+      if (i - prev.index === 1) tally.flip.adjacentPairs++
+      if (prev.raw !== state.raw) {
+        tally.flip.rawFlips++
+        closeRun('raw', prev.raw, runRaw)
+        runRaw = 0
+      }
+      if (prev.held !== state.regime) {
+        tally.flip.heldFlips++
+        codeHeldFlips++
+        closeRun('held', prev.held, runHeld)
+        runHeld = 0
+      }
+      runRaw++
+      runHeld++
+    }
+    prev = { index: i, raw: state.raw, held: state.regime }
   }
+
+  // 最后一段也要算 —— 丢掉它会系统性砍掉每只票最长的那一段之一
+  if (prev !== null) {
+    closeRun('raw', prev.raw, runRaw)
+    closeRun('held', prev.held, runHeld)
+  }
+  if (codePairs > 0) tally.flip.perCodeHeldRate.push(codeHeldFlips / codePairs)
 }
 
 function resolveParams(options: CliOptions): EngineParams {
@@ -272,6 +359,54 @@ function render(tally: Tally, params: EngineParams, codes: number): string {
   for (const regime of REGIMES) {
     const n = tally.raw[regime] ?? 0
     lines.push(`  ${regime.padEnd(12)} ${String(n).padStart(7)}  ${pct(n).padStart(6)}`)
+  }
+
+  lines.push('')
+  lines.push('【改口率与段长】（预注册 §5.92 · 单位是**判定根**不是日历日）')
+  {
+    const f = tally.flip
+    const rate = (n: number): string => (f.pairs === 0 ? '  —  ' : `${((n / f.pairs) * 100).toFixed(2)}%`)
+    const med = (xs: readonly number[]): string => {
+      const m = median([...xs])
+      return m === null ? '—' : m.toFixed(2)
+    }
+    const avg = (xs: readonly number[]): string =>
+      xs.length === 0 ? '—' : (xs.reduce((s, v) => s + v, 0) / xs.length).toFixed(2)
+    lines.push(`  相邻判定根对数 ${f.pairs}（其中下标相邻 ${rate(f.adjacentPairs)}）`)
+    lines.push(
+      `  改口率 · pooled     生效 ${rate(f.heldFlips).padStart(7)}   原始 ${rate(f.rawFlips).padStart(7)}` +
+        `   原始/生效 ${f.heldFlips === 0 ? '—' : (f.rawFlips / f.heldFlips).toFixed(2)}×`
+    )
+    lines.push(
+      `  改口率 · 逐标的中位  生效 ${
+        median([...f.perCodeHeldRate]) === null
+          ? '—'
+          : `${((median([...f.perCodeHeldRate]) as number) * 100).toFixed(2)}%`
+      }（${f.perCodeHeldRate.length} 只）`
+    )
+    lines.push(
+      `  段长 · 生效         中位 ${med(f.runLengths.held)} 根 · 均值 ${avg(f.runLengths.held)} 根（${
+        f.runLengths.held.length
+      } 段）`
+    )
+    lines.push(
+      `  段长 · 原始         中位 ${med(f.runLengths.raw)} 根 · 均值 ${avg(f.runLengths.raw)} 根（${
+        f.runLengths.raw.length
+      } 段）`
+    )
+    for (const regime of REGIMES) {
+      const runs = f.runsByRegime[regime] ?? 0
+      const bars = f.runBarsByRegime[regime] ?? 0
+      lines.push(
+        `    ${regime.padEnd(12)} 段数 ${String(runs).padStart(6)} · 总根数 ${String(bars).padStart(7)}` +
+          ` · 平均段长 ${runs === 0 ? '—' : (bars / runs).toFixed(2)} 根`
+      )
+    }
+    lines.push('  ⚠ 它是**描述量不是判据**：改口率与绩效的关系没测（§5.92 ④）。')
+    lines.push('    产出**不是**「所以该把 hysteresisDays 调成 N」—— 真要动仍要走 docs/07 §3.6 的门槛。')
+    lines.push('  ⚠ 「原始/生效」那个倍数就是 hysteresisDays 实际压掉的改口，它是本地证据；')
+    lines.push('    而外部那个「2 日确认后平均段长 9.7 天」是**市场级 5 档打分**上的数（§5.92 ②），')
+    lines.push('    三个维度都不可比，**只当数量级参照**。')
   }
 
   lines.push('')
