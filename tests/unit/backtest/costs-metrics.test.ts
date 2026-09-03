@@ -8,6 +8,7 @@
 import { describe, expect, it } from 'vitest'
 import type { TradeDate } from '@core/types'
 import {
+  costsOn,
   DEFAULT_COSTS,
   LOT_SIZE,
   buyFees,
@@ -125,6 +126,42 @@ describe('成本模型', () => {
       commission + transfer + amount * DEFAULT_COSTS.stampTaxRate,
       10
     )
+  })
+
+  /**
+   * 印花税**只在卖出侧**（2008-09-19 起单边征收）。
+   *
+   * ⚠ 上面那条是按**公式形状**钉的（买入费 = 佣金 + 过户费）——
+   * 它挡得住「买入也加印花税」，但挡不住有人换一种写法把税混进去。
+   * 这一条换个角度：**把税率翻倍，买入费必须逐位不变**，
+   * 而卖出费的增量必须**恰好**等于 `金额 × 税率增量`。
+   */
+  it('印花税只在卖出侧 —— 把税率翻倍，买入费逐位不变', () => {
+    const amount = 123_456
+    const base = { ...DEFAULT_COSTS, stampTaxRate: 0.0005 }
+    const doubled = { ...base, stampTaxRate: 0.001 }
+
+    expect(buyFees(amount, doubled)).toBe(buyFees(amount, base))
+    expect(sellFees(amount, doubled) - sellFees(amount, base)).toBeCloseTo(amount * 0.0005, 10)
+    // 税率归零时两边完全一样 —— 卖出多出来的那一块只可能是印花税
+    const noTax = { ...base, stampTaxRate: 0 }
+    expect(sellFees(amount, noTax)).toBeCloseTo(buyFees(amount, noTax), 10)
+  })
+
+  /**
+   * 生效日期那一档也只作用于卖出（`stampTaxRateOn`，2026-09-03）。
+   *
+   * 真机物证：同一只票 18,190 元的卖出，券商账单 14.10 = 佣金 5.00 + 印花税 9.10，
+   * 而 18,003 元的买入是 5.00 整 —— 买入那一侧一分印花税都没有。
+   */
+  it('按成交日分档也只动卖出：2023-08-27 vs 08-28，买入一分不变', () => {
+    const amount = 19_261
+    const before = costsOn(DEFAULT_COSTS, '2023-08-27')
+    const after = costsOn(DEFAULT_COSTS, '2023-08-28')
+
+    expect(buyFees(amount, before)).toBe(buyFees(amount, after))
+    // 减半：差额恰好是 金额 × (0.001 − 0.0005)
+    expect(sellFees(amount, before) - sellFees(amount, after)).toBeCloseTo(amount * 0.0005, 10)
   })
 
   it('小额交易走最低佣金 5 元', () => {

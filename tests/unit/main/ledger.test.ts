@@ -592,3 +592,60 @@ describe('netCostOf', () => {
     expect(netCostOf(rows, 0)).toBeNull()
   })
 })
+
+/**
+ * 印花税**只在卖出侧**，记账这一路也要守住（2026-09-03 用户问到）。
+ *
+ * 这一组按 side 逐个查，判据是**不依赖公式形状**的那一种：
+ * 把印花税率翻倍，只有 `SELL` 那一笔的费用会变。
+ */
+describe('印花税只作用于卖出（记账侧）', () => {
+  const ok = (outcome: ReturnType<typeof applyTrade>) => {
+    if (isTradeError(outcome)) throw new Error(`不该报错：${outcome.error}`)
+    return outcome
+  }
+  const LOW = { ...DEFAULT_COSTS, stampTaxRate: 0.0005 }
+  const HIGH = { ...DEFAULT_COSTS, stampTaxRate: 0.001 }
+  const held = { shares: 10_000, cost: 10 }
+
+  it('买入：翻倍税率，费用逐位不变', () => {
+    const input = { side: 'BUY' as const, price: 10, shares: 10_000, board: 'MAIN' as const }
+    expect(ok(applyTrade(null, input, HIGH)).fee).toBe(ok(applyTrade(null, input, LOW)).fee)
+  })
+
+  it('建仓（价不含费）走的是**买入侧** ⇒ 同样没有印花税', () => {
+    const input = {
+      side: 'OPENING' as const,
+      price: 14.75,
+      shares: 5100,
+      board: 'MAIN' as const,
+      feeIncluded: false,
+    }
+    expect(ok(applyTrade(null, input, HIGH)).fee).toBe(ok(applyTrade(null, input, LOW)).fee)
+  })
+
+  it('卖出：翻倍税率，多出来的恰好是 金额 × 税率增量', () => {
+    const input = { side: 'SELL' as const, price: 11, shares: 5000, board: 'MAIN' as const }
+    const low = ok(applyTrade(held, input, LOW)).fee
+    const high = ok(applyTrade(held, input, HIGH)).fee
+    expect(high - low).toBeCloseTo(11 * 5000 * 0.0005, 2)
+    // 而且它真的进了已实现盈亏（费用是从盈亏里扣的）
+    const lowR = ok(applyTrade(held, input, LOW)).realized ?? 0
+    const highR = ok(applyTrade(held, input, HIGH)).realized ?? 0
+    expect(lowR - highR).toBeCloseTo(high - low, 2)
+  })
+
+  it('ETF 卖出免印花税 —— 翻倍税率也一分不变', () => {
+    const input = { side: 'SELL' as const, price: 11, shares: 5000, board: 'ETF' as const }
+    expect(ok(applyTrade(held, input, HIGH)).fee).toBe(ok(applyTrade(held, input, LOW)).fee)
+  })
+
+  it('分红与送转**根本不收费**（不是成交，没有佣金也没有税）', () => {
+    expect(
+      ok(applyTrade(held, { side: 'DIVIDEND', price: 0.3, shares: 10_000, board: 'MAIN' }, HIGH)).fee
+    ).toBe(0)
+    expect(
+      ok(applyTrade(held, { side: 'SPLIT', price: 0, shares: 10_000, board: 'MAIN' }, HIGH)).fee
+    ).toBe(0)
+  })
+})
