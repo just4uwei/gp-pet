@@ -54,7 +54,7 @@
  */
 
 import type { Board, TradeDate } from '@core/types'
-import type { FeeCalibration, TradeFeeRates } from '@shared/ipc-types'
+import type { FeeCalibration, FeeCalibrationRow, TradeFeeRates } from '@shared/ipc-types'
 import {
   TRANSFER_FEE_RATE,
   buyFees,
@@ -166,6 +166,13 @@ export interface SolveResult {
   feeBearing: number
   /** 被截止日挡在外面的笔数 —— **必须报出来**，否则用户不知道今天那两笔没算进去 */
   excludedByDate: number
+  /**
+   * 逐笔会变成多少（只含参与反解的那些）。
+   *
+   * **合计按构造总是对上目标 ⇒ 合计分辨不出配置对不对**，只有逐笔分得出
+   * （见 `FeeCalibrationRow`）。`status !== 'OK'` 时为空数组。
+   */
+  rows: FeeCalibrationRow[]
 }
 
 /**
@@ -189,7 +196,7 @@ export function solveFromFeeTotal(input: {
     through === undefined ? input.rows : input.rows.filter((row) => row.tradedAt <= through)
   const excludedByDate = input.rows.length - inWindow.length
   const bearing = inWindow.filter((row) => feeOfRow(row, board, base) !== null)
-  const stats = { feeBearing: bearing.length, excludedByDate }
+  const stats = { feeBearing: bearing.length, excludedByDate, rows: [] as FeeCalibrationRow[] }
 
   const feeAt = (rate: number): number =>
     feeTotalUnder(bearing, board, { ...base, commissionRate: rate })
@@ -295,6 +302,19 @@ export function solveFromFeeTotal(input: {
     rate = snapped
   }
   const solvedTotal = feeAt(rate)
+  /*
+    逐笔摊开。**这一列才是判据** —— 合计是反解出来的，它按构造总能对上，
+    分辨不出「免最低勾了没有」这种配置错误（真机踩过：同一个 85.11，
+    勾与不勾都对得上合计，而逐笔一个 8/8 全错、一个 8/8 零残差）。
+  */
+  const solvedRates = { ...base, commissionRate: rate }
+  const perRow: FeeCalibrationRow[] = bearing.map((row) => ({
+    tradedAt: row.tradedAt,
+    side: row.side,
+    amount: row.price * Math.trunc(row.shares),
+    feeNow: Math.round((feeOfRow(row, board, base) ?? 0) * 100) / 100,
+    feeAfter: Math.round((feeOfRow(row, board, solvedRates) ?? 0) * 100) / 100,
+  }))
 
   // 解出来了，但那个数不像个佣金率 ⇒ 把疑点说出来，**不替用户否掉**（见 PLAUSIBLE_RATE_MAX）
   const plausibilityNote =
@@ -323,6 +343,7 @@ export function solveFromFeeTotal(input: {
     rate,
     feeTotalAt: solvedTotal,
     ...stats,
+    rows: perRow,
   }
 }
 

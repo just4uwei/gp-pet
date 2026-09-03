@@ -359,6 +359,40 @@ describe('真实账单回归（同花顺 8 笔）', () => {
     })
   })
 
+  /**
+   * ⚠ 真机踩过（2026-09-03）：用户勾了「免 5 元最低佣金」，反解出万 2.488，
+   * **合计照样是 85.11** —— 但逐笔变成 4.81 / 4.95 / 4.48，与账单上那三个
+   * 5.00 整**一笔都对不上**。
+   *
+   * 这条用例钉的是**判据本身**：合计按构造总能对上 ⇒ 它分辨不出配置对不对，
+   * 只有逐笔分得开。界面因此必须把逐笔摆出来（`FeeCalibration.rows`）。
+   */
+  it('**合计分辨不出配置对错**：勾与不勾都能对上 85.11，只有逐笔分得开', () => {
+    const waived = solveFromFeeTotal({
+      rows,
+      board: 'MAIN',
+      base: { ...BASE, minCommission: 0 },
+      targetFeeTotal: TOTAL,
+    })
+    const kept = solveFromFeeTotal({ rows, board: 'MAIN', base: BASE, targetFeeTotal: TOTAL })
+
+    // 两边都能把**合计**解到目标上 —— 这正是「合计不是判据」的意思
+    expect(waived.status).toBe('OK')
+    expect(kept.status).toBe('OK')
+    expect(waived.feeTotalAt).toBeCloseTo(TOTAL, 1)
+    expect(kept.feeTotalAt).toBeCloseTo(TOTAL, 1)
+
+    const offBy = (r: { rows: { feeAfter: number }[] }): number =>
+      r.rows.filter((row, i) => Math.abs(row.feeAfter - BILL[i]![3]) > 0.005).length
+    // 而**逐笔**一个全错、一个零残差
+    expect(offBy(kept)).toBe(0)
+    expect(offBy(waived)).toBe(BILL.length)
+
+    // 勾错时的特征：小额那几笔算出来**不足 5 元**，而账单上恰好是 5.00 整
+    expect(waived.rows.filter((r) => r.feeAfter < 5)).toHaveLength(3)
+    expect(kept.rows.filter((r) => r.feeAfter < 5)).toHaveLength(0)
+  })
+
   it('用减半前的印花税（千 1）算，这 8 笔会多出 29 元 —— 那是修掉的那个缺陷', () => {
     const r2 = (x: number): number => Math.round(x * 100) / 100
     const wrong = BILL.reduce((sum, [side, shares, price, , day]) => {

@@ -248,6 +248,60 @@ export function FeeCalibrateForm({
                 这 {result.feeBearing} 笔：{result.feeTotalNow.toFixed(2)} →{' '}
                 {(result.feeTotalAfter ?? 0).toFixed(2)}（目标 {result.targetFeeTotal.toFixed(2)}）
               </div>
+              {/*
+                ⚠ **逐笔对照才是判据。** 合计是反解出来的，它按构造总能对上 ——
+                真机踩过：同一个 85.11，「免最低」勾与不勾都能对上合计，
+                而逐笔一个是 4.81/4.95/4.48（8/8 全错）、另一个是 5.00/5.00/5.00
+                （8/8 零残差）。用户手上正好有那张逐笔账单，摆出来他一眼就看得出。
+              */}
+              {result.rows.length > 0 ? (
+                <>
+                  <div className="mt-1.5 text-white/45">
+                    逐笔会变成这样 —— <span className="text-white/70">拿它对一下券商的逐笔账单</span>
+                    ，对不上就说明下面那个勾或者截止日选错了：
+                  </div>
+                  <ul className="mt-1 max-h-28 overflow-y-auto font-mono text-[10px] text-white/45">
+                    {result.rows.map((r) => (
+                      <li key={`${r.tradedAt}-${r.side}-${r.amount}`} className="flex gap-2">
+                        <span className="w-20 shrink-0">{shanghaiDate(r.tradedAt)}</span>
+                        <span className="w-8 shrink-0">{r.side === 'SELL' ? '卖' : '买'}</span>
+                        <span className="w-20 shrink-0 text-right">{r.amount.toFixed(0)}</span>
+                        <span className="w-14 shrink-0 text-right text-white/30">
+                          {r.feeNow.toFixed(2)}
+                        </span>
+                        <span className="w-4 shrink-0 text-center text-white/25">→</span>
+                        <span className="w-14 shrink-0 text-right text-white/75">
+                          {r.feeAfter.toFixed(2)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              ) : null}
+
+              {/*
+                这一条专门抓「免最低勾错了」：勾了之后小额那几笔会算出**不足原最低**
+                的费用，而券商账单上那些笔多半恰好是整数 5.00 —— 那就是勾反了。
+                合计仍然对得上，所以只能靠这个特征来提。
+              */}
+              {result.minCommissionAfter === 0 &&
+              result.minCommissionNow > 0 &&
+              result.rows.some((r) => r.feeAfter < result.minCommissionNow) ? (
+                <div className="mt-1.5 rounded border border-amber-400/30 bg-amber-400/[0.08] px-2 py-1.5 text-amber-200/90">
+                  ⚠ 上面有
+                  <span className="font-mono">
+                    {' '}
+                    {result.rows.filter((r) => r.feeAfter < result.minCommissionNow).length}{' '}
+                  </span>
+                  笔算出来<span className="font-medium">不足 {result.minCommissionNow} 元</span>。
+                  如果券商账单上那几笔恰好是
+                  <span className="font-mono"> {result.minCommissionNow.toFixed(2)} </span>
+                  整，说明你的券商<span className="font-medium">有</span>这条最低 ——
+                  把下面「免 5 元最低佣金」那个勾<span className="font-medium">取消</span>再解一次。
+                  （合计两种都对得上，只有逐笔分得开。）
+                </div>
+              ) : null}
+
               {result.audit !== undefined ? (
                 <div className="mt-1 text-white/45">
                   会改写 {result.audit.trades} 笔流水 · {result.audit.positions.length} 只持仓的成本会变

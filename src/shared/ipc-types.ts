@@ -427,6 +427,31 @@ export interface FeeCalibrationQuery {
  * 3. **每一笔都触到最低佣金时，反解在数学上不成立**（`status = 'UNIDENTIFIABLE'`）：
  *    `fee = max(5, 金额 × 费率)` 在 5 元那一侧对费率**完全不敏感**。
  */
+/**
+ * 反解之后**逐笔**会变成多少（017，2026-09-03 加）。
+ *
+ * ## 它为什么必须存在
+ *
+ * 反解按构造让**合计**对上目标 ⇒ **合计分辨不出配置对不对**。
+ * 真机踩过：同一只票、同一个 85.11，「免最低」勾与不勾都能对上合计，
+ * 但逐笔一个是 `4.81 / 4.95 / 4.48`（8/8 全错），另一个是 `5.00 / 5.00 / 5.00`
+ * （8/8 逐笔零残差）。而用户手上**正好有那张逐笔账单** —— 把这一列摆出来，
+ * 他一眼就能看出勾错了。
+ *
+ * 这与 `fees.test.ts` 里那条「只钉总数不够」的用例是同一件事的两面：
+ * 用例挡的是代码回退，这一列挡的是**配置选错**。
+ */
+export interface FeeCalibrationRow {
+  tradedAt: number
+  side: TradeSide
+  /** 成交额（价 × 股数） */
+  amount: number
+  /** 现行费率下这一笔的费用 */
+  feeNow: number
+  /** 反解出的费率下这一笔的费用 —— **拿它去对券商账单** */
+  feeAfter: number
+}
+
 export interface FeeCalibration {
   code: SecCode
   status:
@@ -455,6 +480,11 @@ export interface FeeCalibration {
   feeBearing: number
   /** 被截止日挡在外面的笔数 —— **要显示**，否则用户不知道今天那两笔没算进去 */
   excludedByDate: number
+  /**
+   * 逐笔会变成多少（只含参与反解的那些）。**拿它去对券商的逐笔账单** ——
+   * 合计按构造总是对上的，只有逐笔分得出配置对不对（见 `FeeCalibrationRow`）。
+   */
+  rows: FeeCalibrationRow[]
   /** 应用之后全库会变成什么样。`status !== 'OK'` 时缺省 */
   audit?: FeeAudit
 }

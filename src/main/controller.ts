@@ -1202,6 +1202,8 @@ export class AppController {
       minCommissionAfter: base.minCommission,
       feeBearing: solved.feeBearing,
       excludedByDate: solved.excludedByDate,
+      // 逐笔才是判据 —— 合计按构造总能对上（见 `FeeCalibrationRow`）
+      rows: solved.rows,
       ...(solved.feeTotalAt === undefined ? {} : { feeTotalAfter: solved.feeTotalAt }),
       ...(solved.rate === undefined ? {} : { rateSolved: solved.rate }),
     }
