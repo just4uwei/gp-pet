@@ -298,6 +298,39 @@ describe('replayLedger', () => {
     expect(result.position?.cost).toBeCloseTo((10 * 1000 + 30 + 12 * 1000 + 40) / 2000, 4)
   })
 
+  /**
+   * ⚠ 回归（2026-09-03 真机抓到）：**新录的那一笔手续费恒为 0**。
+   *
+   * 机制：调用方要先把行落库才能重放，而落库那一刻它的费用**还没算出来**
+   * （要等重放）⇒ 先落一个 0 占位。而重放默认「沿用库里存着的费用」
+   * ⇒ 那个 0 被当成事实，一路摊进成本。
+   * 账面上只表现为「费 0.00」这一个不起眼的数字，没有任何东西会报警。
+   *
+   * 用户的真实账本里因此有两笔零费用的流水（一笔建仓 7.5 万、一笔买入 3.7 万，
+   * 少算了 29.23 元）。
+   */
+  it('**点名的那几行照样重算** —— 新录/刚改的一笔落库时费用还没算出来，落的是 0 占位', () => {
+    const rows = [
+      { id: 'old', side: 'BUY' as const, price: 10, shares: 1000, fee: 30 },
+      // 这一行模拟「刚 insert 的占位」：fee 是 0，但它不是事实
+      { id: 'fresh', side: 'BUY' as const, price: 10, shares: 10_000, fee: 0 },
+    ]
+    const naive = replayLedger(rows, 'MAIN', DEFAULT_COSTS)
+    expect(naive.rows[1]?.fee).toBe(0) // ← 不点名就是这个下场
+
+    const fixed = replayLedger(rows, 'MAIN', DEFAULT_COSTS, { refeeIds: new Set(['fresh']) })
+    expect(fixed.rows[1]?.fee).toBeCloseTo(buyFees(100_000, DEFAULT_COSTS), 2)
+    // 旧那一笔仍然沿用库里存着的 30，不被顺手改掉
+    expect(fixed.rows[0]?.fee).toBe(30)
+    /*
+      而且费用要**真的摊进成本** —— 只改报出去的那个数会让
+      「成本 × 股数 − 成交额 ≠ fee」，一个当场对不上的账。
+      容差按 `round4` 给：成本保留 4 位 ⇒ 11000 股上最多差 11000 × 5e-5 = 0.55 元。
+    */
+    const fee = fixed.rows[0]!.fee + fixed.rows[1]!.fee
+    expect(Math.abs(fixed.position!.cost * 11_000 - 110_000 - fee)).toBeLessThan(0.55)
+  })
+
   it('refee 时按传进来的费率重算每一笔', () => {
     const rows = [{ id: 'a', side: 'BUY' as const, price: 10, shares: 1000, fee: 999 }]
     const result = replayLedger(rows, 'MAIN', CHEAP, { refee: true })

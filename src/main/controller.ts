@@ -1021,14 +1021,28 @@ export class AppController {
   private rebuildLedger(
     layer: DataLayer,
     code: SecCode,
-    opts: { refee?: boolean; resetPeak?: boolean; costs?: CostModel } = {}
+    opts: {
+      refee?: boolean
+      /**
+       * 只让这几行重算费用。**新录的与刚改过的那一笔必须点名** ——
+       * 它们落库时费用还没算出来（要等重放），先落的是一个 0 占位，
+       * 不点名就会被当成「库里存着的费用」沿用 ⇒ **手续费恒为 0**
+       * （见 `replayLedger` 里那段注释，2026-09-03 真机抓到）。
+       */
+      refeeIds?: ReadonlySet<string>
+      resetPeak?: boolean
+      costs?: CostModel
+    } = {}
   ): { position: LedgerPosition | null; skipped: { id: string; reason: string }[] } {
     const rows = layer.storage.trades.listByCode(code)
     const result = replayLedger(
       rows.map((row) => this.toReplayRow(row)),
       this.boardOf(code),
       opts.costs ?? this.ledgerCostModel(layer),
-      opts.refee === true ? { refee: true } : {}
+      {
+        ...(opts.refee === true ? { refee: true } : {}),
+        ...(opts.refeeIds === undefined ? {} : { refeeIds: opts.refeeIds }),
+      }
     )
 
     for (const derived of result.rows) {
@@ -1438,6 +1452,8 @@ export class AppController {
       */
       const split = draft.side === 'SPLIT'
       const rebuilt = this.rebuildLedger(layer, code, {
+        // 新录的这一笔费用还没算出来（上面落的是 0 占位）⇒ 必须点名重算
+        refeeIds: new Set([id]),
         resetPeak: split && !isLatest,
       })
       const skipped = rebuilt.skipped.find((entry) => entry.id === id)
@@ -1523,10 +1539,23 @@ export class AppController {
     }
 
     this.assertStorable(next.price, next.shares)
+    /*
+      改动了金额或性质 ⇒ 这一笔的费用必须重算（`trades.update` 写进去的仍是**旧**那个数）。
+      只改日期 / 备注 / 关联时**刻意不重算** —— 那一笔当时真的按当时的费率付了那些钱，
+      顺手按今天的费率改掉它，等于用一次无关的编辑悄悄改写一段历史。
+    */
+    const amountChanged =
+      next.side !== row.side ||
+      next.price !== row.price ||
+      next.shares !== row.shares ||
+      next.feeIncluded !== row.feeIncluded
     layer.storage.db.transaction(() => {
       layer.storage.trades.update(next)
       const hasSplit = layer.storage.trades.listByCode(code).some((r) => r.side === 'SPLIT')
-      const rebuilt = this.rebuildLedger(layer, code, { resetPeak: hasSplit })
+      const rebuilt = this.rebuildLedger(layer, code, {
+        ...(amountChanged ? { refeeIds: new Set([next.id]) } : {}),
+        resetPeak: hasSplit,
+      })
       const skipped = rebuilt.skipped.find((entry) => entry.id === next.id)
       if (skipped) throw new Error(skipped.reason)
     })

@@ -427,7 +427,7 @@ export function replayLedger(
   rows: readonly LedgerReplayRow[],
   board: Board,
   costs: CostModel = DEFAULT_COSTS,
-  opts: { refee?: boolean } = {}
+  opts: { refee?: boolean; refeeIds?: ReadonlySet<string> } = {}
 ): LedgerReplayResult {
   let position: LedgerPosition | null = null
   let peakScale = 1
@@ -437,14 +437,21 @@ export function replayLedger(
   for (const row of rows) {
     /*
       费用取哪个数：
-        * `refee` ⇒ 按 `costs` 现算（这正是那条路要做的事）；
+        * `refee`（整库重算）或 `refeeIds` 点名的那几行 ⇒ 按 `costs` 现算；
         * 否则 ⇒ 用库里存着的那笔（当时真的按当时的费率算出来的）。
 
       ⚠ 必须**从入参走 `feeOverride` 进去**，不能只改返回值里那个 `fee`：
       买入的费用是摊进 `cost` 的，只改报出去的数会让
       `成本 × 股数 − 成交额 ≠ fee` —— 一个当场对不上的账。
       分红与送转恒为 0（不是成交），`applyTrade` 会忽略这一项。
+
+      ⚠ **`refeeIds` 不是可选的优化，它是新录与改动那一笔的唯一出路**
+      （2026-09-03 真机抓到）：调用方要先把行落库才能重放，而落库时那一笔的费用
+      **还没算出来**（它要等重放）—— 于是先落一个 0 占位。没有这份点名的话，
+      那个 0 会被这里当成「库里存着的费用」原样沿用 ⇒ **新录的每一笔手续费恒为 0**，
+      而它一路摊进成本，账面上只表现为「费 0.00」这一个不起眼的数字。
     */
+    const recompute = opts.refee === true || opts.refeeIds?.has(row.id) === true
     const outcome = applyTrade(
       position,
       {
@@ -453,7 +460,7 @@ export function replayLedger(
         shares: row.shares,
         board,
         ...(row.feeIncluded === undefined ? {} : { feeIncluded: row.feeIncluded }),
-        ...(opts.refee === true || row.fee === undefined ? {} : { feeOverride: row.fee }),
+        ...(recompute || row.fee === undefined ? {} : { feeOverride: row.fee }),
       },
       costs
     )
