@@ -112,11 +112,27 @@ export interface DailyBar {
   ma60: number | null
 }
 
-/** 一笔成交（007_trade_log.sql）。BUY / SELL 是真实成交，OPENING 是迁移或导入补的期初建仓 */
+/**
+ * 账本流水的五种行（007_trade_log.sql + 017_trade_costs.sql）。
+ *
+ * - `BUY` / `SELL` —— 真实成交，用户从券商 App 上抄下来的；
+ * - `OPENING` —— 建仓：账本的**起点**（迁移、导入配置，或用户自己补一笔早就持有的仓）。
+ *   它的 `price` 含不含手续费由 `feeIncluded` 说，**默认不含**（系统自动补算）；
+ * - `DIVIDEND` —— 现金分红。`price` = **税后每股派现**，`shares` = 分红涉及股数，
+ *   效果是**扣减摊薄成本**（不是计入已实现盈亏）—— 见 017 头注释里那张表；
+ * - `SPLIT` —— 送股 / 转增股。`shares` = **新增**股数，`price` **真的是 0**
+ *   （送股没付钱，这个 0 是事实而不是拿假值冒充）。
+ *
+ * ⚠ 后两种**不是成交**，所以它们没有手续费、不占 T+1 的当日买入额度、
+ * 也不进「照哪条提醒做的」那套 IS 分解。
+ */
+export type TradeSide = 'BUY' | 'SELL' | 'OPENING' | 'DIVIDEND' | 'SPLIT'
+
+/** 一笔账本流水（007_trade_log.sql）。口径见 `TradeSide` */
 export interface TradeView {
   id: string
   code: SecCode
-  side: 'BUY' | 'SELL' | 'OPENING'
+  side: TradeSide
   /** 成交**日**（用户填的日期，存成北京 12:00），不是录入时刻，也不是真实成交时刻 */
   tradedAt: number
   /**
@@ -134,8 +150,27 @@ export interface TradeView {
   decisionPrice?: number
   price: number
   shares: number
+  /**
+   * 手续费。**一律由系统按费率算**，用户不填这个数（2026-09-03 拍板）——
+   * 对不上的时候改的是费率（走「校正成本」反解，见 `CostCalibration`），不是逐笔改数字。
+   */
   fee: number
-  /** 卖出结转的已实现盈亏（含费）。买入与期初**缺省** —— 不是 0 */
+  /**
+   * 仅 `OPENING`：录入的那个 `price` 已经含手续费了吗（017）。
+   *
+   * `false` = 不含（**新录入的默认**）⇒ 系统按费率补算一笔费用并摊进成本。
+   * `true` = 已含 ⇒ 那个 price 直接就是摊薄成本，不再收费。
+   * **缺省 = 007 迁移与配置导入补出来的老行** —— 它们的 price 取自 `position.cost`，
+   * 按定义就是含费的摊薄成本，所以按 `true` 处理（这不是猜，是那两条路的定义）。
+   */
+  feeIncluded?: boolean
+  /**
+   * 已实现盈亏（含费）。
+   *
+   * 两种行会有它：**卖出**结转的差额，以及**分红把摊薄成本摊到 0 之后多出来的那部分**
+   * （成本不许变负 —— 负成本会让浮亏百分比与止损线一起失去意义）。
+   * 买入、期初、送转**缺省** —— 不是 0（约束 4）。
+   */
   realized?: number
   note?: string
 }
@@ -175,6 +210,13 @@ export interface TradeLedger {
   realizedTotal: number
   /** 手续费合计（含期初那笔的 0 —— 那个 0 是「不知道」，不是「没有」） */
   feeTotal: number
+  /**
+   * 现金分红到账合计（017）。
+   *
+   * **与 `realizedTotal` 单独一行显示，不许并进去** —— 分红走的是「扣减摊薄成本」，
+   * 那笔钱要等卖出时才结转成已实现盈亏。两个数相加会把同一笔钱数两遍。
+   */
+  dividendTotal: number
   /** 当前持仓；已清仓为 null */
   position: PositionView | null
 }
@@ -207,12 +249,30 @@ export interface TradePreview {
   realized: number | null
 }
 
-/** 录一笔成交。价格是**不复权真实成交价**，股数为正整数 */
+/**
+ * 录一笔账本流水。
+ *
+ * - `BUY` / `SELL`：`price` 是**不复权真实成交价**（**不含**手续费，系统自动算），
+ *   `shares` 正整数；
+ * - `OPENING`：建仓，`price` 是成本价，含不含费由 `feeIncluded` 说（默认不含）；
+ * - `DIVIDEND`：`price` 是**税后每股派现**，`shares` 是分红涉及股数；
+ * - `SPLIT`：`price` 传 0（送股没付钱），`shares` 是**新增**股数。
+ *
+ * ⚠ **没有手续费这一项。** 手续费一律由费率算出来（2026-09-03 拍板）：
+ * 对不上的时候要修的是费率，走「校正成本」反解（`CostCalibration`）——
+ * 逐笔改数字会让账本里出现一批无从校对的孤立数。
+ */
 export interface TradeDraft {
   code: SecCode
-  side: 'BUY' | 'SELL'
+  side: TradeSide
   price: number
   shares: number
+  /**
+   * 仅 `OPENING` 有意义：录入的 `price` 已经含手续费了吗。**缺省 = 不含**
+   * ⇒ 系统按费率补算一笔并摊进成本（用户从券商 App 上抄「成交价」比抄
+   * 「摊薄成本」自然得多，所以默认取更常见的那一种）。
+   */
+  feeIncluded?: boolean
   /** 成交**日**。缺省取现在 */
   tradedAt?: number
   /** 真实成交时刻（含分钟）。**缺省 = 用户没填**，主进程落 NULL，不拿 `tradedAt` 顶替 */
@@ -226,6 +286,143 @@ export interface TradeDraft {
    */
   signalId?: string
   note?: string
+}
+
+/**
+ * 改一笔已经录进去的流水（`trade:update`，017）。
+ *
+ * ## 为什么不用「删掉重录」顶替
+ *
+ * 删了重录会丢掉 `signal_id` / `traded_at_exact` 那几列（016 那批 IS 分解的样本），
+ * 而用户改的往往只是股数填错一位 —— 让他为了改一个数字丢掉「照哪条提醒做的」，
+ * 下次他就不会再填那个关联了。
+ *
+ * ## 三条边界
+ *
+ * 1. **`id` 与 `created_at` 都不动。** 后者是同一天多笔的兜底排序键
+ *    （`ORDER BY traded_at ASC, created_at ASC`），改了会让重放顺序变。
+ * 2. **改完必须整条重放**：`realized` 与后续每一笔的成本都依赖它前面那些行，
+ *    只改这一行等于让账本从这里往后全错，而没有任何东西会报警。
+ * 3. **手续费不在可改之列** —— 它由费率算（见 `TradeDraft`）。
+ */
+export interface TradeUpdate {
+  id: string
+  side?: TradeSide
+  price?: number
+  shares?: number
+  /** 仅 `OPENING`：那个价含不含费 */
+  feeIncluded?: boolean
+  tradedAt?: number
+  /** `null` = 清掉那个时刻（改成「不记得」） */
+  tradedAtExact?: number | null
+  /** `null` = 解除关联 */
+  signalId?: string | null
+  /** `null` = 清空备注 */
+  note?: string | null
+}
+
+/**
+ * 「按新费率把历史流水重算一遍」会改动什么（017）。
+ *
+ * **干跑与执行返回同一个形状**，这样确认框里显示的数字与真的发生的事逐位一致 ——
+ * 与 `trade:preview` 那条纪律同一形状（两处各算一遍必然分叉）。
+ *
+ * ⚠ `feeTotalAfter - feeTotalBefore` **不是**用户多付或少付的钱：那些钱早就付掉了。
+ * 它答的是「账本从此按哪个费率讲述历史」，措辞上不许写成「省了多少」。
+ */
+export interface FeeAudit {
+  /** 会被改写的流水笔数。0 ⇒ 没有任何东西要改 */
+  trades: number
+  /** 涉及的标的数 */
+  codes: number
+  feeTotalBefore: number
+  feeTotalAfter: number
+  /**
+   * 「价已含费」的建仓行，因此被跳过的笔数。
+   *
+   * 那种行的 `price` **就是**摊薄成本（007 迁移与配置导入都是这么补的）——
+   * 给它补算一笔费用等于凭空把用户当初填的成本改掉。
+   */
+  feeIncludedSkipped: number
+  /** 成本价会变的持仓。逐只列出来 —— 「N 只票受影响」这种汇总数看不出严重性 */
+  positions: { code: SecCode; costBefore: number; costAfter: number }[]
+  /**
+   * 会被清掉的「已接受的那段亏损」条数（009）。
+   *
+   * 成本变了旧那条止损线就不是同一个判断（`PositionRepo.set` 的既有纪律），
+   * 所以重算会连带清空它们。**必须在确认框里说出来** —— 少一条止损线用户发现不了。
+   */
+  stopAcksCleared: number
+}
+
+/**
+ * 「校正成本」的反解结果（`trade:costPreview`，017，2026-09-03 用户拍板的形态）。
+ *
+ * ## 它在做什么
+ *
+ * 用户在券商 App 上看到某只票的摊薄成本是 `targetCost`，而这里算出来的是 `costNow`。
+ * 差额几乎总是**佣金率**造成的 —— 出厂那套（万 2.5 / 最低 5 元）是「A 股散户常见档」
+ * 的猜测，而真实档位在万 0.85 ~ 万 3 之间。于是**反解**：找一个 `commissionRate`
+ * 让这只票重放出来的成本恰好等于 `targetCost`。
+ *
+ * **不给用户直接改费率的入口**（这是与第一版方案的关键区别）：费率是个四维的东西，
+ * 让用户对着四个框猜，比让他抄一个他每天都在看的数字要难得多，而且抄下来的那个
+ * 成本价是**可核对的事实**，费率不是。
+ *
+ * ## 三条必须一起读的限制
+ *
+ * 1. **一个方程解一个未知数。** 只动 `commissionRate`，其余三项按规定值不动
+ *    （印花税只作用于卖出、不进成本；过户费是交易所规定）。
+ *    ⇒ 它把**全部**差额都归给佣金率。差额若来自漏录的一笔成交 / 忘了的分红 /
+ *    价格填错一位，反解出来的费率就是垃圾 —— 所以超出合理区间时**拒绝**并说明
+ *    更可能的原因，而不是给出一个能让数字对上的荒唐费率。
+ * 2. **费率是账户级的 ⇒ 校正一只票会改动全部标的的成本。** `audit` 就是为此存在的：
+ *    确认之前先看清它动了哪些持仓。如果只有这一只对不上，那更像是**这只票的流水
+ *    本身有问题**，不是费率问题。
+ * 3. **每一笔都触到最低佣金时，反解在数学上不成立**（`status = 'UNIDENTIFIABLE'`）：
+ *    `fee = max(5, 金额 × 费率)` 在 5 元那一侧对费率**完全不敏感** ⇒ 成本不随费率变。
+ *    换一只单笔金额更大的票再试。
+ */
+export interface CostCalibration {
+  code: SecCode
+  status:
+    | 'OK'
+    /** 每一笔买入都触到最低佣金 ⇒ 成本对费率不敏感，这只票身上解不出东西 */
+    | 'UNIDENTIFIABLE'
+    /** 要让成本对上得把费率推到区间外 ⇒ 差额不像是费率造成的 */
+    | 'OUT_OF_RANGE'
+    /** 这只票没有任何会产生手续费的流水（只有卖出 / 只有含费建仓 / 一笔都没有） */
+    | 'NO_BASIS'
+    /** 现在没有持仓，没有「当前成本」可校正 */
+    | 'NO_POSITION'
+  /** 原样显示给用户。`OK` 时是一句说明，其余状态时是「更可能的原因是什么」 */
+  message: string
+  /** 用户抄下来的那个数 */
+  targetCost: number
+  /** 按现行费率算出来的成本 */
+  costNow: number
+  /** 反解成功时：换上新费率之后这只票的成本（应当≈`targetCost`） */
+  costAfter?: number
+  /** 现行佣金率 */
+  rateNow: number
+  /** 反解出来的佣金率。`OUT_OF_RANGE` 时给的是被夹住的边界值，**仅供显示** */
+  rateSolved?: number
+  /** 触到最低佣金的买入笔数 / 会产生手续费的笔数 —— 判 `UNIDENTIFIABLE` 的依据 */
+  minCommissionBound: number
+  feeBearing: number
+  /** 应用之后全库会变成什么样。`status !== 'OK'` 时缺省 */
+  audit?: FeeAudit
+}
+
+/** `trade:costApply` 的结果 */
+export interface CostCalibrationResult {
+  status: 'DONE' | 'REJECTED' | 'FAILED'
+  /** 原样显示给用户（含备份成败）。非 DONE 时是原因 */
+  message: string
+  /** 主进程**重新反解**了一遍的结果 —— 渲染层送来的数字一概不采信 */
+  calibration: CostCalibration
+  /** 事前那份一致性快照的路径；备份没做成时缺省（**不阻断** —— 这一步是可逆的） */
+  backupPath?: string
 }
 
 export interface SignalRecord {
@@ -1440,6 +1637,19 @@ export interface IpcInvokeMap {
   'trade:add': (draft: TradeDraft) => TradeLedger
   /** 删一笔（录错了）。**按剩余流水重放重建持仓**，不做反向增量 */
   'trade:remove': (id: string) => TradeLedger
+  /** 改一笔（录错了但不想丢掉关联）。边界见 `TradeUpdate` */
+  'trade:update': (patch: TradeUpdate) => TradeLedger
+  /**
+   * 「校正成本」的干跑（017）：从这只票的真实摊薄成本**反解佣金率**。
+   * **只读，什么都不写。** 口径与三条限制见 `CostCalibration`。
+   */
+  'trade:costPreview': (query: { code: SecCode; targetCost: number }) => CostCalibration
+  /**
+   * 真的应用：写回费率 + **整库一个事务**重算流水与持仓。
+   *
+   * ⚠ 主进程会**重新反解一遍**（不采信渲染层送来的费率），解不出来就 `REJECTED`。
+   */
+  'trade:costApply': (query: { code: SecCode; targetCost: number }) => CostCalibrationResult
   /**
    * `perCode` = 每只标的最多取几条。**「今日信号」这类列表应当传它** ——
    * 全局 `limit` 会被单只刷屏的票吃光，而症状是「早上那批信号凭空不见了」，
@@ -1662,8 +1872,88 @@ export interface GpBridge {
  * 三个字段随之删掉 —— 旧 settings.json 里残留的这几个键会被 `sanitizeSettings` 忽略
  * （它只认 schema 里有的键），不需要迁移。
  */
+/**
+ * 用户自己的交易费率（017）。**只作用于他自己的账本，不碰回测与影子运行。**
+ *
+ * ## 它不是一个「设置项」，是一个**反解出来的量**
+ *
+ * 设置页**不给这四个数编辑框**（2026-09-03 用户拍板）。写它的唯一路径是
+ * 「校正成本」：用户抄下券商 App 上那只票的摊薄成本，软件从流水反解佣金率
+ * （见 `CostCalibration`）。
+ *
+ * 判据与「设置页不给参数编辑框」（docs/01 §5.5）同一条：
+ * **让用户对着四个他没有依据的数字猜，比让他抄一个他每天都在看的数字要难得多**，
+ * 而抄下来的那个成本价是**可核对的事实**，费率不是。
+ * 界面上这四个数因此是**只读的**，并且要标出「它是怎么来的」。
+ *
+ * ## 为什么与 `DEFAULT_COSTS` 刻意分开
+ *
+ * `src/backtest/costs.ts` 的 `DEFAULT_COSTS` 是**回测与影子的固定假设**
+ * （万 2.5 / 最低 5 元 / 千 1 / 万 0.1 / 滑点 0.1%），它写进 `report.meta.costs`
+ * 并被 `auditKnobs()` 用来判「这份报告是不是出厂口径」。跟着用户改就等于
+ * **每改一次费率，影子那条净值曲线要分一段，而分段前后拆不开就没法引用**
+ * （同「引擎参数一变立刻停止累积」那条纪律）。
+ *
+ * 代价是「实盘盈亏 vs 影子绩效」从此多一项已知口径差 —— 那是**如实呈现**，
+ * 设置页的 hint 与 docs/07 §2.3 都要写出来，不许悄悄让它们分叉。
+ *
+ * ## 为什么没有 `slippage`
+ *
+ * 记账**绝不套滑点**（`main/trades/ledger.ts` 头注释）：用户填的就是真实成交价，
+ * 再往不利方向偏一次等于凭空把它改坏，然后一路进成本、进盈亏、进止损线。
+ * 少这一项 = 让「顺手把滑点也做成可配」这件事在类型上就做不成。
+ *
+ * ⚠ **只有 `commissionRate` 会被反解改动。** 后三项一动不动：
+ * 印花税与过户费是**交易所与国家规定**（不是券商报价，而且印花税只作用于卖出、
+ * 压根不进成本），最低佣金则是**反解不出来**的 —— 它与佣金率在同一个
+ * `max(最低, 金额 × 率)` 里，一个方程解不了两个未知数。
+ * 规则真的变了的那一天要改的是这里的出厂值 + 一个生效日期
+ * （对照 `priceLimitRatio` 那条「规则类常量要带生效日期」）。
+ */
+export interface TradeFeeRates {
+  /** 佣金率（双边）。券商说的「万 2.5」= 0.00025。**唯一会被反解改动的一项** */
+  commissionRate: number
+  /** 单笔最低佣金，元。**0 是合法的**（有券商免最低），不是「没填」 */
+  minCommission: number
+  /** 印花税率，**仅卖出**；场内基金免征（`isFundBoard`）。现行千分之一 = 0.001 */
+  stampTaxRate: number
+  /** 过户费率（双边）；场内基金免征。现行万分之零点一 = 0.00001 */
+  transferFeeRate: number
+}
+
+/**
+ * 现行费率是怎么来的（017）。**缺省 = 出厂默认，没人校正过。**
+ *
+ * 存下来是为了让设置页能回答「这个万 1.2 是哪来的」—— 一个来路不明的费率
+ * 与一个未标定的策略参数是同一类东西（ADR-0003）：它看起来像事实，
+ * 而这一栏就是把「它其实是从 SH600000 的成本反解出来的」写在旁边。
+ */
+export interface TradeFeeSource {
+  /** 从哪只票的成本反解出来的 */
+  code: SecCode
+  /** 用户当时抄下来的那个摊薄成本 */
+  targetCost: number
+  /** 反解出来的佣金率（= 当时写进 `tradeCosts.commissionRate` 的那个数） */
+  commissionRate: number
+  at: number
+}
+
 export interface AppSettings {
   pollIntervalSec: number
+  /**
+   * 用户自己的费率（017）。**出厂值逐位等于 `DEFAULT_COSTS` 的对应四项**
+   * ⇒ 没校正过的用户，账本行为一个字不变。口径与边界见 `TradeFeeRates`。
+   *
+   * ⚠ **没有编辑框**：唯一的写入路径是 `trade:costApply`（从成本反解）。
+   */
+  tradeCosts: TradeFeeRates
+  /**
+   * 上面那个费率的来路。缺省 = 出厂默认。
+   *
+   * **单独一个顶层键而不是塞进 `tradeCosts`**：`sanitizeSettings` 是逐顶层键修的
+   * ⇒ 来路这个对象改坏了不该把一个校正对了的费率一起丢掉。
+   */
+  tradeCostsSource?: TradeFeeSource
   /**
    * 灵敏度三档：得分线与票数线的松紧（`SENSITIVITY_PRESETS`，src/core/params.ts）。
    *

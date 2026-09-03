@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { applyTrade, isTradeError, replayTrades, resolveDecision, t1SellNotice } from '@main/trades/ledger'
+import {
+  applyTrade,
+  isTradeError,
+  replayLedger,
+  replayTrades,
+  resolveDecision,
+  t1SellNotice,
+} from '@main/trades/ledger'
 import { DEFAULT_COSTS, buyFees, sellFees } from '../../../src/backtest/costs'
 
 /**
@@ -80,6 +87,144 @@ describe('applyTrade', () => {
   })
 })
 
+/*
+  现金分红（017，2026-09-03 用户拍板「扣减摊薄成本」）。
+
+  判据是这张账的价格口径：成本与展示价都是**不复权**的（docs/03 §2.3），
+  而除权那天价格自己会掉下来。成本不跟着掉 ⇒ 界面显示一段假浮亏，
+  止损缓冲被凭空吃掉。
+*/
+describe('applyTrade · 现金分红', () => {
+  const ok = (outcome: ReturnType<typeof applyTrade>) => {
+    if (isTradeError(outcome)) throw new Error(`不该报错：${outcome.error}`)
+    return outcome
+  }
+
+  it('按每股派现扣减摊薄成本，股数一个不变', () => {
+    const out = ok(
+      applyTrade({ shares: 1000, cost: 10 }, { side: 'DIVIDEND', price: 0.3, shares: 1000, board: 'MAIN' })
+    )
+    expect(out.position).toEqual({ shares: 1000, cost: 9.7 })
+    // **不计入已实现盈亏**：那笔钱要等卖出时才结转，两处都算会数两遍
+    expect(out.realized).toBeNull()
+    // 不是成交 ⇒ 没有佣金也没有税
+    expect(out.fee).toBe(0)
+    expect(out.peakScale).toBe(1)
+  })
+
+  it('分红股数与持股数不一致时，按**持股数**摊 —— 那笔钱是事实，摊法只有一种算得对', () => {
+    // 用户按公告的股数填了 2000，而现在只持有 1000 股 ⇒ 到账 600 摊到 1000 股上
+    const out = ok(
+      applyTrade({ shares: 1000, cost: 10 }, { side: 'DIVIDEND', price: 0.3, shares: 2000, board: 'MAIN' })
+    )
+    expect(out.position?.cost).toBeCloseTo(10 - 600 / 1000, 4)
+  })
+
+  it('累计分红超过成本时成本夹在 0，**超出部分进 realized**（不丢、不让成本变负）', () => {
+    const out = ok(
+      applyTrade({ shares: 1000, cost: 0.2 }, { side: 'DIVIDEND', price: 0.3, shares: 1000, board: 'MAIN' })
+    )
+    // 负成本会让浮亏百分比与止损线一起失去意义
+    expect(out.position).toEqual({ shares: 1000, cost: 0 })
+    // 丢掉等于凭空少一笔钱：(0.3 − 0.2) × 1000
+    expect(out.realized).toBeCloseTo(100, 2)
+  })
+
+  it('没有持仓时分红被拒绝 —— 无从摊到成本上', () => {
+    expect(
+      isTradeError(applyTrade(null, { side: 'DIVIDEND', price: 0.3, shares: 1000, board: 'MAIN' }))
+    ).toBe(true)
+  })
+
+  it('每股派现必须是正数', () => {
+    expect(
+      isTradeError(
+        applyTrade({ shares: 1000, cost: 10 }, { side: 'DIVIDEND', price: 0, shares: 1000, board: 'MAIN' })
+      )
+    ).toBe(true)
+  })
+})
+
+/*
+  送股 / 转增（017）。
+
+  `peakScale` 是这一组用例的重点：不缩放 `position.peak_price` 的后果**不是**
+  「多一条提醒」，而是移动止损与回撤减仓立刻读出一个假回撤（10 送 10 就是 −50%）
+  并天天触发 —— 与 009 头注释里 `acceptLoss` 不重设 peak 的那个失效形状一模一样。
+*/
+describe('applyTrade · 送股 / 转增', () => {
+  const ok = (outcome: ReturnType<typeof applyTrade>) => {
+    if (isTradeError(outcome)) throw new Error(`不该报错：${outcome.error}`)
+    return outcome
+  }
+
+  it('10 送 10：股数翻倍、成本减半、**总成本恒定**', () => {
+    const out = ok(
+      applyTrade({ shares: 1000, cost: 10 }, { side: 'SPLIT', price: 0, shares: 1000, board: 'MAIN' })
+    )
+    expect(out.position).toEqual({ shares: 2000, cost: 5 })
+    expect(out.position!.cost * out.position!.shares).toBeCloseTo(10 * 1000, 2)
+    expect(out.fee).toBe(0)
+    expect(out.realized).toBeNull()
+  })
+
+  it('peakScale = 持股数 / 送转后股数 —— 调用方据此缩放回撤参考点', () => {
+    const out = ok(
+      applyTrade({ shares: 1000, cost: 10 }, { side: 'SPLIT', price: 0, shares: 300, board: 'MAIN' })
+    )
+    expect(out.peakScale).toBeCloseTo(1000 / 1300, 6)
+  })
+
+  it('送股的 price 允许是 0 —— **你一分钱没付，0 是事实**（不是拿假值冒充）', () => {
+    // 对照：其余四种 side 的 price <= 0 一律拒绝
+    expect(isTradeError(applyTrade({ shares: 100, cost: 10 }, { side: 'SPLIT', price: 0, shares: 100, board: 'MAIN' }))).toBe(false)
+    expect(isTradeError(applyTrade({ shares: 100, cost: 10 }, { side: 'SELL', price: 0, shares: 100, board: 'MAIN' }))).toBe(true)
+  })
+
+  it('没有持仓时送转被拒绝', () => {
+    expect(isTradeError(applyTrade(null, { side: 'SPLIT', price: 0, shares: 100, board: 'MAIN' }))).toBe(true)
+  })
+})
+
+/*
+  建仓（`OPENING`，017 起可以由用户自己录，且价可选含不含费）。
+
+  **缺省按「已含费」** —— 缺这个键的只有 017 之前落库的行，而它们全部取自
+  `position.cost`（按定义就是含费的摊薄成本）。反过来把缺省定成「不含」，
+  升级那一刻全库的期初成本会被凭空补一笔费用。
+*/
+describe('applyTrade · 建仓', () => {
+  const ok = (outcome: ReturnType<typeof applyTrade>) => {
+    if (isTradeError(outcome)) throw new Error(`不该报错：${outcome.error}`)
+    return outcome
+  }
+
+  it('缺省（老行）按「价已含费」：price 直接是成本，fee 落 0', () => {
+    const out = ok(applyTrade(null, { side: 'OPENING', price: 11, shares: 1000, board: 'MAIN' }))
+    expect(out.position).toEqual({ shares: 1000, cost: 11 })
+    // 这个 0 是「不知道」，不是「没有」（007 头注释）
+    expect(out.fee).toBe(0)
+  })
+
+  it('feeIncluded: false 时按费率补算一笔并摊进成本', () => {
+    const out = ok(
+      applyTrade(null, { side: 'OPENING', price: 11, shares: 1000, board: 'MAIN', feeIncluded: false })
+    )
+    const fee = buyFees(11 * 1000, DEFAULT_COSTS)
+    expect(out.fee).toBeCloseTo(fee, 2)
+    expect(out.position?.cost).toBeCloseTo((11 * 1000 + fee) / 1000, 4)
+    // 含费的那一档成本更低 —— 差的正好是那笔费用
+    expect(out.position!.cost).toBeGreaterThan(11)
+  })
+
+  it('建仓**重设**整个持仓，不叠加 —— 它是账本的起点', () => {
+    const out = ok(
+      applyTrade({ shares: 5000, cost: 99 }, { side: 'OPENING', price: 11, shares: 1000, board: 'MAIN' })
+    )
+    expect(out.position).toEqual({ shares: 1000, cost: 11 })
+  })
+})
+
 describe('replayTrades', () => {
   it('期初建仓的 price 直接当成本，**不再收一次费**', () => {
     // 那个 price 就是当初已经含费的成本价（或者用户自己估的），再收一次是重复计费
@@ -129,6 +274,109 @@ describe('replayTrades', () => {
       'MAIN'
     )
     expect(position?.shares).toBe(1500)
+  })
+})
+
+/*
+  `replayLedger`（017）：重放不只给持仓，还给**逐行的派生列**。
+
+  这一组用例钉住的是本次一起修掉的一个旧缺陷：`realized` 是插入时算好存下的、
+  重放不改写 ⇒ 删掉第一笔买入之后，后面那些卖出的已实现盈亏仍按旧成本算，
+  `sumRealized` 给出一个错的数，**而没有任何东西会报警**。
+*/
+describe('replayLedger', () => {
+  const CHEAP: typeof DEFAULT_COSTS = { ...DEFAULT_COSTS, commissionRate: 0.0001 }
+
+  it('默认沿用**行上存着的** fee —— 删一笔不相干的流水，不该把历史费用按今天的费率改一遍', () => {
+    const rows = [
+      { id: 'a', side: 'BUY' as const, price: 10, shares: 1000, fee: 30 },
+      { id: 'b', side: 'BUY' as const, price: 12, shares: 1000, fee: 40 },
+    ]
+    const result = replayLedger(rows, 'MAIN', DEFAULT_COSTS)
+    expect(result.rows.map((row) => row.fee)).toEqual([30, 40])
+    // 成本里含的是那两笔存着的费用，不是按 DEFAULT_COSTS 重算的
+    expect(result.position?.cost).toBeCloseTo((10 * 1000 + 30 + 12 * 1000 + 40) / 2000, 4)
+  })
+
+  it('refee 时按传进来的费率重算每一笔', () => {
+    const rows = [{ id: 'a', side: 'BUY' as const, price: 10, shares: 1000, fee: 999 }]
+    const result = replayLedger(rows, 'MAIN', CHEAP, { refee: true })
+    expect(result.rows[0]?.fee).toBeCloseTo(buyFees(10_000, CHEAP), 2)
+    expect(result.rows[0]?.fee).not.toBe(999)
+  })
+
+  it('refee **跳过「价已含费」的建仓** —— 那个 price 就是摊薄成本，补一笔费用等于凭空改掉它', () => {
+    const included = replayLedger(
+      [{ id: 'a', side: 'OPENING', price: 11, shares: 1000, fee: 0, feeIncluded: true }],
+      'MAIN',
+      CHEAP,
+      { refee: true }
+    )
+    expect(included.rows[0]?.fee).toBe(0)
+    expect(included.position).toEqual({ shares: 1000, cost: 11 })
+
+    // 对照：明确「不含费」的那种照样重算
+    const bare = replayLedger(
+      [{ id: 'a', side: 'OPENING', price: 11, shares: 1000, fee: 0, feeIncluded: false }],
+      'MAIN',
+      CHEAP,
+      { refee: true }
+    )
+    expect(bare.rows[0]?.fee).toBeCloseTo(buyFees(11_000, CHEAP), 2)
+  })
+
+  it('**realized 逐行重算**：删掉第一笔买入之后，后面那笔卖出的已实现盈亏跟着变', () => {
+    const before = replayLedger(
+      [
+        { id: 'buy1', side: 'BUY', price: 10, shares: 1000, fee: 5 },
+        { id: 'buy2', side: 'BUY', price: 20, shares: 1000, fee: 5 },
+        { id: 'sell', side: 'SELL', price: 30, shares: 1000, fee: 5 },
+      ],
+      'MAIN',
+      DEFAULT_COSTS
+    )
+    // 成本 = (10000 + 5 + 20000 + 5) / 2000 = 15.005 ⇒ 卖 1000 股赚 (30 − 15.005) × 1000 − 5
+    expect(before.rows.at(-1)?.realized).toBeCloseTo((30 - 15.005) * 1000 - 5, 2)
+
+    const after = replayLedger(
+      [
+        { id: 'buy2', side: 'BUY', price: 20, shares: 1000, fee: 5 },
+        { id: 'sell', side: 'SELL', price: 30, shares: 1000, fee: 5 },
+      ],
+      'MAIN',
+      DEFAULT_COSTS
+    )
+    expect(after.rows.at(-1)?.realized).toBeCloseTo((30 - 20.005) * 1000 - 5, 2)
+  })
+
+  it('买入不给 realized —— **null 不是 0**（约束 4）', () => {
+    const result = replayLedger([{ id: 'a', side: 'BUY', price: 10, shares: 100, fee: 5 }], 'MAIN')
+    expect(result.rows[0]?.realized).toBeNull()
+  })
+
+  it('跳过的行**列名报出来**，调用方据此判「这一笔录不进去」', () => {
+    const result = replayLedger(
+      [
+        { id: 'open', side: 'OPENING', price: 10, shares: 1000 },
+        { id: 'bad', side: 'SELL', price: 11, shares: 5000 },
+      ],
+      'MAIN'
+    )
+    expect(result.skipped.map((row) => row.id)).toEqual(['bad'])
+    expect(result.skipped[0]?.reason).toContain('超过持有')
+  })
+
+  it('peakScale 是全部送转的累积 —— 连着两次 10 送 10 就是 1/4', () => {
+    const result = replayLedger(
+      [
+        { id: 'open', side: 'OPENING', price: 10, shares: 1000 },
+        { id: 's1', side: 'SPLIT', price: 0, shares: 1000 },
+        { id: 's2', side: 'SPLIT', price: 0, shares: 2000 },
+      ],
+      'MAIN'
+    )
+    expect(result.peakScale).toBeCloseTo(0.25, 6)
+    expect(result.position).toEqual({ shares: 4000, cost: 2.5 })
   })
 })
 

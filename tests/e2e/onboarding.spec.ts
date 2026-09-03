@@ -193,6 +193,20 @@ test.describe('面板五屏', () => {
     await expect(panel.getByText(/已标定 1/)).toBeVisible()
     await expect(panel.getByText(/未测 \d+/)).toBeVisible()
 
+    /*
+      交易费率（017）**只读，没有编辑框**。判据与参数表同一条（docs/01 §5.5）：
+      那四个数用户没有依据去填，而摊薄成本是他每天都在看的可核对的事实
+      ⇒ 唯一的写入路径是持仓页那个「校正成本」（反解佣金率）。
+
+      这一条反过来钉着：日后谁想「顺手给个输入框」，这里会红。
+    */
+    await expect(panel.getByText('费率（只读）')).toBeVisible()
+    await expect(panel.getByText(/成本与券商对不上/)).toBeVisible()
+    // 未校正过时必须说出来 —— 一个来路不明的费率与一个未标定的参数是同一类东西
+    await expect(panel.getByText(/出厂默认档/)).toBeVisible()
+    // 那句「回测与影子不用这份费率」不许省：少了它两边盈亏会被直接相减
+    await expect(panel.getByText(/回测与影子运行不用这份费率/)).toBeVisible()
+
     // 免责声明在「关于」里随时可查（docs/01 §8）
     await expect(panel.getByText('不构成任何投资建议')).toBeVisible()
   })

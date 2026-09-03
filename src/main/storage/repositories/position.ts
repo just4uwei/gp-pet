@@ -83,6 +83,35 @@ export class PositionRepo {
   }
 
   /**
+   * 直接写 `peak_price`（**可以往下写**，与只升的 `bumpPeak` 并列，017）。
+   *
+   * ## 谁需要往下写
+   *
+   * 送股 / 转增：10 送 10 之后价格腰斩，而 `peak_price` 停在除权前
+   * ⇒ 移动止损与回撤减仓立刻读出一个 **−50% 的假回撤**，天天触发。
+   * 缩放它是唯一算得对的做法（缩放因子由 `applyTrade` 的 `peakScale` 给）。
+   *
+   * ## 为什么这不叫篡改事实
+   *
+   * 论证与 `acceptLoss` 那段是同一条：`peak_price` **本来就不是「历史最高价」**，
+   * 而是**风控用的回撤参考点** —— `bumpPeak` 没值时拿 `cost` 兜底，
+   * `addTrade` 还会显式把它抬到成本价。重设一个控制参考点不是篡改事实，
+   * 而除权之后那个旧参考点指向的是一个**已经不存在的价格刻度**。
+   *
+   * ⚠ 一律夹在成本价之上（`MAX(cost, ?)`）：持有期最高价至少是买入价，
+   * 低于成本的 peak 会让移动止损拿一个比成本还低的参考点算回撤（docs/05 §2.3）。
+   * ⚠ 价格口径必须**不复权**，与 `cost` / `stop_floor` 一致（docs/03 §2.3）。
+   */
+  setPeak(code: SecCode, price: number): boolean {
+    if (!Number.isFinite(price) || price <= 0) return false
+    return (
+      this.db
+        .prepare(`UPDATE position SET peak_price = MAX(cost, ?) WHERE code = ?`)
+        .run(price, code).changes > 0
+    )
+  }
+
+  /**
    * 用户确认「接受这一段亏损」，把止损线顺延到 `stopFloor`。
    * 没有这行持仓时什么都不做 —— 不给一条不存在的持仓建止损线。
    *

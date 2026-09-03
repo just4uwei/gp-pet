@@ -12,9 +12,48 @@ import type { AppSettings } from '@shared/ipc-types'
 /** 'HH:MM' */
 const TimeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, '时间格式应为 HH:MM')
 
+/**
+ * 用户自己的交易费率（017）。**settings.json 里没有编辑框对应的入口** ——
+ * 它由「校正成本」反解写入（`CostCalibration`）。但文件是用户可以手改的，
+ * 所以照样要逐项校验。
+ *
+ * 上界不是洁癖，是防手滑：把「万 2.5」当成「2.5」填进去（差 10000 倍）会让
+ * 每一笔买入的成本价变成天文数字，而那个数会一路进止损线 ——
+ * 有上界时它回退到默认值并留一行痕，没有上界时它静默生效。
+ *
+ * 下界一律 `min(0)` 而不是 `positive()`：**0 都是合法取值** ——
+ * 券商可以免最低佣金，场内基金本来就免印花税与过户费。
+ *
+ * `COMMISSION_RATE_MAX` 同时是反解的搜索上界，两处必须是同一个数：
+ * schema 放过一个反解够不到的值，会让「手改 settings.json → 校正一次 → 数字回跳」
+ * 变成一个查不清的现象。
+ */
+export const COMMISSION_RATE_MAX = 0.005
+
+const TradeFeeRatesSchema = z.object({
+  // 千 5 已经比 2000 年代的水平还高，真实档位在万 0.85 ~ 万 3
+  commissionRate: z
+    .number()
+    .min(0)
+    .max(COMMISSION_RATE_MAX, '佣金率不该超过千分之五，检查一下是不是多了几个 0'),
+  minCommission: z.number().min(0).max(100, '单笔最低佣金不该超过 100 元'),
+  stampTaxRate: z.number().min(0).max(0.005, '印花税率不该超过千分之五'),
+  transferFeeRate: z.number().min(0).max(0.001, '过户费率不该超过万分之十'),
+})
+
+/** 费率的来路。整块坏掉时只丢来路、不丢费率（见 `AppSettings.tradeCostsSource`） */
+const TradeFeeSourceSchema = z.object({
+  code: z.string().min(1),
+  targetCost: z.number().positive(),
+  commissionRate: z.number().min(0).max(COMMISSION_RATE_MAX),
+  at: z.number().int().positive(),
+})
+
 export const AppSettingsSchema = z.object({
   // 10–120s：低于 10s 对免费接口是滥用（docs/03 §2.4）
   pollIntervalSec: z.number().int().min(10).max(120),
+  tradeCosts: TradeFeeRatesSchema,
+  tradeCostsSource: TradeFeeSourceSchema.optional(),
   sensitivity: z.enum(['SENSITIVE', 'BALANCED', 'CONSERVATIVE']),
   alertLevelOffset: z.union([z.literal(-1), z.literal(0), z.literal(1)]),
   quietHours: z.array(z.object({ start: TimeSchema, end: TimeSchema })),
@@ -29,6 +68,22 @@ export const AppSettingsSchema = z.object({
 
 export const DEFAULT_SETTINGS: AppSettings = {
   pollIntervalSec: 30,
+  /*
+    出厂费率**逐位等于** `backtest/costs.ts` 的 `DEFAULT_COSTS` 对应四项
+    ⇒ 没校正过的用户，账本行为一个字不变。
+
+    ⚠ 这里刻意**写字面量而不是 import `DEFAULT_COSTS`**：那份是回测与影子的固定假设，
+    两者从此是两个独立的数（见 `TradeFeeRates` 头注释）。import 会造出一条
+    「改了回测假设就悄悄改了所有用户的账本费率」的耦合，而它谁都不会想到去查。
+    `tests/unit/main/settings.test.ts` 有一条用例钉着两者眼下相等 ——
+    它变红是提醒你「两份数分叉了，确认是有意的」，不是让你把这里改成 import。
+  */
+  tradeCosts: {
+    commissionRate: 0.00025,
+    minCommission: 5,
+    stampTaxRate: 0.001,
+    transferFeeRate: 0.00001,
+  },
   sensitivity: 'BALANCED',
   alertLevelOffset: 0,
   quietHours: [],
@@ -76,6 +131,7 @@ export function sanitizeSettings(raw: unknown): SanitizeResult {
   // exactOptionalPropertyTypes 下它与「没有这个键」不等价
   if (settings.dataDir === undefined) delete settings.dataDir
   if (settings.disclaimerAcceptedAt === undefined) delete settings.disclaimerAcceptedAt
+  if (settings.tradeCostsSource === undefined) delete settings.tradeCostsSource
 
   return { settings, repaired }
 }

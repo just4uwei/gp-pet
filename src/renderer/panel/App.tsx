@@ -32,6 +32,7 @@ import type {
   QuoteTick,
   SignalRecord,
   TradeLedger,
+  TradeSide,
   WatchItem,
   WatchPointView,
 } from '@shared/ipc-types'
@@ -829,7 +830,16 @@ export function App(): React.JSX.Element {
    * 不刷的话用户看到的是「录完了但列表上还是没持仓」。
    */
   const submitTrade = useCallback(
-    (draft: { side: 'BUY' | 'SELL'; price: number; shares: number; tradedAt: number; note?: string }): void => {
+    (draft: {
+      side: TradeSide
+      price: number
+      shares: number
+      tradedAt: number
+      tradedAtExact?: number
+      feeIncluded?: boolean
+      signalId?: string
+      note?: string
+    }): void => {
       const code = drawer?.code
       if (code === undefined) return
       setTradeBusy(true)
@@ -856,6 +866,20 @@ export function App(): React.JSX.Element {
         })
         .catch((err: unknown) => setError(errorText(err)))
         .finally(() => setTradeBusy(false))
+    },
+    [reload]
+  )
+
+  /**
+   * 「改一笔」与「校正成本」都是由抽屉里的组件自己发的 IPC（它们各有自己的表单状态），
+   * 交回来的只是结果。这里做的两件事与录入完全一样：换掉账本 + `reload()`
+   * —— 后者是必须的，成本变了会开/关止损类强制提醒那条通道（docs/05 §2.3），
+   * 不刷的话自选行上的持仓角标与状态还是旧的。
+   */
+  const ledgerChanged = useCallback(
+    (next: TradeLedger): void => {
+      setLedger(next)
+      void reload()
     },
     [reload]
   )
@@ -1392,6 +1416,7 @@ export function App(): React.JSX.Element {
           })()}
           onSubmitTrade={submitTrade}
           onRemoveTrade={removeTrade}
+          onLedgerChanged={ledgerChanged}
           tradeBusy={tradeBusy}
           {...(drawer.aiSignalId === undefined ? {} : { aiSignalId: drawer.aiSignalId })}
           {...(drawer.stopIntent === true ? { stopIntent: true } : {})}

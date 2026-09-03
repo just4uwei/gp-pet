@@ -20,7 +20,14 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { SecCode } from '@core/types'
-import type { PositionView, QuoteTick, SignalRecord, TradeLedger, WatchPointView } from '@shared/ipc-types'
+import type {
+  PositionView,
+  QuoteTick,
+  SignalRecord,
+  TradeLedger,
+  TradeSide,
+  WatchPointView,
+} from '@shared/ipc-types'
 import type { SignalGroup } from '@shared/signal-group'
 import { shanghaiDayStartMs } from '@shared/time'
 import { AiPanel } from './AiPanel'
@@ -52,6 +59,7 @@ export function StockDrawer({
   countChips,
   onSubmitTrade,
   onRemoveTrade,
+  onLedgerChanged,
   onStopChanged,
   tradeBusy,
   aiSignalId,
@@ -70,14 +78,25 @@ export function StockDrawer({
   /** 信号行交回上层渲染 —— 展开依据 / AI 的状态在那边，抽屉不该复制一份 */
   renderSignalRow: (record: SignalRecord) => React.JSX.Element
   countChips: React.JSX.Element | null
+  /**
+   * 录一笔流水。**这个形状必须与 `TradePanel.onSubmit` 保持一致** ——
+   * 少列一个可选键不会报错（函数参数是逆变的），但那个键会在这里被静默丢掉。
+   * 2026-08-26 加 `tradedAtExact` / `signalId` 时就漏过一次：靠 `App` 里那个
+   * `...draft` 展开在运行时侥幸传了过去，类型上其实是断的。
+   */
   onSubmitTrade: (draft: {
-    side: 'BUY' | 'SELL'
+    side: TradeSide
     price: number
     shares: number
     tradedAt: number
+    tradedAtExact?: number
+    feeIncluded?: boolean
+    signalId?: string
     note?: string
   }) => void
   onRemoveTrade: (id: string) => void
+  /** 改一笔 / 校正成本之后，把主进程回的新账本交给上层（自选行上的角标要跟着换） */
+  onLedgerChanged: (next: TradeLedger) => void
   /** 止损确认/撤销之后刷新账本里的持仓视图 */
   onStopChanged: (next: PositionView | null) => void
   tradeBusy: boolean
@@ -241,6 +260,7 @@ export function StockDrawer({
               ledger={ledger}
               onSubmit={onSubmitTrade}
               onRemove={onRemoveTrade}
+              onLedgerChanged={onLedgerChanged}
               onStopChanged={onStopChanged}
               onError={onError}
               busy={tradeBusy}

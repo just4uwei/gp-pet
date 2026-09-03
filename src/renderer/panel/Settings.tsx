@@ -26,6 +26,8 @@ import type {
   ParamGap,
   ParamRow,
 } from '@shared/ipc-types'
+import { ratePerThousand, ratePerTenThousand } from '@shared/trade-fees'
+import { shanghaiMdHhmm } from '@shared/time'
 import { DISCLAIMER } from './disclaimer'
 import { AiSettings } from './AiSettings'
 
@@ -282,6 +284,78 @@ function ParamsTable(): React.JSX.Element {
   )
 }
 
+/**
+ * 交易费率（017）。**只读，没有编辑框。**
+ *
+ * ## 为什么不给编辑框
+ *
+ * 与「设置页不给参数编辑框」（docs/01 §5.5）是同一条取舍：
+ * 这四个数用户**没有依据**去填，而**摊薄成本是他每天都在看的可核对的事实**。
+ * 所以唯一的写入路径是持仓页上那个「校正成本」—— 抄一个成本，软件反解佣金率。
+ *
+ * ## 这一屏必须说出来的两件事
+ *
+ * 1. **它是怎么来的**（出厂默认 / 从哪只票反解的）。一个来路不明的费率
+ *    与一个未标定的策略参数是同一类东西（ADR-0003）：它看起来像事实。
+ * 2. **回测与影子运行不用它。** 那两处一律用出厂假设，否则用户校正一次费率
+ *    就让影子净值曲线分一段，而分段前后拆不开就没法引用。
+ *    代价是「实盘盈亏 vs 影子绩效」多一项已知口径差 —— 如实写出来。
+ */
+function TradeCosts({ settings }: { settings: AppSettings }): React.JSX.Element {
+  const rates = settings.tradeCosts
+  const source = settings.tradeCostsSource
+  return (
+    <Section title="交易成本">
+      <div className="px-3.5 py-3">
+        <div className="text-xs text-white/75">费率（只读）</div>
+        <div className="mt-0.5 text-[10px] leading-snug text-white/35">
+          这里不给编辑框：这四个数你没有依据去填，而<span className="text-white/55">摊薄成本</span>
+          你每天都在看。要改就去某只票的「持仓」页点
+          <span className="text-white/55">「成本与券商对不上？校正一下」</span>
+          —— 填一个真实成本，软件从流水反解你的佣金率。
+        </div>
+
+        <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
+          <dt className="text-white/40">佣金（双边）</dt>
+          <dd className="font-mono text-white/70">{ratePerTenThousand(rates.commissionRate)}</dd>
+          <dt className="text-white/40">单笔最低佣金</dt>
+          <dd className="font-mono text-white/70">{rates.minCommission} 元</dd>
+          <dt className="text-white/40">印花税（仅卖出）</dt>
+          <dd className="font-mono text-white/70">{ratePerThousand(rates.stampTaxRate)}</dd>
+          <dt className="text-white/40">过户费（双边）</dt>
+          <dd className="font-mono text-white/70">{ratePerTenThousand(rates.transferFeeRate)}</dd>
+        </dl>
+
+        <p className="mt-2 text-[10px] leading-snug text-white/35">
+          {source === undefined ? (
+            <>
+              这是<span className="text-amber-200/70">出厂默认档</span>
+              （A 股散户常见档位的猜测，真实档位在万 0.85 ~ 万 3）—— 还没有校正过。
+              成本价与券商对不上多半就是这个原因。
+            </>
+          ) : (
+            <>
+              佣金率是 {shanghaiMdHhmm(source.at)} 从
+              <span className="font-mono text-white/55"> {source.code} </span>
+              的成本 <span className="font-mono text-white/55">{source.targetCost.toFixed(3)}</span>{' '}
+              反解出来的。另外三项没动过：印花税与过户费是交易所与国家规定，
+              而最低佣金与佣金率在同一个 max() 里，一个方程解不了两个未知数。
+            </>
+          )}
+        </p>
+
+        <p className="mt-2 rounded border border-white/10 bg-black/20 px-2 py-1.5 text-[10px] leading-snug text-white/40">
+          ⚠ <span className="text-white/60">回测与影子运行不用这份费率</span>，
+          它们一律按出厂假设（佣金万 2.5 / 最低 5 元、印花税千 1、过户费万 0.1、滑点 0.1%）。
+          跟着改的话，你每校正一次费率影子那条净值曲线就要分一段，而分段前后拆不开就没法引用。
+          代价是<span className="text-white/60">实盘盈亏与影子绩效之间多一项口径差</span>，
+          两个数不能直接相减。
+        </p>
+      </div>
+    </Section>
+  )
+}
+
 export function Settings({
   onError,
   onAiChanged,
@@ -469,6 +543,8 @@ export function Settings({
           />
         </Row>
       </Section>
+
+      <TradeCosts settings={settings} />
 
       {/* AI 解读是**只读的解释层**：它不参与信号、闸门、状态点与影子运行。
           配置整块住在 ai.json，不在 AppSettings 里 —— 见 AiSettings.tsx 头注释 */}

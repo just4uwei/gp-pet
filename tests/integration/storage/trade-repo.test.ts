@@ -113,3 +113,104 @@ describe('TradeRepo 的 016 四列', () => {
     expect(rows[0]?.signalId).toBe('sig-7')
   })
 })
+
+/**
+ * 017 的那一列（`fee_included`）与两种新 side。
+ *
+ * 这一组钉的同样是「NULL 与有值必须分得开」：`fee_included` 为 NULL 的行是
+ * **017 之前落库的**，它们的 price 取自 `position.cost`（按定义含费）——
+ * 折成 `false` 会让升级那一刻全库的期初成本被凭空补一笔费用。
+ */
+describe('TradeRepo 的 017 列与新 side', () => {
+  it('不填时 feeIncluded 是 undefined —— 老行的语义是「已含费」，不是 false', async () => {
+    const storage = await openMemory()
+    storage.trades.insert(trade('t-10', { side: 'OPENING' }))
+    const row = storage.trades.get('t-10')
+    expect(row?.feeIncluded).toBeUndefined()
+    expect(row?.feeIncluded).not.toBe(false)
+  })
+
+  it('true / false 都原样往返', async () => {
+    const storage = await openMemory()
+    storage.trades.insert(trade('t-11', { side: 'OPENING', feeIncluded: false }))
+    storage.trades.insert(trade('t-12', { side: 'OPENING', feeIncluded: true }))
+    expect(storage.trades.get('t-11')?.feeIncluded).toBe(false)
+    expect(storage.trades.get('t-12')?.feeIncluded).toBe(true)
+  })
+
+  it('DIVIDEND / SPLIT 存得进也读得出（side 列没有 CHECK 约束）', async () => {
+    const storage = await openMemory()
+    storage.trades.insert(trade('d-1', { side: 'DIVIDEND', price: 0.3, shares: 1000, fee: 0 }))
+    // 送股的 price **真的是 0** —— 你一分钱没付，那是事实不是缺省
+    storage.trades.insert(trade('s-1', { side: 'SPLIT', price: 0, shares: 1000, fee: 0 }))
+    expect(storage.trades.get('d-1')?.side).toBe('DIVIDEND')
+    expect(storage.trades.get('s-1')?.price).toBe(0)
+  })
+
+  it('sumDividends 只数分红，且**不与 sumRealized 相加**（那会把同一笔钱数两遍）', async () => {
+    const storage = await openMemory()
+    storage.trades.insert(trade('b-1', { side: 'BUY' }))
+    storage.trades.insert(trade('d-1', { side: 'DIVIDEND', price: 0.3, shares: 1000, fee: 0 }))
+    storage.trades.insert(trade('d-2', { side: 'DIVIDEND', price: 0.2, shares: 1000, fee: 0 }))
+    storage.trades.insert(trade('x-1', { side: 'SELL', shares: 500, realized: 123 }))
+    expect(storage.trades.sumDividends('SH600000')).toBeCloseTo(500, 6)
+    expect(storage.trades.sumRealized('SH600000')).toBeCloseTo(123, 6)
+  })
+
+  it('送转不占 T+1 的当日买入额度 —— 送来的股票到账当日就可卖', async () => {
+    const storage = await openMemory()
+    storage.trades.insert(trade('b-1', { side: 'BUY', shares: 1000, tradedAt: T0 }))
+    storage.trades.insert(trade('s-1', { side: 'SPLIT', price: 0, shares: 5000, tradedAt: T0 }))
+    storage.trades.insert(trade('d-1', { side: 'DIVIDEND', price: 1, shares: 5000, tradedAt: T0 }))
+    expect(storage.trades.boughtSharesSince('SH600000', T0)).toBe(1000)
+  })
+
+  it('update 覆盖每一列，但 **created_at 不动** —— 它是同日多笔的兜底排序键', async () => {
+    const storage = await openMemory()
+    storage.trades.insert(trade('t-20', { signalId: 'sig-1', tradedAtExact: T0 + 60_000 }))
+    const before = storage.trades.get('t-20')
+    expect(before).not.toBeNull()
+
+    storage.trades.update({ ...before!, shares: 500, price: 20, createdAt: T0 + 999_999 })
+    const after = storage.trades.get('t-20')
+    expect(after?.shares).toBe(500)
+    expect(after?.price).toBe(20)
+    expect(after?.createdAt).toBe(T0)
+    // 改一笔不该丢掉「照哪条提醒做的」—— 那正是它比「删掉重录」强的地方
+    expect(after?.signalId).toBe('sig-1')
+    expect(after?.tradedAtExact).toBe(T0 + 60_000)
+  })
+
+  it('update 能把可空列清回 NULL（`undefined` 一律落 NULL，不是「保持原值」）', async () => {
+    const storage = await openMemory()
+    storage.trades.insert(trade('t-21', { signalId: 'sig-1', decisionPrice: 9.9, note: '旧备注' }))
+    const cleared = { ...storage.trades.get('t-21')! }
+    delete cleared.signalId
+    delete cleared.decisionPrice
+    delete cleared.note
+    storage.trades.update(cleared)
+    const after = storage.trades.get('t-21')
+    expect(after?.signalId).toBeUndefined()
+    expect(after?.decisionPrice).toBeUndefined()
+    expect(after?.note).toBeUndefined()
+  })
+
+  it('setDerived 只动 fee 与 realized，null 落 NULL 而不是 0', async () => {
+    const storage = await openMemory()
+    storage.trades.insert(trade('t-22', { realized: 100 }))
+    storage.trades.setDerived('t-22', 12.5, null)
+    const row = storage.trades.get('t-22')
+    expect(row?.fee).toBe(12.5)
+    // 「不适用」与「刚好打平」必须分得开（约束 4）
+    expect(row?.realized).toBeUndefined()
+    expect(row?.price).toBe(12.34)
+  })
+
+  it('codesWithTrades 去重且**不与自选取交集** —— 卖光移出自选的票照样要重算', async () => {
+    const storage = await openMemory()
+    storage.trades.insert(trade('a-1', { code: 'SH600000' }))
+    storage.trades.insert(trade('a-2', { code: 'SH600000' }))
+    storage.trades.insert(trade('b-1', { code: 'SZ000001' }))
+    expect(storage.trades.codesWithTrades()).toEqual(['SH600000', 'SZ000001'])
+  })
+})

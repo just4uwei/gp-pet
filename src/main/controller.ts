@@ -51,10 +51,15 @@ import type {
   ShadowTradeView,
   SignalEvidence,
   SignalRecord,
+  CostCalibration,
+  CostCalibrationResult,
+  FeeAudit,
   TradeDecisionOption,
   TradeDraft,
+  TradeFeeRates,
   TradeLedger,
   TradePreview,
+  TradeUpdate,
   TradeView,
   WatchItem,
   WatchPointDraft,
@@ -141,7 +146,18 @@ import {
   impossibleConditions,
   isWatchMetric,
 } from './watch/metrics'
-import { applyTrade, isTradeError, replayTrades, resolveDecision, t1SellNotice } from './trades/ledger'
+import {
+  applyTrade,
+  isTradeError,
+  replayLedger,
+  resolveDecision,
+  t1SellNotice,
+  type LedgerPosition,
+  type LedgerReplayRow,
+  type TradeInput,
+} from './trades/ledger'
+import type { CostModel } from '../backtest/costs'
+import { ledgerCosts, ratePerTenThousand, solveCommissionRate } from './trades/fees'
 import { splitCode } from '@core/code'
 import type { TradeRow } from './storage/repositories/trade'
 import type { WatchPointRow } from './storage/repositories/watch'
@@ -207,6 +223,8 @@ function toTradeLogView(row: TradeRow): TradeView {
   }
   if (row.realized !== undefined) view.realized = row.realized
   if (row.note !== undefined) view.note = row.note
+  // 017：缺省 = 老行（按「已含费」处理），不许在这一层折成 false
+  if (row.feeIncluded !== undefined) view.feeIncluded = row.feeIncluded
   // 016 那四列：缺省就是缺省，别在这一层补默认值（约束 4）
   if (row.tradedAtExact !== undefined) view.tradedAtExact = row.tradedAtExact
   if (row.signalId !== undefined) view.signalId = row.signalId
@@ -913,7 +931,9 @@ export class AppController {
   /** 某只票的账本视图。汇总在这一层算，渲染层不再实现一遍口径 */
   tradeLedger(code: SecCode): TradeLedger {
     const layer = this.data
-    if (!layer) return { code, trades: [], realizedTotal: 0, feeTotal: 0, position: null }
+    if (!layer) {
+      return { code, trades: [], realizedTotal: 0, feeTotal: 0, dividendTotal: 0, position: null }
+    }
     const rows = layer.storage.trades.listByCode(code)
     return {
       code,
@@ -921,6 +941,9 @@ export class AppController {
       trades: [...rows].reverse().map(toTradeLogView),
       realizedTotal: layer.storage.trades.sumRealized(code),
       feeTotal: layer.storage.trades.sumFees(code),
+      // 与已实现盈亏**分两行**：分红走扣减成本，那笔钱要等卖出时才进 realized，
+      // 相加会把同一笔钱数两遍（017 头注释）
+      dividendTotal: layer.storage.trades.sumDividends(code),
       /*
         ⚠ 必须走 `toPositionView()`，不能直接把仓储那行 `Position` 丢出去（2026-08-15 修）。
 
@@ -952,6 +975,197 @@ export class AppController {
     return splitCode(code)?.board ?? 'MAIN'
   }
 
+  /**
+   * 记账用的费率（017）。**用户自己的那份，不是 `DEFAULT_COSTS`。**
+   *
+   * ⚠ 回测与影子运行**不走这里** —— 它们一律用 `DEFAULT_COSTS`
+   * （理由在 `shared/ipc-types.ts` 的 `TradeFeeRates`：跟着用户改会让影子净值
+   * 每校正一次就分一段，而分段前后拆不开就没法引用）。
+   */
+  private ledgerCostModel(layer: DataLayer): CostModel {
+    return ledgerCosts(layer.settings.get().tradeCosts)
+  }
+
+  /** 落库行 → 重放入参。`feeIncluded` 的缺省语义（老行 = 已含费）交给 `applyTrade` 判 */
+  private toReplayRow(row: TradeRow): LedgerReplayRow {
+    return {
+      id: row.id,
+      side: row.side,
+      price: row.price,
+      shares: row.shares,
+      fee: row.fee,
+      ...(row.feeIncluded === undefined ? {} : { feeIncluded: row.feeIncluded }),
+    }
+  }
+
+  /**
+   * 按剩余流水重建这只票的账：**逐行写回派生列 + 重建持仓**。
+   * `trade:update` / `trade:remove` / 「校正成本」的全库重算共用这一条路。
+   *
+   * ## 为什么必须连 `realized` 一起写回
+   *
+   * `realized` 依赖它**前面**每一行（成本是逐步摊出来的）。2026-09-03 之前
+   * 这里只重建持仓、不改 `realized` ⇒ 删掉第一笔买入之后，后面那些卖出的
+   * 已实现盈亏仍按旧成本算，`sumRealized` 给出一个错的数
+   * —— 而没有任何东西会报警。这是本次一起修掉的旧缺陷。
+   *
+   * ## `resetPeak`
+   *
+   * 送转的缩放因子**无法从重放里恢复**（`peak_price` 是市场价的滚动最高，
+   * 库里只存最终值）。所以凡是动了含送转的账本，就把回撤参考点重设为
+   * `max(成本, 现价)` —— 论证与 `PositionRepo.setPeak` / `acceptLoss` 同一条。
+   * 取不到现价时退到成本价（**不猜一个价**）。
+   *
+   * 调用方负责把它包进事务：流水改了持仓没改，账就永远对不上。
+   */
+  private rebuildLedger(
+    layer: DataLayer,
+    code: SecCode,
+    opts: { refee?: boolean; resetPeak?: boolean; costs?: CostModel } = {}
+  ): { position: LedgerPosition | null; skipped: { id: string; reason: string }[] } {
+    const rows = layer.storage.trades.listByCode(code)
+    const result = replayLedger(
+      rows.map((row) => this.toReplayRow(row)),
+      this.boardOf(code),
+      opts.costs ?? this.ledgerCostModel(layer),
+      opts.refee === true ? { refee: true } : {}
+    )
+
+    for (const derived of result.rows) {
+      layer.storage.trades.setDerived(derived.id, derived.fee, derived.realized)
+    }
+
+    const held = layer.storage.positions.get(code)
+    if (result.position === null) {
+      if (held !== null) layer.storage.positions.clear(code)
+    } else {
+      /*
+        **只在真的变了的时候才写 `position`。** `PositionRepo.set` 会顺带清掉
+        「已接受的那段亏损」（009，成本变了旧线就不是同一个判断）——
+        而费率重算会把全库的每一只票都过一遍，无条件写等于一次清光所有止损线，
+        包括那些成本一分钱没动的。少一条止损线用户发现不了。
+      */
+      if (held === null || held.shares !== result.position.shares || held.cost !== result.position.cost) {
+        layer.storage.positions.set(
+          code,
+          result.position.shares,
+          result.position.cost,
+          held?.openedAt ?? rows[0]?.tradedAt ?? Date.now()
+        )
+      }
+      if (opts.resetPeak === true) {
+        // 取不到现价时退到成本价：**不猜一个价**（同 acceptLoss 的 priceAt 那条）
+        const last = layer.market.snapshotOf(code)?.last
+        layer.storage.positions.setPeak(code, last ?? result.position.cost)
+      }
+    }
+    return { position: result.position, skipped: result.skipped }
+  }
+
+  /**
+   * 干跑：按 `rates` 把全库流水重算一遍会改动什么。**只读，什么都不写。**
+   *
+   * 与真正那一趟共用 `replayLedger`（同一个 `refee: true`）⇒ 确认框里的数字
+   * 与真的发生的事逐位一致。
+   */
+  private auditRefee(layer: DataLayer, rates: TradeFeeRates): FeeAudit {
+    const costs = ledgerCosts(rates)
+    const audit: FeeAudit = {
+      trades: 0,
+      codes: 0,
+      feeTotalBefore: 0,
+      feeTotalAfter: 0,
+      feeIncludedSkipped: 0,
+      positions: [],
+      stopAcksCleared: 0,
+    }
+
+    for (const code of layer.storage.trades.codesWithTrades()) {
+      const rows = layer.storage.trades.listByCode(code)
+      const result = replayLedger(
+        rows.map((row) => this.toReplayRow(row)),
+        this.boardOf(code),
+        costs,
+        { refee: true }
+      )
+      const feeById = new Map(result.rows.map((row) => [row.id, row.fee]))
+      let changedHere = 0
+      for (const row of rows) {
+        audit.feeTotalBefore += row.fee
+        const next = feeById.get(row.id) ?? row.fee
+        audit.feeTotalAfter += next
+        if (next !== row.fee) changedHere += 1
+        // 「价已含费」的建仓行：它的 price **就是**摊薄成本，补一笔费用等于凭空改掉它
+        if (row.side === 'OPENING' && row.feeIncluded !== false) audit.feeIncludedSkipped += 1
+      }
+      if (changedHere > 0) {
+        audit.trades += changedHere
+        audit.codes += 1
+      }
+
+      const held = layer.storage.positions.get(code)
+      if (held !== null && result.position !== null && held.cost !== result.position.cost) {
+        audit.positions.push({ code, costBefore: held.cost, costAfter: result.position.cost })
+        if (layer.storage.positions.stopAck(code) !== null) audit.stopAcksCleared += 1
+      }
+    }
+    return audit
+  }
+
+  /**
+   * 反解 + 干跑，`costPreview` 与 `costApply` 共用。
+   *
+   * 反解本身住 `trades/fees.ts` 的 `solveCommissionRate`（纯函数、可测），
+   * 这一层只负责取流水、取现行费率、把干跑结果挂上去。
+   */
+  private solveCalibration(
+    query: { code: SecCode; targetCost: number },
+    opts: { withAudit: boolean }
+  ): CostCalibration {
+    const layer = this.requireData()
+    const code = query.code
+    const base = layer.settings.get().tradeCosts
+    const rows = layer.storage.trades.listByCode(code).map((row) => this.toReplayRow(row))
+
+    const solved = solveCommissionRate({
+      rows,
+      board: this.boardOf(code),
+      base,
+      targetCost: query.targetCost,
+    })
+
+    const view: CostCalibration = {
+      code,
+      status: solved.status,
+      message: solved.message,
+      targetCost: query.targetCost,
+      // 反解不出来时（没有持仓）也要给一个数：0 在这里是「算不出来」的显示位，
+      // 而 status 已经说清了它算不出来 —— 界面据此不显示这一栏
+      costNow: solved.costNow ?? 0,
+      rateNow: base.commissionRate,
+      minCommissionBound: solved.minCommissionBound,
+      feeBearing: solved.feeBearing,
+      ...(solved.costAt === undefined ? {} : { costAfter: solved.costAt }),
+      ...(solved.rate === undefined ? {} : { rateSolved: solved.rate }),
+    }
+    if (opts.withAudit && solved.status === 'OK' && solved.rate !== undefined) {
+      view.audit = this.auditRefee(layer, { ...base, commissionRate: solved.rate })
+    }
+    return view
+  }
+
+  /**
+   * 落库前的**可存性**检查 —— 只挡「存不进 SQLite」的值（NaN 会被绑成 NULL，
+   * 撞上 `NOT NULL` 之后抛一句用户看不懂的驱动错误）。
+   *
+   * **记账口径的合法性不在这里判**，由重放判（超卖、无持仓分红…）：
+   * 那些判据住 `applyTrade`，在这里抄第二份必然分叉。
+   */
+  private assertStorable(price: number, shares: number): void {
+    if (!Number.isFinite(price) || price < 0) throw new Error('价格必须是一个非负数')
+    if (!Number.isFinite(shares) || Math.trunc(shares) <= 0) throw new Error('股数必须是一个正整数')
+  }
+
   previewTrade(draft: TradeDraft): TradePreview {
     const empty = { fee: 0, amount: 0, position: null, realized: null }
     const layer = this.data
@@ -960,7 +1174,8 @@ export class AppController {
     const current = layer.storage.positions.get(draft.code)
     const outcome = applyTrade(
       current ? { shares: current.shares, cost: current.cost } : null,
-      { side: draft.side, price: draft.price, shares: draft.shares, board: this.boardOf(draft.code) }
+      this.tradeInputOf(draft),
+      this.ledgerCostModel(layer)
     )
     if (isTradeError(outcome)) return { ...empty, error: outcome.error }
     const warning = this.t1SellWarning(draft, current)
@@ -970,6 +1185,25 @@ export class AppController {
       position: outcome.position,
       realized: outcome.realized,
       ...(warning === null ? {} : { warning }),
+    }
+  }
+
+  /**
+   * 渲染层的 draft → 记账入参。**只有这一处做这个转换**，
+   * 试算与落库必须走同一个（`trade:preview` 那条纪律）。
+   *
+   * ⚠ `SPLIT` 的 `price` 在这里就归零：送股没有成交价，让一个残留的数字落进库里，
+   * 下一次重放它就会被当成真的（`applyTrade` 忽略它，但 `sumDividends` 那类
+   * 按 `price × shares` 求和的查询不会）。
+   */
+  private tradeInputOf(draft: TradeDraft): TradeInput {
+    return {
+      side: draft.side,
+      price: draft.side === 'SPLIT' ? 0 : draft.price,
+      shares: draft.shares,
+      board: this.boardOf(draft.code),
+      // 建仓之外这一项没有意义；新录入的建仓默认「不含费」（用户抄的多半是成交价）
+      ...(draft.side === 'OPENING' ? { feeIncluded: draft.feeIncluded ?? false } : {}),
     }
   }
 
@@ -1123,12 +1357,25 @@ export class AppController {
   }
 
   /**
-   * 录一笔成交：追加流水 + 按加权平均更新持仓。
+   * 录一笔流水（成交 / 建仓 / 分红 / 送转）：追加流水 + 重建持仓。
    *
    * 记账规则在 `trades/ledger.ts`，**与表单里的试算是同一个函数** ——
    * 两处各算一遍必然分叉，而症状是「表单说成本会变成 12.34，存完变成 12.31」。
    *
-   * 落库包在一个事务里：流水写进去了但持仓没更新，账就永远对不上了。
+   * ## 为什么落库之后要整条重放，而不是把这一笔增量叠到当前持仓上
+   *
+   * 2026-09-03 改。旧写法假设「新录的这一笔一定是最新的一笔」，而
+   * **分红与送转天生是补录的**（用户在除权几天后才想起来记），
+   * 补录的行会落在流水中间 ⇒ 增量叠加用的是**今天**的持股数而不是那一天的
+   * ⇒ 分红摊错、送转比例错，而账面上完全看不出来。
+   * 重放是唯一算得对的做法（同 `removeTrade` 的既有理由）。
+   *
+   * 整段包在一个事务里：流水写进去了但持仓没更新，账就永远对不上；
+   * 而重放判定这一笔算不通时**抛错回滚**，那一笔不会留在库里。
+   *
+   * ⚠ **`SPLIT` 要顺带缩放 `peak_price`**（017）。不缩放的后果不是「多一条提醒」，
+   * 而是移动止损与回撤减仓立刻读出一个假回撤（10 送 10 就是 −50%）并天天触发
+   * —— 与 009 头注释里 `acceptLoss` 不重设 peak 的那个失效形状一模一样。
    */
   addTrade(draft: TradeDraft): TradeLedger {
     const layer = this.requireData()
@@ -1136,12 +1383,7 @@ export class AppController {
     if (!layer.storage.watchlist.get(code)) throw new Error('这只股票不在自选里，先添加再录成交')
 
     const current = layer.storage.positions.get(code)
-    const outcome = applyTrade(
-      current ? { shares: current.shares, cost: current.cost } : null,
-      { side: draft.side, price: draft.price, shares: draft.shares, board: this.boardOf(code) }
-    )
-    if (isTradeError(outcome)) throw new Error(outcome.error)
-
+    const input = this.tradeInputOf(draft)
     const now = Date.now()
     const tradedAt = draft.tradedAt ?? now
     /*
@@ -1160,9 +1402,17 @@ export class AppController {
     })
     if ('error' in resolved) throw new Error(resolved.error)
     const decision = resolved.decision
+
+    this.assertStorable(input.price, draft.shares)
+    // 这一笔是不是流水里最新的那一笔 —— 送转的 peak 处置要用（见下面那段）
+    const isLatest = !layer.storage.trades
+      .listByCode(code)
+      .some((row) => row.tradedAt > Math.round(tradedAt))
+    const id = randomUUID()
+
     layer.storage.db.transaction(() => {
       layer.storage.trades.insert({
-        id: randomUUID(),
+        id,
         code,
         side: draft.side,
         tradedAt,
@@ -1170,27 +1420,118 @@ export class AppController {
         ...(draft.tradedAtExact === undefined ? {} : { tradedAtExact: draft.tradedAtExact }),
         ...(draft.signalId === undefined || draft.signalId === '' ? {} : { signalId: draft.signalId }),
         ...(decision === null ? {} : { decisionAt: decision.at, decisionPrice: decision.price }),
-        price: draft.price,
+        price: input.price,
         shares: Math.trunc(draft.shares),
-        fee: outcome.fee,
-        ...(outcome.realized === null ? {} : { realized: outcome.realized }),
+        // 派生列由紧接着那次重放写回，这里先落 0 —— 它在事务里活不过下一行
+        fee: 0,
+        ...(input.feeIncluded === undefined ? {} : { feeIncluded: input.feeIncluded }),
         ...(draft.note === undefined || draft.note === '' ? {} : { note: draft.note.slice(0, 200) }),
         createdAt: now,
       })
-      if (outcome.position === null) {
-        layer.storage.positions.clear(code)
-      } else {
-        layer.storage.positions.set(code, outcome.position.shares, outcome.position.cost, current?.openedAt ?? tradedAt)
+      /*
+        送转的 `peak_price` 处置分两种，判据是「这一笔是不是最新的」：
+          * 最新 ⇒ **按比例缩**。库里那个 peak 是除权前的价格刻度，缩放是精确的，
+            而且**保留了已经发生的回撤**；
+          * 补录在中间 ⇒ 库里那个 peak 可能已经是除权后的刻度，再缩一次会把它做小
+            ⇒ 回撤读小 ⇒ **少发**移动止损，而少发的错误用户发现不了。
+            所以交给 `rebuildLedger` 把参考点重设为 `max(成本, 现价)`。
+      */
+      const split = draft.side === 'SPLIT'
+      const rebuilt = this.rebuildLedger(layer, code, {
+        resetPeak: split && !isLatest,
+      })
+      const skipped = rebuilt.skipped.find((entry) => entry.id === id)
+      if (skipped) throw new Error(skipped.reason)
+
+      if (split && isLatest && current !== null && (rebuilt.position?.shares ?? 0) > 0) {
+        const after = rebuilt.position!.shares
+        layer.storage.positions.setPeak(code, (current.peakPrice * current.shares) / after)
+      } else if (!split && rebuilt.position !== null) {
         // 买入之后持有期最高价至少是成本价：不补这一下，移动止损会拿一个比成本还低的
         // peak 去算回撤（docs/05 §2.3）
-        layer.storage.positions.bumpPeak(code, Math.max(outcome.position.cost, draft.price))
+        layer.storage.positions.bumpPeak(code, Math.max(rebuilt.position.cost, input.price))
       }
     })
 
-    log.info(`[trade] ${code} ${draft.side} ${draft.shares}股 @${draft.price}（费 ${outcome.fee}）`)
+    log.info(`[trade] ${code} ${draft.side} ${draft.shares}股 @${input.price}`)
     // T+1 提示**不拦**录入（见 t1SellWarning），但要留一行 —— 日后查「这笔怎么会有」时用得上
     const t1 = this.t1SellWarning(draft, current)
     if (t1 !== null) log.info(`[trade] ${code} 这笔卖出触发 T+1 提示：${t1}`)
+    this.onStateChanged()
+    return this.tradeLedger(code)
+  }
+
+  /**
+   * 改一笔（`trade:update`）：覆盖那一行 → **整条重放** → 写回派生列与持仓。
+   *
+   * ## 为什么要有这个入口（而不是「删掉重录」）
+   *
+   * 删了重录会丢掉 `signal_id` / `traded_at_exact`（016 那批 IS 分解的样本），
+   * 而用户改的往往只是股数填错一位 —— 让他为了改一个数字丢掉「照哪条提醒做的」，
+   * 下次他就不会再填那个关联了。
+   *
+   * ## 四条边界
+   *
+   * 1. **`created_at` 不动**（`TradeRepo.update` 的头注释）：它是同日多笔的兜底排序键。
+   * 2. **换 `signal_id` 要重新查库**，与 `addTrade` 同一条纪律：渲染层送来的快照一概不采信。
+   * 3. **重放判定这一笔算不通时抛错回滚** —— 半改一半的账本比改不动糟得多。
+   * 4. **只要这只票的流水里有送转，就重设回撤参考点**：改动会让每一步的持股数变，
+   *    而 `peak_price` 的缩放因子无法从重放里恢复（见 `rebuildLedger`）。
+   */
+  updateTrade(patch: TradeUpdate): TradeLedger {
+    const layer = this.requireData()
+    const row = layer.storage.trades.get(patch.id)
+    if (!row) throw new Error('这笔流水已经不在了')
+    const code = row.code
+
+    const side = patch.side ?? row.side
+    const rawPrice = patch.price ?? row.price
+    const next: TradeRow = {
+      ...row,
+      side,
+      // 与录入走同一条归一化：送股的价恒为 0（`tradeInputOf` 的同一条理由）
+      price: side === 'SPLIT' ? 0 : rawPrice,
+      shares: Math.trunc(patch.shares ?? row.shares),
+      ...(patch.tradedAt === undefined ? {} : { tradedAt: patch.tradedAt }),
+    }
+    // 建仓之外这一项没有意义，落 NULL；否则一个换过 side 的行会留着一个骗人的标记
+    if (side !== 'OPENING') delete next.feeIncluded
+    else next.feeIncluded = patch.feeIncluded ?? row.feeIncluded ?? true
+
+    // null = 清掉，undefined = 不改（`TradeUpdate` 里写着这条约定）
+    if (patch.tradedAtExact === null) delete next.tradedAtExact
+    else if (patch.tradedAtExact !== undefined) next.tradedAtExact = patch.tradedAtExact
+    if (patch.note === null) delete next.note
+    else if (patch.note !== undefined && patch.note !== '') next.note = patch.note.slice(0, 200)
+
+    if (patch.signalId === null) {
+      delete next.signalId
+      delete next.decisionAt
+      delete next.decisionPrice
+    } else if (patch.signalId !== undefined && patch.signalId !== '') {
+      const resolved = resolveDecision({
+        signalId: patch.signalId,
+        code,
+        signal: layer.storage.signals.get(patch.signalId),
+      })
+      if ('error' in resolved) throw new Error(resolved.error)
+      next.signalId = patch.signalId
+      if (resolved.decision !== null) {
+        next.decisionAt = resolved.decision.at
+        next.decisionPrice = resolved.decision.price
+      }
+    }
+
+    this.assertStorable(next.price, next.shares)
+    layer.storage.db.transaction(() => {
+      layer.storage.trades.update(next)
+      const hasSplit = layer.storage.trades.listByCode(code).some((r) => r.side === 'SPLIT')
+      const rebuilt = this.rebuildLedger(layer, code, { resetPeak: hasSplit })
+      const skipped = rebuilt.skipped.find((entry) => entry.id === next.id)
+      if (skipped) throw new Error(skipped.reason)
+    })
+
+    log.info(`[trade] ${code} 改了一笔 ${next.side} ${next.shares}股 @${next.price}，已按流水重放`)
     this.onStateChanged()
     return this.tradeLedger(code)
   }
@@ -1236,15 +1577,101 @@ export class AppController {
     const code = row.code
     layer.storage.db.transaction(() => {
       layer.storage.trades.remove(id)
-      const rebuilt = replayTrades(layer.storage.trades.listByCode(code), this.boardOf(code))
-      const openedAt = layer.storage.positions.get(code)?.openedAt ?? row.tradedAt
-      if (rebuilt === null) layer.storage.positions.clear(code)
-      else layer.storage.positions.set(code, rebuilt.shares, rebuilt.cost, openedAt)
+      const hasSplit =
+        row.side === 'SPLIT' || layer.storage.trades.listByCode(code).some((r) => r.side === 'SPLIT')
+      // 删掉的可能正是那笔送转 ⇒ 缩放因子已经无从恢复，重设参考点（见 rebuildLedger）
+      this.rebuildLedger(layer, code, { resetPeak: hasSplit })
     })
 
     log.info(`[trade] ${code} 删掉一笔 ${row.side} ${row.shares}股 @${row.price}，已按剩余流水重建持仓`)
     this.onStateChanged()
     return this.tradeLedger(code)
+  }
+
+  // ── 校正成本：从真实摊薄成本反解佣金率（017）───────────────────────
+  //
+  // 用户抄下券商 App 上那只票的摊薄成本，软件反解出佣金率并（确认后）
+  // 按新费率把全库流水重算一遍。**设置页不给费率编辑框** —— 判据是可核对性：
+  // 那个成本价用户每天都在看，是事实；费率不是（见 `TradeFeeRates` 头注释）。
+  //
+  // 两个方法**共用同一条反解**（`solveCalibration`），这样确认框里显示的数字
+  // 与真的发生的事逐位一致 —— 与 `trade:preview` 那条纪律同一形状。
+
+  costPreview(query: { code: SecCode; targetCost: number }): CostCalibration {
+    return this.solveCalibration(query, { withAudit: true })
+  }
+
+  /**
+   * 真的应用：写回费率 + **整库一个事务**重算流水与持仓。
+   *
+   * 四条：
+   * 1. **主进程重新反解一遍**，渲染层送来的费率一概不采信（同 `resolveDecision`）；
+   * 2. 事前**尽力**做一次一致性快照。`VACUUM INTO` 不能在事务里跑 ⇒ 必须在开事务之前；
+   *    失败只记一行并写进消息，**不阻断** —— 这一步是可逆的（改回原费率再校正一次
+   *    就还原，被改写的两列都是派生量）；
+   * 3. 中途失败**整份回滚**：半库新费率半库旧费率是最坏的结局。
+   * 4. **费率写在重算成功之后。** 顺序是判据不是风格：先写费率再重算的话，
+   *    重算失败时库里是旧数字、设置里是新费率 —— **而那种不一致没有任何东西会报警**
+   *    （下一次删一笔流水时它会突然按新费率把这只票重算一遍）。
+   *    所以重算这一趟把费率**显式传进去**（`opts.costs`），不从 settings 读。
+   */
+  costApply(query: { code: SecCode; targetCost: number }): CostCalibrationResult {
+    const layer = this.requireData()
+    const calibration = this.solveCalibration(query, { withAudit: true })
+    if (calibration.status !== 'OK' || calibration.rateSolved === undefined) {
+      return { status: 'REJECTED', message: calibration.message, calibration }
+    }
+
+    const rate = calibration.rateSolved
+    const rates: TradeFeeRates = { ...layer.settings.get().tradeCosts, commissionRate: rate }
+    let backupPath: string | undefined
+    try {
+      backupPath = backupNow(
+        layer.storage.db,
+        layer.paths.backupDir,
+        Date.now(),
+        DEFAULT_BACKUP_POLICY,
+        (m) => log.info(m)
+      ).path
+    } catch (error) {
+      log.warn('[trade] 校正前的备份没做成（不阻断，这一步可逆）：', error)
+    }
+
+    try {
+      layer.storage.db.transaction(() => {
+        const costs = ledgerCosts(rates)
+        for (const code of layer.storage.trades.codesWithTrades()) {
+          this.rebuildLedger(layer, code, { refee: true, costs })
+        }
+      })
+    } catch (error) {
+      log.warn('[trade] 校正成本失败，已整份回滚（费率未改）：', error)
+      return { status: 'FAILED', message: messageOf(error), calibration }
+    }
+
+    this.patchSettings({
+      tradeCosts: rates,
+      tradeCostsSource: {
+        code: query.code,
+        targetCost: query.targetCost,
+        commissionRate: rate,
+        at: Date.now(),
+      },
+    })
+    log.info(
+      `[trade] 校正成本：${query.code} 目标 ${query.targetCost} → 佣金率 ` +
+        `${ratePerTenThousand(rate)}，改写 ${calibration.audit?.trades ?? 0} 笔流水`
+    )
+    this.onStateChanged()
+    return {
+      status: 'DONE',
+      message:
+        `已按 ${ratePerTenThousand(rate)} 重算了 ${calibration.audit?.trades ?? 0} 笔流水` +
+        `（${calibration.audit?.codes ?? 0} 只标的）。` +
+        (backupPath === undefined ? '⚠ 事前那份备份没做成。' : '事前已备份一份数据库。'),
+      calibration,
+      ...(backupPath === undefined ? {} : { backupPath }),
+    }
   }
 
   /**

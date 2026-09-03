@@ -111,6 +111,33 @@ describe('buildConfigBundle', () => {
     expect(bundle.exportedAt).toBe(1_700_000_000_000)
   })
 
+  it('反解出来的费率与它的来路都跟着走 —— 换机器不该让账本的成本重新偏掉', () => {
+    // `tradeCosts` 是 017 加的：它决定 `position.cost` 与 `realized`，
+    // 不带走的话新机器上按出厂档重算一遍，成本价与旧机器对不上而没人会想到是这里
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      tradeCosts: { ...DEFAULT_SETTINGS.tradeCosts, commissionRate: 0.0001 },
+      tradeCostsSource: {
+        code: 'SH600000',
+        targetCost: 12.345,
+        commissionRate: 0.0001,
+        at: 1_700_000_000_000,
+      },
+    }
+    const bundle = buildConfigBundle({
+      settings,
+      watchlist: [],
+      positions: [],
+      now: 0,
+      appVersion: '0.1.0',
+    })
+    expect(bundle.settings.tradeCosts.commissionRate).toBe(0.0001)
+    // 往返一趟之后两样都还在
+    const parsed = parseConfigBundle(JSON.parse(JSON.stringify(bundle)))
+    expect(parsed.bundle.settings.tradeCosts.commissionRate).toBe(0.0001)
+    expect(parsed.bundle.settings.tradeCostsSource?.code).toBe('SH600000')
+  })
+
   it('自选按 sortOrder 落地，用户排好的次序不在往返中丢', () => {
     const bundle = buildConfigBundle({
       settings: DEFAULT_SETTINGS,

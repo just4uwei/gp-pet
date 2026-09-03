@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { DEFAULT_SETTINGS, sanitizeSettings } from '@main/settings/schema'
 import { SettingsStore } from '@main/settings/store'
+import { DEFAULT_COSTS } from '../../../src/backtest/costs'
 
 describe('sanitizeSettings', () => {
   it('空输入即出厂默认值', () => {
@@ -160,5 +161,65 @@ describe('disclaimerAcceptedAt', () => {
     } finally {
       rmSync(home, { recursive: true, force: true })
     }
+  })
+})
+
+/**
+ * 交易费率（017）。**settings.json 里没有编辑框对应的入口** —— 它由「校正成本」
+ * 反解写入。但文件是用户可以手改的，所以照样要逐项校验。
+ */
+describe('sanitizeSettings · tradeCosts', () => {
+  it('出厂费率**逐位等于** DEFAULT_COSTS 的对应四项 —— 没校正过的用户账本行为不变', () => {
+    /*
+      ⚠ 这条用例变红不是让你把 schema.ts 改成 import DEFAULT_COSTS。
+      两份数是**刻意分开**的（一份是回测与影子的固定假设，一份是用户自己的费率），
+      它变红是在提醒你：两者分叉了，确认这是有意的。
+    */
+    expect(DEFAULT_SETTINGS.tradeCosts).toEqual({
+      commissionRate: DEFAULT_COSTS.commissionRate,
+      minCommission: DEFAULT_COSTS.minCommission,
+      stampTaxRate: DEFAULT_COSTS.stampTaxRate,
+      transferFeeRate: DEFAULT_COSTS.transferFeeRate,
+    })
+    // **没有 slippage** —— 记账绝不套滑点，少这一项让它在类型上就做不成
+    expect('slippage' in DEFAULT_SETTINGS.tradeCosts).toBe(false)
+  })
+
+  it('0 是合法取值 —— 券商可以免最低佣金，场内基金本来就免印花税与过户费', () => {
+    const zeroed = { commissionRate: 0, minCommission: 0, stampTaxRate: 0, transferFeeRate: 0 }
+    const result = sanitizeSettings({ tradeCosts: zeroed })
+    expect(result.settings.tradeCosts).toEqual(zeroed)
+    expect(result.repaired).toEqual([])
+  })
+
+  it('把「万 2.5」当成 2.5 填进去（差 10000 倍）会回默认并留痕，不静默生效', () => {
+    // 不挡的话每一笔买入的成本价都会变成天文数字，而那个数一路进止损线
+    const result = sanitizeSettings({
+      tradeCosts: { ...DEFAULT_SETTINGS.tradeCosts, commissionRate: 2.5 },
+    })
+    expect(result.settings.tradeCosts).toEqual(DEFAULT_SETTINGS.tradeCosts)
+    expect(result.repaired.map((r) => r.field)).toContain('tradeCosts')
+  })
+
+  it('负费率一律拒绝', () => {
+    const result = sanitizeSettings({
+      tradeCosts: { ...DEFAULT_SETTINGS.tradeCosts, minCommission: -1 },
+    })
+    expect(result.settings.tradeCosts).toEqual(DEFAULT_SETTINGS.tradeCosts)
+  })
+
+  it('来路（tradeCostsSource）坏掉时**只丢来路，不丢费率**', () => {
+    // 单独一个顶层键就是为了这个：sanitizeSettings 是逐顶层键修的，
+    // 塞进 tradeCosts 里的话一个坏掉的来路会把校正对了的费率一起丢掉
+    const rates = { ...DEFAULT_SETTINGS.tradeCosts, commissionRate: 0.0001 }
+    const result = sanitizeSettings({ tradeCosts: rates, tradeCostsSource: { code: '' } })
+    expect(result.settings.tradeCosts).toEqual(rates)
+    expect('tradeCostsSource' in result.settings).toBe(false)
+    expect(result.repaired.map((r) => r.field)).toContain('tradeCostsSource')
+  })
+
+  it('合法的来路原样保留', () => {
+    const source = { code: 'SH600000', targetCost: 12.345, commissionRate: 0.0001, at: 1_700_000_000_000 }
+    expect(sanitizeSettings({ tradeCostsSource: source }).settings.tradeCostsSource).toEqual(source)
   })
 })

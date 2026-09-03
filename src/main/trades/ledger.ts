@@ -14,6 +14,23 @@
  *   这是先进先出/加权平均都通用的做法，也让「浮盈」与「已实现」两个数各归各的。
  * - **卖出超过持有股数一律拒绝。** 不允许出现负持仓：这个软件不接券商、不支持融券，
  *   一个负数持仓会一路传到风控层，而那边所有规则都假设 shares > 0。
+ * - **现金分红**（`DIVIDEND`，017）：**扣减摊薄成本**，不进已实现盈亏。
+ *   判据是这张账的价格口径 —— 成本与展示价都是**不复权**的（docs/03 §2.3），
+ *   而除权那天价格自己会掉下来。成本不跟着掉 ⇒ 界面显示一段**假浮亏**，
+ *   止损缓冲被凭空吃掉。唯一的例外是累计分红把成本摊到了 0：
+ *   多出来的那部分记进 `realized`（丢掉等于凭空少一笔钱，让成本变负会让
+ *   浮亏百分比与止损线一起失去意义）。
+ * - **送股 / 转增**（`SPLIT`，017）：股数增、成本按比例摊薄、**总成本恒定**，
+ *   并给出 `peakScale` 让调用方把 `position.peak_price` 一起缩放。
+ *   不缩放 peak 的后果不是「多一条提醒」，而是**移动止损立刻读出一个假回撤**
+ *   —— 与 009 头注释里 `acceptLoss` 不重设 peak 的那个失效形状一模一样。
+ *
+ * ## 手续费：真实账单优先于任何公式
+ *
+ * 费率来自用户自己的设置（`AppSettings.tradeCosts` → `fees.ts` 的 `ledgerCosts`），
+ * 逐笔还可以用 `TradeInput.feeOverride` 直接填券商账单上那个数。
+ * `feeOverride = 0` 是**合法**的（有券商减免）—— 所以「没填」必须是 `undefined`
+ * 而不是 0，否则减免会被下一次「按新费率重算全库」改掉。
  *
  * ## 绝不套用滑点
  *
@@ -78,9 +95,11 @@
  */
 
 import type { Board } from '@core/types'
+import type { TradeSide } from '@shared/ipc-types'
 import { DEFAULT_COSTS, buyFees, sellFees, type CostModel } from '../../backtest/costs'
 
-export type TradeSide = 'BUY' | 'SELL'
+/** 五种流水的定义在 `shared/ipc-types.ts` 的 `TradeSide`（一处定义，主/渲染共用） */
+export type LedgerSide = TradeSide
 
 export interface LedgerPosition {
   shares: number
@@ -89,9 +108,15 @@ export interface LedgerPosition {
 }
 
 export interface TradeInput {
-  side: TradeSide
-  /** 不复权真实成交价 */
+  side: LedgerSide
+  /**
+   * - `BUY` / `SELL`：**不复权真实成交价**（**不含**手续费）；
+   * - `OPENING`：成本价，含不含费由 `feeIncluded` 说；
+   * - `DIVIDEND`：**税后每股派现**；
+   * - `SPLIT`：忽略（送股没有成交价，你一分钱没付）。
+   */
   price: number
+  /** `SPLIT` 时是**新增**股数；`DIVIDEND` 时是分红涉及的股数 */
   shares: number
   /**
    * 板块。**必填**，因为费率靠它区分：场内基金（ETF/LOF）免印花税与过户费。
@@ -102,14 +127,60 @@ export interface TradeInput {
    * 让它必填 = 调用方漏传时**编译不过**，而不是静默算错。
    */
   board: Board
+  /**
+   * 仅 `OPENING`：那个 `price` 已经含手续费了吗（017）。
+   *
+   * - `false`（**新录入的默认**）⇒ 按费率补算一笔，成本 = `(金额 + 费) / 股数`；
+   * - `true` ⇒ 那个价直接就是摊薄成本，不再收费（007 迁移与配置导入补的老行是这一种，
+   *   它们的 price 取自 `position.cost`，按定义就含费 —— 这不是猜，是那两条路的定义）。
+   *
+   * ⚠ **缺省按 `true`（老语义）而不是按新默认**。判据是「谁在调用」：
+   * 缺这个键的只有 017 之前落库的行，而它们全部是含费的。
+   * 反过来把缺省定成 `false`，升级那一刻全库的期初成本会被凭空补一笔费用。
+   */
+  feeIncluded?: boolean
+  /**
+   * 用**库里存着的那笔费用**，而不是按 `costs` 现算（017）。
+   *
+   * ⚠ **这不是「让用户手填手续费」那个功能** —— 用户填不了这个数（2026-09-03 拍板：
+   * 对不上时改的是费率，走「校正成本」反解）。它只有一个调用方：`replayLedger`
+   * 的非 `refee` 那条路。
+   *
+   * 为什么必须能覆盖：`cost` 里含着买入那笔费用，所以「重放要沿用旧费用」这件事
+   * **不能只在返回值上做** —— 只改报出去的 `fee`、成本仍按新费率算的话，
+   * 两个数会当场对不上（`成本 × 股数 − 成交额 ≠ fee`），而这正是本项目最怕的
+   * 「一个对不上的数字」。
+   *
+   * 非有限值或负数一律忽略（退回现算）：那是坏掉的库数据，不是一个决定。
+   */
+  feeOverride?: number
+}
+
+/** `feeOverride` 只在它像个费用时才作数 —— 坏数据退回现算，而不是把负费用摊进成本 */
+function overriddenFee(input: TradeInput): number | null {
+  const value = input.feeOverride
+  if (value === undefined || !Number.isFinite(value) || value < 0) return null
+  return round2(value)
 }
 
 export interface TradeApplied {
   /** 变化后的持仓。null = 已清仓，调用方应删除持仓行 */
   position: LedgerPosition | null
   fee: number
-  /** 本笔结转的已实现盈亏（含费）。买入为 null —— **不是 0**（约束 4） */
+  /**
+   * 本笔结转的已实现盈亏（含费）。买入 / 送转为 null —— **不是 0**（约束 4）。
+   *
+   * 分红只在「累计分红已经把成本摊到 0」时才有值（超出成本基数的那部分）。
+   */
   realized: number | null
+  /**
+   * 送转带来的股数缩放：`新的 peak_price = 旧的 × peakScale`。**其余 side 恒为 1。**
+   *
+   * 为什么由这一层给而不是让调用方自己算：它等于 `持股数 / 送转后股数`，
+   * 而那两个数只有这里知道（调用方手里只有「送了多少股」）。照抄一遍必然分叉，
+   * 而分叉的症状是移动止损的参考点偏掉 —— 一条 L3 强制类规则静默改变触发点。
+   */
+  peakScale: number
 }
 
 export type TradeOutcome = TradeApplied | { error: string }
@@ -134,13 +205,35 @@ export function applyTrade(
   costs: CostModel = DEFAULT_COSTS
 ): TradeOutcome {
   const shares = Math.trunc(input.shares)
-  if (!Number.isFinite(input.price) || input.price <= 0) return { error: '成交价必须是一个正数' }
+  // 送股没有成交价（你一分钱没付）⇒ 只有它允许 price 为 0，其余四种必须是正数
+  if (input.side !== 'SPLIT' && (!Number.isFinite(input.price) || input.price <= 0)) {
+    return { error: input.side === 'DIVIDEND' ? '每股派现必须是一个正数' : '成交价必须是一个正数' }
+  }
   if (!Number.isFinite(shares) || shares <= 0) return { error: '股数必须是一个正整数' }
 
   const amount = input.price * shares
 
+  if (input.side === 'OPENING') {
+    /*
+      建仓 = 账本的起点，**它不叠加在已有持仓上**：整个持仓被这一行重设。
+      这正是 007 迁移与配置导入需要的语义，也是用户「我早就持有这只票」时想要的。
+
+      含费与不含费的区别只有一处 —— 要不要补算那笔费用（见 `TradeInput.feeIncluded`）。
+      两条边界：① 含费那一种的 `fee` 落 0，而那个 0 是**「不知道」**（007 头注释），
+      不是「没有」；② 不含费那一种的 fee 是**算出来的**，所以它会跟着费率重算走。
+    */
+    const included = input.feeIncluded ?? true
+    const fee = included ? 0 : (overriddenFee(input) ?? round2(buyFees(amount, costs, input.board)))
+    return {
+      position: { shares, cost: included ? round4(input.price) : round4((amount + fee) / shares) },
+      fee,
+      realized: null,
+      peakScale: 1,
+    }
+  }
+
   if (input.side === 'BUY') {
-    const fee = round2(buyFees(amount, costs, input.board))
+    const fee = overriddenFee(input) ?? round2(buyFees(amount, costs, input.board))
     const heldShares = current?.shares ?? 0
     const heldValue = (current?.cost ?? 0) * heldShares
     const nextShares = heldShares + shares
@@ -148,6 +241,47 @@ export function applyTrade(
       position: { shares: nextShares, cost: round4((heldValue + amount + fee) / nextShares) },
       fee,
       realized: null,
+      peakScale: 1,
+    }
+  }
+
+  if (input.side === 'DIVIDEND') {
+    /*
+      现金分红 → **扣减摊薄成本**（2026-09-03 拍板，017 头注释里那张表）。
+
+      `shares` 是分红涉及的股数（正常等于当时持股数），而**摊到每股上要除以持股数**
+      —— 两个数在补录时可能不一致（例如用户按公告的股数填），那时正确的做法仍是
+      「到账总额 ÷ 现在持有多少股」：那笔钱是事实，怎么摊只有一种算得对的方式。
+    */
+    if (!current || current.shares <= 0) return { error: '当前没有持仓，分红无从摊到成本上' }
+    const perShare = amount / current.shares
+    const raw = current.cost - perShare
+    // 成本不许变负：负成本会让浮亏百分比与止损线一起失去意义。
+    // 超出成本基数的那部分记成已实现 —— 丢掉等于凭空少一笔钱
+    const overflow = raw < 0 ? round2(-raw * current.shares) : null
+    return {
+      position: { shares: current.shares, cost: round4(Math.max(0, raw)) },
+      fee: 0,
+      realized: overflow,
+      peakScale: 1,
+    }
+  }
+
+  if (input.side === 'SPLIT') {
+    /*
+      送股 / 转增：股数增、成本按比例摊薄、**总成本恒定**（你没付钱，所以没有新增成本）。
+
+      `peakScale` 必须一起交出去 —— 不缩放 `position.peak_price` 的后果不是
+      「多一条提醒」，而是移动止损立刻读出一个**假回撤**（10 送 10 就是 −50%），
+      与 009 头注释里 `acceptLoss` 不重设 peak 的那个失效形状一模一样。
+    */
+    if (!current || current.shares <= 0) return { error: '当前没有持仓，没有可以送转的股票' }
+    const nextShares = current.shares + shares
+    return {
+      position: { shares: nextShares, cost: round4((current.cost * current.shares) / nextShares) },
+      fee: 0,
+      realized: null,
+      peakScale: current.shares / nextShares,
     }
   }
 
@@ -156,7 +290,7 @@ export function applyTrade(
     return { error: `卖出 ${shares} 股超过持有的 ${current.shares} 股` }
   }
 
-  const fee = round2(sellFees(amount, costs, input.board))
+  const fee = overriddenFee(input) ?? round2(sellFees(amount, costs, input.board))
   const realized = round2((input.price - current.cost) * shares - fee)
   const nextShares = current.shares - shares
   return {
@@ -164,6 +298,7 @@ export function applyTrade(
     position: nextShares === 0 ? null : { shares: nextShares, cost: current.cost },
     fee,
     realized,
+    peakScale: 1,
   }
 }
 
@@ -241,35 +376,111 @@ export function resolveDecision(input: {
   return { decision: { at: input.signal.createdAt, price: input.signal.priceAt } }
 }
 
+/** 重放的一行入参。`id` 只用来把重算结果对回去 */
+export interface LedgerReplayRow {
+  id: string
+  side: LedgerSide
+  price: number
+  shares: number
+  /**
+   * 库里存着的那笔费用。**缺省 = 让重放按 `costs` 算一遍。**
+   *
+   * 默认（`refee` 为假）用这个数而不是重算：它是**当时真的按当时的费率算出来的**，
+   * 而「删掉一笔不相干的流水」不该顺手把十年前那些费用按今天的费率改一遍。
+   */
+  fee?: number
+  /** 仅 `OPENING`：那个价含不含费（见 `TradeInput.feeIncluded`，缺省按含费） */
+  feeIncluded?: boolean
+}
+
+export interface LedgerReplayResult {
+  position: LedgerPosition | null
+  /**
+   * 逐行重算出来的派生列，供调用方写回库里。
+   *
+   * **`realized` 必须跟着重放走**：它依赖它前面每一行（成本是逐步摊出来的）。
+   * 只重建持仓、不改 `realized`，症状是删掉第一笔买入之后
+   * 「已实现盈亏合计」给出一个按旧成本算的数 —— 而没有任何东西会报警。
+   */
+  rows: { id: string; fee: number; realized: number | null }[]
+  /** 算不通、被跳过的行（历史数据里的超卖、无持仓分红…）。**要能报出来** */
+  skipped: { id: string; reason: string }[]
+  /** 全部送转累积起来的股数缩放（`新 peak = 旧 peak × 这个数`）。没有送转时为 1 */
+  peakScale: number
+}
+
 /**
- * 按流水重放出持仓。`trade:remove`（录错了要删）走这条路。
+ * 按流水重放出持仓与逐行派生列。`trade:remove` / `trade:update` / 费率重算都走这条路。
  *
  * **不做反向增量回滚**：在「买入 → 卖出 → 又买入」这类序列上，
  * 删掉中间那笔卖出之后，靠反算是回不到正确成本的（卖出不改成本，所以没有可逆信息）。
  * 重放是唯一算得对的做法，而它的前提是**期初那一笔已经补上了**（007 迁移做的事）。
  *
- * 入参必须按 `traded_at` 升序。遇到算不通的一笔（例如历史数据里超卖）就跳过它并继续，
+ * 入参必须按 `traded_at` 升序。遇到算不通的一笔就**跳过并继续**，
  * 而不是整条链失败 —— 重建持仓时半路抛错会让用户的持仓凭空消失。
+ *
+ * `opts.refee` 为真时**按 `costs` 重算每一笔费用**（「校正成本」那条路）。
+ * ⚠ 即便如此，「价已含费」的建仓行仍然不动：它的 `price` **就是**摊薄成本，
+ * 给它补一笔费用等于凭空改掉用户当初填的那个数。
+ */
+export function replayLedger(
+  rows: readonly LedgerReplayRow[],
+  board: Board,
+  costs: CostModel = DEFAULT_COSTS,
+  opts: { refee?: boolean } = {}
+): LedgerReplayResult {
+  let position: LedgerPosition | null = null
+  let peakScale = 1
+  const out: LedgerReplayResult['rows'] = []
+  const skipped: LedgerReplayResult['skipped'] = []
+
+  for (const row of rows) {
+    /*
+      费用取哪个数：
+        * `refee` ⇒ 按 `costs` 现算（这正是那条路要做的事）；
+        * 否则 ⇒ 用库里存着的那笔（当时真的按当时的费率算出来的）。
+
+      ⚠ 必须**从入参走 `feeOverride` 进去**，不能只改返回值里那个 `fee`：
+      买入的费用是摊进 `cost` 的，只改报出去的数会让
+      `成本 × 股数 − 成交额 ≠ fee` —— 一个当场对不上的账。
+      分红与送转恒为 0（不是成交），`applyTrade` 会忽略这一项。
+    */
+    const outcome = applyTrade(
+      position,
+      {
+        side: row.side,
+        price: row.price,
+        shares: row.shares,
+        board,
+        ...(row.feeIncluded === undefined ? {} : { feeIncluded: row.feeIncluded }),
+        ...(opts.refee === true || row.fee === undefined ? {} : { feeOverride: row.fee }),
+      },
+      costs
+    )
+    if (isTradeError(outcome)) {
+      skipped.push({ id: row.id, reason: outcome.error })
+      continue
+    }
+    position = outcome.position
+    peakScale *= outcome.peakScale
+    out.push({ id: row.id, fee: outcome.fee, realized: outcome.realized })
+  }
+  return { position, rows: out, skipped, peakScale }
+}
+
+/**
+ * 只要最终持仓的那个薄包装（调用点很多，不必每处都解构一个五字段的结果）。
+ *
+ * ⚠ 与 `replayLedger` 一样**默认沿用库里存着的费用**。
  */
 export function replayTrades(
-  trades: readonly { side: TradeSide | 'OPENING'; price: number; shares: number }[],
+  trades: readonly Omit<LedgerReplayRow, 'id'>[],
   board: Board,
   costs: CostModel = DEFAULT_COSTS
 ): LedgerPosition | null {
-  let position: LedgerPosition | null = null
-  for (const trade of trades) {
-    if (trade.side === 'OPENING') {
-      // 期初建仓不再收一次费：它的 price 就是当初那个已经含费的成本价
-      position = { shares: Math.trunc(trade.shares), cost: trade.price }
-      continue
-    }
-    const outcome = applyTrade(
-      position,
-      { side: trade.side, price: trade.price, shares: trade.shares, board },
-      costs
-    )
-    if (isTradeError(outcome)) continue
-    position = outcome.position
-  }
-  return position
+  return replayLedger(
+    trades.map((trade, index) => ({ id: String(index), ...trade })),
+    board,
+    costs
+  ).position
 }

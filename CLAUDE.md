@@ -417,6 +417,37 @@ JQData 许可 · 换手率其实早就取通过）与由它们得出的十条方
 `TradeInput.board` 是**必填**的 —— 记账靠缺省会让 ETF 的成本价与已实现盈亏偏高，
 必填让漏传时编译不过。回测缺省仍按股票收满（偏保守是安全方向）。
 
+**⚠ 2026-09-03 账本补上分红与送转，费率改成「反解」（schema v17，`ENGINE_VERSION` 不变，
+回测数字逐位不变，见 [CHANGELOG](./CHANGELOG.md)）。** `trade_log.side` 从三种扩到**五种**：
+`DIVIDEND` **扣减摊薄成本**（不进 `realized` —— 那笔钱等卖出才结转，两处都算会数两遍；
+摊到 0 之后的余额才进）· `SPLIT` 股数增、成本按比例摊薄、并按 `peakScale` **缩放
+`position.peak_price`** · `OPENING` 的价含不含费由 `fee_included` 说（**新录默认不含**，
+**NULL = v17 之前的行按「已含」**，反过来会让升级那一刻全库期初成本被凭空补一笔费用）。
+病根都是**不复权口径**：除权那天价格自己掉下来而成本不动 ⇒ 假浮亏 + 止损缓冲被吃掉，
+10 送 10 更让移动止损立刻读出 −50% 的假回撤（与 `acceptLoss` 不重设 peak 同一形状）。
+**费率没有编辑框**（用户拍板）：唯一写入路径是持仓页「校正成本」——
+抄一个券商那边的摊薄成本，`solveCommissionRate` 从流水**反解佣金率**，
+判据是可核对性（那个成本用户每天都在看，费率不是；同 docs/01 §5.5 那条取舍）。
+⚠ 四条别踩：① **只解 `commissionRate`**（一个方程一个未知数，最低佣金与它在同一个 `max()` 里）；
+② **解不出来就拒绝** —— 每笔都触最低佣金 ⇒ `UNIDENTIFIABLE`（数学结论），
+差额超范围 ⇒ `OUT_OF_RANGE` 并指向「更可能漏了一笔分红/价格填错一位」，
+**不许夹到边界给个数**；③ 反解落在**一整段**费率上（成本 `round4`）⇒ 取中点 + 对齐到万分之 0.05，
+取下边界会系统性偏低半段（券商报万 0.8、界面写万 0.75，而两者同样对得上）；
+④ **回测与影子仍用 `DEFAULT_COSTS`** —— 跟着用户改会让影子净值每校正一次就分一段、
+拆不开就没法引用；代价是实盘盈亏与影子绩效多一项已知口径差，**两个数不能直接相减**。
+
+**⚠ 同一次修掉一个静默缺陷：`trade_log.realized` 此前重放不改写。**
+它是插入时算好存下的，而删一笔只重建持仓 ⇒ 删掉第一笔买入之后，后面那些卖出的
+已实现盈亏仍按旧成本算，`sumRealized` 给出一个错的数 —— **而没有任何东西会报警**。
+现在 `replayLedger` 逐行重算 `fee` 与 `realized` 并写回，`addTrade` / `updateTrade`
+（新入口，改一笔而不丢 `signal_id`）/ `removeTrade` / 费率重算**共用这一条路**。
+同一次还去掉了 `addTrade` 那个「新录的一笔一定是最新的」假设 ——
+**分红与送转天生是补录的**，落在流水中间，增量叠加会拿今天的持股数去摊那一天的钱。
+⚠ 老库里的 `realized` 会在下一次重放时被修正，**那是修缺陷不是引擎变了**。
+⚠ 重放沿用**行上存着的** `fee`（当时真按当时费率算的），只有 `refee: true` 才重算；
+而它必须走 `applyTrade` 的 `feeOverride` 进去 —— 只改报出去的 `fee`、成本仍按新费率算的话
+`成本 × 股数 − 成交额 ≠ fee`，当场对不上（写用例时才发现的）。
+
 里程碑见 [docs/08](./docs/08-开发路线图.md)，偏差见 [docs/notes/](./docs/notes/)。
 
 ## 五条不可违反的约束
@@ -474,10 +505,14 @@ src/backtest 回测 CLI，复用 src/core
 而「回测说赚、影子说亏」到底是策略退化还是口径差异会变成一个查不清的问题。
 
 **同一条边的第二个用例是 `main/trades → backtest/costs`**（2026-08-14，实盘成交记账）：
-用户录入的成交按同一套费率算手续费，实盘盈亏才与影子绩效可比。
+记账复用的是同一套**费用公式**（`buyFees` / `sellFees` / `isFundBoard`）。
 但**记账绝不套 `buyFill` / `sellFill` 的滑点** —— 那两个是回测在模拟「不知道会成交在哪」，
 而用户填的就是真实成交价，再偏一次等于凭空把它改坏，然后一路进成本、进止损线。
 这是那个文件里最容易被「顺手复用」错的地方，`src/main/trades/ledger.ts` 头注释写着。
+⚠ **共用的只有公式，费率从 2026-09-03 起是两份**（017）：记账走
+`AppSettings.tradeCosts`（`main/trades/fees.ts` 的 `ledgerCosts`，`slippage` **显式置 0**
+而不是继承出厂的 0.001），回测与影子一律 `DEFAULT_COSTS`。
+`ledgerCosts` **不许被 `src/backtest` 或 `src/main/shadow` 调用**。
 
 **渲染层不许 import `src/main`**（包括那个纯函数记账器）。成交表单的「录入后会变成什么样」
 走 `trade:preview` 这趟 IPC，与落库共用同一个 `applyTrade` ——
@@ -496,7 +531,8 @@ src/backtest 回测 CLI，复用 src/core
 | 换托盘 / 应用图标 | [resources/icons/README.md](./resources/icons/README.md)（png 是手绘资产；只有 `icon.ico` 是生成件，跑 `node tools/logo/make-ico.mjs` 重出，它**不在** package.json 的 scripts 里） |
 | 改提醒逻辑 | [docs/05](./docs/05-风控与提醒规则.md) |
 | 改影子运行 | [docs/07 §2.3](./docs/07-回测与验证方案.md)（四条前向纪律 + 记账口径） |
-| 改成交记账 / 持仓 | [`src/main/trades/ledger.ts`](./src/main/trades/ledger.ts) 头注释（含费摊薄、卖出不动成本、**不套滑点**、T+1 只提示不硬拒）+ [007_trade_log.sql](./src/main/storage/migrations/007_trade_log.sql) |
+| 改成交记账 / 持仓 | [`src/main/trades/ledger.ts`](./src/main/trades/ledger.ts) 头注释（含费摊薄、卖出不动成本、**不套滑点**、分红扣成本、送转缩 peak、T+1 只提示不硬拒）+ [007_trade_log.sql](./src/main/storage/migrations/007_trade_log.sql) + [017_trade_costs.sql](./src/main/storage/migrations/017_trade_costs.sql) |
+| 改费率 / 校正成本 | [`src/main/trades/fees.ts`](./src/main/trades/fees.ts) 头注释（为什么是反解而不是编辑框、三种解不出来的情况）+ [docs/03 §4.1](./docs/03-数据源与存储设计.md) |
 | 改建仓体检 / T+1 卖出锁定 | [docs/05 §2.1a / §2.5](./docs/05-风控与提醒规则.md) + [`src/core/risk/entry.ts`](./src/core/risk/entry.ts) 头注释（三条边界：只复述、无新阈值、verdict 纯派生） |
 | 改设置页 / 参数表 | [docs/01 §5.5](./docs/01-产品需求与范围.md) + [ADR-0003](./docs/adr/ADR-0003-来源文档数值不作为出厂默认.md) |
 | 改 AI 解读 | [src/main/ai/index.ts](./src/main/ai/index.ts) 头注释（五条纪律）+ [src/main/ai/service.ts](./src/main/ai/service.ts)（两层缓存 / 只有 done 落库）+ [AiPanel.tsx](./src/renderer/panel/AiPanel.tsx) 头注释（为什么是页签、搬过两次家）+ [docs/08 §后续](./docs/08-开发路线图.md) |
