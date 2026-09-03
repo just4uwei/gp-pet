@@ -44,8 +44,10 @@ const TradeFeeRatesSchema = z.object({
 /** 费率的来路。整块坏掉时只丢来路、不丢费率（见 `AppSettings.tradeCostsSource`） */
 const TradeFeeSourceSchema = z.object({
   code: z.string().min(1),
-  targetCost: z.number().positive(),
+  targetFeeTotal: z.number().min(0),
+  throughMs: z.number().int().positive(),
   commissionRate: z.number().min(0).max(COMMISSION_RATE_MAX),
+  minCommission: z.number().min(0).max(100),
   at: z.number().int().positive(),
 })
 

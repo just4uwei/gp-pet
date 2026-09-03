@@ -8,6 +8,7 @@
 
 import { Menu } from 'electron'
 import { normalizeCode } from '@core/code'
+import type { FeeCalibrationQuery } from '@shared/ipc-types'
 import type { AppController } from '../../controller'
 import { buildContextMenu } from '../../tray/menu'
 import { PARAM_GAPS } from '../../settings/params-view'
@@ -109,14 +110,19 @@ export function registerHandlers(controller: AppController): void {
 
   handle('trade:update', (_event, patch) => controller.updateTrade(patch))
 
-  // 校正成本（017）：从真实摊薄成本反解佣金率。preview 只读，apply 才写
-  handle('trade:costPreview', (_event, query) =>
-    controller.costPreview({ code: normalizeCode(query.code), targetCost: query.targetCost })
+  // 校正费率（017）：从券商的累计交易税费反解佣金率。preview 只读，apply 才写
+  const calibrationOf = (query: FeeCalibrationQuery): FeeCalibrationQuery => ({
+    code: normalizeCode(query.code),
+    targetFeeTotal: query.targetFeeTotal,
+    waiveMinCommission: query.waiveMinCommission,
+    ...(query.throughMs === undefined ? {} : { throughMs: query.throughMs }),
+  })
+
+  handle('trade:calibratePreview', (_event, query) =>
+    controller.calibratePreview(calibrationOf(query))
   )
 
-  handle('trade:costApply', (_event, query) =>
-    controller.costApply({ code: normalizeCode(query.code), targetCost: query.targetCost })
-  )
+  handle('trade:calibrateApply', (_event, query) => controller.calibrateApply(calibrationOf(query)))
 
   // 当日分时。**只在用户打开抽屉「行情」页时才被调**，且是全应用唯一一处
   // 由用户交互直接触发取数的通道 —— 缓存与降级都在数据层（data-layer 的 minuteCache

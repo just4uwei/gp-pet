@@ -219,7 +219,14 @@ describe('sanitizeSettings · tradeCosts', () => {
   })
 
   it('合法的来路原样保留', () => {
-    const source = { code: 'SH600000', targetCost: 12.345, commissionRate: 0.0001, at: 1_700_000_000_000 }
+    const source = {
+      code: 'SH600000',
+      targetFeeTotal: 85.11,
+      throughMs: 1_699_900_000_000,
+      commissionRate: 0.0001,
+      minCommission: 0,
+      at: 1_700_000_000_000,
+    }
     expect(sanitizeSettings({ tradeCostsSource: source }).settings.tradeCostsSource).toEqual(source)
   })
 })

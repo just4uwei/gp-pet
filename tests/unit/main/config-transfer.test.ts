@@ -119,8 +119,10 @@ describe('buildConfigBundle', () => {
       tradeCosts: { ...DEFAULT_SETTINGS.tradeCosts, commissionRate: 0.0001 },
       tradeCostsSource: {
         code: 'SH600000',
-        targetCost: 12.345,
+        targetFeeTotal: 85.11,
+        throughMs: 1_699_900_000_000,
         commissionRate: 0.0001,
+        minCommission: 0,
         at: 1_700_000_000_000,
       },
     }

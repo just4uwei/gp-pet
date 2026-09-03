@@ -217,6 +217,23 @@ export interface TradeLedger {
    * 那笔钱要等卖出时才结转成已实现盈亏。两个数相加会把同一笔钱数两遍。
    */
   dividendTotal: number
+  /**
+   * **净成本** = `净投入 / 现持股数`（017，`ledger.netCostOf`）——
+   * 「这些票要涨到多少，我在这只票上才不亏」。没有持仓时为 null。
+   *
+   * ## 它与 `position.cost` 是两个数，而且差得很远
+   *
+   * `position.cost` 是**加权平均成本**（卖出不改成本）；净成本把**已实现盈亏
+   * 折回成本里**。真机实测（2026-09-03）：同一只票 12.067 vs 12.903，
+   * 差的 0.84 元/股 × 8700 股 = 7300 元，正好是那 4 次做 T 的累计亏损。
+   *
+   * **券商持仓页上那个「成本价」多半是这一个**（同花顺/东财默认口径）⇒
+   * 两个数必须**并排显示并各自标明**，只给一个的话用户会以为软件算错了。
+   *
+   * ⚠ **止损一律用 `position.cost`。** 净成本会随已实现亏损**往上跳**
+   * ⇒ 每做亏一笔 T 止损线就抬高一格，那是反的。
+   */
+  netCost: number | null
   /** 当前持仓；已清仓为 null */
   position: PositionView | null
 }
@@ -355,72 +372,100 @@ export interface FeeAudit {
   stopAcksCleared: number
 }
 
+/** 「校正费率」的入参（`trade:calibratePreview` / `trade:calibrateApply`，017） */
+export interface FeeCalibrationQuery {
+  code: SecCode
+  /** 券商显示的这只票的**累计交易税费** */
+  targetFeeTotal: number
+  /**
+   * 截止日（含这一天）。缺省 = 全部流水都算上。
+   *
+   * 它存在的理由很具体：**当日的税费券商往往当天不出**，
+   * 而把今天那两笔算进我们这一侧、券商那一侧却没算，差额会被整个记到费率头上。
+   */
+  throughMs?: number
+  /**
+   * 你的券商免 5 元最低佣金吗。
+   *
+   * ⚠ **这一项必须由用户说，反解不出来**：`fee = max(最低, 金额 × 率)` 里有两个
+   * 未知数而只有一个方程。真机上这是硬约束不是洁癖 —— 那个账户免最低，
+   * 而保留 5 元最低时**即使佣金率归零总费用也够不到券商给的数**。
+   */
+  waiveMinCommission: boolean
+}
+
 /**
- * 「校正成本」的反解结果（`trade:costPreview`，017，2026-09-03 用户拍板的形态）。
+ * 「校正费率」的反解结果（017，2026-09-03 用户拍板的形态）。
  *
  * ## 它在做什么
  *
- * 用户在券商 App 上看到某只票的摊薄成本是 `targetCost`，而这里算出来的是 `costNow`。
- * 差额几乎总是**佣金率**造成的 —— 出厂那套（万 2.5 / 最低 5 元）是「A 股散户常见档」
- * 的猜测，而真实档位在万 0.85 ~ 万 3 之间。于是**反解**：找一个 `commissionRate`
- * 让这只票重放出来的成本恰好等于 `targetCost`。
+ * 用户在券商 App 上看到某只票的累计交易税费是 `targetFeeTotal`，而这里算出来的是
+ * `feeTotalNow`。差额几乎总是**佣金档位**造成的 —— 出厂那套（万 2.5 / 最低 5 元）
+ * 是「A 股散户常见档」的猜测，而真实档位在万 0.85 ~ 万 3 之间。
+ * 于是**反解**：找一个 `commissionRate` 让同一批流水算出同一个总数。
  *
- * **不给用户直接改费率的入口**（这是与第一版方案的关键区别）：费率是个四维的东西，
- * 让用户对着四个框猜，比让他抄一个他每天都在看的数字要难得多，而且抄下来的那个
- * 成本价是**可核对的事实**，费率不是。
+ * **不给用户直接改费率的入口**：费率是个四维的东西，让用户对着四个框猜，
+ * 比让他抄一个他能在券商那边看到的数字要难得多 —— 那笔钱是**可核对的事实**，费率不是。
+ *
+ * ## ⚠ 为什么目标是「税费」而不是「成本」（2026-09-03 换的，真机逼出来的）
+ *
+ * 第一版拿**摊薄成本**当目标，而券商持仓页上那个「成本价」多半是**净成本**
+ * （把已实现盈亏折回成本里，见 `TradeLedger.netCost`）—— 同一只票实测
+ * `12.067` vs `12.903`，**两边根本不是一个数**。用户照着抄下来的那个值
+ * 我们这边永远解不出，而错误的形状是「软件说这个成本不可能」。
+ * 「累计交易税费」没有这个歧义：它就是一笔钱。
  *
  * ## 三条必须一起读的限制
  *
- * 1. **一个方程解一个未知数。** 只动 `commissionRate`，其余三项按规定值不动
- *    （印花税只作用于卖出、不进成本；过户费是交易所规定）。
- *    ⇒ 它把**全部**差额都归给佣金率。差额若来自漏录的一笔成交 / 忘了的分红 /
- *    价格填错一位，反解出来的费率就是垃圾 —— 所以超出合理区间时**拒绝**并说明
- *    更可能的原因，而不是给出一个能让数字对上的荒唐费率。
+ * 1. **一个方程解一个未知数。** 只动 `commissionRate`；印花税与过户费是交易所与
+ *    国家规定，最低佣金由用户那个开关给定。⇒ 它把**全部**差额都归给佣金率。
+ *    差额若来自漏录的一笔成交，反解出来的费率就是垃圾 —— 所以超出合理区间时
+ *    **拒绝**并说明更可能的原因，而不是给出一个能让数字对上的荒唐费率。
  * 2. **费率是账户级的 ⇒ 校正一只票会改动全部标的的成本。** `audit` 就是为此存在的：
  *    确认之前先看清它动了哪些持仓。如果只有这一只对不上，那更像是**这只票的流水
  *    本身有问题**，不是费率问题。
  * 3. **每一笔都触到最低佣金时，反解在数学上不成立**（`status = 'UNIDENTIFIABLE'`）：
- *    `fee = max(5, 金额 × 费率)` 在 5 元那一侧对费率**完全不敏感** ⇒ 成本不随费率变。
- *    换一只单笔金额更大的票再试。
+ *    `fee = max(5, 金额 × 费率)` 在 5 元那一侧对费率**完全不敏感**。
  */
-export interface CostCalibration {
+export interface FeeCalibration {
   code: SecCode
   status:
     | 'OK'
-    /** 每一笔买入都触到最低佣金 ⇒ 成本对费率不敏感，这只票身上解不出东西 */
+    /** 每一笔都触到最低佣金 ⇒ 总费用对费率不敏感，解不出东西 */
     | 'UNIDENTIFIABLE'
-    /** 要让成本对上得把费率推到区间外 ⇒ 差额不像是费率造成的 */
+    /** 要让总费用对上得把费率推到区间外 ⇒ 差额不像是费率造成的 */
     | 'OUT_OF_RANGE'
-    /** 这只票没有任何会产生手续费的流水（只有卖出 / 只有含费建仓 / 一笔都没有） */
+    /** 截止日之内没有任何会产生手续费的流水 */
     | 'NO_BASIS'
-    /** 现在没有持仓，没有「当前成本」可校正 */
-    | 'NO_POSITION'
   /** 原样显示给用户。`OK` 时是一句说明，其余状态时是「更可能的原因是什么」 */
   message: string
   /** 用户抄下来的那个数 */
-  targetCost: number
-  /** 按现行费率算出来的成本 */
-  costNow: number
-  /** 反解成功时：换上新费率之后这只票的成本（应当≈`targetCost`） */
-  costAfter?: number
-  /** 现行佣金率 */
+  targetFeeTotal: number
+  /** 按现行费率算出来的、**同一批**流水的费用合计 */
+  feeTotalNow: number
+  /** 反解成功时：换上新费率之后的费用合计（应当≈`targetFeeTotal`） */
+  feeTotalAfter?: number
   rateNow: number
   /** 反解出来的佣金率。`OUT_OF_RANGE` 时给的是被夹住的边界值，**仅供显示** */
   rateSolved?: number
-  /** 触到最低佣金的买入笔数 / 会产生手续费的笔数 —— 判 `UNIDENTIFIABLE` 的依据 */
-  minCommissionBound: number
+  minCommissionNow: number
+  /** 应用之后的最低佣金（= 用户勾了「免最低」就是 0，否则不动） */
+  minCommissionAfter: number
+  /** 参与反解的笔数（会产生费用、且在截止日之内的） */
   feeBearing: number
+  /** 被截止日挡在外面的笔数 —— **要显示**，否则用户不知道今天那两笔没算进去 */
+  excludedByDate: number
   /** 应用之后全库会变成什么样。`status !== 'OK'` 时缺省 */
   audit?: FeeAudit
 }
 
-/** `trade:costApply` 的结果 */
-export interface CostCalibrationResult {
+/** `trade:calibrateApply` 的结果 */
+export interface FeeCalibrationResult {
   status: 'DONE' | 'REJECTED' | 'FAILED'
   /** 原样显示给用户（含备份成败）。非 DONE 时是原因 */
   message: string
   /** 主进程**重新反解**了一遍的结果 —— 渲染层送来的数字一概不采信 */
-  calibration: CostCalibration
+  calibration: FeeCalibration
   /** 事前那份一致性快照的路径；备份没做成时缺省（**不阻断** —— 这一步是可逆的） */
   backupPath?: string
 }
@@ -1640,16 +1685,16 @@ export interface IpcInvokeMap {
   /** 改一笔（录错了但不想丢掉关联）。边界见 `TradeUpdate` */
   'trade:update': (patch: TradeUpdate) => TradeLedger
   /**
-   * 「校正成本」的干跑（017）：从这只票的真实摊薄成本**反解佣金率**。
-   * **只读，什么都不写。** 口径与三条限制见 `CostCalibration`。
+   * 「校正费率」的干跑（017）：从这只票的**累计交易税费**反解佣金率。
+   * **只读，什么都不写。** 口径与三条限制见 `FeeCalibration`。
    */
-  'trade:costPreview': (query: { code: SecCode; targetCost: number }) => CostCalibration
+  'trade:calibratePreview': (query: FeeCalibrationQuery) => FeeCalibration
   /**
    * 真的应用：写回费率 + **整库一个事务**重算流水与持仓。
    *
    * ⚠ 主进程会**重新反解一遍**（不采信渲染层送来的费率），解不出来就 `REJECTED`。
    */
-  'trade:costApply': (query: { code: SecCode; targetCost: number }) => CostCalibrationResult
+  'trade:calibrateApply': (query: FeeCalibrationQuery) => FeeCalibrationResult
   /**
    * `perCode` = 每只标的最多取几条。**「今日信号」这类列表应当传它** ——
    * 全局 `limit` 会被单只刷屏的票吃光，而症状是「早上那批信号凭空不见了」，
@@ -1929,12 +1974,16 @@ export interface TradeFeeRates {
  * 而这一栏就是把「它其实是从 SH600000 的成本反解出来的」写在旁边。
  */
 export interface TradeFeeSource {
-  /** 从哪只票的成本反解出来的 */
+  /** 从哪只票的累计交易税费反解出来的 */
   code: SecCode
-  /** 用户当时抄下来的那个摊薄成本 */
-  targetCost: number
+  /** 用户当时抄下来的那个税费合计 */
+  targetFeeTotal: number
+  /** 当时用的截止日（今日未结算的税费会被排除在外） */
+  throughMs: number
   /** 反解出来的佣金率（= 当时写进 `tradeCosts.commissionRate` 的那个数） */
   commissionRate: number
+  /** 当时定下的最低佣金（用户勾了「免最低」就是 0） */
+  minCommission: number
   at: number
 }
 

@@ -51,9 +51,10 @@ import type {
   ShadowTradeView,
   SignalEvidence,
   SignalRecord,
-  CostCalibration,
-  CostCalibrationResult,
   FeeAudit,
+  FeeCalibration,
+  FeeCalibrationQuery,
+  FeeCalibrationResult,
   TradeDecisionOption,
   TradeDraft,
   TradeFeeRates,
@@ -149,6 +150,7 @@ import {
 import {
   applyTrade,
   isTradeError,
+  netCostOf,
   replayLedger,
   resolveDecision,
   t1SellNotice,
@@ -157,7 +159,7 @@ import {
   type TradeInput,
 } from './trades/ledger'
 import type { CostModel } from '../backtest/costs'
-import { ledgerCosts, ratePerTenThousand, solveCommissionRate } from './trades/fees'
+import { ledgerCosts, ratePerTenThousand, solveFromFeeTotal } from './trades/fees'
 import { splitCode } from '@core/code'
 import type { TradeRow } from './storage/repositories/trade'
 import type { WatchPointRow } from './storage/repositories/watch'
@@ -932,7 +934,15 @@ export class AppController {
   tradeLedger(code: SecCode): TradeLedger {
     const layer = this.data
     if (!layer) {
-      return { code, trades: [], realizedTotal: 0, feeTotal: 0, dividendTotal: 0, position: null }
+      return {
+        code,
+        trades: [],
+        realizedTotal: 0,
+        feeTotal: 0,
+        dividendTotal: 0,
+        netCost: null,
+        position: null,
+      }
     }
     const rows = layer.storage.trades.listByCode(code)
     return {
@@ -944,6 +954,13 @@ export class AppController {
       // 与已实现盈亏**分两行**：分红走扣减成本，那笔钱要等卖出时才进 realized，
       // 相加会把同一笔钱数两遍（017 头注释）
       dividendTotal: layer.storage.trades.sumDividends(code),
+      /*
+        净成本（= 净投入 / 现持股数）。**券商持仓页上那个「成本价」多半是这一个**，
+        而 `position.cost` 是加权平均成本 —— 两个数差得很远（实测 12.067 vs 12.903），
+        并排显示并各自标明是唯一不让用户以为软件算错的做法。
+        ⚠ 止损用的仍然是 `position.cost`（见 TradeLedger.netCost 头注释）。
+      */
+      netCost: netCostOf(rows, layer.storage.positions.get(code)?.shares ?? 0),
       /*
         ⚠ 必须走 `toPositionView()`，不能直接把仓储那行 `Position` 丢出去（2026-08-15 修）。
 
@@ -1127,39 +1144,52 @@ export class AppController {
   }
 
   /**
-   * 反解 + 干跑，`costPreview` 与 `costApply` 共用。
+   * 反解 + 干跑，`calibratePreview` 与 `calibrateApply` 共用。
    *
-   * 反解本身住 `trades/fees.ts` 的 `solveCommissionRate`（纯函数、可测），
-   * 这一层只负责取流水、取现行费率、把干跑结果挂上去。
+   * 反解本身住 `trades/fees.ts` 的 `solveFromFeeTotal`（纯函数、可测），
+   * 这一层只负责取流水、按「免最低」那个开关定下 `minCommission`、把干跑结果挂上去。
+   *
+   * ⚠ **`minCommission` 由用户那个开关决定，不是解出来的** ——
+   * 一个方程解不了两个未知数（`FeeCalibrationQuery.waiveMinCommission` 写着理由）。
    */
-  private solveCalibration(
-    query: { code: SecCode; targetCost: number },
-    opts: { withAudit: boolean }
-  ): CostCalibration {
+  private solveCalibration(query: FeeCalibrationQuery, opts: { withAudit: boolean }): FeeCalibration {
     const layer = this.requireData()
     const code = query.code
-    const base = layer.settings.get().tradeCosts
-    const rows = layer.storage.trades.listByCode(code).map((row) => this.toReplayRow(row))
+    const current = layer.settings.get().tradeCosts
+    // 「免最低」把 minCommission 定成 0；不勾就沿用现行那个数
+    const base: TradeFeeRates = {
+      ...current,
+      minCommission: query.waiveMinCommission ? 0 : current.minCommission,
+    }
+    const rows = layer.storage.trades.listByCode(code).map((row) => ({
+      side: row.side,
+      price: row.price,
+      shares: row.shares,
+      fee: row.fee,
+      ...(row.feeIncluded === undefined ? {} : { feeIncluded: row.feeIncluded }),
+      tradedAt: row.tradedAt,
+    }))
 
-    const solved = solveCommissionRate({
+    const solved = solveFromFeeTotal({
       rows,
       board: this.boardOf(code),
       base,
-      targetCost: query.targetCost,
+      targetFeeTotal: query.targetFeeTotal,
+      ...(query.throughMs === undefined ? {} : { throughMs: query.throughMs }),
     })
 
-    const view: CostCalibration = {
+    const view: FeeCalibration = {
       code,
       status: solved.status,
       message: solved.message,
-      targetCost: query.targetCost,
-      // 反解不出来时（没有持仓）也要给一个数：0 在这里是「算不出来」的显示位，
-      // 而 status 已经说清了它算不出来 —— 界面据此不显示这一栏
-      costNow: solved.costNow ?? 0,
-      rateNow: base.commissionRate,
-      minCommissionBound: solved.minCommissionBound,
+      targetFeeTotal: query.targetFeeTotal,
+      feeTotalNow: solved.feeTotalNow,
+      rateNow: current.commissionRate,
+      minCommissionNow: current.minCommission,
+      minCommissionAfter: base.minCommission,
       feeBearing: solved.feeBearing,
-      ...(solved.costAt === undefined ? {} : { costAfter: solved.costAt }),
+      excludedByDate: solved.excludedByDate,
+      ...(solved.feeTotalAt === undefined ? {} : { feeTotalAfter: solved.feeTotalAt }),
       ...(solved.rate === undefined ? {} : { rateSolved: solved.rate }),
     }
     if (opts.withAudit && solved.status === 'OK' && solved.rate !== undefined) {
@@ -1617,16 +1647,20 @@ export class AppController {
     return this.tradeLedger(code)
   }
 
-  // ── 校正成本：从真实摊薄成本反解佣金率（017）───────────────────────
+  // ── 校正费率：从券商的累计交易税费反解佣金率（017）─────────────────
   //
-  // 用户抄下券商 App 上那只票的摊薄成本，软件反解出佣金率并（确认后）
+  // 用户抄下券商 App 上那只票的**累计交易税费**，软件反解出佣金率并（确认后）
   // 按新费率把全库流水重算一遍。**设置页不给费率编辑框** —— 判据是可核对性：
-  // 那个成本价用户每天都在看，是事实；费率不是（见 `TradeFeeRates` 头注释）。
+  // 那笔钱是券商真的扣走的，是事实；费率不是（见 `TradeFeeRates` 头注释）。
+  //
+  // ⚠ 目标是「税费」而不是「成本」（2026-09-03 换的）：券商持仓页上那个
+  // 「成本价」多半是**净成本**（含已实现盈亏），与我们的加权平均成本根本不是
+  // 一个数（实测 12.067 vs 12.903）—— 详见 `FeeCalibration` 头注释。
   //
   // 两个方法**共用同一条反解**（`solveCalibration`），这样确认框里显示的数字
   // 与真的发生的事逐位一致 —— 与 `trade:preview` 那条纪律同一形状。
 
-  costPreview(query: { code: SecCode; targetCost: number }): CostCalibration {
+  calibratePreview(query: FeeCalibrationQuery): FeeCalibration {
     return this.solveCalibration(query, { withAudit: true })
   }
 
@@ -1644,7 +1678,7 @@ export class AppController {
    *    （下一次删一笔流水时它会突然按新费率把这只票重算一遍）。
    *    所以重算这一趟把费率**显式传进去**（`opts.costs`），不从 settings 读。
    */
-  costApply(query: { code: SecCode; targetCost: number }): CostCalibrationResult {
+  calibrateApply(query: FeeCalibrationQuery): FeeCalibrationResult {
     const layer = this.requireData()
     const calibration = this.solveCalibration(query, { withAudit: true })
     if (calibration.status !== 'OK' || calibration.rateSolved === undefined) {
@@ -1652,7 +1686,12 @@ export class AppController {
     }
 
     const rate = calibration.rateSolved
-    const rates: TradeFeeRates = { ...layer.settings.get().tradeCosts, commissionRate: rate }
+    // 最低佣金跟着那个开关一起写回 —— 它不是解出来的，是用户说的
+    const rates: TradeFeeRates = {
+      ...layer.settings.get().tradeCosts,
+      commissionRate: rate,
+      minCommission: calibration.minCommissionAfter,
+    }
     let backupPath: string | undefined
     try {
       backupPath = backupNow(
@@ -1674,29 +1713,34 @@ export class AppController {
         }
       })
     } catch (error) {
-      log.warn('[trade] 校正成本失败，已整份回滚（费率未改）：', error)
+      log.warn('[trade] 校正费率失败，已整份回滚（费率未改）：', error)
       return { status: 'FAILED', message: messageOf(error), calibration }
     }
 
+    const now = Date.now()
     this.patchSettings({
       tradeCosts: rates,
       tradeCostsSource: {
         code: query.code,
-        targetCost: query.targetCost,
+        targetFeeTotal: query.targetFeeTotal,
+        throughMs: query.throughMs ?? now,
         commissionRate: rate,
-        at: Date.now(),
+        minCommission: rates.minCommission,
+        at: now,
       },
     })
     log.info(
-      `[trade] 校正成本：${query.code} 目标 ${query.targetCost} → 佣金率 ` +
-        `${ratePerTenThousand(rate)}，改写 ${calibration.audit?.trades ?? 0} 笔流水`
+      `[trade] 校正费率：${query.code} 税费目标 ${query.targetFeeTotal} → 佣金率 ` +
+        `${ratePerTenThousand(rate)} / 最低 ${rates.minCommission} 元，` +
+        `改写 ${calibration.audit?.trades ?? 0} 笔流水`
     )
     this.onStateChanged()
     return {
       status: 'DONE',
       message:
-        `已按 ${ratePerTenThousand(rate)} 重算了 ${calibration.audit?.trades ?? 0} 笔流水` +
-        `（${calibration.audit?.codes ?? 0} 只标的）。` +
+        `已按 ${ratePerTenThousand(rate)}（最低佣金 ` +
+        `${rates.minCommission === 0 ? '免' : `${rates.minCommission} 元`}）` +
+        `重算了 ${calibration.audit?.trades ?? 0} 笔流水（${calibration.audit?.codes ?? 0} 只标的）。` +
         (backupPath === undefined ? '⚠ 事前那份备份没做成。' : '事前已备份一份数据库。'),
       calibration,
       ...(backupPath === undefined ? {} : { backupPath }),

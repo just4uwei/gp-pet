@@ -23,8 +23,15 @@
  * 2. **价格填不复权真实成交价**（券商 App 上那个数）。这条在表单上要写出来 ——
  *    填成前复权价会让止损线在除权后凭空触发（docs/03 §2.3）。
  * 3. **手续费不给输入框，费率也不给。** 手续费按费率算；对不上时走持仓卡上那个
- *    **「校正成本」** —— 抄一个摊薄成本，软件反解佣金率（`CostCalibrateForm`）。
- *    判据是可核对性：那个成本价用户每天都在看，费率不是。
+ *    **「校正费率」** —— 抄一个**累计交易税费**，软件反解佣金率（`FeeCalibrateForm`）。
+ *    判据是可核对性：那笔钱是券商真的扣走的，费率不是。
+ *
+ * ## 两个「成本」并排显示（017）
+ *
+ * `position.cost` 是**加权平均成本**（卖出不改成本，止损用的就是它），
+ * `ledger.netCost` 是**净成本**（净投入 ÷ 现持股数，把已实现盈亏折回成本里）。
+ * 真机实测同一只票 12.067 vs 12.903 —— **券商持仓页上那个「成本价」多半是后者**。
+ * 只给一个的话用户会以为软件算错了，所以两个都给、各自标明。
  *
  * ## T+1 与建仓体检（2026-08-19）
  *
@@ -50,7 +57,7 @@ import type {
 import { shanghaiDate, shanghaiHhmm, shanghaiMdHhmm, shanghaiMsFrom } from '@shared/time'
 import { EntryCheckCard } from './EntryCheckCard'
 import { StopFloorForm, StopFloorNotice } from './StopFloorForm'
-import { CostCalibrateForm } from './CostCalibrateForm'
+import { FeeCalibrateForm } from './FeeCalibrateForm'
 import {
   ENTRY_SIDES,
   FIELD,
@@ -235,7 +242,7 @@ export function TradePanel({
     note?: string
   }) => void
   onRemove: (id: string) => void
-  /** 改一笔 / 校正成本之后把新账本交回上层（自选行上的持仓角标要跟着换） */
+  /** 改一笔 / 校正费率之后把新账本交回上层（自选行上的持仓角标要跟着换） */
   onLedgerChanged: (next: TradeLedger) => void
   /** 止损确认/撤销之后把新的持仓视图交回上层（账本里那份要跟着换） */
   onStopChanged: (next: PositionView | null) => void
@@ -411,6 +418,23 @@ export function TradePanel({
             </span>
             <span className="text-white/40">摊薄成本（含费）</span>
             <span className="text-right font-mono">{position.cost.toFixed(3)}</span>
+            {/*
+              净成本：净投入 ÷ 现持股数，把**已实现盈亏折回成本里**（017）。
+              **券商持仓页上那个「成本价」多半是这一个** —— 只给上面那个的话，
+              用户拿它跟券商一比就会以为软件算错了（真机实测两者差 0.84 元/股）。
+              ⚠ 止损用的是上面那个，不是这个：净成本会随已实现亏损**往上跳**。
+              两者相同（没卖过、没分红）时不显示 —— 一行重复的数只是噪音。
+            */}
+            {ledger?.netCost != null && Math.abs(ledger.netCost - position.cost) >= 0.0005 ? (
+              <>
+                <span className="text-white/40" title="净投入 ÷ 现持股数，含已实现盈亏与分红。券商多半显示这个">
+                  净成本（含已实现）
+                </span>
+                <span className="text-right font-mono text-white/70">
+                  {ledger.netCost.toFixed(3)}
+                </span>
+              </>
+            ) : null}
             <span className="text-white/40">现价</span>
             <span className={`text-right font-mono ${quote?.stale === true ? 'text-white/35' : ''}`}>
               {last === undefined ? '—' : last.toFixed(2)}
@@ -425,14 +449,18 @@ export function TradePanel({
         )}
 
         {/*
-          校正成本（017）。**入口摆在成本价旁边**：用户正好在对着这个数与券商 App 比。
-          没有持仓时不给 —— 反解的目标就是「当前成本」，没有它无从校正。
+          校正费率（017）。**入口摆在累计手续费旁边**：用户正好在对着这个数与券商 App 比。
+          账本为空时不给 —— 没有流水就没有可反解的东西。
+
+          ⚠ 目标是**累计交易税费**不是成本价（2026-09-03 换的）：券商持仓页上那个
+          「成本价」多半是净成本（含已实现盈亏），与我们的加权平均成本不是一个数
+          —— 见 FeeCalibrateForm 头注释。
         */}
-        {position !== null ? (
+        {ledger !== null ? (
           calibrateOpen ? (
-            <CostCalibrateForm
+            <FeeCalibrateForm
               code={code}
-              currentCost={position.cost}
+              feeTotal={ledger.feeTotal}
               onDone={(next) => {
                 setCalibrateOpen(false)
                 onLedgerChanged(next)
@@ -443,10 +471,10 @@ export function TradePanel({
           ) : (
             <button
               className="mt-1.5 text-[10px] text-white/30 underline decoration-dotted hover:text-sky-200/70"
-              title="从券商那边的真实摊薄成本反解你的佣金率"
+              title="从券商那边的累计交易税费反解你的佣金率（不是填成本价）"
               onClick={() => setCalibrateOpen(true)}
             >
-              成本与券商对不上？校正一下
+              手续费与券商对不上？校正一下
             </button>
           )
         ) : null}

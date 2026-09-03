@@ -27,7 +27,7 @@ import type {
   ParamRow,
 } from '@shared/ipc-types'
 import { ratePerThousand, ratePerTenThousand } from '@shared/trade-fees'
-import { shanghaiMdHhmm } from '@shared/time'
+import { shanghaiDate, shanghaiMdHhmm } from '@shared/time'
 import { DISCLAIMER } from './disclaimer'
 import { AiSettings } from './AiSettings'
 
@@ -309,10 +309,11 @@ function TradeCosts({ settings }: { settings: AppSettings }): React.JSX.Element 
       <div className="px-3.5 py-3">
         <div className="text-xs text-white/75">费率（只读）</div>
         <div className="mt-0.5 text-[10px] leading-snug text-white/35">
-          这里不给编辑框：这四个数你没有依据去填，而<span className="text-white/55">摊薄成本</span>
-          你每天都在看。要改就去某只票的「持仓」页点
-          <span className="text-white/55">「成本与券商对不上？校正一下」</span>
-          —— 填一个真实成本，软件从流水反解你的佣金率。
+          这里不给编辑框：这四个数你没有依据去填，而
+          <span className="text-white/55">累计交易税费</span>
+          在券商那边看得到。要改就去某只票的「持仓」页点
+          <span className="text-white/55">「手续费与券商对不上？校正一下」</span>
+          —— 填那个税费合计，软件从流水反解你的佣金率。
         </div>
 
         <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
@@ -337,9 +338,16 @@ function TradeCosts({ settings }: { settings: AppSettings }): React.JSX.Element 
             <>
               佣金率是 {shanghaiMdHhmm(source.at)} 从
               <span className="font-mono text-white/55"> {source.code} </span>
-              的成本 <span className="font-mono text-white/55">{source.targetCost.toFixed(3)}</span>{' '}
-              反解出来的。另外三项没动过：印花税与过户费是交易所与国家规定，
-              而最低佣金与佣金率在同一个 max() 里，一个方程解不了两个未知数。
+              截至 {shanghaiDate(source.throughMs)} 的累计税费{' '}
+              <span className="font-mono text-white/55">{source.targetFeeTotal.toFixed(2)}</span>{' '}
+              反解出来的；最低佣金
+              <span className="font-mono text-white/55">
+                {' '}
+                {source.minCommission === 0 ? '免' : `${source.minCommission} 元`}{' '}
+              </span>
+              是你当时勾的（<span className="text-white/45">它反解不出来</span> ——
+              与佣金率在同一个 max() 里，一个方程解不了两个未知数）。
+              印花税与过户费一直没动过：那是交易所与国家规定。
             </>
           )}
         </p>

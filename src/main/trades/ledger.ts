@@ -476,6 +476,42 @@ export function replayLedger(
 }
 
 /**
+ * **净投入**：`买入金额 + 买入费 − 卖出金额 + 卖出费 − 分红到账`（017）。
+ *
+ * 除以现持股数就是「**净成本**」——「这些票要涨到多少，我在这只票上才不亏」。
+ *
+ * ## 它与 `LedgerPosition.cost` 是两个数，而且差得很远
+ *
+ * `cost` 是**加权平均成本**（卖出不改成本）；净成本把**已实现盈亏折回成本里**。
+ * 真机实测（2026-09-03）：同一只票 `cost = 12.067`、净成本 `= 12.903`，
+ * 差的 0.84 元/股 × 8700 股 = 7300 元，正好是那 4 次做 T 的累计亏损。
+ *
+ * **券商持仓页上那个「成本价」多半是净成本这一个**（同花顺/东财默认口径），
+ * 所以两个数必须并排显示 —— 只给一个的话用户会以为软件算错了。
+ *
+ * ⚠ **止损一律用 `cost`，不许换成这个。** 净成本会随已实现亏损**往上跳**
+ * ⇒ 每做亏一笔 T，止损线就抬高一格，那是反的。
+ *
+ * 返回 null = 没有持仓（清仓之后「还要涨到多少」这个问题不成立，
+ * 答案在已实现盈亏那一行）。
+ */
+export function netCostOf(
+  rows: readonly { side: LedgerSide; price: number; shares: number; fee: number }[],
+  shares: number
+): number | null {
+  if (shares <= 0) return null
+  let net = 0
+  for (const row of rows) {
+    const amount = row.price * Math.trunc(row.shares)
+    if (row.side === 'BUY' || row.side === 'OPENING') net += amount + row.fee
+    else if (row.side === 'SELL') net += row.fee - amount
+    // 分红是拿回来的钱，从投入里减掉；送转不涉及现金（`price` 为 0，天然不动 net）
+    else if (row.side === 'DIVIDEND') net -= amount
+  }
+  return round4(net / shares)
+}
+
+/**
  * 只要最终持仓的那个薄包装（调用点很多，不必每处都解构一个五字段的结果）。
  *
  * ⚠ 与 `replayLedger` 一样**默认沿用库里存着的费用**。

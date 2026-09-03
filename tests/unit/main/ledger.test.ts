@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   applyTrade,
   isTradeError,
+  netCostOf,
   replayLedger,
   replayTrades,
   resolveDecision,
@@ -525,5 +526,62 @@ describe('resolveDecision', () => {
   it('快照取库里的 createdAt / priceAt —— 调用方送什么都不采信', () => {
     const out = resolveDecision({ signalId: 'sig-1', code: 'SH600000', signal })
     expect(out).toEqual({ decision: { at: 1_700_000_000_000, price: 12.34 } })
+  })
+})
+
+/**
+ * 净成本（`netCostOf`，017）= 净投入 ÷ 现持股数。
+ *
+ * 它与 `LedgerPosition.cost` 是**两个数**：后者是加权平均成本（卖出不改成本），
+ * 净成本把已实现盈亏折回成本里。真机实测同一只票 12.067 vs 12.903 ——
+ * 而**券商持仓页上那个「成本价」多半是净成本**，所以两个必须并排显示。
+ *
+ * ⚠ 止损一律用 `cost`：净成本会随已实现亏损**往上跳**，每做亏一笔 T 止损线就抬一格。
+ */
+describe('netCostOf', () => {
+  it('只买不卖时 = 加权平均成本（含费）', () => {
+    const rows = [{ side: 'BUY' as const, price: 10, shares: 1000, fee: 30 }]
+    expect(netCostOf(rows, 1000)).toBeCloseTo((10_000 + 30) / 1000, 4)
+  })
+
+  it('做亏一笔 T 之后**高于**加权平均成本 —— 那笔亏损被折回成本里', () => {
+    const rows = [
+      { side: 'BUY' as const, price: 10, shares: 2000, fee: 10 },
+      { side: 'BUY' as const, price: 10, shares: 1000, fee: 5 },
+      { side: 'SELL' as const, price: 9, shares: 1000, fee: 15 },
+    ]
+    // 净投入 = 20010 + 10005 − 9000 + 15 = 21030，剩 2000 股
+    expect(netCostOf(rows, 2000)).toBeCloseTo(21_030 / 2000, 4)
+    // 加权平均成本只有 (20010 + 10005) / 3000 ≈ 10.005 —— 两个数差着那笔亏损
+    expect(netCostOf(rows, 2000)!).toBeGreaterThan(10.005)
+  })
+
+  it('分红是拿回来的钱，从净投入里减掉', () => {
+    const rows = [
+      { side: 'BUY' as const, price: 10, shares: 1000, fee: 0 },
+      { side: 'DIVIDEND' as const, price: 0.3, shares: 1000, fee: 0 },
+    ]
+    expect(netCostOf(rows, 1000)).toBeCloseTo((10_000 - 300) / 1000, 4)
+  })
+
+  it('送转不涉及现金，只摊薄 —— 净投入不变、净成本按股数摊开', () => {
+    const rows = [
+      { side: 'BUY' as const, price: 10, shares: 1000, fee: 0 },
+      { side: 'SPLIT' as const, price: 0, shares: 1000, fee: 0 },
+    ]
+    expect(netCostOf(rows, 2000)).toBeCloseTo(5, 4)
+  })
+
+  it('「价已含费」的建仓：那个价本身就是净投入的一部分，fee = 0 不额外加', () => {
+    const rows = [{ side: 'OPENING' as const, price: 14.75, shares: 5100, fee: 0 }]
+    expect(netCostOf(rows, 5100)).toBeCloseTo(14.75, 4)
+  })
+
+  it('清仓之后返回 null —— 「还要涨到多少」这个问题不成立（**不是 0**）', () => {
+    const rows = [
+      { side: 'BUY' as const, price: 10, shares: 1000, fee: 0 },
+      { side: 'SELL' as const, price: 11, shares: 1000, fee: 0 },
+    ]
+    expect(netCostOf(rows, 0)).toBeNull()
   })
 })
