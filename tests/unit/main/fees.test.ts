@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import { ledgerCosts, solveFromFeeTotal, type FeeRow } from '@main/trades/fees'
-import { DEFAULT_COSTS, buyFees, sellFees } from '../../../src/backtest/costs'
+import {
+  DEFAULT_COSTS,
+  STAMP_TAX_HALVED_ON,
+  STAMP_TAX_RATE_AFTER,
+  STAMP_TAX_RATE_BEFORE,
+  TRANSFER_FEE_RATE,
+  buyFees,
+  sellFees,
+} from '../../../src/backtest/costs'
 import type { TradeFeeRates } from '@shared/ipc-types'
 
 /**
@@ -14,12 +22,7 @@ import type { TradeFeeRates } from '@shared/ipc-types'
  * 根本不是一个数（实测 12.067 vs 12.903）。而「累计交易税费」没有这个歧义。
  */
 
-const BASE: TradeFeeRates = {
-  commissionRate: 0.00025,
-  minCommission: 5,
-  stampTaxRate: 0.001,
-  transferFeeRate: 0.00001,
-}
+const BASE: TradeFeeRates = { commissionRate: 0.00025, minCommission: 5 }
 /** 免最低那一档（用户勾了「免 5 元最低佣金」时调用方就是这么给的） */
 const WAIVED: TradeFeeRates = { ...BASE, minCommission: 0 }
 
@@ -38,7 +41,7 @@ const row = (side: FeeRow['side'], shares: number, price: number, day = 0): FeeR
 const BIG: FeeRow[] = [row('BUY', 10_000, 10), row('SELL', 10_000, 11)]
 
 function feeUnder(rates: TradeFeeRates, rows = BIG): number {
-  const costs = ledgerCosts(rates)
+  const costs = ledgerCosts(rates, '2026-09-03')
   const r2 = (x: number): number => Math.round(x * 100) / 100
   return r2(
     rows.reduce((sum, r) => {
@@ -53,19 +56,34 @@ function feeUnder(rates: TradeFeeRates, rows = BIG): number {
 
 describe('ledgerCosts', () => {
   it('**滑点恒为 0** —— 记账绝不套滑点（用户填的就是真实成交价）', () => {
-    expect(ledgerCosts(BASE).slippage).toBe(0)
+    expect(ledgerCosts(BASE, '2026-09-03').slippage).toBe(0)
     // 刻意不是继承出厂的 0.001：日后谁真在记账里用了滑点，结果是「不偏」而不是静默偏 0.1%
     expect(DEFAULT_COSTS.slippage).toBe(0.001)
   })
 
-  it('四项原样带过去，一个都不许悄悄换成出厂值', () => {
-    const rates: TradeFeeRates = {
+  it('券商那两项原样带过去；印花税与过户费**按日期取规则**，不从设置读', () => {
+    const rates: TradeFeeRates = { commissionRate: 0.0001, minCommission: 0 }
+    expect(ledgerCosts(rates, '2026-09-03')).toEqual({
       commissionRate: 0.0001,
       minCommission: 0,
-      stampTaxRate: 0.0005,
-      transferFeeRate: 0,
-    }
-    expect(ledgerCosts(rates)).toEqual({ ...rates, slippage: 0 })
+      stampTaxRate: STAMP_TAX_RATE_AFTER,
+      transferFeeRate: TRANSFER_FEE_RATE,
+      slippage: 0,
+    })
+  })
+
+  /**
+   * ⚠ 这一条是 2026-09-03 真机抓到的：我们把印花税写死 0.001，
+   * 而它 **2023-08-28 起已经减半到 0.0005** ⇒ 用户账本上每一笔卖出都被多扣一倍。
+   * 更坏的是它**污染了反解** —— 那 2 倍的误差被整个折算进佣金率。
+   */
+  it('印花税按生效日分档：2023-08-28 之前千 1、之后千 0.5', () => {
+    const rates: TradeFeeRates = { commissionRate: 0.00025, minCommission: 5 }
+    expect(ledgerCosts(rates, '2023-08-25').stampTaxRate).toBe(STAMP_TAX_RATE_BEFORE)
+    // 生效当天就是新规
+    expect(ledgerCosts(rates, STAMP_TAX_HALVED_ON).stampTaxRate).toBe(STAMP_TAX_RATE_AFTER)
+    expect(ledgerCosts(rates, '2026-09-03').stampTaxRate).toBe(STAMP_TAX_RATE_AFTER)
+    expect(STAMP_TAX_RATE_BEFORE / STAMP_TAX_RATE_AFTER).toBe(2)
   })
 })
 
@@ -155,12 +173,13 @@ describe('solveFromFeeTotal', () => {
   })
 
   it('保留最低、且每笔都触到最低 ⇒ UNIDENTIFIABLE（费用对费率完全不敏感）', () => {
-    const tiny: FeeRow[] = [row('BUY', 100, 10), row('BUY', 100, 10, 1)]
+    // 单笔 500 元：即使佣金率拉到千 5 也只有 2.5 元，永远被 5 元最低盖住
+    const tiny: FeeRow[] = [row('BUY', 100, 5), row('BUY', 100, 5, 1)]
     const solved = solveFromFeeTotal({
       rows: tiny,
       board: 'MAIN',
       base: BASE,
-      targetFeeTotal: 11,
+      targetFeeTotal: 8,
     })
     expect(solved.status).toBe('UNIDENTIFIABLE')
     // 不给一个「差不多能对上」的费率：那会把一个解不出的问题固化成一个荒唐的数
@@ -264,5 +283,75 @@ describe('solveFromFeeTotal', () => {
     // 股票那边光印花税就 110 元，1 元这个目标够不到；ETF 免征，解得出来
     expect(stock.status).toBe('OUT_OF_RANGE')
     expect(etf.status).toBe('OK')
+  })
+})
+
+/**
+ * **真实账单回归**（同花顺，湖南白银，2026-09-03）。
+ *
+ * 这一组不是构造出来的：8 笔逐笔费用全部来自券商 App 的截图，
+ * 而它一次抓出了两个缺陷 —— 印花税写成了减半前的千 1（差一倍），
+ * 以及「最低 5 元」被当成只卡佣金（过户费另加）。
+ *
+ * ⚠ 它钉的是**逐笔零残差**，不是「总数差不多」：只对总数的话，
+ * 一个 2 倍的印花税误差可以被佣金率整个吸收掉，而那正是当时发生的事
+ * —— 反解给出「万 1.13 + 免最低」，一个看起来精确、实际完全虚构的结论。
+ */
+describe('真实账单回归（同花顺 8 笔）', () => {
+  const D = (day: string): number => Date.parse(`${day}T04:00:00Z`)
+  /** [side, 股数, 价, 账单上的费用] */
+  const BILL: [FeeRow['side'], number, number, number, string][] = [
+    ['OPENING', 5100, 14.75, 17.71, '2026-01-22'],
+    ['BUY', 3600, 10.33, 8.75, '2026-05-19'],
+    ['BUY', 1700, 11.38, 5.0, '2026-08-26'],
+    ['SELL', 1700, 11.33, 14.63, '2026-08-26'],
+    ['BUY', 1700, 11.7, 5.0, '2026-08-28'],
+    ['SELL', 1700, 11.67, 14.92, '2026-08-28'],
+    ['BUY', 1700, 10.59, 5.0, '2026-08-31'],
+    ['SELL', 1700, 10.7, 14.1, '2026-08-31'],
+  ]
+  const rows: FeeRow[] = BILL.map(([side, shares, price, , day]) => ({
+    side,
+    shares,
+    price,
+    fee: 0,
+    tradedAt: D(day),
+    ...(side === 'OPENING' ? { feeIncluded: false } : {}),
+  }))
+  /** 账单合计，也就是同花顺那一屏的「交易税费」 */
+  const TOTAL = BILL.reduce((sum, [, , , fee]) => sum + fee, 0)
+
+  it('账单合计恰好是券商显示的 85.11', () => {
+    expect(TOTAL).toBeCloseTo(85.11, 2)
+  })
+
+  it('反解出万 2.25 + 最低 5 元（**不需要勾免最低**）', () => {
+    const solved = solveFromFeeTotal({ rows, board: 'MAIN', base: BASE, targetFeeTotal: TOTAL })
+    expect(solved.status).toBe('OK')
+    expect((solved.rate ?? 0) * 1e4).toBeCloseTo(2.25, 2)
+    expect(solved.feeTotalAt).toBeCloseTo(TOTAL, 2)
+  })
+
+  it('**逐笔零残差** —— 只对总数的话，一个 2 倍的印花税误差会被佣金率整个吸收', () => {
+    const solved = solveFromFeeTotal({ rows, board: 'MAIN', base: BASE, targetFeeTotal: TOTAL })
+    const rates: TradeFeeRates = { ...BASE, commissionRate: solved.rate ?? 0 }
+    const r2 = (x: number): number => Math.round(x * 100) / 100
+    BILL.forEach(([side, shares, price, actual, day], i) => {
+      const costs = ledgerCosts(rates, day)
+      const amount = price * shares
+      const mine = side === 'SELL' ? r2(sellFees(amount, costs)) : r2(buyFees(amount, costs))
+      expect(mine, `第 ${i + 1} 笔 ${day} ${side}`).toBeCloseTo(actual, 2)
+    })
+  })
+
+  it('用减半前的印花税（千 1）算，这 8 笔会多出 29 元 —— 那是修掉的那个缺陷', () => {
+    const r2 = (x: number): number => Math.round(x * 100) / 100
+    const wrong = BILL.reduce((sum, [side, shares, price, , day]) => {
+      // 硬塞一个「不按日期分档」的旧口径：印花税恒为千 1
+      const costs = { ...ledgerCosts(BASE, day), stampTaxRate: STAMP_TAX_RATE_BEFORE }
+      const amount = price * shares
+      return sum + (side === 'SELL' ? r2(sellFees(amount, costs)) : r2(buyFees(amount, costs)))
+    }, 0)
+    expect(wrong - TOTAL).toBeGreaterThan(28)
   })
 })

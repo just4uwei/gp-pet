@@ -36,10 +36,15 @@ const TradeFeeRatesSchema = z.object({
     .number()
     .min(0)
     .max(COMMISSION_RATE_MAX, '佣金率不该超过千分之五，检查一下是不是多了几个 0'),
-  minCommission: z.number().min(0).max(100, '单笔最低佣金不该超过 100 元'),
-  stampTaxRate: z.number().min(0).max(0.005, '印花税率不该超过千分之五'),
-  transferFeeRate: z.number().min(0).max(0.001, '过户费率不该超过万分之十'),
+  minCommission: z.number().min(0).max(100, '单笔最低手续费不该超过 100 元'),
 })
+/*
+  ⚠ 这里**只有券商那两项**。印花税与过户费是国家与交易所的规定，住
+  `backtest/costs.ts` 并带生效日期 —— 见 `TradeFeeRates` 头注释。
+
+  zod 默认**剥掉多余的键**（非 strict），所以 2026-09-03 之前写进 settings.json 的
+  那两项会被静默丢掉，而那正是想要的：它们当时存的是一个**已经过期一倍的印花税率**。
+*/
 
 /** 费率的来路。整块坏掉时只丢来路、不丢费率（见 `AppSettings.tradeCostsSource`） */
 const TradeFeeSourceSchema = z.object({
@@ -71,7 +76,7 @@ export const AppSettingsSchema = z.object({
 export const DEFAULT_SETTINGS: AppSettings = {
   pollIntervalSec: 30,
   /*
-    出厂费率**逐位等于** `backtest/costs.ts` 的 `DEFAULT_COSTS` 对应四项
+    出厂费率**逐位等于** `backtest/costs.ts` 的 `DEFAULT_COSTS` 对应两项
     ⇒ 没校正过的用户，账本行为一个字不变。
 
     ⚠ 这里刻意**写字面量而不是 import `DEFAULT_COSTS`**：那份是回测与影子的固定假设，
@@ -83,8 +88,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   tradeCosts: {
     commissionRate: 0.00025,
     minCommission: 5,
-    stampTaxRate: 0.001,
-    transferFeeRate: 0.00001,
   },
   sensitivity: 'BALANCED',
   alertLevelOffset: 0,

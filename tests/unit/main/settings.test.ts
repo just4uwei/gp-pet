@@ -178,15 +178,22 @@ describe('sanitizeSettings · tradeCosts', () => {
     expect(DEFAULT_SETTINGS.tradeCosts).toEqual({
       commissionRate: DEFAULT_COSTS.commissionRate,
       minCommission: DEFAULT_COSTS.minCommission,
-      stampTaxRate: DEFAULT_COSTS.stampTaxRate,
-      transferFeeRate: DEFAULT_COSTS.transferFeeRate,
     })
     // **没有 slippage** —— 记账绝不套滑点，少这一项让它在类型上就做不成
     expect('slippage' in DEFAULT_SETTINGS.tradeCosts).toBe(false)
+    /*
+      ⚠ **也没有印花税与过户费**（2026-09-03 订正）：那两项是国家与交易所的规定，
+      带生效日期住 `backtest/costs.ts`。把规则当成可配的数写进设置，
+      就会出现 2026-09-03 那个缺陷：印花税 2023-08-28 起已减半，而设置里躺着一个
+      过期一倍的 0.001 —— 用户每一笔卖出多扣一倍，且反解把那 2 倍误差
+      整个折算进了佣金率，给出一个看起来精确、实际虚构的结论。
+    */
+    expect('stampTaxRate' in DEFAULT_SETTINGS.tradeCosts).toBe(false)
+    expect('transferFeeRate' in DEFAULT_SETTINGS.tradeCosts).toBe(false)
   })
 
-  it('0 是合法取值 —— 券商可以免最低佣金，场内基金本来就免印花税与过户费', () => {
-    const zeroed = { commissionRate: 0, minCommission: 0, stampTaxRate: 0, transferFeeRate: 0 }
+  it('0 是合法取值 —— 券商可以免最低手续费', () => {
+    const zeroed = { commissionRate: 0, minCommission: 0 }
     const result = sanitizeSettings({ tradeCosts: zeroed })
     expect(result.settings.tradeCosts).toEqual(zeroed)
     expect(result.repaired).toEqual([])
@@ -206,6 +213,19 @@ describe('sanitizeSettings · tradeCosts', () => {
       tradeCosts: { ...DEFAULT_SETTINGS.tradeCosts, minCommission: -1 },
     })
     expect(result.settings.tradeCosts).toEqual(DEFAULT_SETTINGS.tradeCosts)
+  })
+
+  it('2026-09-03 之前写进文件的印花税/过户费被静默剥掉 —— 那是过期一倍的规则', () => {
+    const legacy = {
+      commissionRate: 0.0001,
+      minCommission: 0,
+      stampTaxRate: 0.001, // 已经过期：2023-08-28 起是 0.0005
+      transferFeeRate: 0.00001,
+    }
+    const result = sanitizeSettings({ tradeCosts: legacy })
+    expect(result.settings.tradeCosts).toEqual({ commissionRate: 0.0001, minCommission: 0 })
+    // 剥掉不算「修复」—— 它不是坏值，只是不该由设置管
+    expect(result.repaired.map((r) => r.field)).not.toContain('tradeCosts')
   })
 
   it('来路（tradeCostsSource）坏掉时**只丢来路，不丢费率**', () => {

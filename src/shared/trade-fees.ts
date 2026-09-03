@@ -26,3 +26,29 @@ export function ratePerThousand(rate: number): string {
   const value = rate * 1000
   return `千 ${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(2).replace(/0$/, '')}`
 }
+
+/**
+ * 证券交易印花税**减半**的生效日与前后两档。
+ *
+ * ⚠ **一处定义，两边共用**：`src/backtest/costs.ts` 从这里 re-export
+ * （渲染层不能 import `src/backtest`，而设置页要把这个日期显示给用户看）。
+ * 依据是财政部、税务总局 2023-08-27 公告：自 2023-08-28 起减半征收，
+ * 卖出方按成交金额的 0.05%（此前 0.1%），买入方不征。
+ *
+ * 它存在的理由与 `MAIN_ST_LIMIT_WIDENED_ON` 一模一样：**不带生效日期的规则常量
+ * 迟早会错，而它错的时候没有任何东西会报警。**
+ */
+export const STAMP_TAX_HALVED_ON = '2023-08-28'
+/** 减半之前：卖出方 0.1% */
+export const STAMP_TAX_RATE_BEFORE = 0.001
+/** 减半之后：卖出方 0.05% */
+export const STAMP_TAX_RATE_AFTER = 0.0005
+
+/**
+ * 过户费率（双边，场内基金免）。自 2022-04-29 起沪深统一为成交金额的 0.001%。
+ *
+ * ⚠ 它**也是规则**，理论上同样该带生效日期（2022-04-29 之前上交所是 0.002%）。
+ * 眼下没做，理由是量级：回测窗口内它最多差 万0.1，而印花税那一项差的是**一倍**。
+ * 记在这里，别当成「已经处理好了」。
+ */
+export const TRANSFER_FEE_RATE = 0.00001

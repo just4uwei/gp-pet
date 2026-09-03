@@ -287,11 +287,18 @@ describe('replayTrades', () => {
 */
 describe('replayLedger', () => {
   const CHEAP: typeof DEFAULT_COSTS = { ...DEFAULT_COSTS, commissionRate: 0.0001 }
+  /*
+    `tradedAt` 是**必填**的（费率里有按日期分档的规则：印花税 2023-08-28 起减半）。
+    这一组用例传的是固定 `CostModel`，日期用不上 —— 但类型上必须给，
+    那正是「漏传就编译不过」想要的效果。
+  */
+  const AT = Date.UTC(2026, 0, 22)
+  const at = <T extends object>(row: T): T & { tradedAt: number } => ({ ...row, tradedAt: AT })
 
   it('默认沿用**行上存着的** fee —— 删一笔不相干的流水，不该把历史费用按今天的费率改一遍', () => {
     const rows = [
-      { id: 'a', side: 'BUY' as const, price: 10, shares: 1000, fee: 30 },
-      { id: 'b', side: 'BUY' as const, price: 12, shares: 1000, fee: 40 },
+      at({ id: 'a', side: 'BUY' as const, price: 10, shares: 1000, fee: 30 }),
+      at({ id: 'b', side: 'BUY' as const, price: 12, shares: 1000, fee: 40 }),
     ]
     const result = replayLedger(rows, 'MAIN', DEFAULT_COSTS)
     expect(result.rows.map((row) => row.fee)).toEqual([30, 40])
@@ -312,9 +319,9 @@ describe('replayLedger', () => {
    */
   it('**点名的那几行照样重算** —— 新录/刚改的一笔落库时费用还没算出来，落的是 0 占位', () => {
     const rows = [
-      { id: 'old', side: 'BUY' as const, price: 10, shares: 1000, fee: 30 },
+      at({ id: 'old', side: 'BUY' as const, price: 10, shares: 1000, fee: 30 }),
       // 这一行模拟「刚 insert 的占位」：fee 是 0，但它不是事实
-      { id: 'fresh', side: 'BUY' as const, price: 10, shares: 10_000, fee: 0 },
+      at({ id: 'fresh', side: 'BUY' as const, price: 10, shares: 10_000, fee: 0 }),
     ]
     const naive = replayLedger(rows, 'MAIN', DEFAULT_COSTS)
     expect(naive.rows[1]?.fee).toBe(0) // ← 不点名就是这个下场
@@ -333,7 +340,7 @@ describe('replayLedger', () => {
   })
 
   it('refee 时按传进来的费率重算每一笔', () => {
-    const rows = [{ id: 'a', side: 'BUY' as const, price: 10, shares: 1000, fee: 999 }]
+    const rows = [at({ id: 'a', side: 'BUY' as const, price: 10, shares: 1000, fee: 999 })]
     const result = replayLedger(rows, 'MAIN', CHEAP, { refee: true })
     expect(result.rows[0]?.fee).toBeCloseTo(buyFees(10_000, CHEAP), 2)
     expect(result.rows[0]?.fee).not.toBe(999)
@@ -341,7 +348,7 @@ describe('replayLedger', () => {
 
   it('refee **跳过「价已含费」的建仓** —— 那个 price 就是摊薄成本，补一笔费用等于凭空改掉它', () => {
     const included = replayLedger(
-      [{ id: 'a', side: 'OPENING', price: 11, shares: 1000, fee: 0, feeIncluded: true }],
+      [at({ id: 'a', side: 'OPENING', price: 11, shares: 1000, fee: 0, feeIncluded: true })],
       'MAIN',
       CHEAP,
       { refee: true }
@@ -351,7 +358,7 @@ describe('replayLedger', () => {
 
     // 对照：明确「不含费」的那种照样重算
     const bare = replayLedger(
-      [{ id: 'a', side: 'OPENING', price: 11, shares: 1000, fee: 0, feeIncluded: false }],
+      [at({ id: 'a', side: 'OPENING', price: 11, shares: 1000, fee: 0, feeIncluded: false })],
       'MAIN',
       CHEAP,
       { refee: true }
@@ -362,9 +369,9 @@ describe('replayLedger', () => {
   it('**realized 逐行重算**：删掉第一笔买入之后，后面那笔卖出的已实现盈亏跟着变', () => {
     const before = replayLedger(
       [
-        { id: 'buy1', side: 'BUY', price: 10, shares: 1000, fee: 5 },
-        { id: 'buy2', side: 'BUY', price: 20, shares: 1000, fee: 5 },
-        { id: 'sell', side: 'SELL', price: 30, shares: 1000, fee: 5 },
+        at({ id: 'buy1', side: 'BUY', price: 10, shares: 1000, fee: 5 }),
+        at({ id: 'buy2', side: 'BUY', price: 20, shares: 1000, fee: 5 }),
+        at({ id: 'sell', side: 'SELL', price: 30, shares: 1000, fee: 5 }),
       ],
       'MAIN',
       DEFAULT_COSTS
@@ -374,8 +381,8 @@ describe('replayLedger', () => {
 
     const after = replayLedger(
       [
-        { id: 'buy2', side: 'BUY', price: 20, shares: 1000, fee: 5 },
-        { id: 'sell', side: 'SELL', price: 30, shares: 1000, fee: 5 },
+        at({ id: 'buy2', side: 'BUY', price: 20, shares: 1000, fee: 5 }),
+        at({ id: 'sell', side: 'SELL', price: 30, shares: 1000, fee: 5 }),
       ],
       'MAIN',
       DEFAULT_COSTS
@@ -384,15 +391,15 @@ describe('replayLedger', () => {
   })
 
   it('买入不给 realized —— **null 不是 0**（约束 4）', () => {
-    const result = replayLedger([{ id: 'a', side: 'BUY', price: 10, shares: 100, fee: 5 }], 'MAIN')
+    const result = replayLedger([at({ id: 'a', side: 'BUY', price: 10, shares: 100, fee: 5 })], 'MAIN')
     expect(result.rows[0]?.realized).toBeNull()
   })
 
   it('跳过的行**列名报出来**，调用方据此判「这一笔录不进去」', () => {
     const result = replayLedger(
       [
-        { id: 'open', side: 'OPENING', price: 10, shares: 1000 },
-        { id: 'bad', side: 'SELL', price: 11, shares: 5000 },
+        at({ id: 'open', side: 'OPENING', price: 10, shares: 1000 }),
+        at({ id: 'bad', side: 'SELL', price: 11, shares: 5000 }),
       ],
       'MAIN'
     )
@@ -403,9 +410,9 @@ describe('replayLedger', () => {
   it('peakScale 是全部送转的累积 —— 连着两次 10 送 10 就是 1/4', () => {
     const result = replayLedger(
       [
-        { id: 'open', side: 'OPENING', price: 10, shares: 1000 },
-        { id: 's1', side: 'SPLIT', price: 0, shares: 1000 },
-        { id: 's2', side: 'SPLIT', price: 0, shares: 2000 },
+        at({ id: 'open', side: 'OPENING', price: 10, shares: 1000 }),
+        at({ id: 's1', side: 'SPLIT', price: 0, shares: 1000 }),
+        at({ id: 's2', side: 'SPLIT', price: 0, shares: 2000 }),
       ],
       'MAIN'
     )

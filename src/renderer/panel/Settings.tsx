@@ -27,6 +27,12 @@ import type {
   ParamRow,
 } from '@shared/ipc-types'
 import { ratePerThousand, ratePerTenThousand } from '@shared/trade-fees'
+import {
+  STAMP_TAX_HALVED_ON,
+  STAMP_TAX_RATE_AFTER,
+  STAMP_TAX_RATE_BEFORE,
+  TRANSFER_FEE_RATE,
+} from '@shared/trade-fees'
 import { shanghaiDate, shanghaiMdHhmm } from '@shared/time'
 import { DISCLAIMER } from './disclaimer'
 import { AiSettings } from './AiSettings'
@@ -319,13 +325,34 @@ function TradeCosts({ settings }: { settings: AppSettings }): React.JSX.Element 
         <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
           <dt className="text-white/40">佣金（双边）</dt>
           <dd className="font-mono text-white/70">{ratePerTenThousand(rates.commissionRate)}</dd>
-          <dt className="text-white/40">单笔最低佣金</dt>
-          <dd className="font-mono text-white/70">{rates.minCommission} 元</dd>
-          <dt className="text-white/40">印花税（仅卖出）</dt>
-          <dd className="font-mono text-white/70">{ratePerThousand(rates.stampTaxRate)}</dd>
-          <dt className="text-white/40">过户费（双边）</dt>
-          <dd className="font-mono text-white/70">{ratePerTenThousand(rates.transferFeeRate)}</dd>
+          <dt className="text-white/40">单笔最低手续费</dt>
+          <dd className="font-mono text-white/70">
+            {rates.minCommission === 0 ? '免' : `${rates.minCommission} 元`}
+          </dd>
         </dl>
+
+        {/*
+          印花税与过户费**不在上面那张表里**：它们是国家与交易所的规定，不是券商报价，
+          而且**带生效日期**（印花税 2023-08-28 起减半）。
+          把规则当成一个可配的数存进设置，就会出现 2026-09-03 那个缺陷：
+          设置里躺着一个过期一倍的印花税率，用户每一笔卖出多扣一倍，
+          而反解还把那 2 倍误差整个折算进了佣金率。
+        */}
+        <div className="mt-2 rounded border border-white/10 bg-black/20 px-2.5 py-2">
+          <div className="text-[10px] text-white/45">下面两项是规定，不归你也不归券商</div>
+          <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
+            <dt className="text-white/40">印花税（仅卖出）</dt>
+            <dd className="font-mono text-white/70">
+              {ratePerThousand(STAMP_TAX_RATE_AFTER)}
+              <span className="ml-1 font-sans text-[10px] text-white/30">
+                （{STAMP_TAX_HALVED_ON} 起减半；之前是
+                {ratePerThousand(STAMP_TAX_RATE_BEFORE)}，按成交日分档）
+              </span>
+            </dd>
+            <dt className="text-white/40">过户费（双边）</dt>
+            <dd className="font-mono text-white/70">{ratePerTenThousand(TRANSFER_FEE_RATE)}</dd>
+          </dl>
+        </div>
 
         <p className="mt-2 text-[10px] leading-snug text-white/35">
           {source === undefined ? (
@@ -347,7 +374,6 @@ function TradeCosts({ settings }: { settings: AppSettings }): React.JSX.Element 
               </span>
               是你当时勾的（<span className="text-white/45">它反解不出来</span> ——
               与佣金率在同一个 max() 里，一个方程解不了两个未知数）。
-              印花税与过户费一直没动过：那是交易所与国家规定。
             </>
           )}
         </p>

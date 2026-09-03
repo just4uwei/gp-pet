@@ -94,12 +94,18 @@
  * —— 016 之前的 18 行四列全 NULL（不猜、不回填），得等新的成交攒起来。
  */
 
-import type { Board } from '@core/types'
+import type { Board, TradeDate } from '@core/types'
 import type { TradeSide } from '@shared/ipc-types'
+import { shanghaiDate } from '@shared/time'
 import { DEFAULT_COSTS, buyFees, sellFees, type CostModel } from '../../backtest/costs'
 
 /** 五种流水的定义在 `shared/ipc-types.ts` 的 `TradeSide`（一处定义，主/渲染共用） */
 export type LedgerSide = TradeSide
+
+/** 成交时刻（epoch ms）→ 北京交易日。费率里那些按日期分档的规则要用它 */
+function tradeDateOf(tradedAt: number): TradeDate {
+  return shanghaiDate(tradedAt)
+}
 
 export interface LedgerPosition {
   shares: number
@@ -376,12 +382,31 @@ export function resolveDecision(input: {
   return { decision: { at: input.signal.createdAt, price: input.signal.priceAt } }
 }
 
+/**
+ * 重放时怎么拿到「那一天的费率」。
+ *
+ * 给一个 `CostModel` = 整条流水共用一套（测试与旧调用点）；给一个函数 =
+ * **按每一行自己的日期取规则**（印花税 2023-08-28 起减半，见 `stampTaxRateOn`）。
+ * 后者是实盘那条路必须用的：一律拿「今天」的规则去算八年前那笔卖出，
+ * 会让历史的已实现盈亏整体错掉，而账面上看不出来。
+ */
+export type CostsResolver = CostModel | ((asOf: TradeDate) => CostModel)
+
+function costsOn(resolver: CostsResolver, asOf: TradeDate): CostModel {
+  return typeof resolver === 'function' ? resolver(asOf) : resolver
+}
+
 /** 重放的一行入参。`id` 只用来把重算结果对回去 */
 export interface LedgerReplayRow {
   id: string
   side: LedgerSide
   price: number
   shares: number
+  /**
+   * 成交日（epoch ms）。**必填** —— 费率里有按日期分档的规则（印花税），
+   * 给它一个默认值等于让漏传的调用点静默沿用某一版规则。
+   */
+  tradedAt: number
   /**
    * 库里存着的那笔费用。**缺省 = 让重放按 `costs` 算一遍。**
    *
@@ -426,7 +451,7 @@ export interface LedgerReplayResult {
 export function replayLedger(
   rows: readonly LedgerReplayRow[],
   board: Board,
-  costs: CostModel = DEFAULT_COSTS,
+  costs: CostsResolver = DEFAULT_COSTS,
   opts: { refee?: boolean; refeeIds?: ReadonlySet<string> } = {}
 ): LedgerReplayResult {
   let position: LedgerPosition | null = null
@@ -462,7 +487,8 @@ export function replayLedger(
         ...(row.feeIncluded === undefined ? {} : { feeIncluded: row.feeIncluded }),
         ...(recompute || row.fee === undefined ? {} : { feeOverride: row.fee }),
       },
-      costs
+      // **按这一行自己的日期取规则**，不是拿「今天」的规则算八年前那笔
+      costsOn(costs, tradeDateOf(row.tradedAt))
     )
     if (isTradeError(outcome)) {
       skipped.push({ id: row.id, reason: outcome.error })
@@ -517,12 +543,14 @@ export function netCostOf(
  * ⚠ 与 `replayLedger` 一样**默认沿用库里存着的费用**。
  */
 export function replayTrades(
-  trades: readonly Omit<LedgerReplayRow, 'id'>[],
+  trades: readonly Omit<LedgerReplayRow, 'id' | 'tradedAt'>[],
   board: Board,
   costs: CostModel = DEFAULT_COSTS
 ): LedgerPosition | null {
   return replayLedger(
-    trades.map((trade, index) => ({ id: String(index), ...trade })),
+    // 这个包装只接受**固定**费率（`costs` 是 CostModel 不是函数）⇒ 日期用不上，
+    // 落 0 是安全的。要按日期分档的调用点一律直接用 `replayLedger`
+    trades.map((trade, index) => ({ id: String(index), tradedAt: 0, ...trade })),
     board,
     costs
   ).position

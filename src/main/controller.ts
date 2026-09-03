@@ -159,7 +159,7 @@ import {
   type TradeInput,
 } from './trades/ledger'
 import type { CostModel } from '../backtest/costs'
-import { ledgerCosts, ratePerTenThousand, solveFromFeeTotal } from './trades/fees'
+import { ledgerCosts, ratePerTenThousand, solveFromFeeTotal, tradeDateOf } from './trades/fees'
 import { splitCode } from '@core/code'
 import type { TradeRow } from './storage/repositories/trade'
 import type { WatchPointRow } from './storage/repositories/watch'
@@ -999,8 +999,8 @@ export class AppController {
    * （理由在 `shared/ipc-types.ts` 的 `TradeFeeRates`：跟着用户改会让影子净值
    * 每校正一次就分一段，而分段前后拆不开就没法引用）。
    */
-  private ledgerCostModel(layer: DataLayer): CostModel {
-    return ledgerCosts(layer.settings.get().tradeCosts)
+  private ledgerCostModel(layer: DataLayer, asOf: number): CostModel {
+    return ledgerCosts(layer.settings.get().tradeCosts, tradeDateOf(asOf))
   }
 
   /** 落库行 → 重放入参。`feeIncluded` 的缺省语义（老行 = 已含费）交给 `applyTrade` 判 */
@@ -1011,8 +1011,20 @@ export class AppController {
       price: row.price,
       shares: row.shares,
       fee: row.fee,
+      // 必带：费率里有按日期分档的规则（印花税 2023-08-28 起减半）
+      tradedAt: row.tradedAt,
       ...(row.feeIncluded === undefined ? {} : { feeIncluded: row.feeIncluded }),
     }
+  }
+
+  /**
+   * 重放用的费率解析器：**按每一行自己的日期取规则**。
+   *
+   * 不能预先固化成一个 `CostModel` —— 那等于拿「今天」的印花税率去算八年前那笔卖出，
+   * 而历史的已实现盈亏会整体错掉、账面上看不出来（`stampTaxRateOn` 头注释）。
+   */
+  private ledgerCostsBy(rates: TradeFeeRates): (asOf: TradeDate) => CostModel {
+    return (asOf) => ledgerCosts(rates, asOf)
   }
 
   /**
@@ -1048,14 +1060,15 @@ export class AppController {
        */
       refeeIds?: ReadonlySet<string>
       resetPeak?: boolean
-      costs?: CostModel
+      /** 显式给一套费率（校正那一趟用，不从 settings 读 —— 见 `calibrateApply` 的第 4 条） */
+      costs?: (asOf: TradeDate) => CostModel
     } = {}
   ): { position: LedgerPosition | null; skipped: { id: string; reason: string }[] } {
     const rows = layer.storage.trades.listByCode(code)
     const result = replayLedger(
       rows.map((row) => this.toReplayRow(row)),
       this.boardOf(code),
-      opts.costs ?? this.ledgerCostModel(layer),
+      opts.costs ?? this.ledgerCostsBy(layer.settings.get().tradeCosts),
       {
         ...(opts.refee === true ? { refee: true } : {}),
         ...(opts.refeeIds === undefined ? {} : { refeeIds: opts.refeeIds }),
@@ -1100,7 +1113,7 @@ export class AppController {
    * 与真的发生的事逐位一致。
    */
   private auditRefee(layer: DataLayer, rates: TradeFeeRates): FeeAudit {
-    const costs = ledgerCosts(rates)
+    const costsBy = this.ledgerCostsBy(rates)
     const audit: FeeAudit = {
       trades: 0,
       codes: 0,
@@ -1116,7 +1129,7 @@ export class AppController {
       const result = replayLedger(
         rows.map((row) => this.toReplayRow(row)),
         this.boardOf(code),
-        costs,
+        costsBy,
         { refee: true }
       )
       const feeById = new Map(result.rows.map((row) => [row.id, row.fee]))
@@ -1219,7 +1232,8 @@ export class AppController {
     const outcome = applyTrade(
       current ? { shares: current.shares, cost: current.cost } : null,
       this.tradeInputOf(draft),
-      this.ledgerCostModel(layer)
+      // 试算按**这一笔自己的成交日**取规则（补录 2023 年之前那笔卖出时印花税是千 1）
+      this.ledgerCostModel(layer, draft.tradedAt ?? Date.now())
     )
     if (isTradeError(outcome)) return { ...empty, error: outcome.error }
     const warning = this.t1SellWarning(draft, current)
@@ -1707,7 +1721,7 @@ export class AppController {
 
     try {
       layer.storage.db.transaction(() => {
-        const costs = ledgerCosts(rates)
+        const costs = this.ledgerCostsBy(rates)
         for (const code of layer.storage.trades.codesWithTrades()) {
           this.rebuildLedger(layer, code, { refee: true, costs })
         }

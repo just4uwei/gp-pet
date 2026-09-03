@@ -31,13 +31,19 @@
  * 同一只票实测 12.067 vs 12.903，两边**根本不是一个数**。
  * 而「累计交易税费」没有这个歧义：它就是一笔钱。
  *
- * ## 最低佣金必须由用户说，解不出来
+ * ## 印花税与过户费**不参与反解**，它们是规定
  *
- * `fee = max(最低, 金额 × 率) + …` 里有**两个**未知数，而只有一个方程。
- * 真机上这一条是**硬约束**而不是洁癖：那个账户免 5 元最低，
- * 而**保留 5 元最低时，即使佣金率归零总费用也有 99.56 元**，够不到券商的 85.11
- * ⇒ 无论怎么解都解不出来。所以「免不免最低」做成一个**用户勾的开关**
- * （那是他知道的账户事实），剩下的一个未知数才解得动。
+ * 那两项住 `backtest/costs.ts` 并**带生效日期**（`stampTaxRateOn`）。
+ * 2026-09-03 之前它们被当成可配的数写死，而印花税 **2023-08-28 起已经减半到 0.05%**
+ * ⇒ 一个 2 倍的误差被反解**整个折算进佣金率**，给出「你的佣金是万 1.13、还免最低」
+ * 这种看起来精确、实际完全虚构的结论（真机核对：真实是万 2.25 + 最低 5 元）。
+ * **规则一旦混进被解的未知数里，解出来的就不是费率而是误差的容器。**
+ *
+ * ## 最低手续费必须由用户说，解不出来
+ *
+ * `fee = max(最低, 金额 × 率 + 过户费)` 里有**两个**未知数，而只有一个方程。
+ * 所以「免不免最低」做成一个**用户勾的开关**（那是他知道的账户事实），
+ * 剩下的一个未知数才解得动。
  *
  * 实现是**二分**，前提是 `费用(费率)` 单调不减 —— `max()` 与线性项都单调。
  * 二分而不是解析解，是因为 `max()` 让它分段、且分段点取决于每一笔的金额。
@@ -47,22 +53,41 @@
  * （那更可能是漏了一笔流水、或者最低佣金那个开关勾反了）· 压根没有会产生费用的流水。
  */
 
-import type { Board } from '@core/types'
+import type { Board, TradeDate } from '@core/types'
 import type { FeeCalibration, TradeFeeRates } from '@shared/ipc-types'
-import { buyFees, sellFees, type CostModel } from '../../backtest/costs'
+import {
+  TRANSFER_FEE_RATE,
+  buyFees,
+  sellFees,
+  stampTaxRateOn,
+  type CostModel,
+} from '../../backtest/costs'
+import { shanghaiDate } from '@shared/time'
 import { ratePerTenThousand } from '@shared/trade-fees'
 import { COMMISSION_RATE_MAX } from '../settings/schema'
 import type { LedgerSide } from './ledger'
 
-export function ledgerCosts(rates: TradeFeeRates): CostModel {
+/**
+ * 用户费率 + **那一天的规则** → 记账用的 `CostModel`。
+ *
+ * `asOf` 是**这一笔成交那一天**的日期，**必填**：印花税 2023-08-28 起减半，
+ * 给它一个默认值等于让漏传的调用点静默沿用旧规则（与 `priceLimitRatio` 同一条纪律）。
+ * 印花税与过户费**不从用户设置读** —— 它们是规定不是偏好，见 `TradeFeeRates` 头注释。
+ */
+export function ledgerCosts(rates: TradeFeeRates, asOf: TradeDate): CostModel {
   return {
     commissionRate: rates.commissionRate,
     minCommission: rates.minCommission,
-    stampTaxRate: rates.stampTaxRate,
-    transferFeeRate: rates.transferFeeRate,
+    stampTaxRate: stampTaxRateOn(asOf),
+    transferFeeRate: TRANSFER_FEE_RATE,
     // 见头注释：记账不套滑点，这个 0 是刻意的
     slippage: 0,
   }
+}
+
+/** 成交时刻（epoch ms）→ 北京交易日，喂给 `ledgerCosts` 的第二参 */
+export function tradeDateOf(tradedAt: number): TradeDate {
+  return shanghaiDate(tradedAt)
 }
 
 /** 费用落库时按分取整（`round2`）⇒ 判「对上了」的容差取半分再放宽一点 */
@@ -107,8 +132,11 @@ export interface FeeRow {
  * 这一行在给定费率下会被收多少费。`null` = **这一行不产生费用**
  * （分红 / 送转不是成交；「价已含费」的建仓，它的费用当初就摊在那个价里了）。
  */
-function feeOfRow(row: FeeRow, board: Board, costs: CostModel): number | null {
+function feeOfRow(row: FeeRow, board: Board, rates: TradeFeeRates): number | null {
   const amount = row.price * Math.trunc(row.shares)
+  // **按这一行自己的日期取规则** —— 印花税 2023-08-28 起减半，一律用「今天」的
+  // 规则去算八年前那笔卖出，是这次要修的东西
+  const costs = ledgerCosts(rates, tradeDateOf(row.tradedAt))
   if (row.side === 'BUY') return buyFees(amount, costs, board)
   if (row.side === 'SELL') return sellFees(amount, costs, board)
   if (row.side === 'OPENING') return row.feeIncluded === false ? buyFees(amount, costs, board) : null
@@ -117,10 +145,9 @@ function feeOfRow(row: FeeRow, board: Board, costs: CostModel): number | null {
 
 /** 一批流水在给定费率下的费用合计（按分取整，与落库口径一致） */
 function feeTotalUnder(rows: readonly FeeRow[], board: Board, rates: TradeFeeRates): number {
-  const costs = ledgerCosts(rates)
   let total = 0
   for (const row of rows) {
-    const fee = feeOfRow(row, board, costs)
+    const fee = feeOfRow(row, board, rates)
     if (fee !== null) total += Math.round(fee * 100) / 100
   }
   return Math.round(total * 100) / 100
@@ -150,7 +177,7 @@ export interface SolveResult {
 export function solveFromFeeTotal(input: {
   rows: readonly FeeRow[]
   board: Board
-  /** 除 `commissionRate` 之外的三项按它走；`minCommission` 已由「免最低」开关定好 */
+  /** `minCommission` 已由「免最低」开关定好；印花税与过户费按日期取规则，不在这里 */
   base: TradeFeeRates
   targetFeeTotal: number
   /** 截止日（含这一天）。`undefined` = 全部算上 */
@@ -161,8 +188,7 @@ export function solveFromFeeTotal(input: {
   const inWindow =
     through === undefined ? input.rows : input.rows.filter((row) => row.tradedAt <= through)
   const excludedByDate = input.rows.length - inWindow.length
-  const costsNow = ledgerCosts(base)
-  const bearing = inWindow.filter((row) => feeOfRow(row, board, costsNow) !== null)
+  const bearing = inWindow.filter((row) => feeOfRow(row, board, base) !== null)
   const stats = { feeBearing: bearing.length, excludedByDate }
 
   const feeAt = (rate: number): number =>
@@ -191,7 +217,7 @@ export function solveFromFeeTotal(input: {
     return {
       status: 'UNIDENTIFIABLE',
       message:
-        `这 ${bearing.length} 笔全都触到了最低佣金（${base.minCommission} 元）` +
+        `这 ${bearing.length} 笔全都触到了最低手续费（${base.minCommission} 元）` +
         `—— 佣金率对总费用没有影响，反解不出来。` +
         (base.minCommission > 0
           ? '如果你的券商其实免这个最低，勾上「免 5 元最低佣金」再试。'
