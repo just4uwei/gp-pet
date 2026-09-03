@@ -58,6 +58,7 @@ import {
   buyFees,
   buyFill,
   lotsAffordable,
+  costsOn,
   sellFees,
   sellFill,
   type CostModel,
@@ -548,7 +549,8 @@ function fillTrade(
     if (!limitedDown) {
       const exitAdj = sellFill(bar.openAdj, costs)
       const amount = shares * exitAdj
-      const exitFees = sellFees(amount, costs, series.profile.board)
+      // 印花税按**卖出那一天**取规则（2023-08-28 起减半）
+      const exitFees = sellFees(amount, costsOn(costs, bar.date), series.profile.board)
       return { deployed, pnl: (exitAdj - fillAdj) * shares - entryFees - exitFees }
     }
     exitIdx++

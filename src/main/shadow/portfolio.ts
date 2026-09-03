@@ -38,6 +38,7 @@ import {
   buyFees,
   buyFill,
   lotsAffordable,
+  costsOn,
   sellFees,
   sellFill,
   type CostModel,
@@ -226,7 +227,8 @@ export function executeOrder(
   const qty = quantizeSell(position.shares, fraction)
   const fillAdj = sellFill(ctx.bar.openAdj, ctx.costs)
   const amount = qty * fillAdj
-  const fees = sellFees(amount, ctx.costs, ctx.board)
+  // 印花税按**这一天**取规则（2023-08-28 起减半）
+  const fees = sellFees(amount, costsOn(ctx.costs, ctx.bar.date), ctx.board)
   // 部分卖出时买入费用按比例摊到这一笔，剩余留给后续那笔
   const allocatedEntryCosts = position.entryCosts * (qty / position.shares)
   const grossPnl = (fillAdj - position.entryPriceAdj) * qty

@@ -48,7 +48,16 @@ import type {
   SecCode,
   TradeDate,
 } from '../core/types'
-import { DEFAULT_COSTS, buyFees, buyFill, lotsAffordable, sellFees, sellFill, type CostModel } from './costs'
+import {
+  DEFAULT_COSTS,
+  buyFees,
+  buyFill,
+  costsOn,
+  lotsAffordable,
+  sellFees,
+  sellFill,
+  type CostModel,
+} from './costs'
 import type { EquityPoint } from './metrics'
 import type { LoadedSeries } from './data'
 
@@ -346,7 +355,8 @@ export function simulateCode(
             const qty = quantizeSell(shares, fraction)
             const fillAdj = sellFill(bar.openAdj, costs)
             const amount = qty * fillAdj
-            const fees = sellFees(amount, costs, profile.board)
+            // 印花税按**这一根 K 线的日期**取规则（2023-08-28 起减半）
+            const fees = sellFees(amount, costsOn(costs, bar.date), profile.board)
             cash += amount - fees
             // 部分卖出时买入费用按比例摊到这一笔，剩余留给后续那笔
             const allocatedEntryCosts = entryCosts * (qty / shares)
@@ -494,7 +504,7 @@ export function simulateCode(
   ) {
     const fillAdj = sellFill(lastBar.closeAdj, costs)
     const amount = shares * fillAdj
-    const fees = sellFees(amount, costs, profile.board)
+    const fees = sellFees(amount, costsOn(costs, lastBar.date), profile.board)
     cash += amount - fees
     result.trades.push({
       code: profile.code,

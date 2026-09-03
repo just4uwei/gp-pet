@@ -52,6 +52,7 @@ export interface CliOptions {
     commissionRate?: number
     minCommission?: number
     stampTaxRate?: number
+    stampTaxPinned?: number
     transferFeeRate?: number
     slippage?: number
   }
@@ -110,7 +111,7 @@ export const USAGE = `用法：
   --warmup <根>          前 N 根只喂数据不判信号，默认 params.data.fullBars
   --commission <率>      默认 0.00025（双边）
   --min-commission <元>  默认 5
-  --stamp-tax <率>       默认 0.001（仅卖出）
+  --stamp-tax <率>       钉死印花税率（默认按成交日取规则：2023-08-28 起千 0.5，之前千 1）
   --transfer-fee <率>    默认 0.00001（双边）
   --slippage <率>        默认 0.001
   --rf <年化率>          无风险利率，只多打一行 sharpeNet（默认 0 = 不算）
@@ -251,7 +252,12 @@ export function parseArgs(argv: readonly string[]): CliOptions | 'help' {
         options.costs.minCommission = positiveNumber(key, requireValue(key, next))
         break
       case '--stamp-tax':
-        options.costs.stampTaxRate = positiveNumber(key, requireValue(key, next))
+        {
+          // 钉死它：`costsOn` 从此不再按成交日改写这一项（那正是这个实验旋钮的意思）
+          const pinned = positiveNumber(key, requireValue(key, next))
+          options.costs.stampTaxRate = pinned
+          options.costs.stampTaxPinned = pinned
+        }
         break
       case '--transfer-fee':
         options.costs.transferFeeRate = positiveNumber(key, requireValue(key, next))

@@ -2,7 +2,8 @@
  * 交易成本与滑点（docs/07 §2.2）。
  *
  * 默认值取 A 股散户的常见档位：
- *   佣金 双边万 2.5（最低 5 元）· 印花税 卖出千 1 · 过户费 双边万 0.1 · 滑点 0.1%
+ *   佣金 双边万 2.5（最低 5 元）· 印花税 卖出**千 0.5**（2023-08-28 减半，之前千 1，
+ *   按成交日分档 —— 见 `stampTaxRateOn` / `costsOn`）· 过户费 双边万 0.1 · 滑点 0.1%
  *
  * 为什么成本不能省：本策略的信号频率不低，来回一趟的固定摩擦约 0.3%。
  * 一个「年化 17%」的回测，扣掉摩擦后可能只剩个位数 —— 不含成本的回测数字
@@ -22,7 +23,12 @@ export {
   STAMP_TAX_RATE_BEFORE,
   TRANSFER_FEE_RATE,
 } from '../shared/trade-fees'
-import { STAMP_TAX_HALVED_ON as HALVED_ON, STAMP_TAX_RATE_AFTER as AFTER, STAMP_TAX_RATE_BEFORE as BEFORE } from '../shared/trade-fees'
+import {
+  STAMP_TAX_HALVED_ON as HALVED_ON,
+  STAMP_TAX_RATE_AFTER as AFTER,
+  STAMP_TAX_RATE_BEFORE as BEFORE,
+  TRANSFER_FEE_RATE as TRANSFER_FEE_RATE_VALUE,
+} from '../shared/trade-fees'
 
 /**
  * 卖出印花税率。`asOf` 是**这一笔成交那一天**的日期（`YYYY-MM-DD`），**必填** ——
@@ -69,10 +75,18 @@ export function isFundBoard(board?: Board): boolean {
 export interface CostModel {
   /** 佣金率（双边） */
   commissionRate: number
-  /** 单笔最低佣金，元 */
+  /** 单笔最低**手续费**（佣金 + 过户费那一整块），元。见 `handlingFee` */
   minCommission: number
-  /** 印花税率，仅卖出 */
+  /**
+   * **这一笔**按哪个印花税率算（仅卖出）。它随成交日变 —— 由 `costsOn(costs, 成交日)`
+   * 按 `STAMP_TAX_HALVED_ON` 填好，调用方不该自己拍一个数。
+   */
   stampTaxRate: number
+  /**
+   * 非空 = 用户用 `--stamp-tax` **把它钉死了**（实验旋钮），`costsOn` 不再按日期改写。
+   * 缺省 = 按成交日取规则。`auditKnobs` 会把它标成非出厂口径。
+   */
+  stampTaxPinned?: number
   /** 过户费率（双边） */
   transferFeeRate: number
   /** 滑点，按成交价的比例双向不利方向偏移 */
@@ -82,9 +96,24 @@ export interface CostModel {
 export const DEFAULT_COSTS: CostModel = {
   commissionRate: 0.00025,
   minCommission: 5,
-  stampTaxRate: 0.001,
-  transferFeeRate: 0.00001,
+  // **现行**税率（2023-08-28 减半后）。历史那一段由 `costsOn` 按成交日换成 0.001
+  stampTaxRate: AFTER,
+  transferFeeRate: TRANSFER_FEE_RATE_VALUE,
   slippage: 0.001,
+}
+
+/**
+ * 把「按成交日取规则」应用到一份成本模型上 —— **每一笔卖出之前都要过这一道**。
+ *
+ * 为什么不把日期塞进 `sellFees` 的参数：调用点有五处（回测两处、随机基准一处、
+ * 影子两处、记账一处），而记账那边已经在按行解析费率了。
+ * 让**调用方解析、`sellFees` 只收一份算好的模型**，两边就只有一种写法。
+ *
+ * ⚠ 相等时返回原对象（不复制）：模拟里每根 K 线都会调它。
+ */
+export function costsOn(costs: CostModel, asOf: TradeDate): CostModel {
+  const rate = costs.stampTaxPinned ?? stampTaxRateOn(asOf)
+  return rate === costs.stampTaxRate ? costs : { ...costs, stampTaxRate: rate }
 }
 
 /** 买入成交价：滑点一律朝不利方向（买贵、卖便宜），不做「有时有利」的假设 */

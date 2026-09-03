@@ -61,7 +61,7 @@ import type { KlineRepo } from '../storage/repositories/kline'
 import type { MetaRepo } from '../storage/repositories/meta'
 import type { ShadowJournalEntry, ShadowRepo } from '../storage/repositories/shadow'
 import { SHADOW_KEYS } from '../storage/repositories/shadow'
-import { DEFAULT_COSTS, sellFees, sellFill, type CostModel } from '../../backtest/costs'
+import { DEFAULT_COSTS, costsOn, sellFees, sellFill, type CostModel } from '../../backtest/costs'
 import type { EngineParams } from '@core/params'
 import {
   MAX_DEFER_BARS,
@@ -429,7 +429,7 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
           const exitAdj = sellFill(position.lastCloseAdj, costs)
           const amount = exitAdj * position.shares
           // 板块决定费率：场内基金免印花税与过户费（costs.ts 的 isFundBoard）
-          const fees = sellFees(amount, costs, profileOf(position.code)?.board)
+          const fees = sellFees(amount, costsOn(costs, date), profileOf(position.code)?.board)
           cash += amount - fees
           repo.insertTrade({
             id: newId(),
