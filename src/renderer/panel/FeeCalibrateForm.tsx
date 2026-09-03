@@ -71,6 +71,18 @@ export function FeeCalibrateForm({
   const [through, setThrough] = useState(defaultThrough)
   const [waive, setWaive] = useState(false)
   const [result, setResult] = useState<FeeCalibration | null>(null)
+  /**
+   * 「应用」点过一次，正在等第二次确认。
+   *
+   * ⚠ **刻意不用 `window.confirm`**（2026-09-03 换掉）：它是一个**原生模态框**，
+   * 而这一屏在它关掉之后还要继续输入 —— 用户实测「第二次校正时输入框点不进去、
+   * 敲了没字」，而自动化**永远复现不出来**（Playwright 把 `window.confirm` 拦掉，
+   * 从头到尾没有真的弹过原生框）。既然测不到，就不该留在关键路径上。
+   *
+   * 换成页内两步之后还顺手去掉了一处重复：后果清单（改写几笔、清掉几条止损线、
+   * 逐只列出受影响的持仓）**本来就画在表单里**，原生框只是把同样的话再说一遍。
+   */
+  const [confirming, setConfirming] = useState(false)
   const [busy, setBusy] = useState(false)
 
   const targetFeeTotal = Number(target)
@@ -92,33 +104,35 @@ export function FeeCalibrateForm({
 
   const apply = (): void => {
     if (result === null || result.status !== 'OK') return
-    const audit = result.audit
-    const ok = window.confirm(
-      `按 ${code} 的税费反解出的佣金率，重算整个账本？\n\n` +
-        `· 会改写 ${audit?.trades ?? 0} 笔流水（${audit?.codes ?? 0} 只标的）\n` +
-        `· 成本价会变的持仓：${audit?.positions.length ?? 0} 只\n` +
-        `· 会清掉 ${audit?.stopAcksCleared ?? 0} 条「已接受的那段亏损」` +
-        `（成本变了，那条线不再是同一个判断）\n\n` +
-        '费率是账户级的，所以它作用于全部标的 —— 如果只有这一只对不上，' +
-        '更可能是这只票的流水本身漏了什么。\n\n' +
-        '这一步可逆：重新校正一次就还原。事前会自动备份一份数据库。'
-    )
-    if (!ok) return
     setBusy(true)
     void window.gp
       .invoke('trade:calibrateApply', query)
       .then((res) => {
-        if (res.status === 'DONE') {
-          void window.gp.invoke('trade:list', { code }).then(onDone)
-        } else {
+        if (res.status !== 'DONE') {
           onError(res.message)
+          setConfirming(false)
+          return undefined
         }
+        // ⚠ 这一趟也要 catch：漏了的话账本已经改完、界面却停在原地不动，
+        // 而用户会以为「没生效」再点一次
+        return window.gp
+          .invoke('trade:list', { code })
+          .then(onDone)
+          .catch((err: unknown) =>
+            onError(
+              `账本已按新费率重算，但刷新这一屏失败了：${err instanceof Error ? err.message : String(err)}`
+            )
+          )
       })
       .catch((err: unknown) => onError(err instanceof Error ? err.message : String(err)))
       .finally(() => setBusy(false))
   }
 
-  const dirty = (): void => setResult(null)
+  /** 改了任何一个入参 ⇒ 上一次的结果与那次待确认都作废 */
+  const dirty = (): void => {
+    setResult(null)
+    setConfirming(false)
+  }
 
   return (
     <div className="mt-2 rounded border border-white/10 bg-black/20 p-2.5">
@@ -209,9 +223,41 @@ export function FeeCalibrateForm({
                   ))}
                 </ul>
               ) : null}
-              <button className="gp-btn mt-2 w-full justify-center" disabled={busy} onClick={apply}>
-                {busy ? '重算中…' : '应用到全部标的'}
-              </button>
+              {/*
+                两步确认（页内，不用原生模态框 —— 见 `confirming` 的注释）。
+                第二步那段话讲的是**上面那张清单之外**的三件事：
+                费率是账户级的 · 可逆 · 事前会备份。清单本身不重复。
+              */}
+              {confirming ? (
+                <div className="mt-2 rounded border border-amber-400/40 bg-amber-400/[0.08] px-2 py-1.5">
+                  <div className="text-[10px] leading-snug text-amber-100/90">
+                    费率是<span className="font-medium">账户级</span>的 —— 它作用于全部标的。
+                    如果只有这一只对不上，更可能是这只票的流水本身漏了什么。
+                    <br />
+                    这一步<span className="font-medium">可逆</span>：重新校正一次就还原，事前会自动备份一份数据库。
+                  </div>
+                  <div className="mt-1.5 flex gap-1.5">
+                    <button
+                      className="gp-btn flex-1 justify-center border-amber-400/50 text-amber-100"
+                      disabled={busy}
+                      onClick={apply}
+                    >
+                      {busy ? '重算中…' : '确认，重算整个账本'}
+                    </button>
+                    <button className="gp-btn" disabled={busy} onClick={() => setConfirming(false)}>
+                      再想想
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  className="gp-btn mt-2 w-full justify-center"
+                  disabled={busy}
+                  onClick={() => setConfirming(true)}
+                >
+                  应用到全部标的
+                </button>
+              )}
             </>
           ) : null}
         </div>

@@ -306,6 +306,9 @@ export function TradePanel({
   // 换票时把关联清掉：上一只票的提醒挂到这一只上是纯粹的错误
   useEffect(() => setSignalId(''), [code])
 
+  // 换票时收起校正表单：用户点开的是 A 的校正，不是 B 的（见下面那个 key={code}）
+  useEffect(() => setCalibrateOpen(false), [code])
+
   /**
    * 切到「现金分红」时把股数预填成当前持仓 —— 绝大多数分红就是按全仓派的，
    * 让用户再抄一遍自己刚在上面看到的那个数没有意义。
@@ -458,7 +461,14 @@ export function TradePanel({
         */}
         {ledger !== null ? (
           calibrateOpen ? (
+            /*
+              ⚠ `key={code}` 是必需的：抽屉里换一只票**不会卸载** `TradePanel`
+              （React 认的是位置，只换 props）⇒ 表单会带着上一只票的输入值与反解结果
+              继续显示，而那些数字对这只票**是错的**。给它一个 key = 换票即重挂。
+              下面那个 effect 顺带把它收起来 —— 用户点开的是 A 的校正，不是 B 的。
+            */
             <FeeCalibrateForm
+              key={code}
               code={code}
               feeTotal={ledger.feeTotal}
               onDone={(next) => {
