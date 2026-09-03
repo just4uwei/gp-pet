@@ -332,6 +332,21 @@ describe('真实账单回归（同花顺 8 笔）', () => {
     expect(solved.feeTotalAt).toBeCloseTo(TOTAL, 2)
   })
 
+  /**
+   * 券商账单把过户费**并进「佣金」那一栏**（同花顺实测：其他费用 0.00），
+   * 而我们拆成「净佣金率 + 过户费率」两项。钱完全一样 ——
+   * `金额 × (净佣金率 + 过户费率)` 恒等于 `金额 × 全包率` ——
+   * 但只报净佣金率的话，用户拿账单一除（17.71 ÷ 75225 = 万2.354）就会发现「对不上」。
+   */
+  it('结论里要报出**合计费率**（佣金 + 过户费），那才是账单上「佣金」栏那个数', () => {
+    const solved = solveFromFeeTotal({ rows, board: 'MAIN', base: BASE, targetFeeTotal: TOTAL })
+    expect(solved.status).toBe('OK')
+    // 净佣金率 万2.25，连过户费一起是 万2.35 —— 后者与 17.71 ÷ 75225 对得上
+    expect(solved.message).toContain('连过户费一起算是')
+    const allIn = (solved.rate ?? 0) + TRANSFER_FEE_RATE
+    expect(allIn * 1e4).toBeCloseTo(17.71 / 75225 * 1e4, 2)
+  })
+
   it('**逐笔零残差** —— 只对总数的话，一个 2 倍的印花税误差会被佣金率整个吸收', () => {
     const solved = solveFromFeeTotal({ rows, board: 'MAIN', base: BASE, targetFeeTotal: TOTAL })
     const rates: TradeFeeRates = { ...BASE, commissionRate: solved.rate ?? 0 }

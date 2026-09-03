@@ -470,7 +470,7 @@ export function TradePanel({
             <FeeCalibrateForm
               key={code}
               code={code}
-              feeTotal={ledger.feeTotal}
+              trades={ledger.trades}
               onDone={(next) => {
                 setCalibrateOpen(false)
                 onLedgerChanged(next)

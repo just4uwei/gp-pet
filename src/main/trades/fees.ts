@@ -305,12 +305,19 @@ export function solveFromFeeTotal(input: {
       : ''
   const excludedNote =
     excludedByDate > 0 ? `（截止日之后的 ${excludedByDate} 笔没有参与反解。）` : ''
+  /*
+    顺带报出**合计费率**（佣金 + 过户费）。券商账单上「佣金」那一栏多半就是这个数 ——
+    同花顺把过户费并进佣金里、「其他费用」显示 0.00（2026-09-03 用户实测），
+    而我们拆成两项。钱完全一样，但只报净佣金率会让用户拿账单一除就发现「对不上」。
+  */
+  const allIn = ratePerTenThousand(rate + TRANSFER_FEE_RATE)
   return {
     status: 'OK',
     message:
       `按 ${bearing.length} 笔流水反解出佣金率 ${ratePerTenThousand(rate)}` +
-      `（现行 ${ratePerTenThousand(base.commissionRate)}，最低佣金 ` +
+      `（现行 ${ratePerTenThousand(base.commissionRate)}，最低手续费 ` +
       `${base.minCommission === 0 ? '免' : `${base.minCommission} 元`}）。` +
+      `连过户费一起算是 ${allIn} —— 券商账单上「佣金」那一栏多半是这个数。` +
       `${excludedNote}${plausibilityNote}`,
     feeTotalNow,
     rate,

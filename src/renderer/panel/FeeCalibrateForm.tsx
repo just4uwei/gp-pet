@@ -32,9 +32,9 @@
  *    差额若来自漏录的一笔流水，按边界值应用只会把错误固化成一个荒唐的费率。
  */
 
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { SecCode } from '@core/types'
-import type { FeeCalibration, TradeLedger } from '@shared/ipc-types'
+import type { FeeCalibration, TradeLedger, TradeView } from '@shared/ipc-types'
 import { shanghaiDate, shanghaiMsFrom } from '@shared/time'
 
 const TONE: Record<FeeCalibration['status'], string> = {
@@ -54,14 +54,18 @@ function defaultThrough(): string {
 
 export function FeeCalibrateForm({
   code,
-  feeTotal,
+  trades,
   onDone,
   onCancel,
   onError,
 }: {
   code: SecCode
-  /** 我们现在算出来的累计手续费，用来当输入框的占位（让用户看着它抄旁边那个数） */
-  feeTotal: number
+  /**
+   * 这只票的全部流水。**只用来按截止日切一下、把两边的费用合计加出来**
+   * —— 那是把 `TradeView.fee` 这一列求和，不是在渲染层重算费率
+   * （费率口径只有 `main/trades/fees.ts` 一处，见 `trade:preview` 那条纪律）。
+   */
+  trades: readonly TradeView[]
   /** 应用成功后把新账本交回上层 */
   onDone: (ledger: TradeLedger) => void
   onCancel: () => void
@@ -88,6 +92,31 @@ export function FeeCalibrateForm({
   const targetFeeTotal = Number(target)
   // 截止日按北京日**收盘之后**算，否则当天那些流水会被自己的截止日挡掉
   const throughMs = (shanghaiMsFrom(through, '23:59') ?? Date.now()) + 59_000
+
+  /*
+    ⚠ 把「截止日之内」与「之后」两边的费用**当场摊开**（2026-09-03 加）。
+
+    这个功能最容易出的错不是解错，而是**两边不是同一个窗口**：
+    截止日排掉了今天那两笔，而用户抄的券商数字**已经把今天算进去了**
+    ⇒ 差额被整个记到佣金率头上，解出一个看起来精确的错数。
+    出错时账面上没有任何异样 —— 所以要在他动手之前就把两个数摆出来。
+  */
+  const split = useMemo(() => {
+    let inWindow = 0
+    let inFee = 0
+    let after = 0
+    let afterFee = 0
+    for (const t of trades) {
+      if (t.tradedAt <= throughMs) {
+        inWindow += 1
+        inFee += t.fee
+      } else {
+        after += 1
+        afterFee += t.fee
+      }
+    }
+    return { inWindow, inFee, after, afterFee }
+  }, [trades, throughMs])
   const valid = target.trim() !== '' && Number.isFinite(targetFeeTotal) && targetFeeTotal >= 0
   const query = { code, targetFeeTotal, throughMs, waiveMinCommission: waive }
 
@@ -191,10 +220,24 @@ export function FeeCalibrateForm({
         （这一项软件猜不出来，但它常常就是对不上的原因）
       </label>
 
-      <p className="mt-1 text-[10px] text-white/25">
-        我们现在算出来的是 <span className="font-mono text-white/45">{feeTotal.toFixed(2)}</span>
-        （全部流水，含截止日之后的）
+      {/*
+        两边的窗口必须一致 —— 这是这个功能最容易出的错，而且出错时账面上看不出来。
+        所以把「截止日之内我们算多少」直接摆在输入框下面，让他拿券商那个数当场比。
+      */}
+      <p className="mt-1 text-[10px] leading-snug text-white/30">
+        截止日之内 <span className="font-mono text-white/50">{split.inWindow}</span> 笔，
+        我们现在算 <span className="font-mono text-white/50">{split.inFee.toFixed(2)}</span> 元
+        —— <span className="text-white/45">你填的那个数要是同一个窗口的</span>。
       </p>
+      {split.after > 0 ? (
+        <p className="mt-1 rounded border border-amber-400/25 bg-amber-400/[0.07] px-2 py-1.5 text-[10px] leading-snug text-amber-200/85">
+          ⚠ 截止日之后还有 <span className="font-mono">{split.after}</span> 笔
+          （我们算 <span className="font-mono">{split.afterFee.toFixed(2)}</span> 元）
+          <span className="font-medium">没算进去</span>。
+          如果券商那个数**已经把它们算了**，就把截止日往后挪 —— 否则这点差额会被
+          整个记到佣金率头上，解出一个看起来精确的错数。
+        </p>
+      ) : null}
 
       {result !== null ? (
         <div className={`mt-2 rounded border px-2 py-1.5 text-[10px] leading-relaxed ${TONE[result.status]}`}>

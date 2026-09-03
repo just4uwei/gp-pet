@@ -325,9 +325,28 @@ function TradeCosts({ settings }: { settings: AppSettings }): React.JSX.Element 
         <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
           <dt className="text-white/40">佣金（双边）</dt>
           <dd className="font-mono text-white/70">{ratePerTenThousand(rates.commissionRate)}</dd>
+          {/*
+            合计费率 = 佣金 + 过户费。**券商账单上「佣金」那一栏多半就是这个数** ——
+            同花顺把过户费并进佣金里、「其他费用」显示 0.00（2026-09-03 用户实测），
+            而我们拆成两项。钱完全一样（`金额 × (净佣金率 + 过户费率)` 恒等于
+            `金额 × 全包率`），但只显示上面那一行会让用户拿账单一除就发现「对不上」。
+          */}
+          <dt className="text-white/40">
+            合计费率
+            <span className="ml-1 text-[10px] text-white/25">佣金 + 过户费</span>
+          </dt>
+          <dd className="font-mono text-white/70">
+            {ratePerTenThousand(rates.commissionRate + TRANSFER_FEE_RATE)}
+            <span className="ml-1 font-sans text-[10px] text-white/30">
+              （券商账单上「佣金」那一栏多半是这个数 —— 它把过户费并了进去）
+            </span>
+          </dd>
           <dt className="text-white/40">单笔最低手续费</dt>
           <dd className="font-mono text-white/70">
             {rates.minCommission === 0 ? '免' : `${rates.minCommission} 元`}
+            <span className="ml-1 font-sans text-[10px] text-white/30">
+              （卡的是「佣金 + 过户费」整块）
+            </span>
           </dd>
         </dl>
 
